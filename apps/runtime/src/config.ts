@@ -18,8 +18,9 @@ export interface RuntimeConfig {
   dataDir: string;
   replicaId: string;
   /**
-   * OpenAI 兼容 Provider 三元组（T4 最小实现：只读环境变量；Provider CRUD 与
-   * 凭据库是 T5 的事）。null 表示未配置——会话可建，发消息返回 503。
+   * OpenAI 兼容 Provider 三元组（T5 起：MORROW_PROVIDER_* 解析结果作为 ProviderRegistry
+   * 的 env 回退——显式 CRUD 注册的 Provider 优先，环境变量只在无注册 Provider 时充当
+   * 默认；null 表示未配置——会话可建，发消息返回 503）。
    */
   provider: ProviderConfig | null;
 }
@@ -55,8 +56,9 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
 }
 
 /**
- * Provider 环境变量解析（T4 最小实现）：三个变量都缺省 → null（未配置 Provider）。
- * 任一出现则 BASE_URL 与 MODEL 必填；API_KEY 可空串（vLLM/Ollama 等本地端点常免密）。
+ * Provider 环境变量解析（T5 起作为 env 回退种子，票面约定：显式 CRUD > 环境变量）：
+ * 三个变量都缺省 → null（未配置 Provider）。任一出现则 BASE_URL 与 MODEL 必填；
+ * API_KEY 可空串（vLLM/Ollama 等本地端点常免密）。
  */
 export function parseProviderConfig(env: Record<string, string | undefined>): ProviderConfig | null {
   const baseUrl = env.MORROW_PROVIDER_BASE_URL;

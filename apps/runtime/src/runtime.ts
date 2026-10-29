@@ -1,9 +1,12 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { createPiAdapter, type AgentRuntime } from "@morrow/pi-adapter";
 import packageJson from "../package.json" with { type: "json" };
-import type { ProviderConfig, RuntimeConfig } from "./config.ts";
+import type { RuntimeConfig } from "./config.ts";
+import { testProviderConnectivity } from "./connectivity.ts";
+import { detectSecretStore, type SecretStore } from "./keyring.ts";
 import { probeSandbox } from "./health.ts";
 import { EventLedger } from "./ledger.ts";
+import { ProviderRegistry, ProviderRegistryError, ENV_PROVIDER_ID, type ProviderResolver, type ResolvedProvider } from "./providers.ts";
 import { SessionManager, type SessionFrame } from "./sessions.ts";
 import { buildEventEnvelope } from "./envelope.ts";
 import { computeIntegrityHash, type EventEnvelope } from "@morrow/protocol";
@@ -13,7 +16,9 @@ import { computeIntegrityHash, type EventEnvelope } from "@morrow/protocol";
  *
  * node:http + 极简路由，不引框架——为 T8 bun compile 单二进制留路（ADR-0003）。
  * 路由面：GET /v1/health、GET /v1/events、T4 会话族（POST/GET /v1/sessions、
- * POST/GET /v1/sessions/:id/messages、GET /v1/sessions/:id/stream SSE）。
+ * POST/GET /v1/sessions/:id/messages、GET /v1/sessions/:id/stream SSE）、
+ * T5 Provider 族（GET/POST /v1/providers、GET/PUT/DELETE /v1/providers/:id、
+ * POST /v1/providers/:id/default、POST /v1/providers/:id/test）。
  * 未匹配路径 404，路径命中但方法不符 405（账本 append-only：对事件的任何变更
  * 方法在请求层即被拒绝）。
  * 生命周期：start 先监听后记账 runtime.started（携带实际端口）；close 先停收请求，
@@ -27,6 +32,7 @@ interface RequestContext {
   ledger: EventLedger;
   replicaId: string;
   sessions: SessionManager;
+  providers: ProviderRegistry;
 }
 
 type Handler = (
@@ -45,10 +51,16 @@ interface Route {
 
 export interface RuntimeOptions {
   /**
-   * Agent Loop 运行时工厂（PiAdapter 接口注入 seam）。缺省时由 config.provider
-   * 构建 createPiAdapter 工厂；provider 未配置则发消息 503（provider_not_configured）。
+   * Agent Loop 运行时工厂（PiAdapter 接口注入 seam）。缺省时用默认工厂
+   * （createPiAdapter，Provider 配置由 ProviderResolver 按会话解析）；
+   * 无任何 Provider 时发消息 503（provider_not_configured）。
    */
-  agentAdapterFactory?: (sessionId: string) => Promise<AgentRuntime>;
+  agentAdapterFactory?: (sessionId: string, provider: ResolvedProvider | null) => Promise<AgentRuntime>;
+  /**
+   * 凭据库注入 seam（票 T5）：缺省按平台探测（macOS Keychain 实测；Windows/Linux
+   * 未实测）。测试与宿主可注入内存桩避免触碰用户钥匙串。
+   */
+  secretStore?: SecretStore;
 }
 
 export interface RuntimeHandle {
@@ -57,6 +69,8 @@ export interface RuntimeHandle {
   ledger: EventLedger;
   /** 会话管理器（库形态可直用：abort / 订阅等测试与宿主 seam） */
   sessions: SessionManager;
+  /** Provider 注册表（库形态可直用：CRUD / 默认 / env 回退解析） */
+  providers: ProviderRegistry;
   /**
    * 优雅停止：停止接收请求 → 中止并释放会话运行时 → 记账 runtime.stopped →
    * 关闭账本（WAL checkpoint）。signal 传入收到的 POSIX 信号名，落进 stopped 事件的 payload。
@@ -69,6 +83,13 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 const routes: Route[] = [
   { method: "GET", re: /^\/v1\/health$/, handler: handleHealth },
   { method: "GET", re: /^\/v1\/events$/, handler: handleEvents },
+  { method: "GET", re: /^\/v1\/providers$/, handler: handleListProviders },
+  { method: "POST", re: /^\/v1\/providers$/, handler: handleRegisterProvider },
+  { method: "GET", re: /^\/v1\/providers\/([^/]+)$/, handler: handleGetProvider },
+  { method: "PUT", re: /^\/v1\/providers\/([^/]+)$/, handler: handleUpdateProvider },
+  { method: "DELETE", re: /^\/v1\/providers\/([^/]+)$/, handler: handleDeleteProvider },
+  { method: "POST", re: /^\/v1\/providers\/([^/]+)\/default$/, handler: handleSetDefaultProvider },
+  { method: "POST", re: /^\/v1\/providers\/([^/]+)\/test$/, handler: handleTestProvider },
   { method: "POST", re: /^\/v1\/sessions$/, handler: handleCreateSession },
   { method: "GET", re: /^\/v1\/sessions$/, handler: handleListSessions },
   { method: "GET", re: /^\/v1\/sessions\/([^/]+)\/messages$/, handler: handleHistory },
@@ -78,12 +99,20 @@ const routes: Route[] = [
 
 export async function startRuntime(config: RuntimeConfig, options: RuntimeOptions = {}): Promise<RuntimeHandle> {
   const ledger = EventLedger.open(config.dataDir);
+  const providers = new ProviderRegistry({
+    dataDir: config.dataDir,
+    secretStore: options.secretStore ?? detectSecretStore().store,
+    envFallback: config.provider,
+  });
   const sessions = new SessionManager({
     ledger,
     replicaId: config.replicaId,
-    factory: options.agentAdapterFactory ?? defaultAgentFactory(config.provider),
+    factory: options.agentAdapterFactory ?? defaultAgentFactory(),
+    providers,
+    // 注入工厂（测试/宿主自带 Agent Loop）时不做 Provider 预检（T4 语义）；默认工厂要求有 Provider
+    providerRequired: options.agentAdapterFactory === undefined,
   });
-  const ctx: RequestContext = { ledger, replicaId: config.replicaId, sessions };
+  const ctx: RequestContext = { ledger, replicaId: config.replicaId, sessions, providers };
   const server = createServer((req, res) => {
     routeRequest(req, res, ctx);
   });
@@ -110,6 +139,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     port,
     ledger,
     sessions,
+    providers,
     async close(signal?: string): Promise<void> {
       if (closing) return;
       closing = true;
@@ -135,15 +165,21 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
   };
 }
 
-/** 生产默认工厂：config.provider → createPiAdapter（OpenAI 兼容协议，ADR-0002） */
-function defaultAgentFactory(provider: ProviderConfig | null): ((sessionId: string) => Promise<AgentRuntime>) | null {
-  if (provider === null) return null;
-  return async () =>
-    createPiAdapter({
+/** 生产默认工厂：按会话解析的 Provider → createPiAdapter（OpenAI 兼容协议，ADR-0002） */
+function defaultAgentFactory(): (sessionId: string, provider: ResolvedProvider | null) => Promise<AgentRuntime> {
+  return async (_sessionId, provider) => {
+    if (provider === null) {
+      throw new Error("no model provider configured");
+    }
+    return createPiAdapter({
       baseUrl: provider.baseUrl,
-      apiKey: provider.apiKey,
+      // pi-ai 对空 key 抛 "No API key for provider"；免密端点（vLLM/Ollama）用其自身
+      // 的 "unused" 占位约定（这些端点忽略 Authorization 头）
+      apiKey: provider.apiKey.length > 0 ? provider.apiKey : "unused",
       model: { id: provider.modelId, contextWindow: provider.contextWindow, maxTokens: provider.maxTokens },
+      ...(provider.compat !== undefined ? { compat: provider.compat } : {}),
     });
+  };
 }
 
 function routeRequest(req: IncomingMessage, res: ServerResponse, ctx: RequestContext): void {
@@ -259,6 +295,7 @@ function listen(server: Server, host: string, port: number): Promise<number> {
 
 interface CreateSessionBody {
   title?: unknown;
+  provider_id?: unknown;
 }
 
 async function handleCreateSession(
@@ -269,17 +306,25 @@ async function handleCreateSession(
 ): Promise<void> {
   const body = await readJsonBody(req, res);
   if (body === null) return; // 响应已在 readJsonBody 里写出
-  const { title } = body as CreateSessionBody;
+  const { title, provider_id: providerId } = body as CreateSessionBody;
   if (title !== undefined && (typeof title !== "string" || title.trim().length === 0)) {
     sendError(res, 400, "invalid_body", "title must be a non-empty string when present");
     return;
   }
-  const created = ctx.sessions.createSession(title === undefined ? undefined : title.trim());
+  if (providerId !== undefined && (typeof providerId !== "string" || !ctx.providers.exists(providerId))) {
+    sendError(res, 400, "unknown_provider", `provider "${String(providerId)}" is not registered (GET /v1/providers for the list)`);
+    return;
+  }
+  const created = ctx.sessions.createSession(
+    title === undefined ? undefined : title.trim(),
+    typeof providerId === "string" ? providerId : undefined,
+  );
   sendJson(res, 201, {
     session_id: created.sessionId,
     event_id: created.eventId,
     sequence: created.sequence,
     occurred_at: created.occurredAt,
+    ...(typeof providerId === "string" ? { provider_id: providerId } : {}),
     ...(title === undefined ? {} : { title: title.trim() }),
   });
 }
@@ -418,6 +463,89 @@ function handleStream(
     clearInterval(heartbeat);
     unsubscribe();
   });
+}
+
+// --- T5 Provider 族 handlers -------------------------------------------------
+// 密钥安全不变量：任何响应/日志只含 has_api_key 投影，绝不回显 api_key（含错误路径——
+// ProviderRegistryError 的消息不携带密钥内容；测试覆盖 JSON 全文不含密钥的断言）。
+
+function handleProviderRegistryError(res: ServerResponse, err: unknown): void {
+  if (err instanceof ProviderRegistryError) {
+    const status = err.code === "invalid_input" ? 400 : err.code === "conflict" ? 409 : 404;
+    sendError(res, status, `provider_${err.code}`, err.message);
+    return;
+  }
+  throw err;
+}
+
+async function handleListProviders(_req: IncomingMessage, res: ServerResponse, _url: URL, ctx: RequestContext): Promise<void> {
+  const providers = await ctx.providers.listAll();
+  sendJson(res, 200, { providers, default_provider_id: await ctx.providers.defaultProviderId() });
+}
+
+async function handleRegisterProvider(req: IncomingMessage, res: ServerResponse, _url: URL, ctx: RequestContext): Promise<void> {
+  const body = await readJsonBody(req, res);
+  if (body === null) return;
+  try {
+    const record = await ctx.providers.register(body);
+    sendJson(res, 201, record);
+  } catch (err) {
+    handleProviderRegistryError(res, err);
+  }
+}
+
+async function handleGetProvider(_req: IncomingMessage, res: ServerResponse, _url: URL, ctx: RequestContext, params: string[]): Promise<void> {
+  const record = await ctx.providers.get(params[0]);
+  if (record === null) {
+    sendError(res, 404, "provider_not_found", `provider "${params[0]}" not found`);
+    return;
+  }
+  sendJson(res, 200, record);
+}
+
+async function handleUpdateProvider(req: IncomingMessage, res: ServerResponse, _url: URL, ctx: RequestContext, params: string[]): Promise<void> {
+  const body = await readJsonBody(req, res);
+  if (body === null) return;
+  try {
+    const record = await ctx.providers.update(params[0], body);
+    sendJson(res, 200, record);
+  } catch (err) {
+    handleProviderRegistryError(res, err);
+  }
+}
+
+async function handleDeleteProvider(_req: IncomingMessage, res: ServerResponse, _url: URL, ctx: RequestContext, params: string[]): Promise<void> {
+  try {
+    await ctx.providers.delete(params[0]);
+    sendJson(res, 200, { deleted: true, provider_id: params[0] });
+  } catch (err) {
+    handleProviderRegistryError(res, err);
+  }
+}
+
+async function handleSetDefaultProvider(_req: IncomingMessage, res: ServerResponse, _url: URL, ctx: RequestContext, params: string[]): Promise<void> {
+  try {
+    await ctx.providers.setDefault(params[0]);
+    sendJson(res, 200, { default_provider_id: await ctx.providers.defaultProviderId() });
+  } catch (err) {
+    handleProviderRegistryError(res, err);
+  }
+}
+
+/** 连通性测试：对注册 Provider（或 env 回退）发一次最小 OpenAI 兼容请求，三类结果（见 connectivity.ts） */
+async function handleTestProvider(_req: IncomingMessage, res: ServerResponse, _url: URL, ctx: RequestContext, params: string[]): Promise<void> {
+  const providerId = params[0];
+  if (!ctx.providers.exists(providerId)) {
+    sendError(res, 404, "provider_not_found", `provider "${providerId}" not found`);
+    return;
+  }
+  const resolved = await ctx.providers.resolve(providerId);
+  if (resolved === null) {
+    sendError(res, 404, "provider_not_found", `provider "${providerId}" not found`);
+    return;
+  }
+  const result = await testProviderConnectivity(resolved);
+  sendJson(res, 200, result);
 }
 
 /** 读取并解析 JSON 请求体；非法时写出 400/413 并返回 null */
