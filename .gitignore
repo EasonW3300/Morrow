@@ -26,3 +26,6 @@ logs/
 # OS
 .DS_Store
 Thumbs.db
+
+# Rust build output (root pattern is anchored; desktop Tauri target needs its own)
+apps/desktop/src-tauri/target/
