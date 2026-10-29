@@ -177,3 +177,27 @@ test("list paginates and filters by replica_id", () => {
   ledger.close();
   removeDir(dir);
 });
+
+test("closed ledger rejects every operation with an honest ledger_closed code (not invalid_envelope)", () => {
+  const dir = tmpDir();
+  const ledger = EventLedger.open(dir);
+  ledger.append(makeEvent({ payload: { i: 1 } }));
+  ledger.close();
+  ledger.close(); // close 幂等
+
+  const cases: Array<[string, () => unknown]> = [
+    ["append", () => ledger.append(makeEvent({ payload: { i: 2 } }))],
+    ["list", () => ledger.list()],
+    ["scan", () => ledger.scan()],
+    ["count", () => ledger.count()],
+    ["verifyIntegrity", () => ledger.verifyIntegrity()],
+  ];
+  for (const [name, fn] of cases) {
+    assert.throws(fn, (err: LedgerError) => {
+      assert.ok(err instanceof LedgerError, name);
+      assert.equal(err.code, "ledger_closed", `${name} 应报 ledger_closed（不是信封非法）`);
+      return true;
+    }, name);
+  }
+  removeDir(dir);
+});

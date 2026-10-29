@@ -8,6 +8,11 @@ export type {
   EventEnvelope,
   SchemaVersion,
 } from "./event-envelope.ts";
+export type {
+  ConnectivityResult,
+  ProviderCompatConfig,
+  ProviderRecord,
+} from "./api-contracts.ts";
 export {
   canonicalJson,
   computeIntegrityHash,

@@ -10,7 +10,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { emptyProviderForm, providerFormFromRecord, toCreatePayload, toUpdatePatch, validateProviderForm } from "./provider-form.ts";
+import { emptyProviderForm, providerFormFromRecord, toCreatePayload, validateProviderForm } from "./provider-form.ts";
 
 test("合法三元组通过：create 模式 api_key 可空（免密本地端点）", () => {
   const errors = validateProviderForm({
@@ -18,12 +18,12 @@ test("合法三元组通过：create 模式 api_key 可空（免密本地端点�
     name: "本地 vLLM",
     baseUrl: "http://127.0.0.1:8000",
     model: "qwen2.5-7b",
-  }, "create");
+  });
   assert.deepEqual(errors, {});
 });
 
 test("name / base_url / model 缺失各自报错，互不掩盖", () => {
-  const errors = validateProviderForm({ ...emptyProviderForm(), name: "  ", baseUrl: "", model: "" }, "create");
+  const errors = validateProviderForm({ ...emptyProviderForm(), name: "  ", baseUrl: "", model: "" });
   assert.ok(errors.name !== undefined);
   assert.ok(errors.baseUrl !== undefined);
   assert.ok(errors.model !== undefined);
@@ -37,13 +37,13 @@ test("base_url 必须是 http(s) URL：拒绝非协议与 ftp", () => {
       name: "n",
       baseUrl: bad,
       model: "m",
-    }, "create");
+    });
     assert.ok(errors.baseUrl !== undefined, `${bad} 应报错`);
   }
 });
 
 test("context_window / max_tokens 留空合法，填了必须是正整数", () => {
-  const ok = validateProviderForm({ ...emptyProviderForm(), name: "n", baseUrl: "http://a.b", model: "m" }, "create");
+  const ok = validateProviderForm({ ...emptyProviderForm(), name: "n", baseUrl: "http://a.b", model: "m" });
   assert.deepEqual(ok, {});
   const bad = validateProviderForm({
     ...emptyProviderForm(),
@@ -52,15 +52,15 @@ test("context_window / max_tokens 留空合法，填了必须是正整数", () =
     model: "m",
     contextWindow: "abc",
     maxTokens: "-1",
-  }, "create");
+  });
   assert.ok(bad.contextWindow !== undefined);
   assert.ok(bad.maxTokens !== undefined);
 });
 
 test("edit 模式：api_key 留空 = 不轮换，合法；非空也合法（轮换）", () => {
   const base = { name: "n", baseUrl: "http://a.b", model: "m" };
-  assert.deepEqual(validateProviderForm({ ...emptyProviderForm(), ...base, apiKey: "" }, "edit"), {});
-  assert.deepEqual(validateProviderForm({ ...emptyProviderForm(), ...base, apiKey: "sk-new" }, "edit"), {});
+  assert.deepEqual(validateProviderForm({ ...emptyProviderForm(), ...base, apiKey: "" }), {});
+  assert.deepEqual(validateProviderForm({ ...emptyProviderForm(), ...base, apiKey: "sk-new" }), {});
 });
 
 test("toCreatePayload：空 api_key 不发送字段（免密端点语义），非空才带", () => {
@@ -73,15 +73,15 @@ test("toCreatePayload：空 api_key 不发送字段（免密端点语义），�
   assert.equal(keyed.max_tokens, 1024);
 });
 
-test("toUpdatePatch：api_key 仅在非空时轮换；数字字段转为 number", () => {
+test("toCreatePayload 即编辑 patch（原 toUpdatePatch 纯转发已删）：api_key 仅在非空时轮换", () => {
   const form = { ...emptyProviderForm(), name: "n", baseUrl: "http://a.b", model: "m", apiKey: "" };
-  const patch = toUpdatePatch(form);
+  const patch = toCreatePayload(form);
   assert.equal("api_key" in patch, false, "空 key 编辑不应触发轮换");
-  const rotated = toUpdatePatch({ ...form, apiKey: "sk-new" });
+  const rotated = toCreatePayload({ ...form, apiKey: "sk-new" });
   assert.equal(rotated.api_key, "sk-new");
 });
 
-test("providerFormFromRecord → toUpdatePatch 往返：api_key 不回填明文（has_api_key 投影之外没有密钥）", () => {
+test("providerFormFromRecord → toCreatePayload 往返：api_key 不回填明文（has_api_key 投影之外没有密钥）", () => {
   const form = providerFormFromRecord({
     provider_id: "p1",
     name: "云上",
@@ -96,7 +96,7 @@ test("providerFormFromRecord → toUpdatePatch 往返：api_key 不回填明文�
   });
   assert.equal(form.apiKey, "", "编辑表单不得持有/回显已保存的密钥");
   assert.equal(form.contextWindow, "8192");
-  const patch = toUpdatePatch(form);
+  const patch = toCreatePayload(form); // 编辑保存直用同一 payload 构造器
   assert.equal("api_key" in patch, false);
   assert.equal(patch.compat.supportsDeveloperRole, true);
 });

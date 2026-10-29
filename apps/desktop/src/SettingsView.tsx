@@ -11,7 +11,6 @@ import {
   emptyProviderForm,
   providerFormFromRecord,
   toCreatePayload,
-  toUpdatePatch,
   validateProviderForm,
   type ProviderFormErrors,
   type ProviderFormValues,
@@ -75,7 +74,7 @@ export function SettingsView({ base }: { base: string }) {
 
   const save = async () => {
     if (form === null || saving) return;
-    const errors = validateProviderForm(form, editingId === null ? "create" : "edit");
+    const errors = validateProviderForm(form);
     setFormErrors(errors);
     if (Object.keys(errors).length > 0) return;
     setSaving(true);
@@ -84,7 +83,8 @@ export function SettingsView({ base }: { base: string }) {
       if (editingId === null) {
         await api.createProvider(base, toCreatePayload(form));
       } else {
-        await api.updateProvider(base, editingId, toUpdatePatch(form));
+        // PATCH 语义：toCreatePayload 里留空的 apiKey 不进 payload（= 不轮换），其余全量提交
+        await api.updateProvider(base, editingId, toCreatePayload(form));
       }
       closeForm();
       await reload();

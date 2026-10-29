@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
+import { UUID_RE } from "./uuid-v7.ts";
 
 /**
  * Runtime 配置（PRD §6.1 本地 HTTP 形态）：
@@ -34,7 +35,6 @@ export interface ProviderConfig {
   maxTokens: number;
 }
 
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 export function defaultDataDir(): string {
   return join(homedir(), ".morrow", "data");

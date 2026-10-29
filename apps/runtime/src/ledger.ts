@@ -21,7 +21,7 @@ import { openSqlite, type SqliteDatabase } from "./db.ts";
 
 export const DB_FILE_NAME = "events.sqlite";
 
-export type LedgerErrorCode = "invalid_envelope" | "hash_mismatch" | "duplicate_event_id";
+export type LedgerErrorCode = "invalid_envelope" | "hash_mismatch" | "duplicate_event_id" | "ledger_closed";
 
 export class LedgerError extends Error {
   code: LedgerErrorCode;
@@ -284,7 +284,8 @@ export class EventLedger {
   }
 
   #assertOpen(): void {
-    if (this.#closed) throw new LedgerError("invalid_envelope", "ledger is closed");
+    // 诚实错误码："账本已关"不是信封非法（曾误用 invalid_envelope，M0 code-review / Issue #11）
+    if (this.#closed) throw new LedgerError("ledger_closed", "ledger is closed");
   }
 }
 

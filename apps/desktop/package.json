@@ -14,6 +14,7 @@
     "test": "pnpm run typecheck && node --experimental-strip-types --test \"src/*.test.ts\" && cargo test --manifest-path src-tauri/Cargo.toml"
   },
   "dependencies": {
+    "@morrow/protocol": "workspace:*",
     "@tauri-apps/api": "^2.0.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"

@@ -11,6 +11,7 @@ import { ProviderRegistry, ProviderRegistryError, ENV_PROVIDER_ID, type Provider
 import { SessionManager, type SessionFrame } from "./sessions.ts";
 import { buildEventEnvelope } from "./envelope.ts";
 import { computeIntegrityHash, type EventEnvelope } from "@morrow/protocol";
+import { UUID_RE } from "./uuid-v7.ts";
 
 /**
  * Runtime HTTP 服务（PRD §6.2 的 M0 子集）。
@@ -28,7 +29,8 @@ import { computeIntegrityHash, type EventEnvelope } from "@morrow/protocol";
  * started），最后关闭账本落盘。
  */
 
-const VERSION: string = packageJson.version;
+/** 版本号唯一来源：本包 package.json（main.ts 的 ready 行也从这里取——不再双真相源） */
+export const VERSION: string = packageJson.version;
 
 interface RequestContext {
   ledger: EventLedger;
@@ -82,8 +84,6 @@ export interface RuntimeHandle {
    */
   close(signal?: string): Promise<void>;
 }
-
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 const routes: Route[] = [
   { method: "GET", re: /^\/v1\/health$/, handler: handleHealth },
@@ -198,8 +198,11 @@ function defaultAgentFactory(): (sessionId: string, provider: ResolvedProvider |
 function routeRequest(req: IncomingMessage, res: ServerResponse, ctx: RequestContext): void {
   // CORS：桌面 WebView 与浏览器联调是跨源客户端（PRD §6.1「渠道适配器亦为 API 客户端」）。
   // 只对本地来源（localhost / 127.0.0.1 / tauri://）放行——互联网页面的 Origin 不在列表内，
-  // 不能读写本地控制面；跨设备鉴权头是后续票的事。last-event-id 供 EventSource 断线重连
-  // 携带（非 safelist 头，需进 preflight 白名单）。
+  // 其脚本发起的跨源读写会被浏览器拦截。但 CORS 不是 CSRF 的完整防线：不带自定义头的
+  // simple POST（safelist content-type 如 text/plain）不经 preflight，请求本身仍会到达——
+  // 防线第二道是 readJsonBody 强制 application/json（safelist 外 → 强制 preflight → 204 空
+  // 白名单不放行；且服务器端直接 415 拒收）。残余风险见 docs/security/threat-model.md 域 4。
+  // last-event-id 供 EventSource 断线重连携带（非 safelist 头，需进 preflight 白名单）。
   const origin = req.headers.origin;
   if (typeof origin === "string" && isLocalOrigin(origin)) {
     res.setHeader("access-control-allow-origin", origin);
@@ -596,8 +599,20 @@ async function handleTestProvider(_req: IncomingMessage, res: ServerResponse, _u
   sendJson(res, 200, result);
 }
 
-/** 读取并解析 JSON 请求体；非法时写出 400/413 并返回 null */
+/**
+ * 读取并解析 JSON 请求体；非法时写出 400/413/415 并返回 null。
+ *
+ * content-type 必须显式为 application/json：application/json 不在 CORS「简单请求」
+ * safelist 内，跨源页面伪造的 simple POST（text/plain）会被强制走 preflight——
+ * 这是写端点的 CSRF 防线之一（威胁模型域 4「浏览器网页 CSRF 向量」；曾不校验
+ * content-type，M0 code-review / Issue #11 补上）。
+ */
 async function readJsonBody(req: IncomingMessage, res: ServerResponse, maxBytes = 1_000_000): Promise<Record<string, unknown> | null> {
+  const contentType = req.headers["content-type"];
+  if (contentType === undefined || !/^application\/json\b/i.test(contentType.trim())) {
+    sendError(res, 415, "unsupported_media_type", "content-type must be application/json");
+    return null;
+  }
   const chunks: Buffer[] = [];
   let size = 0;
   for await (const chunk of req) {

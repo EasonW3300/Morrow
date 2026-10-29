@@ -59,16 +59,22 @@ provider 参数）；凭据库可经 `startRuntime(config, { secretStore })` 注
 | PUT | `/v1/providers/:id` | 更新（部分字段；`api_key` 提供即轮换）→ 200 / 404 |
 | DELETE | `/v1/providers/:id` | 删除（元数据 + 凭据库条目）→ 200 `{ deleted }` / 404 |
 | POST | `/v1/providers/:id/default` | 把默认 Provider 切到该 id → 200 `{ default_provider_id }` |
-| POST | `/v1/providers/:id/test` | 连通性测试 → `{ result: "ok" \| "auth_failed" \| "unreachable" \| "error", ... }`（见下文） |
+| POST | `/v1/providers/:id/test` | 连通性测试 → `{ result: "ok" \| "auth_failed" \| "unreachable" \| "error", ... }`（`unreachable` 带 `kind: "timeout" \| "connect_error"` 结构化类别，见下文） |
 | GET | `/v1/devices` | 本副本已知设备记录（只读；M0 最小实现，见下文「Device 记录」）→ `{ devices: [{ replica_id, label, created_at, last_seen_at }] }` |
 
 错误统一 `{ error: { code, message } }`；未匹配路径 404，路径命中但方法不符 405，
-body 非法 400 `invalid_body`，未知会话 404。node:http + 极简路由，不引框架——为 T8 bun compile 留路。
+body 非法 400 `invalid_body`，body 的 content-type 非 application/json 一律 415
+`unsupported_media_type`（CSRF 最小防护，见下），未知会话 404。node:http + 极简路由，
+不引框架——为 T8 bun compile 留路。
 
 CORS（票 T6）：桌面 WebView 与浏览器联调是跨源客户端；本地来源
 （`http(s)://(localhost|127.0.0.1|tauri.localhost)`、`tauri://localhost`）放行，
 preflight OPTIONS → 204，白名单含 `content-type` 与 `last-event-id`（SSE 断线重连）。
-非本地来源不带 CORS 头，浏览器直接拦截——互联网页面不可读写本地控制面。
+非本地来源不带 CORS 头，浏览器拦截其跨源读写。但 CORS 不等于 CSRF 防线：**simple POST
+（text/plain 等 safelist content-type）不经 preflight、请求本身仍会到达**——因此写端点
+（带 body 的 POST/PUT）在服务器端强制 `content-type: application/json`，缺失/撒谎一律
+415（safelist 外的合法跨源请求会被浏览器强制 preflight，白名单不放行）。当前防护与
+残余风险（GET 类只读、无 body 的 POST、DNS rebinding）见 `docs/security/threat-model.md` 域 4。
 
 ## Provider 配置与凭据库（T5，ADR-0002）
 
@@ -129,12 +135,15 @@ compile 铺路；实现见 `src/keyring.ts`）：
 
 | 帧 | `id:` | 账本 | 说明 |
 | --- | :-: | :-: | --- |
-| `event: <event_type>` + `data: <信封 JSON>` | 账本 seq | ✅ | durable 帧；顺序与账本一致 |
+| `event: <event_type>` + `data: <信封 JSON>` | 账本 seq | ✅ | durable 帧；账本子序列保序（口径见下） |
 | `event: text_delta` + `data: {"delta":"..."}` | 无 | ❌ | 流式文本增量，易失展示层事件 |
 | `event: done` + `data: {"session_id"}` | 无 | ❌ | 本轮结束标记（连接时空闲立即发；每轮完成后再发） |
 
 - **连接即重放**：不带 `Last-Event-ID` 从会话首事件全量重放；带 `Last-Event-ID`（数字 seq）
   只重放其后的账本事件，再接 live 帧。重放与 live 之间按 seq 去重，durable 帧顺序 = 账本顺序。
+- **保序口径（明确语义）**：「事件顺序与账本一致」指 **durable 帧是账本的子序列、按 seq 保序**
+  （本会话的账本事件之间不交错、不乱序）；`text_delta` 是**易失帧**，不入账本、不参与该保证
+  （断连即丢，权威全文见 `message.assistant`）。
 - **断线取舍**：断连期间的 `text_delta` 不可恢复（易失）；`message.assistant` 是权威全文
   （每轮恰好一条，中断轮也落盘已产出前缀 + `stop_reason: "aborted"`），客户端重连后以其覆盖
   本地累积的部分文本。进程重启后重放同样从账本投影（增量丢失，durable 完整）。
@@ -238,17 +247,17 @@ src/
   sessions.ts    SessionManager：会话事件族 → 账本 + Agent Loop（串行队列）+ 会话帧广播 + Provider 绑定解析
   providers.ts   ProviderRegistry：三元组 CRUD + 默认指针 + env 回退解析（元数据 → providers.json，密钥 → 凭据库）
   keyring.ts     OS 凭据库统一封装（macOS security 实测 / Windows cmdkey+PowerShell / Linux secret-tool / 内存桩）
-  connectivity.ts Provider 连通性测试（最小 OpenAI 兼容请求 + 三类结果分类）
+  connectivity.ts Provider 连通性测试（最小 OpenAI 兼容请求；unreachable 带 timeout/connect_error 结构化 kind）
   ledger.ts      EventLedger：append-only 账本（schema 校验、hash 复算、分页/过滤、scan、完整性校验）
   envelope.ts    事件信封工厂（T2 生命周期事件与 T4 会话事件共用）
   db.ts          SQLite 薄 facade（node:sqlite 绑定收敛点）
   devices.ts     DeviceRegistry：devices 表（replica_id 主键）+ 启动种子（M0 最小实现，票 #3）
   config.ts      环境变量解析（含 Provider 三元组 env 回退种子）+ 副本身份持久化
   health.ts      沙箱可用性探针（M0 桩）
-  uuid-v7.ts     UUID v7 生成（事件 event_id / message_id / provider_id 用）
+  uuid-v7.ts     UUID v7 生成 + 小写 uuid 形态正则 UUID_RE（config / runtime 共用）
   index.ts       公共出口（库形态供桌面宿主内嵌）
 scripts/
   smoke-real-provider.ts  真实 Provider 冒烟（手动执行，读环境变量，不进测试套件）
 test/         node:test：ledger / server / config / lifecycle / sessions / keyring / providers /
-              providers.api / connectivity / provider-switch 十个 seam
+              providers.api / connectivity / provider-switch / cors / devices 等 seam
 ```

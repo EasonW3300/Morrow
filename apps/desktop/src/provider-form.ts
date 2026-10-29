@@ -1,3 +1,5 @@
+import type { ProviderRecord } from "@morrow/protocol";
+
 /**
  * Provider 表单：状态类型 + 校验 + payload 映射（票 T7 / Issue #8）。
  *
@@ -44,7 +46,7 @@ export function emptyProviderForm(): ProviderFormValues {
   };
 }
 
-export function validateProviderForm(values: ProviderFormValues, mode: "create" | "edit"): ProviderFormErrors {
+export function validateProviderForm(values: ProviderFormValues): ProviderFormErrors {
   const errors: ProviderFormErrors = {};
   if (values.name.trim().length === 0) errors.name = "显示名必填";
   const baseUrl = values.baseUrl.trim();
@@ -58,7 +60,7 @@ export function validateProviderForm(values: ProviderFormValues, mode: "create" 
   if (contextWindow === "invalid") errors.contextWindow = "必须为正整数";
   const maxTokens = optionalPositiveInt(values.maxTokens);
   if (maxTokens === "invalid") errors.maxTokens = "必须为正整数";
-  void mode; // create/edit 目前共用校验；api_key 可空是两种模式的共同语义（edit 留空 = 不轮换）
+  // create/edit 共用同一套校验；api_key 不在本表单校验范围（两种模式语义一致：留空 = 不轮换/免密）
   return errors;
 }
 
@@ -105,26 +107,9 @@ export function toCreatePayload(values: ProviderFormValues): CreateProviderPaylo
   return payload;
 }
 
-export function toUpdatePatch(values: ProviderFormValues): CreateProviderPayload {
-  // PATCH 语义：留空的 apiKey 不进 patch（= 不轮换），其余字段按表单全量提交
-  return toCreatePayload(values);
-}
-
-export interface ProviderRecordLike {
-  provider_id: string;
-  name: string;
-  base_url: string;
-  model: string;
-  compat: Record<string, boolean>;
-  context_window: number;
-  max_tokens: number;
-  created_at: string;
-  has_api_key: boolean;
-  is_default: boolean;
-}
-
-/** 编辑表单回填：密钥绝不回填（运行时只给 has_api_key 投影，表单也不持有明文） */
-export function providerFormFromRecord(record: ProviderRecordLike): ProviderFormValues {
+/** 编辑表单回填：密钥绝不回填（运行时只给 has_api_key 投影，表单也不持有明文）。
+ *  记录类型直接用 @morrow/protocol 的 ProviderRecord（唯一真相源；原先本文件自持 ProviderRecordLike 拷贝） */
+export function providerFormFromRecord(record: ProviderRecord): ProviderFormValues {
   return {
     name: record.name,
     baseUrl: record.base_url,

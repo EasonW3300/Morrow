@@ -1,7 +1,12 @@
 /**
  * 控制面 API 封装（fetch，PRD §6.1：UI ↔ Runtime 仅本地 HTTP + JSON）。
  * 错误统一 { error: { code, message } } → ApiError（UI 层做可读呈现）。
+ *
+ * 跨包类型（ProviderRecord / ConnectivityResult）的唯一真相源在 @morrow/protocol——
+ * 此处只 re-export（原先本文件自持一份拷贝，M0 code-review / Issue #11 收敛）。
  */
+import type { ConnectivityResult, ProviderRecord } from "@morrow/protocol";
+export type { ConnectivityResult, ProviderRecord };
 export class ApiError extends Error {
   constructor(
     readonly status: number,
@@ -61,31 +66,10 @@ export interface SessionHistory {
   messages: MessageRecord[];
 }
 
-/** Provider 元数据投影（GET/POST /v1/providers 等，票 T5）——绝无 api_key 字段，只有 has_api_key 投影 */
-export interface ProviderRecord {
-  provider_id: string;
-  name: string;
-  base_url: string;
-  model: string;
-  compat: Record<string, boolean>;
-  context_window: number;
-  max_tokens: number;
-  created_at: string;
-  has_api_key: boolean;
-  is_default: boolean;
-}
-
 export interface ProviderListResponse {
   providers: ProviderRecord[];
   default_provider_id: string | null;
 }
-
-/** 连通性测试结果（POST /v1/providers/:id/test，四类见 apps/runtime/src/connectivity.ts） */
-export type ConnectivityResult =
-  | { result: "ok"; http_status: number; latency_ms: number }
-  | { result: "auth_failed"; http_status: number; latency_ms: number }
-  | { result: "unreachable"; detail: string; latency_ms: number }
-  | { result: "error"; http_status: number; latency_ms: number };
 
 /** GET /v1/health 载荷（沙箱为 M0 桩：not-configured） */
 export interface HealthPayload {
