@@ -1,0 +1,24 @@
+{
+  "name": "@morrow/runtime",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Runtime 骨架 + 事件账本 v1（node:http 极简路由 + node:sqlite append-only 账本）",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "bin": "./src/main.ts",
+  "scripts": {
+    "start": "node --experimental-sqlite --experimental-strip-types src/main.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "tsc --noEmit && node --experimental-sqlite --test --experimental-strip-types \"test/*.test.ts\""
+  },
+  "dependencies": {
+    "@morrow/protocol": "workspace:*",
+    "ajv": "^8.17.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0"
+  }
+}

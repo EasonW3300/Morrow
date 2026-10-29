@@ -8,6 +8,22 @@ importers:
 
   .: {}
 
+  apps/runtime:
+    dependencies:
+      '@morrow/protocol':
+        specifier: workspace:*
+        version: link:../../packages/protocol
+      ajv:
+        specifier: ^8.17.1
+        version: 8.20.0
+    devDependencies:
+      '@types/node':
+        specifier: ^22.10.0
+        version: 22.20.5
+      typescript:
+        specifier: ^5.7.0
+        version: 5.9.3
+
   packages/protocol:
     devDependencies:
       '@types/node':
