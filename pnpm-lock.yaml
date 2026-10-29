@@ -55,6 +55,22 @@ importers:
         specifier: ^5.7.0
         version: 5.9.3
 
+  scripts/packaging:
+    dependencies:
+      '@morrow/pi-adapter':
+        specifier: workspace:*
+        version: link:../../packages/pi-adapter
+      '@morrow/runtime':
+        specifier: workspace:*
+        version: link:../../apps/runtime
+    devDependencies:
+      '@types/node':
+        specifier: ^22.10.0
+        version: 22.20.5
+      typescript:
+        specifier: ^5.7.0
+        version: 5.9.3
+
 packages:
 
   '@anthropic-ai/sdk@0.129.0':

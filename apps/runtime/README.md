@@ -140,8 +140,8 @@ WAL/busy_timeout pragma）访问。依据 `morrow-research/NOTES-bun.md`：
   双代码路径）均不进依赖树；
 - facade 收敛在一个文件：若 Bun 兼容层在 M0 冒烟暴露缺陷（如 `backup()` 同步阻塞——本包不使用
   `backup()`，WAL checkpoint 走干净关闭默认路径），换驱动只动 `src/db.ts`。
-- M0 冒烟待补：bun compile 后 `node:sqlite` 实测（NOTES-bun.md §4 清单），结论出来前
-  ADR-0003 的"首选 bun compile"保持待验证状态。
+- M0 冒烟已完成（票 T8）：bun compile 后 `node:sqlite` 零标志实测通过，结论与证据见
+  `docs/adr/0006-sqlite-binding-node-sqlite.md`；打包与探针入口见 `scripts/packaging/`。
 
 ## 结构
 
