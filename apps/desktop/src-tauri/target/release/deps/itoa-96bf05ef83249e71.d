@@ -1,8 +1,0 @@
-/Users/wys3300/Desktop/project/Morrow-wt/t6/apps/desktop/src-tauri/target/release/deps/itoa-96bf05ef83249e71.d: /Users/wys3300/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/itoa-1.0.18/src/lib.rs /Users/wys3300/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/itoa-1.0.18/src/u128_ext.rs
-
-/Users/wys3300/Desktop/project/Morrow-wt/t6/apps/desktop/src-tauri/target/release/deps/libitoa-96bf05ef83249e71.rlib: /Users/wys3300/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/itoa-1.0.18/src/lib.rs /Users/wys3300/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/itoa-1.0.18/src/u128_ext.rs
-
-/Users/wys3300/Desktop/project/Morrow-wt/t6/apps/desktop/src-tauri/target/release/deps/libitoa-96bf05ef83249e71.rmeta: /Users/wys3300/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/itoa-1.0.18/src/lib.rs /Users/wys3300/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/itoa-1.0.18/src/u128_ext.rs
-
-/Users/wys3300/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/itoa-1.0.18/src/lib.rs:
-/Users/wys3300/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/itoa-1.0.18/src/u128_ext.rs:
