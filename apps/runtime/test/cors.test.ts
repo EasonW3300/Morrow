@@ -37,6 +37,49 @@ test("preflight from a local origin returns 204 with echoed origin and method al
   }
 });
 
+test("preflight 放行 PUT/DELETE（票 T8 前的设置 UI，Issue #8：Provider 编辑与删除）", async () => {
+  const dir = tmpDir("morrow-cors-");
+  const runtime = await startRuntime(testConfig(dir));
+  try {
+    for (const method of ["PUT", "DELETE"]) {
+      const res = await fetch(`http://127.0.0.1:${runtime.port}/v1/providers/p1`, {
+        method: "OPTIONS",
+        headers: { origin: "tauri://localhost", "access-control-request-method": method },
+      });
+      assert.equal(res.status, 204, `${method} preflight 应 204`);
+      assert.match(
+        res.headers.get("access-control-allow-methods") ?? "",
+        new RegExp(method),
+        `${method} 应在 allow-methods 白名单（跨源 WebView 否则拦截编辑/删除）`,
+      );
+    }
+  } finally {
+    await runtime.close();
+    removeDir(dir);
+  }
+});
+
+test("PUT/DELETE 实请求带本地来源拿到 CORS 授权（不只是 preflight 空头支票）", async () => {
+  const dir = tmpDir("morrow-cors-");
+  const runtime = await startRuntime(testConfig(dir));
+  try {
+    const put = await fetch(`http://127.0.0.1:${runtime.port}/v1/providers/p1`, {
+      method: "PUT",
+      headers: { origin: "http://localhost:1420", "content-type": "application/json" },
+      body: JSON.stringify({ name: "x" }),
+    });
+    assert.equal(put.headers.get("access-control-allow-origin"), "http://localhost:1420");
+    const del = await fetch(`http://127.0.0.1:${runtime.port}/v1/providers/p1`, {
+      method: "DELETE",
+      headers: { origin: "http://localhost:1420" },
+    });
+    assert.equal(del.headers.get("access-control-allow-origin"), "http://localhost:1420");
+  } finally {
+    await runtime.close();
+    removeDir(dir);
+  }
+});
+
 test("tauri://localhost shell origin is allowed on real requests", async () => {
   const dir = tmpDir("morrow-cors-");
   const runtime = await startRuntime(testConfig(dir));

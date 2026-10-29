@@ -62,6 +62,19 @@ MORROW_DATA_DIR=/tmp/morrow-fixture node --experimental-sqlite --experimental-st
 `?runtime=` 仅用于浏览器联调的端点发现；打包应用内一律走 sidecar 上报的地址，
 且无论哪种方式 UI 与 Runtime 都只有控制面 HTTP/SSE 一种通道。
 
+### 设置与健康页联调（票 T7 / Issue #8）
+
+```bash
+node --experimental-sqlite --experimental-strip-types apps/desktop/scripts/settings-fixture.ts
+# 打开 http://127.0.0.1:1420/?runtime=http://127.0.0.1:<runtime端口>（stdout ready JSON 给出）
+```
+
+夹具 = 真实 Runtime（Provider CRUD / 连通性测试 / 会话族，密钥走内存 SecretStore，不碰
+系统钥匙串）+ 四条连通性路径的本地 mock（200→ok、401→auth_failed、无人监听端口→
+unreachable、500→error）+ 脚本化 Agent（建会话发消息无需真实模型）。浏览器级全流程验证：
+新增 Provider（密钥框 password 型、保存后不回显）→ 逐一点「测试连通」核对四类结果的归类
+呈现 → 设为默认 → 会话页新建会话发消息 → 健康页核对 /v1/health 全量字段与沙箱桩说明。
+
 ## 已知边界（M0）
 
 - 历史回看来自 `GET /v1/sessions/:id/messages` 投影（user/assistant 消息）；历史轮次的
