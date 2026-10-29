@@ -1,10 +1,11 @@
 /**
- * 录制 fixtures 回放测试 —— Pi 1.4.0 真实事件形态 → 五类窄事件。
+ * fixtures 回放测试 —— Pi 1.4.0 **真实录制**的原始 AgentEvent → 五类窄事件。
  *
- * fixtures 取自 pi-mono v1.4.0 的 AgentEvent / AssistantMessageEvent /
- * Message 形态（packages/agent/src/types.ts、packages/ai/src/types.ts），
- * 以静态 JSON 存于本包 fixtures/pi-1.4.0/。回放只经过纯函数 translatePiEvent，
- * 不 import 任何 @earendil-works/* 运行时代码（Node 22.12 引擎隔离）。
+ * fixtures/pi-1.4.0/*.json 由 scripts/record-fixtures.ts 录制：真实
+ * @earendil-works/pi-agent-core 1.4.0 对本地 OpenAI 兼容 mock 服务器运行时的
+ * 原始 AgentEvent 流（曾为手工构造，M0 code-review / Issue #4 更正为真录制）。
+ * 回放只经过纯函数 translatePiEvent，不 import 任何 @earendil-works/* 运行时代码
+ * （Node 22.12 引擎隔离）；重录后需同步本文件的期望序列。
  */
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
@@ -31,14 +32,14 @@ describe("Pi 1.4.0 fixtures 回放：正常对话流（文本 + 工具 + 文本�
     assert.deepEqual(out, [
       { type: "text_delta", delta: "北京今天" },
       { type: "text_delta", delta: "晴。" },
-      { type: "tool_start", toolCallId: "call_abc123", toolName: "get_weather", args: { city: "北京" } },
+      { type: "tool_start", toolCallId: "call_rec_1", toolName: "get_weather", args: { city: "北京" } },
       {
         type: "tool_end",
-        toolCallId: "call_abc123",
+        toolCallId: "call_rec_1",
         toolName: "get_weather",
         text: "晴，12°C",
         isError: false,
-        durationMs: 42,
+        durationMs: 0, // 真实测量值（录制时工具瞬时完成）；静态 fixture 回放故为确定值
       },
       { type: "text_delta", delta: "北京晴，12°C。" },
       { type: "agent_end", stopReason: "stop" },
@@ -59,9 +60,9 @@ describe("Pi 1.4.0 fixtures 回放：供应商错误", () => {
     const out: MorrowAgentEvent[] = [];
     for (const event of fixture.events) out.push(...translatePiEvent(event));
 
+    // error message 由 Pi 1.4.0 真实产生：状态码 + 响应体 JSON 原文（录制所得，勿手工改写）
     assert.deepEqual(out, [
-      { type: "text_delta", delta: "让我查" },
-      { type: "error", message: "HTTP 502: upstream connect error" },
+      { type: "error", message: '502: {"message":"upstream connect error","type":"bad_gateway"}' },
       { type: "agent_end", stopReason: "error" },
     ]);
   });
