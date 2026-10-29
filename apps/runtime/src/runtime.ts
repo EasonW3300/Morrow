@@ -3,6 +3,7 @@ import { createPiAdapter, type AgentRuntime } from "@morrow/pi-adapter";
 import packageJson from "../package.json" with { type: "json" };
 import type { RuntimeConfig } from "./config.ts";
 import { testProviderConnectivity } from "./connectivity.ts";
+import { DeviceRegistry, type DeviceRecord } from "./devices.ts";
 import { detectSecretStore, type SecretStore } from "./keyring.ts";
 import { probeSandbox } from "./health.ts";
 import { EventLedger } from "./ledger.ts";
@@ -15,7 +16,8 @@ import { computeIntegrityHash, type EventEnvelope } from "@morrow/protocol";
  * Runtime HTTP 服务（PRD §6.2 的 M0 子集）。
  *
  * node:http + 极简路由，不引框架——为 T8 bun compile 单二进制留路（ADR-0003）。
- * 路由面：GET /v1/health、GET /v1/events、T4 会话族（POST/GET /v1/sessions、
+ * 路由面：GET /v1/health、GET /v1/events、GET /v1/devices（M0 只读登记，票 #3）、
+ * T4 会话族（POST/GET /v1/sessions、
  * POST/GET /v1/sessions/:id/messages、GET /v1/sessions/:id/stream SSE）、
  * T5 Provider 族（GET/POST /v1/providers、GET/PUT/DELETE /v1/providers/:id、
  * POST /v1/providers/:id/default、POST /v1/providers/:id/test）。
@@ -33,6 +35,7 @@ interface RequestContext {
   replicaId: string;
   sessions: SessionManager;
   providers: ProviderRegistry;
+  devices: DeviceRegistry;
 }
 
 type Handler = (
@@ -67,6 +70,8 @@ export interface RuntimeHandle {
   host: string;
   port: number;
   ledger: EventLedger;
+  /** Device 记录注册表（票 #3 最小实现；库形态可直用） */
+  devices: DeviceRegistry;
   /** 会话管理器（库形态可直用：abort / 订阅等测试与宿主 seam） */
   sessions: SessionManager;
   /** Provider 注册表（库形态可直用：CRUD / 默认 / env 回退解析） */
@@ -82,6 +87,7 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 
 const routes: Route[] = [
   { method: "GET", re: /^\/v1\/health$/, handler: handleHealth },
+  { method: "GET", re: /^\/v1\/devices$/, handler: handleListDevices },
   { method: "GET", re: /^\/v1\/events$/, handler: handleEvents },
   { method: "GET", re: /^\/v1\/providers$/, handler: handleListProviders },
   { method: "POST", re: /^\/v1\/providers$/, handler: handleRegisterProvider },
@@ -99,6 +105,10 @@ const routes: Route[] = [
 
 export async function startRuntime(config: RuntimeConfig, options: RuntimeOptions = {}): Promise<RuntimeHandle> {
   const ledger = EventLedger.open(config.dataDir);
+  // Device 记录（票 #3 的 M0 最小实现）：启动时从 replica-id 演化出的 config.replicaId 种子；
+  // 不做配对/撤销（M3 范围）
+  const devices = DeviceRegistry.open(config.dataDir);
+  devices.touch(config.replicaId);
   const providers = new ProviderRegistry({
     dataDir: config.dataDir,
     secretStore: options.secretStore ?? detectSecretStore().store,
@@ -112,7 +122,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     // 注入工厂（测试/宿主自带 Agent Loop）时不做 Provider 预检（T4 语义）；默认工厂要求有 Provider
     providerRequired: options.agentAdapterFactory === undefined,
   });
-  const ctx: RequestContext = { ledger, replicaId: config.replicaId, sessions, providers };
+  const ctx: RequestContext = { ledger, replicaId: config.replicaId, sessions, providers, devices };
   const server = createServer((req, res) => {
     routeRequest(req, res, ctx);
   });
@@ -121,6 +131,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
   try {
     port = await listen(server, config.host, config.port);
   } catch (err) {
+    devices.close();
     ledger.close();
     throw err;
   }
@@ -140,6 +151,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     ledger,
     sessions,
     providers,
+    devices,
     async close(signal?: string): Promise<void> {
       if (closing) return;
       closing = true;
@@ -160,6 +172,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
       } catch (err) {
         console.error("[morrow] failed to append runtime.stopped:", err);
       }
+      devices.close();
       ledger.close();
     },
   };
@@ -250,6 +263,12 @@ function handleHealth(_req: IncomingMessage, res: ServerResponse, _url: URL, ctx
     sandbox: probeSandbox(),
     ledger: { events: ctx.ledger.count() },
   });
+}
+
+/** Device 记录列表（只读；M0 仅本副本一条——多设备是 M3 的事，票 #3） */
+function handleListDevices(_req: IncomingMessage, res: ServerResponse, _url: URL, ctx: RequestContext): void {
+  const devices: DeviceRecord[] = ctx.devices.list();
+  sendJson(res, 200, { devices });
 }
 
 function handleEvents(_req: IncomingMessage, res: ServerResponse, url: URL, ctx: RequestContext): void {

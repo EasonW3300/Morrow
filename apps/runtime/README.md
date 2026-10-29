@@ -60,6 +60,7 @@ provider 参数）；凭据库可经 `startRuntime(config, { secretStore })` 注
 | DELETE | `/v1/providers/:id` | 删除（元数据 + 凭据库条目）→ 200 `{ deleted }` / 404 |
 | POST | `/v1/providers/:id/default` | 把默认 Provider 切到该 id → 200 `{ default_provider_id }` |
 | POST | `/v1/providers/:id/test` | 连通性测试 → `{ result: "ok" \| "auth_failed" \| "unreachable" \| "error", ... }`（见下文） |
+| GET | `/v1/devices` | 本副本已知设备记录（只读；M0 最小实现，见下文「Device 记录」）→ `{ devices: [{ replica_id, label, created_at, last_seen_at }] }` |
 
 错误统一 `{ error: { code, message } }`；未匹配路径 404，路径命中但方法不符 405，
 body 非法 400 `invalid_body`，未知会话 404。node:http + 极简路由，不引框架——为 T8 bun compile 留路。
@@ -203,6 +204,17 @@ node --experimental-sqlite --experimental-strip-types apps/runtime/scripts/smoke
 - **内部事件**：`runtime.started` / `runtime.stopped`（`actor_id: "agent:runtime"`，stopped 的
   `causation_id` 指向本次运行的 started）。
 
+## Device 记录（M0 最小实现，票 #3）
+
+`devices` 表（与事件账本同库 `events.sqlite`，表可变、不影响 events 的 append-only）：
+`replica_id`（主键）、`label`（M0 无命名机制，恒 null）、`created_at`（首见时间）、
+`last_seen_at`（最近一次启动）。启动时从 `replica-id` 文件解析出的 `config.replicaId`
+upsert 种子；`GET /v1/devices` 只读。
+
+**边界（如实）**：M0 只登记**本副本**一条记录——不做配对、撤销、多设备注册表；那是 M3
+同步里程碑的范围（PRD §5.2 配对协议、AC-04/05）。`actor_id` 的事件级归属已由信封
+（`owner` / `agent:runtime`）承载，本表是设备维度的补充记录。
+
 ## SQLite 访问选型（验收第 5 条，结论记录在案）
 
 **定 `node:sqlite`（`DatabaseSync`）为唯一绑定**，经 `src/db.ts` 薄 facade（exec/prepare/close +
@@ -230,6 +242,7 @@ src/
   ledger.ts      EventLedger：append-only 账本（schema 校验、hash 复算、分页/过滤、scan、完整性校验）
   envelope.ts    事件信封工厂（T2 生命周期事件与 T4 会话事件共用）
   db.ts          SQLite 薄 facade（node:sqlite 绑定收敛点）
+  devices.ts     DeviceRegistry：devices 表（replica_id 主键）+ 启动种子（M0 最小实现，票 #3）
   config.ts      环境变量解析（含 Provider 三元组 env 回退种子）+ 副本身份持久化
   health.ts      沙箱可用性探针（M0 桩）
   uuid-v7.ts     UUID v7 生成（事件 event_id / message_id / provider_id 用）
