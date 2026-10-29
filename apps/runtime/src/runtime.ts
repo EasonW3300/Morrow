@@ -192,7 +192,8 @@ function routeRequest(req: IncomingMessage, res: ServerResponse, ctx: RequestCon
     res.setHeader("access-control-allow-origin", origin);
     res.setHeader("vary", "origin");
     res.setHeader("access-control-allow-headers", "content-type, last-event-id");
-    res.setHeader("access-control-allow-methods", "GET, POST, OPTIONS");
+    // PUT/DELETE：设置 UI 的 Provider 编辑/删除（票 T7 / Issue #8）——跨源 WebView 需在白名单内
+    res.setHeader("access-control-allow-methods", "GET, POST, PUT, DELETE, OPTIONS");
   }
   if ((req.method ?? "").toUpperCase() === "OPTIONS") {
     res.writeHead(204);
