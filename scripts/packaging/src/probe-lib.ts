@@ -260,11 +260,16 @@ export function ensureExecutable(binaryPath: string): void {
  * 退出码/信号 + stderr 尾部 + stdout 非对象噪声行。EOF 类失败（如 Windows
  * sidecar 阶段 A 的 "json line source EOF"）原样丢失 stderr，排障无从下手——
  * CI 可维护性：任何探针失败都必须带出子进程的可观测状态。
+ *
+ * killOrigin：探针最近一次 kill 的调用来源标注（由调用方在 kill 前设置）。
+ * 子进程死于信号而探针未发过 kill 时标注 external——区分"探针自身终止路径"
+ * 与"外部/子进程自身异常"，这是 run 40882409974 windows 腿定位的关键线索。
  */
 export function describeChildDiagnostics(
   child: ChildProcess | undefined,
   stderr: string,
   source: JsonLineSource,
+  killOrigin?: string,
 ): string {
   const parts: string[] = [];
   if (child === undefined) {
@@ -273,6 +278,7 @@ export function describeChildDiagnostics(
     parts.push(`child exit=${child.exitCode}`);
   } else if (child.signalCode !== null) {
     parts.push(`child killed by signal ${child.signalCode}`);
+    parts.push(`kill origin: ${killOrigin ?? "external (probe sent no kill)"}`);
   } else {
     parts.push("child still running");
   }

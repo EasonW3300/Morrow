@@ -3,7 +3,10 @@
  *
  * 阶段 A（sidecar 生命周期契约，复刻 Tauri 父进程行为）：
  *   常规模式拉起 → 读 stdout 单行 ready JSON 拿端口 → GET /v1/health 探针请求 →
- *   SIGTERM → 断言 {stopped:true, signal} 行 + 退出码 0（优雅退出：记账 + WAL checkpoint）。
+ *   unix：SIGTERM → 断言 {stopped:true, signal} 行 + 退出码 0（优雅退出：记账 + WAL checkpoint）；
+ *   Windows：kill() 即 TerminateProcess（OS 级无 SIGTERM，运行时收不到信号），断言
+ *   进程被终止即止——优雅记账改由阶段 B 二进制内 runtime.close() 覆盖（standalone
+ *   已证该路径可用）；与桌面壳 src-tauri/src/sidecar.rs 的 Windows 已知限制同口径。
  * 阶段 B（同一套探针）：与 standalone 相同的嵌入探针（health + sqlite + 对话），
  *   以被父进程拉起的方式再跑一遍——"同样探针"在 sidecar 形态下通过。
  *
@@ -49,6 +52,7 @@ async function runSidecarLifecycle(binaryPath: string): Promise<LifecycleResult>
   const mock = await startMockOpenAI(); // 挂着但常规模式不使用；保持两阶段环境一致
   const dataDir = mkdtempSync(join(tmpdir(), "morrow-sidecar-"));
   let child: ReturnType<typeof spawn> | undefined;
+  let killOrigin: string | undefined; // 诊断用：探针最近一次 kill 的来源（外部 kill 时为 undefined）
   try {
     ensureExecutable(binaryPath); // CI 产物无执行位（download-artifact 不保留 mode），spawn 前自愈
     child = spawn(binaryPath, [], {
@@ -75,20 +79,41 @@ async function runSidecarLifecycle(binaryPath: string): Promise<LifecycleResult>
         throw new Error(`sidecar phase A: health probe failed: ${health.status} ${JSON.stringify(health.body)}`);
       }
 
+      // 终止契约分平台（run 40882409974 windows 腿定位：探针自己的 kill("SIGTERM") 在
+      // Windows 即 TerminateProcess，子进程收不到信号、无 stopped 行，close 触发 EOF——
+      // 不是子进程崩溃，也不是 watchdog/cleanup 误杀）
+      const graceful = process.platform !== "win32";
+      killOrigin = graceful
+        ? "phase A: SIGTERM after health (graceful contract, unix)"
+        : "phase A: hard terminate after health (Windows kill()=TerminateProcess, no stopped line expected)";
       child.kill("SIGTERM");
-      const stopped = await source.next(15_000);
-      if (stopped.stopped !== true || stopped.signal !== "SIGTERM") {
-        throw new Error(`sidecar phase A: expected stopped line, got ${JSON.stringify(stopped)}`);
+
+      if (graceful) {
+        const stopped = await source.next(15_000);
+        if (stopped.stopped !== true || stopped.signal !== "SIGTERM") {
+          throw new Error(`sidecar phase A: expected stopped line, got ${JSON.stringify(stopped)}`);
+        }
+        const exit = await waitExit(child, 15_000);
+        if (exit.code !== 0) {
+          throw new Error(`sidecar phase A: exit code ${exit.code} (expected 0); stderr: ${stderr.slice(-500)}`);
+        }
+        return { ready, healthBody: health.body, stoppedLine: stopped, exitCode: exit.code };
       }
+      // Windows：断言进程确被终止；stopped 行不期望（无 OS 级 SIGTERM 可投递）
       const exit = await waitExit(child, 15_000);
-      if (exit.code !== 0) {
-        throw new Error(`sidecar phase A: exit code ${exit.code} (expected 0); stderr: ${stderr.slice(-500)}`);
+      if (exit.code === null && exit.signal === null) {
+        throw new Error(`sidecar phase A: child did not terminate after hard kill; stderr: ${stderr.slice(-500)}`);
       }
-      return { ready, healthBody: health.body, stoppedLine: stopped, exitCode: exit.code };
+      return {
+        ready,
+        healthBody: health.body,
+        stoppedLine: { stopped: false, reason: "Windows hard terminate (no OS-level SIGTERM)" },
+        exitCode: exit.code,
+      };
     } catch (err) {
-      // 失败必附子进程可观测状态（run 40872208364 windows 腿 EOF 时 stderr 全丢，无法定位）
+      // 失败必附子进程可观测状态与 kill 来源（外部 kill 还是探针自身 kill 一眼可辨）
       const message = err instanceof Error ? err.message : String(err);
-      throw new Error(`${message} [${describeChildDiagnostics(child, stderr, source)}]`);
+      throw new Error(`${message} [${describeChildDiagnostics(child, stderr, source, killOrigin)}]`);
     }
   } finally {
     if (child !== undefined && child.exitCode === null && child.signalCode === null) {
@@ -111,7 +136,7 @@ async function main(): Promise<void> {
   const lifecycle = await runSidecarLifecycle(binaryPath);
   console.log(
     `[probe:sidecar] phase A (lifecycle): ready port=${lifecycle.ready.port}, health ok, ` +
-      `SIGTERM → ${JSON.stringify(lifecycle.stoppedLine)}, exit=${lifecycle.exitCode}`,
+      `terminate → ${JSON.stringify(lifecycle.stoppedLine)}, exit=${lifecycle.exitCode}`,
   );
 
   // 阶段 B：同一套探针（health + sqlite + 对话）以 sidecar 方式（父进程拉起）通过
