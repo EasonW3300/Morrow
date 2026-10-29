@@ -29,3 +29,7 @@ Thumbs.db
 
 # Rust build output (root pattern is anchored; desktop Tauri target needs its own)
 apps/desktop/src-tauri/target/
+
+# Tauri codegen 产物：tauri_build::build()（src-tauri/build.rs）每次构建重写，不入库。
+# （曾误提交为快照，每次构建产生 ~2300 行噪音 diff；M0 code-review / Issue #11）
+apps/desktop/src-tauri/gen/schemas/
