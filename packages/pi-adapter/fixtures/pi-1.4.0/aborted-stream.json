@@ -1,0 +1,94 @@
+{
+  "description": "Pi 1.4.0 AgentEvent 流式中断：用户 abort() 后，部分流式文本已产出，assistant 消息以 stopReason=aborted 结束，agent_end 收尾（无 error 事件）。形态同 normal-text-tool.json。",
+  "events": [
+    { "type": "agent_start" },
+    { "type": "turn_start" },
+    {
+      "type": "message_start",
+      "message": {
+        "role": "assistant",
+        "content": [],
+        "api": "openai-completions",
+        "provider": "morrow-openai-compat",
+        "model": "test-chat-model",
+        "usage": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 0, "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0 } },
+        "stopReason": "pending",
+        "timestamp": 1769692802000
+      }
+    },
+    {
+      "type": "message_update",
+      "message": {
+        "role": "assistant",
+        "content": [{ "type": "text", "text": "我正在" }],
+        "api": "openai-completions",
+        "provider": "morrow-openai-compat",
+        "model": "test-chat-model",
+        "usage": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 0, "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0 } },
+        "stopReason": "pending",
+        "timestamp": 1769692802000
+      },
+      "assistantMessageEvent": { "type": "text_delta", "contentIndex": 0, "delta": "我正在", "partial": { "role": "assistant", "content": [{ "type": "text", "text": "我正在" }], "api": "openai-completions", "provider": "morrow-openai-compat", "model": "test-chat-model", "usage": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 0, "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0 } }, "stopReason": "pending", "timestamp": 1769692802000 } }
+    },
+    {
+      "type": "message_update",
+      "message": {
+        "role": "assistant",
+        "content": [{ "type": "text", "text": "我正在整理你的偏好" }],
+        "api": "openai-completions",
+        "provider": "morrow-openai-compat",
+        "model": "test-chat-model",
+        "usage": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 0, "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0 } },
+        "stopReason": "pending",
+        "timestamp": 1769692802000
+      },
+      "assistantMessageEvent": { "type": "text_delta", "contentIndex": 0, "delta": "整理你的偏好", "partial": { "role": "assistant", "content": [{ "type": "text", "text": "我正在整理你的偏好" }], "api": "openai-completions", "provider": "morrow-openai-compat", "model": "test-chat-model", "usage": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 0, "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0 } }, "stopReason": "pending", "timestamp": 1769692802000 } }
+    },
+    {
+      "type": "message_end",
+      "message": {
+        "role": "assistant",
+        "content": [{ "type": "text", "text": "我正在整理你的偏好" }],
+        "api": "openai-completions",
+        "provider": "morrow-openai-compat",
+        "model": "test-chat-model",
+        "usage": { "input": 88, "output": 7, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 95, "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0 } },
+        "stopReason": "aborted",
+        "timestamp": 1769692802000,
+        "durationMs": 480
+      }
+    },
+    {
+      "type": "turn_end",
+      "message": {
+        "role": "assistant",
+        "content": [{ "type": "text", "text": "我正在整理你的偏好" }],
+        "api": "openai-completions",
+        "provider": "morrow-openai-compat",
+        "model": "test-chat-model",
+        "usage": { "input": 88, "output": 7, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 95, "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0 } },
+        "stopReason": "aborted",
+        "timestamp": 1769692802000,
+        "durationMs": 480
+      },
+      "toolResults": []
+    },
+    {
+      "type": "agent_end",
+      "messages": [
+        { "role": "user", "content": "总结一下我的偏好", "timestamp": 1769692801900 },
+        {
+          "role": "assistant",
+          "content": [{ "type": "text", "text": "我正在整理你的偏好" }],
+          "api": "openai-completions",
+          "provider": "morrow-openai-compat",
+          "model": "test-chat-model",
+          "usage": { "input": 88, "output": 7, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 95, "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0 } },
+          "stopReason": "aborted",
+          "timestamp": 1769692802000,
+          "durationMs": 480
+        }
+      ]
+    }
+  ]
+}
