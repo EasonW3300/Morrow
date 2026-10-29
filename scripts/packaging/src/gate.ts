@@ -157,7 +157,9 @@ async function main(): Promise<void> {
       status: sidecar.ok ? "pass" : "fail",
       executor: "CI",
       detail: sidecar.ok
-        ? "ready → health → SIGTERM → {stopped} + 退出码 0；阶段 B 同套探针通过"
+        ? process.platform === "win32"
+          ? "ready → health → 硬终止（Windows kill()=TerminateProcess，无 OS 级 SIGTERM，优雅记账由阶段 B 二进制内 close 覆盖，与桌面壳 sidecar.rs 限制同口径）；阶段 B 同套探针通过"
+          : "ready → health → SIGTERM → {stopped} + 退出码 0；阶段 B 同套探针通过"
         : `probe exit=${sidecar.exitCode}`,
     });
   }

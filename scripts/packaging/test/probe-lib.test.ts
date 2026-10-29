@@ -220,9 +220,30 @@ describe("describeChildDiagnostics", () => {
 
   it("信号终止的子进程带 signal；未退出标 still running", () => {
     const source = createJsonLineSource();
-    const signaled = { exitCode: null, signalCode: "SIGKILL" } as unknown as ChildProcess;
-    assert.match(describeChildDiagnostics(signaled, "", source), /killed by signal SIGKILL/);
+    const signaled = { exitCode: null, signalCode: "SIGTERM" } as unknown as ChildProcess;
+    assert.match(describeChildDiagnostics(signaled, "", source), /killed by signal SIGTERM/);
     const alive = { exitCode: null, signalCode: null } as unknown as ChildProcess;
     assert.match(describeChildDiagnostics(alive, "", source), /still running/);
+  });
+
+  it("signal 死亡标注 kill 来源：探针自身 kill vs 外部（run 40882409974 windows 腿定位线索）", () => {
+    const source = createJsonLineSource();
+    const signaled = { exitCode: null, signalCode: "SIGTERM" } as unknown as ChildProcess;
+    assert.match(
+      describeChildDiagnostics(signaled, "", source, "phase A: SIGTERM after health"),
+      /kill origin: phase A: SIGTERM after health/,
+    );
+    assert.match(
+      describeChildDiagnostics(signaled, "", source),
+      /kill origin: external \(probe sent no kill\)/,
+    );
+  });
+
+  it("exit code 死亡不标 kill 来源（TerminateProcess 以 code 呈现时不混淆）", () => {
+    const source = createJsonLineSource();
+    const exited = { exitCode: 1, signalCode: null } as unknown as ChildProcess;
+    const diag = describeChildDiagnostics(exited, "", source, "phase A: hard terminate");
+    assert.match(diag, /child exit=1/);
+    assert.doesNotMatch(diag, /kill origin/);
   });
 });
