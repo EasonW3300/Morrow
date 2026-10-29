@@ -17,6 +17,20 @@ export interface RuntimeConfig {
   port: number;
   dataDir: string;
   replicaId: string;
+  /**
+   * OpenAI 兼容 Provider 三元组（T4 最小实现：只读环境变量；Provider CRUD 与
+   * 凭据库是 T5 的事）。null 表示未配置——会话可建，发消息返回 503。
+   */
+  provider: ProviderConfig | null;
+}
+
+/** OpenAI Chat Completions 兼容端点配置（GLOSSARY: Provider） */
+export interface ProviderConfig {
+  baseUrl: string;
+  apiKey: string;
+  modelId: string;
+  contextWindow: number;
+  maxTokens: number;
 }
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -37,7 +51,35 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   if (!UUID_RE.test(replicaId)) {
     throw new Error(`invalid MORROW_REPLICA_ID: "${replicaId}" (lowercase uuid expected)`);
   }
-  return { host, port, dataDir, replicaId };
+  return { host, port, dataDir, replicaId, provider: parseProviderConfig(env) };
+}
+
+/**
+ * Provider 环境变量解析（T4 最小实现）：三个变量都缺省 → null（未配置 Provider）。
+ * 任一出现则 BASE_URL 与 MODEL 必填；API_KEY 可空串（vLLM/Ollama 等本地端点常免密）。
+ */
+export function parseProviderConfig(env: Record<string, string | undefined>): ProviderConfig | null {
+  const baseUrl = env.MORROW_PROVIDER_BASE_URL;
+  const modelId = env.MORROW_PROVIDER_MODEL;
+  if (baseUrl === undefined && modelId === undefined && env.MORROW_PROVIDER_API_KEY === undefined) {
+    return null;
+  }
+  if (!baseUrl || !modelId) {
+    throw new Error(
+      "provider config requires MORROW_PROVIDER_BASE_URL and MORROW_PROVIDER_MODEL (MORROW_PROVIDER_API_KEY optional)",
+    );
+  }
+  const contextWindow = parsePositiveInt(env.MORROW_PROVIDER_CONTEXT_WINDOW ?? "131072", "MORROW_PROVIDER_CONTEXT_WINDOW");
+  const maxTokens = parsePositiveInt(env.MORROW_PROVIDER_MAX_TOKENS ?? "8192", "MORROW_PROVIDER_MAX_TOKENS");
+  return { baseUrl, apiKey: env.MORROW_PROVIDER_API_KEY ?? "", modelId, contextWindow, maxTokens };
+}
+
+function parsePositiveInt(raw: string, name: string): number {
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new Error(`invalid ${name}: "${raw}" (positive integer expected)`);
+  }
+  return value;
 }
 
 /** 从 dataDir 读取或创建副本身份文件；显式传入且合法时直接采用 */

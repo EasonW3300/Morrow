@@ -3,7 +3,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { loadConfig, defaultDataDir } from "../src/config.ts";
+import { loadConfig, defaultDataDir, parseProviderConfig } from "../src/config.ts";
 import { removeDir, tmpDir } from "./helpers.ts";
 
 test("loadConfig falls back to safe defaults", () => {
@@ -45,4 +45,47 @@ test("loadConfig rejects a malformed MORROW_REPLICA_ID", () => {
 
 test("loadConfig rejects a non-numeric MORROW_PORT", () => {
   assert.throws(() => loadConfig({ MORROW_PORT: "http" }), /port/i);
+});
+
+test("parseProviderConfig: absent env -> null; full trio -> provider config", () => {
+  assert.equal(parseProviderConfig({}), null);
+  const provider = parseProviderConfig({
+    MORROW_PROVIDER_BASE_URL: "http://127.0.0.1:11434/v1",
+    MORROW_PROVIDER_API_KEY: "",
+    MORROW_PROVIDER_MODEL: "qwen3:8b",
+  });
+  assert.deepEqual(provider, {
+    baseUrl: "http://127.0.0.1:11434/v1",
+    apiKey: "",
+    modelId: "qwen3:8b",
+    contextWindow: 131072,
+    maxTokens: 8192,
+  });
+});
+
+test("parseProviderConfig: partial config and bad numbers are rejected", () => {
+  assert.throws(() => parseProviderConfig({ MORROW_PROVIDER_BASE_URL: "http://x" }), /MORROW_PROVIDER_MODEL/);
+  assert.throws(
+    () =>
+      parseProviderConfig({
+        MORROW_PROVIDER_BASE_URL: "http://x",
+        MORROW_PROVIDER_MODEL: "m",
+        MORROW_PROVIDER_CONTEXT_WINDOW: "0",
+      }),
+    /CONTEXT_WINDOW/,
+  );
+});
+
+test("loadConfig carries the parsed provider into the runtime config", () => {
+  const dir = tmpDir("morrow-prov-");
+  const config = loadConfig({
+    MORROW_DATA_DIR: dir,
+    MORROW_PROVIDER_BASE_URL: "https://api.example.com/v1",
+    MORROW_PROVIDER_API_KEY: "sk-test",
+    MORROW_PROVIDER_MODEL: "gpt-test",
+  });
+  assert.equal(config.provider?.baseUrl, "https://api.example.com/v1");
+  assert.equal(config.provider?.apiKey, "sk-test");
+  assert.equal(config.provider?.modelId, "gpt-test");
+  removeDir(dir);
 });

@@ -10,6 +10,9 @@ importers:
 
   apps/runtime:
     dependencies:
+      '@morrow/pi-adapter':
+        specifier: workspace:*
+        version: link:../../packages/pi-adapter
       '@morrow/protocol':
         specifier: workspace:*
         version: link:../../packages/protocol
