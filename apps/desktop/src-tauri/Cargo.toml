@@ -11,6 +11,9 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# 信号转发（sidecar.rs）为 unix 专属；Windows 无 SIGTERM 语义（见模块注释已知限制）
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [profile.release]

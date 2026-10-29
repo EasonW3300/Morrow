@@ -71,6 +71,27 @@ jobs:
         with:
           fetch-depth: 1 # 仓库历史 blob 大（~600MB），浅克隆
 
+      # Tauri v2 官方 prerequisites（Ubuntu）：webkit2gtk-4.1 通道 + 配套 -dev 包。
+      # 首跑 linux 腿红在 gio-sys/glib-sys/gobject-sys 的 pkg-config 找不到 gio-2.0/glib-2.0/gobject-2.0，
+      # 即 runner 缺 GTK/WebKit 栈；libgtk-3-dev/libsoup-3.0-dev/libjavascriptcoregtk-4.1-dev 显式列出，
+      # librsvg2-dev/libayatana-appindicator3-dev 覆盖 rsvg 与托盘，libxdo-dev/libssl-dev 为官方清单项，
+      # deb bundle 的依赖计算由上述 -dev 包满足。
+      - name: Install Tauri Linux system dependencies
+        if: matrix.name == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libglib2.0-dev \
+            libsoup-3.0-dev \
+            libjavascriptcoregtk-4.1-dev \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            librsvg2-dev \
+            libayatana-appindicator3-dev \
+            libxdo-dev \
+            libssl-dev
+
       - uses: pnpm/action-setup@v4 # 版本取 package.json packageManager（pnpm@9.12.0）
 
       - uses: actions/setup-node@v4
@@ -97,8 +118,11 @@ jobs:
       - name: Pack runtime single binary (bun compile)
         run: pnpm pack:runtime
 
+      # 经 package.json 显式 script（tauri:build = tauri build），不用裸 pnpm exec——
+      # Windows 首跑 exec 在底层 cargo 失败时报误导性的 Command "tauri" not found
+      # （ERR_PNPM_RECURSIVE_EXEC_FIRST_FAIL），run script 走标准 .bin 解析，跨平台一致
       - name: Build desktop bundle (tauri)
-        run: pnpm --filter @morrow/desktop exec tauri build --bundles ${{ matrix.bundles }}
+        run: pnpm --filter @morrow/desktop run tauri:build --bundles ${{ matrix.bundles }}
 
       - name: Upload runtime binary
         if: always()
