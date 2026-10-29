@@ -10,6 +10,10 @@ _Avoid_: 用户、admin、租户（本项目无多租户）
 **Trusted Contact（可信联系人）**: 经 Owner 显式授权、可经由渠道与 Agent 交互并访问有限能力的外部人员；默认不可访问 Owner 的私人记忆、文件与开发环境。
 _Avoid_: 朋友、协作者
 
+**Pairing Code（配对码）**: 已信任设备生成的一次性短时凭证，用于把新 Device 加入信任网络。
+
+**Invite Code（邀请码）**: Owner 生成的一次性凭证，用于把外部人员的渠道身份绑定为 Trusted Contact。
+
 **Device（设备）**: 运行 Morrow 一份实例的机器，持有独立设备密钥与同步游标。
 
 **Replica（副本）**: 同一 Owner 的数据在一个 Device 上的完整本地拷贝；副本间通过事件同步保持一致。
@@ -54,7 +58,9 @@ _Avoid_: 知识、笔记
 
 **Procedural Memory（程序性记忆）**: Agent 从重复经验中沉淀的操作经验；经测试后才成为正式 Skill。
 
-**Sensitivity Level（敏感等级）**: 记忆的可见性分级，决定其能否跨副本同步、能否对 Trusted Contact 引用、能否自动改写。
+**Notification Rule（通知规则）**: 事件类型 × 目标渠道 × 免打扰时段构成的通知投放配置；同一任务同类事件按窗口去重。
+
+**Sensitivity Level（敏感等级）**: 记忆的可见性分级，决定其能否跨副本同步、能否对 Trusted Contact 引用、能否自动改写；分为 `public`（可同步、可引用）/ `private`（仅 Owner 会话可读，同步时加密）/ `locked`（禁止一切自动改写，变更必须经 Owner 确认）。
 
 ## 能力
 
