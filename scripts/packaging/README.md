@@ -63,6 +63,31 @@ pnpm --filter @morrow/packaging test   # 探针脚本关键函数单测（node:t
   SIGTERM → 断言 `{stopped:true, signal:"SIGTERM"}` 行 + 退出码 0；
 - **阶段 B（同样探针）**：以被父进程拉起的方式再跑一遍 `--probe` 套件。
 
+## 冒烟门（T9 / Issue #10）
+
+单平台门禁流水线（本机与 CI `.github/workflows/m0.yml` 同口径）：
+
+```bash
+pnpm gate:runtime   # 快速门禁：runtime 二进制 + standalone/sidecar 探针 → 报告（bundle 项跳过）
+# 完整门禁（CI 形态，含桌面 bundle 校验）：
+node --experimental-strip-types src/gate.ts --binary <path> --bundle-dir <dir> --report <out.md> --summary
+```
+
+- 产物校验（二进制 + bundle 目录）失败 → 不跑探针，报告 `gate-result: fail`，退出码 1
+  （负向路径单测：`test/gate-cli.test.ts`）；
+- 清单四项：#1 启动、#2 健康探针/对话、#3 sidecar 通信由 CI 探针验证；**#4 麦克风捕获探针
+  与桌面 GUI 真机启动为真机门禁项**——CI runner 无音频设备与 GUI 会话，由 T10 在真机执行，
+  报告标注「待真机」且不计入 CI 门禁判定（`gateVerdict`）；
+- 三平台报告由 `src/assemble-gate-report.ts` 聚合为 `m0-gate-report`（任一平台报告缺失或
+  非 pass → 汇总红，单测：`test/assemble.test.ts`）。
+
+## bun 解析（merger 发现的修复）
+
+`pack:runtime` 链条经 pnpm 脚本 shell 执行 bun，而本机 bun 由官方 installer 装在
+`~/.bun/bin/bun`（不写 shell 配置，ADR-0006）→ 脚本层曾直接 ENOENT。现所有脚本层 bun 调用
+经 `src/with-bun.ts` 显式解析（PATH → 用户级安装位，win32 候选带 `.exe`），
+`build.ts` 复用同一 resolver（`src/bun-path.ts`，单测：`test/bun-path.test.ts`）。
+
 ## 结构
 
 ```
@@ -75,6 +100,11 @@ src/
   probe-lib.ts         JSON 行流 / ready 握手 / 探针 HTTP / 嵌入探针套件（纯函数部分单测覆盖）
   probe-standalone.ts  standalone 探针入口
   probe-sidecar.ts     sidecar 探针入口（两阶段）
-test/                 node:test 单测（target / probe-lib）
+  bun-path.ts          bun 解析（PATH → ~/.bun/bin/bun，win32 .exe；with-bun 与 build.ts 共用）
+  with-bun.ts          脚本层 bun 启动器（package.json binary 脚本的显式解析入口）
+  gate-lib.ts          冒烟门库：产物校验 / 二进制发现 / verdict / 报告构建 / 汇总（单测覆盖）
+  gate.ts              冒烟门 CLI（本机与 CI 同口径）
+  assemble-gate-report.ts  三平台门禁报告聚合 CLI（report job 用）
+test/                 node:test 单测（target / probe-lib / bun-path / gate-lib / gate-cli / assemble）
 dist/                 产物（gitignored）
 ```
