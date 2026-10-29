@@ -1,0 +1,22 @@
+{
+  "name": "@morrow/packaging",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Runtime 单二进制打包（bun compile）与启动探针（T8 / Issue #9，ADR-0003/0006）",
+  "scripts": {
+    "binary": "bun run src/build.ts",
+    "probe:standalone": "node --experimental-strip-types src/probe-standalone.ts",
+    "probe:sidecar": "node --experimental-strip-types src/probe-sidecar.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "tsc --noEmit && node --test --experimental-strip-types \"test/*.test.ts\""
+  },
+  "dependencies": {
+    "@morrow/pi-adapter": "workspace:*",
+    "@morrow/runtime": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0"
+  }
+}

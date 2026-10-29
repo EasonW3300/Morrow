@@ -31,3 +31,25 @@ export type { SandboxProbe, SandboxStatus } from "./health.ts";
 export { uuidv7 } from "./uuid-v7.ts";
 export { openSqlite } from "./db.ts";
 export type { SqliteDatabase, SqliteStatement, SqliteParam } from "./db.ts";
+export {
+  ProviderRegistry,
+  ProviderRegistryError,
+  ENV_PROVIDER_ID,
+} from "./providers.ts";
+export type {
+  ProviderRecord,
+  ProviderRegistryOptions,
+  ProviderResolver,
+  ResolvedProvider,
+} from "./providers.ts";
+export { testProviderConnectivity } from "./connectivity.ts";
+export type { ConnectivityProbeInput, ConnectivityResult } from "./connectivity.ts";
+export {
+  createInMemorySecretStore,
+  createKeychainStore,
+  createLinuxSecretToolStore,
+  createWindowsCredentialStore,
+  defaultExec,
+  detectSecretStore,
+} from "./keyring.ts";
+export type { DetectedSecretStore, ExecFn, ExecResult, SecretStore } from "./keyring.ts";
