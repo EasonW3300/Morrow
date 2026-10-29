@@ -43,6 +43,20 @@ export interface LedgerListOptions {
   offset?: number;
 }
 
+/** 账本条目：信封原文 + 写入序号（SSE id、投影排序用） */
+export interface LedgerEntry {
+  sequence: number;
+  envelope: EventEnvelope;
+}
+
+/** scan 的选择器；两个条件同时给定时取交集 */
+export interface LedgerScanSelector {
+  /** 按信封 session_id 过滤（M0 无专列，JSON 扫描；量级：单副本会话事件） */
+  sessionId?: string;
+  /** 按 event_type 过滤（有专列，走索引） */
+  eventType?: string;
+}
+
 export interface LedgerPage {
   events: EventEnvelope[];
   total: number;
@@ -102,6 +116,7 @@ export class EventLedger {
   #countByReplicaStmt;
   #pageByReplicaStmt;
   #seqRangeAllStmt;
+  #byTypeStmt;
   #sampleStmt;
 
   private constructor(db: SqliteDatabase) {
@@ -117,6 +132,7 @@ export class EventLedger {
       "SELECT envelope FROM events WHERE replica_id = ? ORDER BY seq LIMIT ? OFFSET ?",
     );
     this.#seqRangeAllStmt = db.prepare("SELECT seq, envelope FROM events ORDER BY seq");
+    this.#byTypeStmt = db.prepare("SELECT seq, envelope FROM events WHERE event_type = ? ORDER BY seq");
     this.#sampleStmt = db.prepare(
       "SELECT seq, envelope FROM events WHERE (seq % ?) = 0 ORDER BY seq",
     );
@@ -163,6 +179,33 @@ export class EventLedger {
       }
       throw err;
     }
+  }
+
+  /**
+   * 全量扫描（seq 升序）并按选择器过滤，返回带写入序号的信封条目。
+   * 会话投影（会话列表/历史/SSE 重放）都走这里；无分页——M0 量级为单副本
+   * 会话事件，会话事件的量随消息数线性增长，分页是 T5+ 同步层的事。
+   */
+  scan(selector: LedgerScanSelector = {}): LedgerEntry[] {
+    this.#assertOpen();
+    const eventType = selector.eventType;
+    if (selector.sessionId !== undefined) {
+      const rows = this.#seqRangeAllStmt.all() as Array<{ seq: number | bigint; envelope: string }>;
+      const out: LedgerEntry[] = [];
+      for (const row of rows) {
+        const envelope = JSON.parse(row.envelope) as EventEnvelope;
+        if (envelope.session_id !== selector.sessionId) continue;
+        if (eventType !== undefined && envelope.event_type !== eventType) continue;
+        out.push({ sequence: Number(row.seq), envelope });
+      }
+      return out;
+    }
+    const rows = (
+      eventType === undefined
+        ? this.#seqRangeAllStmt.all()
+        : this.#byTypeStmt.all(eventType)
+    ) as Array<{ seq: number | bigint; envelope: string }>;
+    return rows.map((row) => ({ sequence: Number(row.seq), envelope: JSON.parse(row.envelope) as EventEnvelope }));
   }
 
   /** 分页查询，按写入顺序（seq 升序）返回信封原文 */

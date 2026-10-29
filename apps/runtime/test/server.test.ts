@@ -28,7 +28,13 @@ interface ApiError {
 }
 
 function testConfig(dir: string): RuntimeConfig {
-  return { host: "127.0.0.1", port: 0, dataDir: dir, replicaId: "f47ac10b-58cc-4372-a567-0e02b2c3d479" };
+  return {
+    host: "127.0.0.1",
+    port: 0,
+    dataDir: dir,
+    replicaId: "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+    provider: null,
+  };
 }
 
 test("GET /v1/health returns ok with the sandbox probe status", async () => {
