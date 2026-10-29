@@ -1,0 +1,97 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://morrow.dev/schemas/event-envelope/v1.json",
+  "title": "Morrow Event Envelope v1",
+  "description": "PRD §6.3 事件信封 schema v1。演进规则见 packages/protocol/README.md：只加字段不删改；破坏性变更必须升 schema_version；已写入事件永不重写。",
+  "type": "object",
+  "properties": {
+    "event_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "description": "UUID v7（时间有序，同步去重键）"
+    },
+    "replica_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "description": "产生事件的副本（device 或 server）uuid"
+    },
+    "actor_id": {
+      "description": "owner | contact:<id> | agent:<id>",
+      "oneOf": [
+        { "const": "owner" },
+        { "type": "string", "pattern": "^contact:[0-9A-Za-z_-]+$" },
+        { "type": "string", "pattern": "^agent:[0-9A-Za-z_-]+$" }
+      ]
+    },
+    "task_id": {
+      "type": ["string", "null"],
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "description": "关联任务；非任务事件为 null 或缺省"
+    },
+    "session_id": {
+      "type": ["string", "null"],
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "event_type": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+$",
+      "description": "小写点分标识，如 tool.started；事件类型清单只增不减"
+    },
+    "occurred_at": {
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d{1,9})?Z$",
+      "description": "RFC 3339 UTC（必须 Z 结尾）；生产方规范形态为毫秒精度"
+    },
+    "causation_id": {
+      "type": ["string", "null"],
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "description": "因果链上触发本事件的前置事件 id；无则为 null 或缺省"
+    },
+    "schema_version": { "const": 1 },
+    "payload": {
+      "type": "object",
+      "description": "按 event_type 定义的具体负载；信封层不约束内部字段"
+    },
+    "integrity_hash": {
+      "type": "string",
+      "pattern": "^sha256-[0-9a-f]{64}$",
+      "description": "对除本字段外的整个信封做规范序列化后取 sha256，规则见 README"
+    },
+    "idempotency_key": {
+      "type": "string",
+      "minLength": 1,
+      "description": "外发副作用幂等键；仅外发副作用事件携带"
+    },
+    "receipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["channel"],
+      "properties": {
+        "channel": { "type": "string", "minLength": 1 },
+        "remote_message_id": { "type": "string", "minLength": 1 },
+        "delivered_at": {
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d{1,9})?Z$",
+          "description": "渠道确认送达时间（RFC 3339 UTC）"
+        },
+        "error": { "type": "string", "minLength": 1, "description": "渠道回执的失败原因（送达失败时）" }
+      },
+      "description": "渠道回执；仅外发副作用事件携带。delivery_unknown 为 true 时通常无回执"
+    },
+    "delivery_unknown": {
+      "type": "boolean",
+      "description": "true 表示已发送但未获得确认回执（送达状态未知）"
+    }
+  },
+  "required": [
+    "event_id",
+    "replica_id",
+    "actor_id",
+    "event_type",
+    "occurred_at",
+    "schema_version",
+    "payload",
+    "integrity_hash"
+  ],
+  "additionalProperties": false
+}
