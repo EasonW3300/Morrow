@@ -14,6 +14,8 @@ export type {
   VerifyIntegrityOptions,
 } from "./ledger.ts";
 export { startRuntime } from "./runtime.ts";
+export { DeviceRegistry } from "./devices.ts";
+export type { DeviceRecord } from "./devices.ts";
 export type { RuntimeHandle, RuntimeOptions } from "./runtime.ts";
 export { loadConfig, defaultDataDir, resolveReplicaId, parseProviderConfig } from "./config.ts";
 export type { RuntimeConfig, ProviderConfig } from "./config.ts";

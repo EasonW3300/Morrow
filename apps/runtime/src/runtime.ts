@@ -3,6 +3,7 @@ import { createPiAdapter, type AgentRuntime } from "@morrow/pi-adapter";
 import packageJson from "../package.json" with { type: "json" };
 import type { RuntimeConfig } from "./config.ts";
 import { testProviderConnectivity } from "./connectivity.ts";
+import { DeviceRegistry, type DeviceRecord } from "./devices.ts";
 import { detectSecretStore, type SecretStore } from "./keyring.ts";
 import { probeSandbox } from "./health.ts";
 import { EventLedger } from "./ledger.ts";
@@ -10,12 +11,14 @@ import { ProviderRegistry, ProviderRegistryError, ENV_PROVIDER_ID, type Provider
 import { SessionManager, type SessionFrame } from "./sessions.ts";
 import { buildEventEnvelope } from "./envelope.ts";
 import { computeIntegrityHash, type EventEnvelope } from "@morrow/protocol";
+import { UUID_RE } from "./uuid-v7.ts";
 
 /**
  * Runtime HTTP 服务（PRD §6.2 的 M0 子集）。
  *
  * node:http + 极简路由，不引框架——为 T8 bun compile 单二进制留路（ADR-0003）。
- * 路由面：GET /v1/health、GET /v1/events、T4 会话族（POST/GET /v1/sessions、
+ * 路由面：GET /v1/health、GET /v1/events、GET /v1/devices（M0 只读登记，票 #3）、
+ * T4 会话族（POST/GET /v1/sessions、
  * POST/GET /v1/sessions/:id/messages、GET /v1/sessions/:id/stream SSE）、
  * T5 Provider 族（GET/POST /v1/providers、GET/PUT/DELETE /v1/providers/:id、
  * POST /v1/providers/:id/default、POST /v1/providers/:id/test）。
@@ -26,13 +29,15 @@ import { computeIntegrityHash, type EventEnvelope } from "@morrow/protocol";
  * started），最后关闭账本落盘。
  */
 
-const VERSION: string = packageJson.version;
+/** 版本号唯一来源：本包 package.json（main.ts 的 ready 行也从这里取——不再双真相源） */
+export const VERSION: string = packageJson.version;
 
 interface RequestContext {
   ledger: EventLedger;
   replicaId: string;
   sessions: SessionManager;
   providers: ProviderRegistry;
+  devices: DeviceRegistry;
 }
 
 type Handler = (
@@ -67,6 +72,8 @@ export interface RuntimeHandle {
   host: string;
   port: number;
   ledger: EventLedger;
+  /** Device 记录注册表（票 #3 最小实现；库形态可直用） */
+  devices: DeviceRegistry;
   /** 会话管理器（库形态可直用：abort / 订阅等测试与宿主 seam） */
   sessions: SessionManager;
   /** Provider 注册表（库形态可直用：CRUD / 默认 / env 回退解析） */
@@ -78,10 +85,9 @@ export interface RuntimeHandle {
   close(signal?: string): Promise<void>;
 }
 
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
-
 const routes: Route[] = [
   { method: "GET", re: /^\/v1\/health$/, handler: handleHealth },
+  { method: "GET", re: /^\/v1\/devices$/, handler: handleListDevices },
   { method: "GET", re: /^\/v1\/events$/, handler: handleEvents },
   { method: "GET", re: /^\/v1\/providers$/, handler: handleListProviders },
   { method: "POST", re: /^\/v1\/providers$/, handler: handleRegisterProvider },
@@ -99,6 +105,10 @@ const routes: Route[] = [
 
 export async function startRuntime(config: RuntimeConfig, options: RuntimeOptions = {}): Promise<RuntimeHandle> {
   const ledger = EventLedger.open(config.dataDir);
+  // Device 记录（票 #3 的 M0 最小实现）：启动时从 replica-id 演化出的 config.replicaId 种子；
+  // 不做配对/撤销（M3 范围）
+  const devices = DeviceRegistry.open(config.dataDir);
+  devices.touch(config.replicaId);
   const providers = new ProviderRegistry({
     dataDir: config.dataDir,
     secretStore: options.secretStore ?? detectSecretStore().store,
@@ -112,7 +122,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     // 注入工厂（测试/宿主自带 Agent Loop）时不做 Provider 预检（T4 语义）；默认工厂要求有 Provider
     providerRequired: options.agentAdapterFactory === undefined,
   });
-  const ctx: RequestContext = { ledger, replicaId: config.replicaId, sessions, providers };
+  const ctx: RequestContext = { ledger, replicaId: config.replicaId, sessions, providers, devices };
   const server = createServer((req, res) => {
     routeRequest(req, res, ctx);
   });
@@ -121,6 +131,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
   try {
     port = await listen(server, config.host, config.port);
   } catch (err) {
+    devices.close();
     ledger.close();
     throw err;
   }
@@ -140,6 +151,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     ledger,
     sessions,
     providers,
+    devices,
     async close(signal?: string): Promise<void> {
       if (closing) return;
       closing = true;
@@ -160,6 +172,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
       } catch (err) {
         console.error("[morrow] failed to append runtime.stopped:", err);
       }
+      devices.close();
       ledger.close();
     },
   };
@@ -185,8 +198,11 @@ function defaultAgentFactory(): (sessionId: string, provider: ResolvedProvider |
 function routeRequest(req: IncomingMessage, res: ServerResponse, ctx: RequestContext): void {
   // CORS：桌面 WebView 与浏览器联调是跨源客户端（PRD §6.1「渠道适配器亦为 API 客户端」）。
   // 只对本地来源（localhost / 127.0.0.1 / tauri://）放行——互联网页面的 Origin 不在列表内，
-  // 不能读写本地控制面；跨设备鉴权头是后续票的事。last-event-id 供 EventSource 断线重连
-  // 携带（非 safelist 头，需进 preflight 白名单）。
+  // 其脚本发起的跨源读写会被浏览器拦截。但 CORS 不是 CSRF 的完整防线：不带自定义头的
+  // simple POST（safelist content-type 如 text/plain）不经 preflight，请求本身仍会到达——
+  // 防线第二道是 readJsonBody 强制 application/json（safelist 外 → 强制 preflight → 204 空
+  // 白名单不放行；且服务器端直接 415 拒收）。残余风险见 docs/security/threat-model.md 域 4。
+  // last-event-id 供 EventSource 断线重连携带（非 safelist 头，需进 preflight 白名单）。
   const origin = req.headers.origin;
   if (typeof origin === "string" && isLocalOrigin(origin)) {
     res.setHeader("access-control-allow-origin", origin);
@@ -250,6 +266,12 @@ function handleHealth(_req: IncomingMessage, res: ServerResponse, _url: URL, ctx
     sandbox: probeSandbox(),
     ledger: { events: ctx.ledger.count() },
   });
+}
+
+/** Device 记录列表（只读；M0 仅本副本一条——多设备是 M3 的事，票 #3） */
+function handleListDevices(_req: IncomingMessage, res: ServerResponse, _url: URL, ctx: RequestContext): void {
+  const devices: DeviceRecord[] = ctx.devices.list();
+  sendJson(res, 200, { devices });
 }
 
 function handleEvents(_req: IncomingMessage, res: ServerResponse, url: URL, ctx: RequestContext): void {
@@ -577,8 +599,20 @@ async function handleTestProvider(_req: IncomingMessage, res: ServerResponse, _u
   sendJson(res, 200, result);
 }
 
-/** 读取并解析 JSON 请求体；非法时写出 400/413 并返回 null */
+/**
+ * 读取并解析 JSON 请求体；非法时写出 400/413/415 并返回 null。
+ *
+ * content-type 必须显式为 application/json：application/json 不在 CORS「简单请求」
+ * safelist 内，跨源页面伪造的 simple POST（text/plain）会被强制走 preflight——
+ * 这是写端点的 CSRF 防线之一（威胁模型域 4「浏览器网页 CSRF 向量」；曾不校验
+ * content-type，M0 code-review / Issue #11 补上）。
+ */
 async function readJsonBody(req: IncomingMessage, res: ServerResponse, maxBytes = 1_000_000): Promise<Record<string, unknown> | null> {
+  const contentType = req.headers["content-type"];
+  if (contentType === undefined || !/^application\/json\b/i.test(contentType.trim())) {
+    sendError(res, 415, "unsupported_media_type", "content-type must be application/json");
+    return null;
+  }
   const chunks: Buffer[] = [];
   let size = 0;
   for await (const chunk of req) {

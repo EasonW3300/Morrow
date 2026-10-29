@@ -1,92 +1,461 @@
 {
-  "description": "Pi 1.4.0 AgentEvent 流式中断：用户 abort() 后，部分流式文本已产出，assistant 消息以 stopReason=aborted 结束，agent_end 收尾（无 error 事件）。形态同 normal-text-tool.json。",
+  "description": "Pi 1.4.0 真实录制（scripts/record-fixtures.ts × 本地 OpenAI 兼容 mock）：流式中断——两个 text_delta 后 abort()，agent_end(stopReason=aborted) 收尾，不发 error。事件为原始 AgentEvent。",
   "events": [
-    { "type": "agent_start" },
-    { "type": "turn_start" },
+    {
+      "type": "agent_start"
+    },
+    {
+      "type": "turn_start"
+    },
+    {
+      "type": "message_start",
+      "message": {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "北京今天天气怎么样？"
+          }
+        ],
+        "timestamp": 1793284075860
+      }
+    },
+    {
+      "type": "message_end",
+      "message": {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "北京今天天气怎么样？"
+          }
+        ],
+        "timestamp": 1793284075860
+      }
+    },
     {
       "type": "message_start",
       "message": {
         "role": "assistant",
-        "content": [],
+        "content": [
+          {
+            "type": "text",
+            "text": "我正在整理你的偏好"
+          }
+        ],
         "api": "openai-completions",
-        "provider": "morrow-openai-compat",
+        "provider": "morrow",
         "model": "test-chat-model",
-        "usage": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 0, "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0 } },
+        "usage": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 0,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "total": 0
+          }
+        },
         "stopReason": "pending",
-        "timestamp": 1769692802000
+        "timestamp": 1793284075860
       }
     },
     {
       "type": "message_update",
+      "assistantMessageEvent": {
+        "type": "text_start",
+        "contentIndex": 0,
+        "partial": {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "text",
+              "text": "我正在整理你的偏好"
+            }
+          ],
+          "api": "openai-completions",
+          "provider": "morrow",
+          "model": "test-chat-model",
+          "usage": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "totalTokens": 0,
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "total": 0
+            }
+          },
+          "stopReason": "aborted",
+          "timestamp": 1793284075860,
+          "responseId": "chatcmpl-record",
+          "errorMessage": "Request was aborted",
+          "durationMs": 5,
+          "thinkingLevel": "off"
+        }
+      },
       "message": {
         "role": "assistant",
-        "content": [{ "type": "text", "text": "我正在" }],
+        "content": [
+          {
+            "type": "text",
+            "text": "我正在整理你的偏好"
+          }
+        ],
         "api": "openai-completions",
-        "provider": "morrow-openai-compat",
+        "provider": "morrow",
         "model": "test-chat-model",
-        "usage": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 0, "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0 } },
+        "usage": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 0,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "total": 0
+          }
+        },
         "stopReason": "pending",
-        "timestamp": 1769692802000
-      },
-      "assistantMessageEvent": { "type": "text_delta", "contentIndex": 0, "delta": "我正在", "partial": { "role": "assistant", "content": [{ "type": "text", "text": "我正在" }], "api": "openai-completions", "provider": "morrow-openai-compat", "model": "test-chat-model", "usage": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 0, "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0 } }, "stopReason": "pending", "timestamp": 1769692802000 } }
+        "timestamp": 1793284075860,
+        "responseId": "chatcmpl-record"
+      }
     },
     {
       "type": "message_update",
+      "assistantMessageEvent": {
+        "type": "text_delta",
+        "contentIndex": 0,
+        "delta": "我正在",
+        "partial": {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "text",
+              "text": "我正在整理你的偏好"
+            }
+          ],
+          "api": "openai-completions",
+          "provider": "morrow",
+          "model": "test-chat-model",
+          "usage": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "totalTokens": 0,
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "total": 0
+            }
+          },
+          "stopReason": "aborted",
+          "timestamp": 1793284075860,
+          "responseId": "chatcmpl-record",
+          "errorMessage": "Request was aborted",
+          "durationMs": 5,
+          "thinkingLevel": "off"
+        }
+      },
       "message": {
         "role": "assistant",
-        "content": [{ "type": "text", "text": "我正在整理你的偏好" }],
+        "content": [
+          {
+            "type": "text",
+            "text": "我正在整理你的偏好"
+          }
+        ],
         "api": "openai-completions",
-        "provider": "morrow-openai-compat",
+        "provider": "morrow",
         "model": "test-chat-model",
-        "usage": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 0, "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0 } },
+        "usage": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 0,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "total": 0
+          }
+        },
         "stopReason": "pending",
-        "timestamp": 1769692802000
+        "timestamp": 1793284075860,
+        "responseId": "chatcmpl-record"
+      }
+    },
+    {
+      "type": "message_update",
+      "assistantMessageEvent": {
+        "type": "text_delta",
+        "contentIndex": 0,
+        "delta": "整理你的偏好",
+        "partial": {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "text",
+              "text": "我正在整理你的偏好"
+            }
+          ],
+          "api": "openai-completions",
+          "provider": "morrow",
+          "model": "test-chat-model",
+          "usage": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "totalTokens": 0,
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "total": 0
+            }
+          },
+          "stopReason": "aborted",
+          "timestamp": 1793284075860,
+          "responseId": "chatcmpl-record",
+          "errorMessage": "Request was aborted",
+          "durationMs": 5,
+          "thinkingLevel": "off"
+        }
       },
-      "assistantMessageEvent": { "type": "text_delta", "contentIndex": 0, "delta": "整理你的偏好", "partial": { "role": "assistant", "content": [{ "type": "text", "text": "我正在整理你的偏好" }], "api": "openai-completions", "provider": "morrow-openai-compat", "model": "test-chat-model", "usage": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 0, "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0 } }, "stopReason": "pending", "timestamp": 1769692802000 } }
+      "message": {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "我正在整理你的偏好"
+          }
+        ],
+        "api": "openai-completions",
+        "provider": "morrow",
+        "model": "test-chat-model",
+        "usage": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 0,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "total": 0
+          }
+        },
+        "stopReason": "pending",
+        "timestamp": 1793284075860,
+        "responseId": "chatcmpl-record"
+      }
+    },
+    {
+      "type": "message_update",
+      "assistantMessageEvent": {
+        "type": "text_end",
+        "contentIndex": 0,
+        "content": "我正在整理你的偏好",
+        "partial": {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "text",
+              "text": "我正在整理你的偏好"
+            }
+          ],
+          "api": "openai-completions",
+          "provider": "morrow",
+          "model": "test-chat-model",
+          "usage": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "totalTokens": 0,
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "total": 0
+            }
+          },
+          "stopReason": "aborted",
+          "timestamp": 1793284075860,
+          "responseId": "chatcmpl-record",
+          "errorMessage": "Request was aborted",
+          "durationMs": 5,
+          "thinkingLevel": "off"
+        }
+      },
+      "message": {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "我正在整理你的偏好"
+          }
+        ],
+        "api": "openai-completions",
+        "provider": "morrow",
+        "model": "test-chat-model",
+        "usage": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 0,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "total": 0
+          }
+        },
+        "stopReason": "aborted",
+        "timestamp": 1793284075860,
+        "responseId": "chatcmpl-record",
+        "errorMessage": "Request was aborted",
+        "durationMs": 5
+      }
     },
     {
       "type": "message_end",
       "message": {
         "role": "assistant",
-        "content": [{ "type": "text", "text": "我正在整理你的偏好" }],
+        "content": [
+          {
+            "type": "text",
+            "text": "我正在整理你的偏好"
+          }
+        ],
         "api": "openai-completions",
-        "provider": "morrow-openai-compat",
+        "provider": "morrow",
         "model": "test-chat-model",
-        "usage": { "input": 88, "output": 7, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 95, "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0 } },
+        "usage": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 0,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "total": 0
+          }
+        },
         "stopReason": "aborted",
-        "timestamp": 1769692802000,
-        "durationMs": 480
+        "timestamp": 1793284075860,
+        "responseId": "chatcmpl-record",
+        "errorMessage": "Request was aborted",
+        "durationMs": 5,
+        "thinkingLevel": "off"
       }
     },
     {
       "type": "turn_end",
       "message": {
         "role": "assistant",
-        "content": [{ "type": "text", "text": "我正在整理你的偏好" }],
+        "content": [
+          {
+            "type": "text",
+            "text": "我正在整理你的偏好"
+          }
+        ],
         "api": "openai-completions",
-        "provider": "morrow-openai-compat",
+        "provider": "morrow",
         "model": "test-chat-model",
-        "usage": { "input": 88, "output": 7, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 95, "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0 } },
+        "usage": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 0,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "total": 0
+          }
+        },
         "stopReason": "aborted",
-        "timestamp": 1769692802000,
-        "durationMs": 480
+        "timestamp": 1793284075860,
+        "responseId": "chatcmpl-record",
+        "errorMessage": "Request was aborted",
+        "durationMs": 5,
+        "thinkingLevel": "off"
       },
       "toolResults": []
     },
     {
       "type": "agent_end",
       "messages": [
-        { "role": "user", "content": "总结一下我的偏好", "timestamp": 1769692801900 },
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "text",
+              "text": "北京今天天气怎么样？"
+            }
+          ],
+          "timestamp": 1793284075860
+        },
         {
           "role": "assistant",
-          "content": [{ "type": "text", "text": "我正在整理你的偏好" }],
+          "content": [
+            {
+              "type": "text",
+              "text": "我正在整理你的偏好"
+            }
+          ],
           "api": "openai-completions",
-          "provider": "morrow-openai-compat",
+          "provider": "morrow",
           "model": "test-chat-model",
-          "usage": { "input": 88, "output": 7, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 95, "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0 } },
+          "usage": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "totalTokens": 0,
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "total": 0
+            }
+          },
           "stopReason": "aborted",
-          "timestamp": 1769692802000,
-          "durationMs": 480
+          "timestamp": 1793284075860,
+          "responseId": "chatcmpl-record",
+          "errorMessage": "Request was aborted",
+          "durationMs": 5,
+          "thinkingLevel": "off"
         }
       ]
     }

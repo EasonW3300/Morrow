@@ -15,3 +15,10 @@ export function uuidv7(now: number = Date.now()): string {
   const hex = bytes.toString("hex");
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
+
+/**
+ * 小写 uuid 形态校验（事件信封的 event_id/replica_id 都是这个形态）。
+ * config.ts（MORROW_REPLICA_ID / replica-id 文件）与 runtime.ts（events 查询参数）
+ * 共用此定义——原先各有一份，收敛于此（M0 code-review / Issue #11）。
+ */
+export const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;

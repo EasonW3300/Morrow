@@ -1,4 +1,5 @@
 import type { AdapterCompatConfig } from "@morrow/pi-adapter";
+import type { ProviderRecord } from "@morrow/protocol";
 import type { ProviderConfig } from "./config.ts";
 import type { SecretStore } from "./keyring.ts";
 import { uuidv7 } from "./uuid-v7.ts";
@@ -23,19 +24,8 @@ const PROVIDER_ID_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 const DEFAULT_CONTEXT_WINDOW = 131072;
 const DEFAULT_MAX_TOKENS = 8192;
 
-/** Provider 元数据（对外投影；绝无密钥字段，has_api_key/is_default 为投影值） */
-export interface ProviderRecord {
-  provider_id: string;
-  name: string;
-  base_url: string;
-  model: string;
-  compat: AdapterCompatConfig;
-  context_window: number;
-  max_tokens: number;
-  created_at: string;
-  has_api_key: boolean;
-  is_default: boolean;
-}
+/** Provider 元数据投影（类型唯一真相源在 @morrow/protocol；绝无密钥字段，has_api_key/is_default 为投影值） */
+export type { ProviderRecord };
 
 /** 会话运行时可用的完整 Provider 配置（密钥已解析；仅运行时内部使用，不得入日志/响应） */
 export interface ResolvedProvider {

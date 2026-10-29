@@ -89,11 +89,13 @@
 | 默认只绑回环地址 | Runtime 默认 `127.0.0.1`、端口随机（0）；M0 部署形态（桌面 sidecar）中 UI 与 Runtime 同机，无网络暴露面 | `apps/runtime/src/config.ts`（host 默认 127.0.0.1） |
 | 私有网络优先 | 传输安全由隧道层（Tailscale/WireGuard）保证，Runtime 不直接暴露公网；公网 ACME 模式预留不验收 | ADR-0004 |
 | 配对协议定版 | 一次性配对码（5 分钟）+ 双端设备指纹确认 + 公钥入 OS 凭据库 | PRD §5.2 流程 1、FR-DEP-2 |
+| 浏览器网页 CSRF 向量（M0 code-review 补登） | 互联网页面虽拿不到跨源读（CORS 白名单仅本地来源），但**不带自定义头的 simple POST（text/plain）不经 preflight、请求本身会到达**——防线第二道：写端点（POST/PUT 带 body 的控制面 API）强制 `content-type: application/json`，撒谎/缺失一律 415 拒收（application/json 在 CORS safelist 外，合法浏览器跨源请求必被强制 preflight，白名单不放行即空） | `apps/runtime/src/runtime.ts`（routeRequest 注释 + readJsonBody）；`apps/runtime/test/cors.test.ts`（text/plain simple POST → 415 且无副作用） |
 
 **残余风险**：
 
 1. **M0 的 UI↔Runtime 本地 HTTP 无鉴权头**：127.0.0.1 上同机任意用户态进程可探测随机端口并调用控制面 API。单用户桌面场景接受（威胁主体即设备本身，归域 1）；设备鉴权头是 M3 跨设备 API 复用时的前置项，届时回环裸奔不可延续到多设备形态。
 2. 配对码 / 指纹确认 / 同步引擎（`sync/push/pull`、租约、fencing token）**全部未实现**——本域对策在 M3 前只有「不监听网络」这一条，混合部署模式不可用。
+3. **CSRF 防线是黑名单式最小防护，非穷尽**：content-type 强制只挡「伪造写」这一类——GET 类只读端点对网页仍可被探测性请求（响应读不到，但 side effect 如 SSE 连接建立存在）；`POST /v1/providers/:id/test` 无 body、不受 content-type 约束，网页可触发（后果仅一次对已注册 Provider 的出站连通性请求）；DNS rebinding（Origin 为重绑定的公网域名）不在本地来源白名单内，读被 CORS 挡、写被 content-type 挡，但 Host 头未校验。完整解法仍是 M3 的请求鉴权。
 
 **责任归属**：
 
@@ -109,7 +111,8 @@
 | R1 | 敏感数据明文落盘 | 接受至 M1/M3（磁盘加密建议 + 敏感分级先行） | M1/M3 |
 | R2 | 密钥 argv 暴露窗口 | 接受并记录（各 OS CLI 固有限制，keyring.ts 头注） | M3 复审 |
 | R3 | 账本 hash 无签名 | 接受至 M3（设备密钥就绪后升级为签名） | M3 |
-| R4 | 本地控制面无鉴权 | 接受至 M3（多设备形态前必须加设备鉴权头） | M3 |
+| R4 | 本地控制面无鉴权 | 接受至 M3（多设备形态前必须加设备鉴权头）；M0 已加最小 CSRF 防护（写端点强制 application/json） | M3 |
+| R7 | 浏览器网页 CSRF 向量（simple POST 可达本地控制面） | 最小防护已落地（415 拒收非 JSON 写请求），GET 类只读与无 body POST 的副作用面接受至 M3 鉴权 | M3 |
 | R5 | 沙箱未建即引入生成代码 | 禁令已定（无沙箱禁用），M2 交付完整对策 | M2 |
 | R6 | 提示注入绕过信任层 | 契约已定（权限层兜底，非提示层），M4 落地 | M4/M1 |
 

@@ -70,3 +70,20 @@ CI 边界（T9 定义）：CI runner 无音频设备与 GUI 会话，清单 #4 �
 | 验收基线已记录 | **达成** | `docs/prd/ac-baseline-m0.md`（硬件/工具链/网络/模型现状/测试数据/待校准表）；README 可达 |
 
 **M0 门槛：全部达成**。遗留待办（不阻塞 M0）：麦克风探针 Owner 授权（§2.2）、真实 Provider 密钥与 AC-02 双端点（ac-baseline §4）、windows/linux 真机走查（M6）。
+
+## 5. 如实补记（M0 code-review 复核，2026-10-29）
+
+以下边界在复核中确认，随报告归档以免后续误读（不改任何判定结论）：
+
+1. **keyring Windows/Linux 后端未实测**：`apps/runtime/src/keyring.ts` 的 Windows
+   `cmdkey`+CredRead 与 Linux `secret-tool` 路径只有接口/exec 桩测试锁定命令构造；CI 三平台
+   与本机门禁均未对真实 OS 凭据库做过读写（macOS Keychain 为唯一实测后端）。与
+   `docs/security/threat-model.md` 域 1 残余风险 4 一致。
+2. **负向验证形态**：CI 内的负向路径（如产物缺失即红、探针失败即红）以**单元测试 + 本机实跑**
+   为证据，未在 CI 中做「注入故障观察变红」的实演——门禁设计（T9）选择了成本更低的等价物，
+   记录在案。
+3. **Owner 待办（不阻塞 M0）**：AC-02 的真实双端点（OpenAI / 兼容网关）对话验证待 Owner
+   密钥；麦克风 TCC 授权（§2.2）待 Owner 在系统设置为宿主 App 开启一次后重跑探针。
+4. **SSE 保序口径**：验收面「事件顺序与账本一致」的准确语义是——**durable 帧为账本子序列、
+   按 seq 保序；`text_delta` 为易失帧**，不入账本、不参与该保证（断连即丢，权威全文见
+   `message.assistant`）。实现未变，仅口径明确（apps/runtime/README.md「SSE 会话事件流」节）。

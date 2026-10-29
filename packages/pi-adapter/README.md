@@ -45,8 +45,12 @@ Pi 原始 10+ 类事件在适配层内翻译（NOTES-pi §9），对外只暴露
 
 ## fixtures
 
-`fixtures/pi-1.4.0/` 存放按 pi-mono v1.4.0 事件形态录制的静态 JSON（正常流 / 供应商错误 / 流式中断），由 `test/events.replay.test.ts` 回放。回放只经过纯函数 `translatePiEvent`，不 import Pi 运行时（与引擎版本解耦）。
+`fixtures/pi-1.4.0/` 存放**真实录制**的 Pi 1.4.0 原始 AgentEvent 流（正常流 / 供应商 502 错误 / 流式中断），
+由 `scripts/record-fixtures.ts` 对本地 OpenAI 兼容 mock 服务器跑真实 `@earendil-works/pi-agent-core` 1.4.0 录制
+（不访问外网；重录后需同步回放测试的期望序列）。曾为按事件类型定义手工构造、却自称「录制」——
+M0 code-review / Issue #4 更正为真录制并保留可复现脚本。由 `test/events.replay.test.ts` 回放；
+回放只经过纯函数 `translatePiEvent`，不 import Pi 运行时（与引擎版本解耦）。
 
 ## 架构测试
 
-`test/architecture.test.ts` 扫描 `packages/` 之下除本包外的所有源文件，出现 `@earendil-works/*` import 即红（ADR-0001 的强制执行点）。
+`test/architecture.test.ts` 扫描 `packages/`（除本包）与 `apps/` 之下的所有源文件（测试文件除外），出现 `@earendil-works/*` import 即红（ADR-0001 的强制执行点）。

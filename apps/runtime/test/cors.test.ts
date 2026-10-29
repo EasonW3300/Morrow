@@ -1,7 +1,9 @@
 // CORS 语义（票 T6 / Issue #7）：桌面 WebView 与浏览器联调是跨源客户端；
 // 只对本地来源放行（tauri://localhost、http(s)://(localhost|127.0.0.1|tauri.localhost)），
-// 互联网页面不可读写本地控制面。preflight 放行 content-type 与 last-event-id
-// （EventSource 断线重连自动携带，非 safelist 头）。
+// 互联网页面的跨源脚本读写会被浏览器拦截。但 CORS 不是 CSRF 完整防线——simple POST
+// （text/plain，safelist 内）不经 preflight 仍会到达，故写端点另行强制 application/json
+// （safelist 外 → 浏览器强制 preflight；服务器端 415 拒收）。残余风险见 threat-model 域 4。
+// preflight 放行 content-type 与 last-event-id（EventSource 断线重连自动携带，非 safelist 头）。
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { RuntimeConfig } from "../src/config.ts";
@@ -117,6 +119,65 @@ test("no origin header (same-origin / non-browser client) works untouched", asyn
     const res = await fetch(`http://127.0.0.1:${runtime.port}/v1/health`);
     assert.equal(res.status, 200);
     assert.equal(res.headers.get("access-control-allow-origin"), null);
+  } finally {
+    await runtime.close();
+    removeDir(dir);
+  }
+});
+
+// --- CSRF 防线（M0 code-review / Issue #11）：写端点强制 application/json -------------------
+// 不带自定义头的 simple POST（text/plain 在 CORS safelist 内）不经 preflight，请求本身
+// 会到达服务器——防线在服务器端：readJsonBody 对非 application/json 一律 415，伪造写请求
+// 无效。合法 JSON body 但 content-type 撒谎（text/plain）同样拒收。
+
+test("simple POST with text/plain (CSRF vector) is rejected 415 even with a valid JSON body", async () => {
+  const dir = tmpDir("morrow-cors-");
+  const runtime = await startRuntime(testConfig(dir));
+  try {
+    // 恶意页面会构造的形态：无预检的 text/plain simple POST，body 是合法 JSON
+    const res = await fetch(`http://127.0.0.1:${runtime.port}/v1/sessions`, {
+      method: "POST",
+      headers: { "content-type": "text/plain" },
+      body: JSON.stringify({ title: "csrf" }),
+    });
+    assert.equal(res.status, 415);
+    const body = (await res.json()) as { error: { code: string } };
+    assert.equal(body.error.code, "unsupported_media_type");
+    // 无副作用：会话没有被创建
+    const list = await fetch(`http://127.0.0.1:${runtime.port}/v1/sessions`);
+    assert.deepEqual(((await list.json()) as { sessions: unknown[] }).sessions, []);
+  } finally {
+    await runtime.close();
+    removeDir(dir);
+  }
+});
+
+test("missing content-type header on a body-bearing POST is rejected 415", async () => {
+  const dir = tmpDir("morrow-cors-");
+  const runtime = await startRuntime(testConfig(dir));
+  try {
+    const res = await fetch(`http://127.0.0.1:${runtime.port}/v1/sessions`, {
+      method: "POST",
+      headers: { origin: "http://localhost:1420" }, // 无 content-type
+      body: JSON.stringify({ title: "x" }),
+    });
+    assert.equal(res.status, 415);
+  } finally {
+    await runtime.close();
+    removeDir(dir);
+  }
+});
+
+test("application/json with parameters (charset) is accepted on write endpoints", async () => {
+  const dir = tmpDir("morrow-cors-");
+  const runtime = await startRuntime(testConfig(dir));
+  try {
+    const res = await fetch(`http://127.0.0.1:${runtime.port}/v1/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json; charset=utf-8" },
+      body: JSON.stringify({ title: "ok" }),
+    });
+    assert.equal(res.status, 201);
   } finally {
     await runtime.close();
     removeDir(dir);

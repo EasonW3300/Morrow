@@ -1,15 +1,58 @@
 {
-  "description": "Pi 1.4.0 AgentEvent 正常流：两轮流式文本 + 一次工具调用（get_weather）+ 最终文本。形态取自 pi-mono v1.4.0 packages/agent/src/types.ts (AgentEvent) 与 packages/ai/src/types.ts (AssistantMessageEvent / Message / Usage)。",
+  "description": "Pi 1.4.0 真实录制（scripts/record-fixtures.ts × 本地 OpenAI 兼容 mock）：两轮流式文本 + 一次工具调用（get_weather）+ 最终文本。事件为 @earendil-works/pi-agent-core 1.4.0 的原始 AgentEvent。",
   "events": [
-    { "type": "agent_start" },
-    { "type": "turn_start" },
+    {
+      "type": "agent_start"
+    },
+    {
+      "type": "turn_start"
+    },
+    {
+      "type": "message_start",
+      "message": {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "北京今天天气怎么样？"
+          }
+        ],
+        "timestamp": 1793284075734
+      }
+    },
+    {
+      "type": "message_end",
+      "message": {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "北京今天天气怎么样？"
+          }
+        ],
+        "timestamp": 1793284075734
+      }
+    },
     {
       "type": "message_start",
       "message": {
         "role": "assistant",
-        "content": [],
+        "content": [
+          {
+            "type": "text",
+            "text": "北京今天晴。"
+          },
+          {
+            "type": "toolCall",
+            "id": "call_rec_1",
+            "name": "get_weather",
+            "arguments": {
+              "city": "北京"
+            }
+          }
+        ],
         "api": "openai-completions",
-        "provider": "morrow-openai-compat",
+        "provider": "morrow",
         "model": "test-chat-model",
         "usage": {
           "input": 0,
@@ -17,235 +60,1285 @@
           "cacheRead": 0,
           "cacheWrite": 0,
           "totalTokens": 0,
-          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0 }
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "total": 0
+          }
         },
         "stopReason": "pending",
-        "timestamp": 1769692800000
+        "timestamp": 1793284075803
       }
     },
     {
       "type": "message_update",
+      "assistantMessageEvent": {
+        "type": "text_start",
+        "contentIndex": 0,
+        "partial": {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "text",
+              "text": "北京今天晴。"
+            },
+            {
+              "type": "toolCall",
+              "id": "call_rec_1",
+              "name": "get_weather",
+              "arguments": {
+                "city": "北京"
+              }
+            }
+          ],
+          "api": "openai-completions",
+          "provider": "morrow",
+          "model": "test-chat-model",
+          "usage": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "totalTokens": 0,
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "total": 0
+            }
+          },
+          "stopReason": "toolUse",
+          "timestamp": 1793284075803,
+          "responseId": "chatcmpl-record",
+          "rawStopReason": "tool_calls",
+          "durationMs": 32,
+          "thinkingLevel": "off"
+        }
+      },
       "message": {
         "role": "assistant",
-        "content": [{ "type": "text", "text": "北京今天" }],
+        "content": [
+          {
+            "type": "text",
+            "text": "北京今天晴。"
+          },
+          {
+            "type": "toolCall",
+            "id": "call_rec_1",
+            "name": "get_weather",
+            "arguments": {
+              "city": "北京"
+            }
+          }
+        ],
         "api": "openai-completions",
-        "provider": "morrow-openai-compat",
+        "provider": "morrow",
         "model": "test-chat-model",
-        "usage": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 0, "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0 } },
+        "usage": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 0,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "total": 0
+          }
+        },
         "stopReason": "pending",
-        "timestamp": 1769692800000
-      },
-      "assistantMessageEvent": { "type": "text_delta", "contentIndex": 0, "delta": "北京今天", "partial": { "role": "assistant", "content": [{ "type": "text", "text": "北京今天" }], "api": "openai-completions", "provider": "morrow-openai-compat", "model": "test-chat-model", "usage": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 0, "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0 } }, "stopReason": "pending", "timestamp": 1769692800000 } }
+        "timestamp": 1793284075803,
+        "responseId": "chatcmpl-record"
+      }
     },
     {
       "type": "message_update",
+      "assistantMessageEvent": {
+        "type": "text_delta",
+        "contentIndex": 0,
+        "delta": "北京今天",
+        "partial": {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "text",
+              "text": "北京今天晴。"
+            },
+            {
+              "type": "toolCall",
+              "id": "call_rec_1",
+              "name": "get_weather",
+              "arguments": {
+                "city": "北京"
+              }
+            }
+          ],
+          "api": "openai-completions",
+          "provider": "morrow",
+          "model": "test-chat-model",
+          "usage": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "totalTokens": 0,
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "total": 0
+            }
+          },
+          "stopReason": "toolUse",
+          "timestamp": 1793284075803,
+          "responseId": "chatcmpl-record",
+          "rawStopReason": "tool_calls",
+          "durationMs": 32,
+          "thinkingLevel": "off"
+        }
+      },
       "message": {
         "role": "assistant",
-        "content": [{ "type": "text", "text": "北京今天晴。" }],
+        "content": [
+          {
+            "type": "text",
+            "text": "北京今天晴。"
+          },
+          {
+            "type": "toolCall",
+            "id": "call_rec_1",
+            "name": "get_weather",
+            "arguments": {
+              "city": "北京"
+            }
+          }
+        ],
         "api": "openai-completions",
-        "provider": "morrow-openai-compat",
+        "provider": "morrow",
         "model": "test-chat-model",
-        "usage": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 0, "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0 } },
+        "usage": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 0,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "total": 0
+          }
+        },
         "stopReason": "pending",
-        "timestamp": 1769692800000
-      },
-      "assistantMessageEvent": { "type": "text_delta", "contentIndex": 0, "delta": "晴。", "partial": { "role": "assistant", "content": [{ "type": "text", "text": "北京今天晴。" }], "api": "openai-completions", "provider": "morrow-openai-compat", "model": "test-chat-model", "usage": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 0, "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0 } }, "stopReason": "pending", "timestamp": 1769692800000 } }
+        "timestamp": 1793284075803,
+        "responseId": "chatcmpl-record"
+      }
     },
     {
       "type": "message_update",
+      "assistantMessageEvent": {
+        "type": "text_delta",
+        "contentIndex": 0,
+        "delta": "晴。",
+        "partial": {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "text",
+              "text": "北京今天晴。"
+            },
+            {
+              "type": "toolCall",
+              "id": "call_rec_1",
+              "name": "get_weather",
+              "arguments": {
+                "city": "北京"
+              }
+            }
+          ],
+          "api": "openai-completions",
+          "provider": "morrow",
+          "model": "test-chat-model",
+          "usage": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "totalTokens": 0,
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "total": 0
+            }
+          },
+          "stopReason": "toolUse",
+          "timestamp": 1793284075803,
+          "responseId": "chatcmpl-record",
+          "rawStopReason": "tool_calls",
+          "durationMs": 32,
+          "thinkingLevel": "off"
+        }
+      },
       "message": {
         "role": "assistant",
-        "content": [{ "type": "text", "text": "北京今天晴。" }, { "type": "toolCall", "id": "call_abc123", "name": "get_weather", "arguments": {} }],
+        "content": [
+          {
+            "type": "text",
+            "text": "北京今天晴。"
+          },
+          {
+            "type": "toolCall",
+            "id": "call_rec_1",
+            "name": "get_weather",
+            "arguments": {
+              "city": "北京"
+            }
+          }
+        ],
         "api": "openai-completions",
-        "provider": "morrow-openai-compat",
+        "provider": "morrow",
         "model": "test-chat-model",
-        "usage": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 0, "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0 } },
+        "usage": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 0,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "total": 0
+          }
+        },
         "stopReason": "pending",
-        "timestamp": 1769692800000
-      },
-      "assistantMessageEvent": { "type": "toolcall_start", "contentIndex": 1, "partial": { "role": "assistant", "content": [{ "type": "text", "text": "北京今天晴。" }, { "type": "toolCall", "id": "call_abc123", "name": "get_weather", "arguments": {} }], "api": "openai-completions", "provider": "morrow-openai-compat", "model": "test-chat-model", "usage": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 0, "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0 } }, "stopReason": "pending", "timestamp": 1769692800000 } }
+        "timestamp": 1793284075803,
+        "responseId": "chatcmpl-record"
+      }
     },
     {
       "type": "message_update",
+      "assistantMessageEvent": {
+        "type": "toolcall_start",
+        "contentIndex": 1,
+        "partial": {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "text",
+              "text": "北京今天晴。"
+            },
+            {
+              "type": "toolCall",
+              "id": "call_rec_1",
+              "name": "get_weather",
+              "arguments": {
+                "city": "北京"
+              }
+            }
+          ],
+          "api": "openai-completions",
+          "provider": "morrow",
+          "model": "test-chat-model",
+          "usage": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "totalTokens": 0,
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "total": 0
+            }
+          },
+          "stopReason": "toolUse",
+          "timestamp": 1793284075803,
+          "responseId": "chatcmpl-record",
+          "rawStopReason": "tool_calls",
+          "durationMs": 32,
+          "thinkingLevel": "off"
+        }
+      },
       "message": {
         "role": "assistant",
-        "content": [{ "type": "text", "text": "北京今天晴。" }, { "type": "toolCall", "id": "call_abc123", "name": "get_weather", "arguments": { "city": "北京" } }],
+        "content": [
+          {
+            "type": "text",
+            "text": "北京今天晴。"
+          },
+          {
+            "type": "toolCall",
+            "id": "call_rec_1",
+            "name": "get_weather",
+            "arguments": {
+              "city": "北京"
+            }
+          }
+        ],
         "api": "openai-completions",
-        "provider": "morrow-openai-compat",
+        "provider": "morrow",
         "model": "test-chat-model",
-        "usage": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 0, "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0 } },
+        "usage": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 0,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "total": 0
+          }
+        },
         "stopReason": "pending",
-        "timestamp": 1769692800000
+        "timestamp": 1793284075803,
+        "responseId": "chatcmpl-record"
+      }
+    },
+    {
+      "type": "message_update",
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 1,
+        "delta": "",
+        "partial": {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "text",
+              "text": "北京今天晴。"
+            },
+            {
+              "type": "toolCall",
+              "id": "call_rec_1",
+              "name": "get_weather",
+              "arguments": {
+                "city": "北京"
+              }
+            }
+          ],
+          "api": "openai-completions",
+          "provider": "morrow",
+          "model": "test-chat-model",
+          "usage": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "totalTokens": 0,
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "total": 0
+            }
+          },
+          "stopReason": "toolUse",
+          "timestamp": 1793284075803,
+          "responseId": "chatcmpl-record",
+          "rawStopReason": "tool_calls",
+          "durationMs": 32,
+          "thinkingLevel": "off"
+        }
       },
-      "assistantMessageEvent": { "type": "toolcall_end", "contentIndex": 1, "toolCall": { "type": "toolCall", "id": "call_abc123", "name": "get_weather", "arguments": { "city": "北京" } }, "partial": { "role": "assistant", "content": [{ "type": "text", "text": "北京今天晴。" }, { "type": "toolCall", "id": "call_abc123", "name": "get_weather", "arguments": { "city": "北京" } }], "api": "openai-completions", "provider": "morrow-openai-compat", "model": "test-chat-model", "usage": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 0, "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0 } }, "stopReason": "pending", "timestamp": 1769692800000 } }
+      "message": {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "北京今天晴。"
+          },
+          {
+            "type": "toolCall",
+            "id": "call_rec_1",
+            "name": "get_weather",
+            "arguments": {
+              "city": "北京"
+            }
+          }
+        ],
+        "api": "openai-completions",
+        "provider": "morrow",
+        "model": "test-chat-model",
+        "usage": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 0,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "total": 0
+          }
+        },
+        "stopReason": "pending",
+        "timestamp": 1793284075803,
+        "responseId": "chatcmpl-record"
+      }
+    },
+    {
+      "type": "message_update",
+      "assistantMessageEvent": {
+        "type": "toolcall_delta",
+        "contentIndex": 1,
+        "delta": "{\"city\":\"北京\"}",
+        "partial": {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "text",
+              "text": "北京今天晴。"
+            },
+            {
+              "type": "toolCall",
+              "id": "call_rec_1",
+              "name": "get_weather",
+              "arguments": {
+                "city": "北京"
+              }
+            }
+          ],
+          "api": "openai-completions",
+          "provider": "morrow",
+          "model": "test-chat-model",
+          "usage": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "totalTokens": 0,
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "total": 0
+            }
+          },
+          "stopReason": "toolUse",
+          "timestamp": 1793284075803,
+          "responseId": "chatcmpl-record",
+          "rawStopReason": "tool_calls",
+          "durationMs": 32,
+          "thinkingLevel": "off"
+        }
+      },
+      "message": {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "北京今天晴。"
+          },
+          {
+            "type": "toolCall",
+            "id": "call_rec_1",
+            "name": "get_weather",
+            "arguments": {
+              "city": "北京"
+            }
+          }
+        ],
+        "api": "openai-completions",
+        "provider": "morrow",
+        "model": "test-chat-model",
+        "usage": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 0,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "total": 0
+          }
+        },
+        "stopReason": "toolUse",
+        "timestamp": 1793284075803,
+        "responseId": "chatcmpl-record",
+        "rawStopReason": "tool_calls"
+      }
+    },
+    {
+      "type": "message_update",
+      "assistantMessageEvent": {
+        "type": "text_end",
+        "contentIndex": 0,
+        "content": "北京今天晴。",
+        "partial": {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "text",
+              "text": "北京今天晴。"
+            },
+            {
+              "type": "toolCall",
+              "id": "call_rec_1",
+              "name": "get_weather",
+              "arguments": {
+                "city": "北京"
+              }
+            }
+          ],
+          "api": "openai-completions",
+          "provider": "morrow",
+          "model": "test-chat-model",
+          "usage": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "totalTokens": 0,
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "total": 0
+            }
+          },
+          "stopReason": "toolUse",
+          "timestamp": 1793284075803,
+          "responseId": "chatcmpl-record",
+          "rawStopReason": "tool_calls",
+          "durationMs": 32,
+          "thinkingLevel": "off"
+        }
+      },
+      "message": {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "北京今天晴。"
+          },
+          {
+            "type": "toolCall",
+            "id": "call_rec_1",
+            "name": "get_weather",
+            "arguments": {
+              "city": "北京"
+            }
+          }
+        ],
+        "api": "openai-completions",
+        "provider": "morrow",
+        "model": "test-chat-model",
+        "usage": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 0,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "total": 0
+          }
+        },
+        "stopReason": "toolUse",
+        "timestamp": 1793284075803,
+        "responseId": "chatcmpl-record",
+        "rawStopReason": "tool_calls",
+        "durationMs": 32
+      }
+    },
+    {
+      "type": "message_update",
+      "assistantMessageEvent": {
+        "type": "toolcall_end",
+        "contentIndex": 1,
+        "toolCall": {
+          "type": "toolCall",
+          "id": "call_rec_1",
+          "name": "get_weather",
+          "arguments": {
+            "city": "北京"
+          }
+        },
+        "partial": {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "text",
+              "text": "北京今天晴。"
+            },
+            {
+              "type": "toolCall",
+              "id": "call_rec_1",
+              "name": "get_weather",
+              "arguments": {
+                "city": "北京"
+              }
+            }
+          ],
+          "api": "openai-completions",
+          "provider": "morrow",
+          "model": "test-chat-model",
+          "usage": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "totalTokens": 0,
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "total": 0
+            }
+          },
+          "stopReason": "toolUse",
+          "timestamp": 1793284075803,
+          "responseId": "chatcmpl-record",
+          "rawStopReason": "tool_calls",
+          "durationMs": 32,
+          "thinkingLevel": "off"
+        }
+      },
+      "message": {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "北京今天晴。"
+          },
+          {
+            "type": "toolCall",
+            "id": "call_rec_1",
+            "name": "get_weather",
+            "arguments": {
+              "city": "北京"
+            }
+          }
+        ],
+        "api": "openai-completions",
+        "provider": "morrow",
+        "model": "test-chat-model",
+        "usage": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 0,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "total": 0
+          }
+        },
+        "stopReason": "toolUse",
+        "timestamp": 1793284075803,
+        "responseId": "chatcmpl-record",
+        "rawStopReason": "tool_calls",
+        "durationMs": 32
+      }
     },
     {
       "type": "message_end",
       "message": {
         "role": "assistant",
-        "content": [{ "type": "text", "text": "北京今天晴。" }, { "type": "toolCall", "id": "call_abc123", "name": "get_weather", "arguments": { "city": "北京" } }],
+        "content": [
+          {
+            "type": "text",
+            "text": "北京今天晴。"
+          },
+          {
+            "type": "toolCall",
+            "id": "call_rec_1",
+            "name": "get_weather",
+            "arguments": {
+              "city": "北京"
+            }
+          }
+        ],
         "api": "openai-completions",
-        "provider": "morrow-openai-compat",
+        "provider": "morrow",
         "model": "test-chat-model",
-        "usage": { "input": 132, "output": 24, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 156, "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0 } },
+        "usage": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 0,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "total": 0
+          }
+        },
         "stopReason": "toolUse",
-        "timestamp": 1769692800000,
-        "durationMs": 613
+        "timestamp": 1793284075803,
+        "responseId": "chatcmpl-record",
+        "rawStopReason": "tool_calls",
+        "durationMs": 32,
+        "thinkingLevel": "off"
       }
     },
-    { "type": "tool_execution_start", "toolCallId": "call_abc123", "toolName": "get_weather", "args": { "city": "北京" } },
+    {
+      "type": "tool_execution_start",
+      "toolCallId": "call_rec_1",
+      "toolName": "get_weather",
+      "args": {
+        "city": "北京"
+      }
+    },
     {
       "type": "tool_execution_end",
-      "toolCallId": "call_abc123",
+      "toolCallId": "call_rec_1",
       "toolName": "get_weather",
-      "result": { "content": [{ "type": "text", "text": "晴，12°C" }], "details": {} },
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "晴，12°C"
+          }
+        ],
+        "details": {}
+      },
       "isError": false,
-      "durationMs": 42
+      "durationMs": 0
     },
     {
       "type": "message_start",
       "message": {
         "role": "toolResult",
-        "toolCallId": "call_abc123",
+        "toolCallId": "call_rec_1",
         "toolName": "get_weather",
-        "content": [{ "type": "text", "text": "晴，12°C" }],
+        "content": [
+          {
+            "type": "text",
+            "text": "晴，12°C"
+          }
+        ],
         "details": {},
         "isError": false,
-        "timestamp": 1769692800042,
-        "durationMs": 42
+        "durationMs": 0,
+        "timestamp": 1793284075838
       }
     },
     {
       "type": "message_end",
       "message": {
         "role": "toolResult",
-        "toolCallId": "call_abc123",
+        "toolCallId": "call_rec_1",
         "toolName": "get_weather",
-        "content": [{ "type": "text", "text": "晴，12°C" }],
+        "content": [
+          {
+            "type": "text",
+            "text": "晴，12°C"
+          }
+        ],
         "details": {},
         "isError": false,
-        "timestamp": 1769692800042,
-        "durationMs": 42
+        "durationMs": 0,
+        "timestamp": 1793284075838
       }
     },
     {
       "type": "turn_end",
       "message": {
         "role": "assistant",
-        "content": [{ "type": "text", "text": "北京今天晴。" }, { "type": "toolCall", "id": "call_abc123", "name": "get_weather", "arguments": { "city": "北京" } }],
+        "content": [
+          {
+            "type": "text",
+            "text": "北京今天晴。"
+          },
+          {
+            "type": "toolCall",
+            "id": "call_rec_1",
+            "name": "get_weather",
+            "arguments": {
+              "city": "北京"
+            }
+          }
+        ],
         "api": "openai-completions",
-        "provider": "morrow-openai-compat",
+        "provider": "morrow",
         "model": "test-chat-model",
-        "usage": { "input": 132, "output": 24, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 156, "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0 } },
+        "usage": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 0,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "total": 0
+          }
+        },
         "stopReason": "toolUse",
-        "timestamp": 1769692800000,
-        "durationMs": 613
+        "timestamp": 1793284075803,
+        "responseId": "chatcmpl-record",
+        "rawStopReason": "tool_calls",
+        "durationMs": 32,
+        "thinkingLevel": "off"
       },
       "toolResults": [
         {
           "role": "toolResult",
-          "toolCallId": "call_abc123",
+          "toolCallId": "call_rec_1",
           "toolName": "get_weather",
-          "content": [{ "type": "text", "text": "晴，12°C" }],
+          "content": [
+            {
+              "type": "text",
+              "text": "晴，12°C"
+            }
+          ],
           "details": {},
           "isError": false,
-          "timestamp": 1769692800042,
-          "durationMs": 42
+          "durationMs": 0,
+          "timestamp": 1793284075838
         }
       ]
     },
-    { "type": "turn_start" },
+    {
+      "type": "turn_start"
+    },
     {
       "type": "message_start",
       "message": {
         "role": "assistant",
-        "content": [],
+        "content": [
+          {
+            "type": "text",
+            "text": "北京晴，12°C。"
+          }
+        ],
         "api": "openai-completions",
-        "provider": "morrow-openai-compat",
+        "provider": "morrow",
         "model": "test-chat-model",
-        "usage": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 0, "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0 } },
+        "usage": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 0,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "total": 0
+          }
+        },
         "stopReason": "pending",
-        "timestamp": 1769692800043
+        "timestamp": 1793284075839
       }
     },
     {
       "type": "message_update",
+      "assistantMessageEvent": {
+        "type": "text_start",
+        "contentIndex": 0,
+        "partial": {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "text",
+              "text": "北京晴，12°C。"
+            }
+          ],
+          "api": "openai-completions",
+          "provider": "morrow",
+          "model": "test-chat-model",
+          "usage": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "totalTokens": 0,
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "total": 0
+            }
+          },
+          "stopReason": "stop",
+          "timestamp": 1793284075839,
+          "responseId": "chatcmpl-record",
+          "rawStopReason": "stop",
+          "durationMs": 8,
+          "thinkingLevel": "off"
+        }
+      },
       "message": {
         "role": "assistant",
-        "content": [{ "type": "text", "text": "北京晴，12°C。" }],
+        "content": [
+          {
+            "type": "text",
+            "text": "北京晴，12°C。"
+          }
+        ],
         "api": "openai-completions",
-        "provider": "morrow-openai-compat",
+        "provider": "morrow",
         "model": "test-chat-model",
-        "usage": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 0, "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0 } },
-        "stopReason": "pending",
-        "timestamp": 1769692800043
+        "usage": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 0,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "total": 0
+          }
+        },
+        "stopReason": "stop",
+        "timestamp": 1793284075839,
+        "responseId": "chatcmpl-record",
+        "rawStopReason": "stop"
+      }
+    },
+    {
+      "type": "message_update",
+      "assistantMessageEvent": {
+        "type": "text_delta",
+        "contentIndex": 0,
+        "delta": "北京晴，12°C。",
+        "partial": {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "text",
+              "text": "北京晴，12°C。"
+            }
+          ],
+          "api": "openai-completions",
+          "provider": "morrow",
+          "model": "test-chat-model",
+          "usage": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "totalTokens": 0,
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "total": 0
+            }
+          },
+          "stopReason": "stop",
+          "timestamp": 1793284075839,
+          "responseId": "chatcmpl-record",
+          "rawStopReason": "stop",
+          "durationMs": 8,
+          "thinkingLevel": "off"
+        }
       },
-      "assistantMessageEvent": { "type": "text_delta", "contentIndex": 0, "delta": "北京晴，12°C。", "partial": { "role": "assistant", "content": [{ "type": "text", "text": "北京晴，12°C。" }], "api": "openai-completions", "provider": "morrow-openai-compat", "model": "test-chat-model", "usage": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 0, "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0 } }, "stopReason": "pending", "timestamp": 1769692800043 } }
+      "message": {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "北京晴，12°C。"
+          }
+        ],
+        "api": "openai-completions",
+        "provider": "morrow",
+        "model": "test-chat-model",
+        "usage": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 0,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "total": 0
+          }
+        },
+        "stopReason": "stop",
+        "timestamp": 1793284075839,
+        "responseId": "chatcmpl-record",
+        "rawStopReason": "stop"
+      }
+    },
+    {
+      "type": "message_update",
+      "assistantMessageEvent": {
+        "type": "text_end",
+        "contentIndex": 0,
+        "content": "北京晴，12°C。",
+        "partial": {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "text",
+              "text": "北京晴，12°C。"
+            }
+          ],
+          "api": "openai-completions",
+          "provider": "morrow",
+          "model": "test-chat-model",
+          "usage": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "totalTokens": 0,
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "total": 0
+            }
+          },
+          "stopReason": "stop",
+          "timestamp": 1793284075839,
+          "responseId": "chatcmpl-record",
+          "rawStopReason": "stop",
+          "durationMs": 8,
+          "thinkingLevel": "off"
+        }
+      },
+      "message": {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "北京晴，12°C。"
+          }
+        ],
+        "api": "openai-completions",
+        "provider": "morrow",
+        "model": "test-chat-model",
+        "usage": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 0,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "total": 0
+          }
+        },
+        "stopReason": "stop",
+        "timestamp": 1793284075839,
+        "responseId": "chatcmpl-record",
+        "rawStopReason": "stop",
+        "durationMs": 8
+      }
     },
     {
       "type": "message_end",
       "message": {
         "role": "assistant",
-        "content": [{ "type": "text", "text": "北京晴，12°C。" }],
+        "content": [
+          {
+            "type": "text",
+            "text": "北京晴，12°C。"
+          }
+        ],
         "api": "openai-completions",
-        "provider": "morrow-openai-compat",
+        "provider": "morrow",
         "model": "test-chat-model",
-        "usage": { "input": 168, "output": 12, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 180, "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0 } },
+        "usage": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 0,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "total": 0
+          }
+        },
         "stopReason": "stop",
-        "timestamp": 1769692800043,
-        "durationMs": 208
+        "timestamp": 1793284075839,
+        "responseId": "chatcmpl-record",
+        "rawStopReason": "stop",
+        "durationMs": 8,
+        "thinkingLevel": "off"
       }
     },
     {
       "type": "turn_end",
       "message": {
         "role": "assistant",
-        "content": [{ "type": "text", "text": "北京晴，12°C。" }],
+        "content": [
+          {
+            "type": "text",
+            "text": "北京晴，12°C。"
+          }
+        ],
         "api": "openai-completions",
-        "provider": "morrow-openai-compat",
+        "provider": "morrow",
         "model": "test-chat-model",
-        "usage": { "input": 168, "output": 12, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 180, "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0 } },
+        "usage": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 0,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "total": 0
+          }
+        },
         "stopReason": "stop",
-        "timestamp": 1769692800043,
-        "durationMs": 208
+        "timestamp": 1793284075839,
+        "responseId": "chatcmpl-record",
+        "rawStopReason": "stop",
+        "durationMs": 8,
+        "thinkingLevel": "off"
       },
       "toolResults": []
     },
     {
       "type": "agent_end",
       "messages": [
-        { "role": "user", "content": "北京天气怎么样？", "timestamp": 1769692799950 },
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "text",
+              "text": "北京今天天气怎么样？"
+            }
+          ],
+          "timestamp": 1793284075734
+        },
         {
           "role": "assistant",
-          "content": [{ "type": "text", "text": "北京今天晴。" }, { "type": "toolCall", "id": "call_abc123", "name": "get_weather", "arguments": { "city": "北京" } }],
+          "content": [
+            {
+              "type": "text",
+              "text": "北京今天晴。"
+            },
+            {
+              "type": "toolCall",
+              "id": "call_rec_1",
+              "name": "get_weather",
+              "arguments": {
+                "city": "北京"
+              }
+            }
+          ],
           "api": "openai-completions",
-          "provider": "morrow-openai-compat",
+          "provider": "morrow",
           "model": "test-chat-model",
-          "usage": { "input": 132, "output": 24, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 156, "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0 } },
+          "usage": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "totalTokens": 0,
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "total": 0
+            }
+          },
           "stopReason": "toolUse",
-          "timestamp": 1769692800000,
-          "durationMs": 613
+          "timestamp": 1793284075803,
+          "responseId": "chatcmpl-record",
+          "rawStopReason": "tool_calls",
+          "durationMs": 32,
+          "thinkingLevel": "off"
         },
         {
           "role": "toolResult",
-          "toolCallId": "call_abc123",
+          "toolCallId": "call_rec_1",
           "toolName": "get_weather",
-          "content": [{ "type": "text", "text": "晴，12°C" }],
+          "content": [
+            {
+              "type": "text",
+              "text": "晴，12°C"
+            }
+          ],
           "details": {},
           "isError": false,
-          "timestamp": 1769692800042,
-          "durationMs": 42
+          "durationMs": 0,
+          "timestamp": 1793284075838
         },
         {
           "role": "assistant",
-          "content": [{ "type": "text", "text": "北京晴，12°C。" }],
+          "content": [
+            {
+              "type": "text",
+              "text": "北京晴，12°C。"
+            }
+          ],
           "api": "openai-completions",
-          "provider": "morrow-openai-compat",
+          "provider": "morrow",
           "model": "test-chat-model",
-          "usage": { "input": 168, "output": 12, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 180, "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0 } },
+          "usage": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "totalTokens": 0,
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "total": 0
+            }
+          },
           "stopReason": "stop",
-          "timestamp": 1769692800043,
-          "durationMs": 208
+          "timestamp": 1793284075839,
+          "responseId": "chatcmpl-record",
+          "rawStopReason": "stop",
+          "durationMs": 8,
+          "thinkingLevel": "off"
         }
       ]
     }

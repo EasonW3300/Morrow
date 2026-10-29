@@ -1,5 +1,5 @@
 import { loadConfig } from "./config.ts";
-import { startRuntime } from "./runtime.ts";
+import { startRuntime, VERSION } from "./runtime.ts";
 
 /**
  * Runtime 进程入口（ADR-0003：桌面 sidecar 与 Ubuntu 服务器同一代码）。
@@ -55,7 +55,7 @@ async function main(): Promise<void> {
   await writeLine(
     JSON.stringify({
       ready: true,
-      version: "0.1.0",
+      version: VERSION,
       host: runtime.host,
       port: runtime.port,
       pid: process.pid,

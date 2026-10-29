@@ -10,6 +10,7 @@ round-trip 契约测试固定：两边共用同一份测试夹具（`test/fixtur
 | `schema/event-envelope.schema.json` | 事件信封 v1 JSON Schema（2020-12）。**跨语言契约的唯一真相源**，Go workers 等直接读取 |
 | `src/event-envelope.ts` | 等价 TypeScript 类型 |
 | `src/integrity.ts` | `canonicalJson` + `computeIntegrityHash`（integrity_hash 规范序列化） |
+| `src/api-contracts.ts` | 控制面 API 合约类型（`ProviderRecord` / `ConnectivityResult` / `ProviderCompatConfig`）——runtime 与 desktop 的唯一真相源（M0 code-review / Issue #11 收敛三处拷贝） |
 | `src/index.ts` | 公共出口 |
 
 ## 事件信封 v1 字段
