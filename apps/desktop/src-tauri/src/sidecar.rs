@@ -4,6 +4,8 @@
 //! `{"ready":true,"host":...,"port":...,"pid":...}`，父进程据此拿到控制面地址；
 //! `MORROW_PORT` 默认 0（随机空闲），sidecar 场景无端口冲突。
 //! 父进程退出 → SIGTERM 子进程 → Runtime 优雅退出（runtime.stopped 落账 + WAL checkpoint）。
+//! Windows 已知限制：OS 级无 SIGTERM（Node 子进程收不到外部终止信号），terminate()
+//! 直接强杀、信号转发为 no-op——Windows 上 Runtime 优雅落盘仅覆盖窗口关闭等正常退出路径。
 //!
 //! 启动命令可配置（为 T8 单二进制 / T9 留配置面），解析优先级：
 //!   MORROW_SIDECAR_COMMAND / MORROW_SIDECAR_ARGS（JSON 数组）/ MORROW_SIDECAR_CWD
@@ -168,25 +170,29 @@ impl SidecarProcess {
             .unwrap_or(true)
     }
 
-    /// SIGTERM → 最多等 2s → SIGKILL。幂等（ExitRequested/Exit/Drop 可能多次触发）。
+    /// unix：SIGTERM → 最多等 2s → SIGKILL。幂等（ExitRequested/Exit/Drop 可能多次触发）。
+    /// Windows：无 SIGTERM 等价物，跳过宽限期直接强杀（代价见模块注释「Windows 已知限制」）。
     pub fn terminate(&self) {
         if self.terminated.swap(true, Ordering::SeqCst) {
             return;
         }
         let mut child = self.child.lock().unwrap();
-        let pid = child.id();
-        if pid != 0 {
-            // SIGTERM：Runtime 优雅退出（runtime.stopped 落账 + WAL checkpoint）后 exit 0
-            unsafe {
-                libc::kill(pid as i32, libc::SIGTERM);
+        #[cfg(unix)]
+        {
+            let pid = child.id();
+            if pid != 0 {
+                // SIGTERM：Runtime 优雅退出（runtime.stopped 落账 + WAL checkpoint）后 exit 0
+                unsafe {
+                    libc::kill(pid as i32, libc::SIGTERM);
+                }
             }
-        }
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < deadline {
-            if matches!(child.try_wait(), Ok(Some(_))) {
-                return;
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                if matches!(child.try_wait(), Ok(Some(_))) {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(50));
             }
-            thread::sleep(Duration::from_millis(50));
         }
         let _ = child.kill();
         let _ = child.wait();
@@ -295,8 +301,11 @@ fn log_line(path: &Option<PathBuf>, line: &str) {
 
 /// 运行中的 sidecar 的 pid（进程级转发改 SignalForward 用：SIGTERM/SIGINT 到壳时，
 /// Tauri 事件循环不会运行（默认处置直接终止），异步信号安全处理里只有 kill 一个 syscall）。
+/// Windows 无信号消费方，保留统一写入面（main.rs store 不分平台）。
 pub static SIDECAR_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
+/// SIGTERM/SIGINT → 给 sidecar 发 SIGTERM 后 _exit(0)（异步信号安全：仅 kill 一个 syscall）。
+#[cfg(unix)]
 extern "C" fn forward_termination_signal(_signal: libc::c_int) {
     let pid = SIDECAR_PID.load(Ordering::SeqCst);
     if pid > 0 {
@@ -309,11 +318,18 @@ extern "C" fn forward_termination_signal(_signal: libc::c_int) {
 
 /// 注册 SIGTERM/SIGINT 转发：壳被外部信号终止时，先给 sidecar 发 SIGTERM 再退出，
 /// 保证 Runtime 优雅落盘（runtime.stopped 落账 + WAL checkpoint）。
+/// Windows：无 SIGTERM/SIGINT 语义可注册（控制台事件仅覆盖有控制台的会话，打包 GUI
+/// 应用无控制台；Node 子进程也收不到 OS 级终止信号），不做转发——no-op，已知限制见
+/// 模块注释；窗口关闭/正常退出路径仍经 terminate() 收敛。
 pub fn install_signal_forwarding() {
-    let handler = forward_termination_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
-    unsafe {
-        libc::signal(libc::SIGTERM, handler);
-        libc::signal(libc::SIGINT, handler);
+    #[cfg(unix)]
+    {
+        let handler =
+            forward_termination_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
+        unsafe {
+            libc::signal(libc::SIGTERM, handler);
+            libc::signal(libc::SIGINT, handler);
+        }
     }
 }
 
