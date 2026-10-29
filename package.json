@@ -1,0 +1,14 @@
+{
+  "name": "morrow",
+  "private": true,
+  "version": "0.1.0",
+  "description": "单主人、长期记忆、可自主生成能力的个人 Agent",
+  "packageManager": "pnpm@9.12.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "pnpm -r build",
+    "test": "pnpm -r test"
+  }
+}

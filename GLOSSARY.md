@@ -25,6 +25,10 @@ _Avoid_: 节点
 
 **Channel Adapter（渠道适配器）**: 把某一平台的具体收发行为转换为统一入站/出站消息结构的模块。
 
+**Stable Baseline Channel（稳定基线渠道）**: 由平台官方 API 驱动、承担可靠性验收参照的渠道；首版为飞书 Bot 与 QQ 官方 Bot。
+
+**Experimental Adapter（实验适配器）**: 依赖非官方自动化、出厂默认关闭、需 Owner 显式启用并自担账号风险的渠道适配器；首版为微信个人号。
+
 **Conversation（会话记录）**: 某一渠道上的一段原始消息往来，保留平台来源与权限上下文。
 _Avoid_: Chat
 
