@@ -12,28 +12,13 @@
  */
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, statSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { resolveBunOnThisMachine } from "./bun-path.ts";
 import { binaryFileName, compileCommand, compileTarget } from "./target.ts";
 
 const entryPath = fileURLToPath(new URL("./entry.ts", import.meta.url));
 const distDir = fileURLToPath(new URL("../dist/", import.meta.url));
-
-/**
- * 定位 bun：先 PATH，再用户级安装位 ~/.bun/bin/bun（官方 installer 的默认落点，
- * 本机安装方式见 ADR-0006）。两者皆无则返回 null（由调用方给出安装指引）。
- */
-function resolveBun(): string | null {
-  const onPath = spawnSync("bun", ["--version"], { stdio: "ignore" });
-  if (!onPath.error && onPath.status === 0) return "bun";
-  const userLevel = join(homedir(), ".bun", "bin", "bun");
-  if (existsSync(userLevel)) {
-    const probe = spawnSync(userLevel, ["--version"], { stdio: "ignore" });
-    if (!probe.error && probe.status === 0) return userLevel;
-  }
-  return null;
-}
 
 /** 组装 bun build --compile 命令行（见 target.ts；单测锁定首个子命令必须是 build） */
 
@@ -42,7 +27,8 @@ function main(): void {
   const arch = process.arch;
   const outfile = join(distDir, binaryFileName(platform, arch));
 
-  const bun = resolveBun();
+  // 定位 bun：PATH → 用户级安装位（共享 resolver，见 bun-path.ts；与 with-bun.ts 同口径）
+  const bun = resolveBunOnThisMachine();
   if (bun === null) {
     console.error("[pack] bun not found (PATH and ~/.bun/bin/bun). install it first:");
     console.error("  curl -fsSL https://bun.sh/install | bash -s \"bun-v1.4.4\"   # → ~/.bun, 无系统配置");

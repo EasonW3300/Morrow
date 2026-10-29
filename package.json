@@ -13,6 +13,7 @@
     "pack:runtime": "pnpm --filter @morrow/packaging binary",
     "probe:runtime:standalone": "pnpm --filter @morrow/packaging probe:standalone",
     "probe:runtime:sidecar": "pnpm --filter @morrow/packaging probe:sidecar",
-    "probe:runtime": "pnpm run probe:runtime:standalone && pnpm run probe:runtime:sidecar"
+    "probe:runtime": "pnpm run probe:runtime:standalone && pnpm run probe:runtime:sidecar",
+    "gate:runtime": "node --experimental-strip-types scripts/packaging/src/gate.ts"
   }
 }

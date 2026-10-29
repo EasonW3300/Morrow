@@ -5,7 +5,7 @@
   "type": "module",
   "description": "Runtime 单二进制打包（bun compile）与启动探针（T8 / Issue #9，ADR-0003/0006）",
   "scripts": {
-    "binary": "bun run src/build.ts",
+    "binary": "node --experimental-strip-types src/with-bun.ts run src/build.ts",
     "probe:standalone": "node --experimental-strip-types src/probe-standalone.ts",
     "probe:sidecar": "node --experimental-strip-types src/probe-sidecar.ts",
     "typecheck": "tsc --noEmit",

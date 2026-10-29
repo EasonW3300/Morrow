@@ -1,0 +1,212 @@
+# M0 CI：三 OS 桌面构建矩阵 + Ubuntu 服务器单二进制 + 冒烟门（T9 / Issue #10，规格用户故事 9、21）。
+#
+# 结构：
+#   build  （矩阵 macos/linux/windows）：工具链 → pnpm pack:runtime（bun compile 单二进制，
+#          x64 目标自动 -baseline，见 scripts/packaging/src/target.ts）→ tauri build 桌面包 →
+#          上传 runtime 二进制 + 桌面 bundle 两个 artifact。
+#          Ubuntu 的 runtime artifact 即服务器单二进制（ADR-0003 双宿主：同一单二进制两形态），
+#          故 artifact 名为 runtime-server-linux-x64；macos/windows 的为 sidecar 二进制。
+#   gate   （矩阵 ×3，needs: build）：下载产物 → 门禁脚本显式校验产物存在（缺失即红，负向路径
+#          有单测与本地实跑证据）→ standalone 探针（ready JSON → /v1/health 200 → 对话探针经
+#          内置 mock → exit 0）→ sidecar 探针（生命周期契约 + 同套探针）→ 平台门禁报告
+#          （step summary + 归档 artifact）。
+#   report （needs: [build, gate]）：聚合三平台报告为 m0-gate-report（step summary + 归档）；
+#          任一平台报告缺失或 gate-result 非 pass → job 红（needs + 显式校验保证"步骤缺失即红"）。
+#
+# 真机门禁项边界（报告与票面注释同步注明）：CI runner 无音频设备与 GUI 会话，
+# 桌面 GUI 真机启动与麦克风捕获探针由 T10 在真机执行，不计入 CI 门禁判定。
+#
+# 私有仓库分钟数：concurrency 取消同 ref 旧跑；checkout 浅克隆（仓库历史 blob 约 600MB）；
+# Rust 走 Swatinem/rust-cache；gate job 只装 Node（探针零依赖）。
+#
+# 注意：bun 版本 pin 1.4.4（与 ADR-0006 本机实测一致；NOTES-bun 建议 CI 与本地同版本）。
+
+name: m0
+
+on:
+  push:
+    branches: [integration/m0, main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: m0-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  BUN_VERSION: "1.4.4"
+
+jobs:
+  build:
+    name: build (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 桌面 bundle 类型按平台给（tauri.conf.json 固定 targets: ["app"]，仅 macOS 可用，
+          # linux/windows 以 --bundles 覆盖：deb / nsis 在两类 runner 上工具链预装）
+          - os: macos-latest
+            name: macos
+            bundles: app
+            bundle-dir: apps/desktop/src-tauri/target/release/bundle/macos
+            runtime-artifact: runtime-binary-macos
+          - os: ubuntu-latest
+            name: linux
+            bundles: deb
+            bundle-dir: apps/desktop/src-tauri/target/release/bundle/deb
+            # Ubuntu runtime 产物即服务器单二进制（ADR-0003；bun-linux-x64-baseline，x64 自动 -baseline）
+            runtime-artifact: runtime-server-linux-x64
+          - os: windows-latest
+            name: windows
+            bundles: nsis
+            bundle-dir: apps/desktop/src-tauri/target/release/bundle/nsis
+            runtime-artifact: runtime-binary-windows
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1 # 仓库历史 blob 大（~600MB），浅克隆
+
+      - uses: pnpm/action-setup@v4 # 版本取 package.json packageManager（pnpm@9.12.0）
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/desktop/src-tauri
+
+      - name: Install bun (official oven-sh action, pinned)
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }} # 官方 release 源，装到 ~/.bun/bin 并入 PATH
+
+      - name: Install workspace dependencies
+        run: pnpm install --frozen-lockfile
+
+      # bun PATH 修复（T9 交付 1）：脚本层经 with-bun.ts 显式解析（PATH → ~/.bun/bin/bun），
+      # 即使 PATH 注入缺失也能回落到用户级安装位（本机 ADR-0006 同款问题）
+      - name: Pack runtime single binary (bun compile)
+        run: pnpm pack:runtime
+
+      - name: Build desktop bundle (tauri)
+        run: pnpm --filter @morrow/desktop exec tauri build --bundles ${{ matrix.bundles }}
+
+      - name: Upload runtime binary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.runtime-artifact }}
+          path: scripts/packaging/dist/
+          if-no-files-found: error
+
+      - name: Upload desktop bundle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-bundle-${{ matrix.name }}
+          path: ${{ matrix.bundle-dir }}/
+          if-no-files-found: error
+
+  gate:
+    name: gate (${{ matrix.name }})
+    needs: build
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            name: macos
+            runtime-artifact: runtime-binary-macos
+          - os: ubuntu-latest
+            name: linux
+            runtime-artifact: runtime-server-linux-x64
+          - os: windows-latest
+            name: windows
+            runtime-artifact: runtime-binary-windows
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22 # 探针与门禁脚本零第三方依赖，node stdlib 即可
+
+      - name: Download runtime binary artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.runtime-artifact }}
+          path: artifacts/runtime
+
+      - name: Download desktop bundle artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: desktop-bundle-${{ matrix.name }}
+          path: artifacts/bundle
+
+      # 产物缺失 → runArtifactChecks 失败 → 报告 FAIL + exit 1（负向路径单测：
+      # scripts/packaging/test/gate-cli.test.ts，本机实跑证据见票 #10）
+      - name: Smoke gate (artifact checks + standalone/sidecar probes + report)
+        run: >-
+          node --experimental-strip-types scripts/packaging/src/gate.ts
+          --binary-dir artifacts/runtime
+          --bundle-dir artifacts/bundle
+          --report gate-report-${{ matrix.name }}.md
+          --summary
+
+      - name: Upload gate report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-report-${{ matrix.name }}
+          path: gate-report-${{ matrix.name }}.md
+          if-no-files-found: error
+
+  report:
+    name: gate report (aggregate)
+    needs: [build, gate]
+    if: always() # gate 红也要聚合出红报告；聚合步骤自身会以非 0 退出
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Download all gate reports
+        uses: actions/download-artifact@v4
+        with:
+          pattern: gate-report-*
+          path: gate-reports
+          merge-multiple: true
+
+      - name: Assemble gate report
+        run: >-
+          node --experimental-strip-types scripts/packaging/src/assemble-gate-report.ts
+          --dir gate-reports
+          --platforms macos,linux,windows
+          --out m0-gate-report.md
+          --summary
+
+      - name: Upload aggregate gate report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: m0-gate-report
+          path: m0-gate-report.md
+          if-no-files-found: error
