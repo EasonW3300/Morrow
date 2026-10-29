@@ -1,0 +1,20 @@
+{
+  "name": "@morrow/protocol",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "事件信封 schema、API 合约与共享类型（TS + JSON Schema）",
+  "exports": {
+    ".": "./src/index.ts",
+    "./schema/event-envelope.schema.json": "./schema/event-envelope.schema.json"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "tsc --noEmit && node --test --experimental-strip-types \"test/*.test.ts\""
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "ajv": "^8.17.1",
+    "typescript": "^5.7.0"
+  }
+}
