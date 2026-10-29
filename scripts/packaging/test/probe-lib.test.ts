@@ -3,12 +3,25 @@
  *
  * - parseJsonObjectLine / asReadyEvent：sidecar 启动协议的 stdout 单行 JSON 握手；
  * - createJsonLineSource：子进程 stdout 的 JSON 行流（分块边界、噪声容错、超时）；
- * - fetchJson：探针请求（/v1/health）。
+ * - fetchJson：探针请求（/v1/health）；
+ * - ensureExecutable：CI 产物执行位自愈（download-artifact 不保留 mode，#10 gate 腿 EACCES）；
+ * - describeChildDiagnostics：探针失败附子进程退出码/stderr/stdout 噪声（CI 可维护性）。
  */
 import assert from "node:assert/strict";
 import http from "node:http";
+import { chmodSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { ChildProcess } from "node:child_process";
 import { after, describe, it } from "node:test";
-import { asReadyEvent, createJsonLineSource, fetchJson, parseJsonObjectLine } from "../src/probe-lib.ts";
+import {
+  asReadyEvent,
+  createJsonLineSource,
+  describeChildDiagnostics,
+  ensureExecutable,
+  fetchJson,
+  parseJsonObjectLine,
+} from "../src/probe-lib.ts";
 import type { ReadyEvent } from "../src/probe-lib.ts";
 
 describe("parseJsonObjectLine", () => {
@@ -160,5 +173,56 @@ describe("fetchJson", () => {
   it("连接拒绝按错误抛出（含 url 信息）", async () => {
     // 端口 1（tcpmux）常规无监听，连接立即被拒
     await assert.rejects(fetchJson("http://127.0.0.1:1/v1/health", 2000), /health check failed|fetch failed/i);
+  });
+});
+
+describe("ensureExecutable", () => {
+  it("非可执行文件自愈为 0755（run 40872208364 EACCES：download-artifact 不保留 mode 位）", () => {
+    if (process.platform === "win32") return; // Windows 无可执行位概念，ensureExecutable 直接跳过
+    const dir = mkdtempSync(join(tmpdir(), "morrow-chmod-"));
+    const file = join(dir, "morrow-runtime-fake");
+    writeFileSync(file, "#!/bin/sh\n");
+    chmodSync(file, 0o644);
+    ensureExecutable(file);
+    assert.equal(statSync(file).mode & 0o777, 0o755);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("已是可执行文件保持不变（幂等）", () => {
+    if (process.platform === "win32") return;
+    const dir = mkdtempSync(join(tmpdir(), "morrow-chmod-"));
+    const file = join(dir, "already-exec");
+    writeFileSync(file, "#!/bin/sh\n");
+    chmodSync(file, 0o700);
+    ensureExecutable(file);
+    assert.equal(statSync(file).mode & 0o777, 0o755);
+    rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+describe("describeChildDiagnostics", () => {
+  it("已退出的子进程带退出码与 stderr 尾部", () => {
+    const source = createJsonLineSource();
+    const child = { exitCode: 1, signalCode: null } as unknown as ChildProcess;
+    const diag = describeChildDiagnostics(child, "[morrow] fatal: boom\n", source);
+    assert.match(diag, /child exit=1/);
+    assert.match(diag, /stderr tail: \[morrow\] fatal: boom/);
+  });
+
+  it("EOF 场景带 stdout 噪声行（非 JSON 输出不再丢失）", () => {
+    const source = createJsonLineSource();
+    source.push("panic: runtime error\n");
+    const child = { exitCode: 101, signalCode: null } as unknown as ChildProcess;
+    const diag = describeChildDiagnostics(child, "", source);
+    assert.match(diag, /child exit=101/);
+    assert.match(diag, /stdout noise: \["panic: runtime error"\]/);
+  });
+
+  it("信号终止的子进程带 signal；未退出标 still running", () => {
+    const source = createJsonLineSource();
+    const signaled = { exitCode: null, signalCode: "SIGKILL" } as unknown as ChildProcess;
+    assert.match(describeChildDiagnostics(signaled, "", source), /killed by signal SIGKILL/);
+    const alive = { exitCode: null, signalCode: null } as unknown as ChildProcess;
+    assert.match(describeChildDiagnostics(alive, "", source), /still running/);
   });
 });

@@ -22,6 +22,8 @@ import {
   asReadyEvent,
   assertMockContract,
   createJsonLineSource,
+  describeChildDiagnostics,
+  ensureExecutable,
   fetchJson,
   resolveBinaryPath,
   runEmbeddedProbe,
@@ -48,6 +50,7 @@ async function runSidecarLifecycle(binaryPath: string): Promise<LifecycleResult>
   const dataDir = mkdtempSync(join(tmpdir(), "morrow-sidecar-"));
   let child: ReturnType<typeof spawn> | undefined;
   try {
+    ensureExecutable(binaryPath); // CI 产物无执行位（download-artifact 不保留 mode），spawn 前自愈
     child = spawn(binaryPath, [], {
       env: { ...process.env, MORROW_DATA_DIR: dataDir, MORROW_PORT: "0" },
       stdio: ["ignore", "pipe", "pipe"],
@@ -60,27 +63,33 @@ async function runSidecarLifecycle(binaryPath: string): Promise<LifecycleResult>
     });
     child.once("close", () => source.end());
 
-    const ready = asReadyEvent(await source.next(20_000));
-    if (ready === undefined) {
-      throw new Error("sidecar phase A: first stdout json line is not a ready event");
-    }
+    try {
+      const ready = asReadyEvent(await source.next(20_000));
+      if (ready === undefined) {
+        throw new Error("sidecar phase A: first stdout json line is not a ready event");
+      }
 
-    const health = await fetchJson(`http://${ready.host}:${ready.port}/v1/health`, 5_000);
-    const body = health.body as { status?: string; ledger?: { events?: number } } | undefined;
-    if (health.status !== 200 || body?.status !== "ok" || (body.ledger?.events ?? 0) < 1) {
-      throw new Error(`sidecar phase A: health probe failed: ${health.status} ${JSON.stringify(health.body)}`);
-    }
+      const health = await fetchJson(`http://${ready.host}:${ready.port}/v1/health`, 5_000);
+      const body = health.body as { status?: string; ledger?: { events?: number } } | undefined;
+      if (health.status !== 200 || body?.status !== "ok" || (body.ledger?.events ?? 0) < 1) {
+        throw new Error(`sidecar phase A: health probe failed: ${health.status} ${JSON.stringify(health.body)}`);
+      }
 
-    child.kill("SIGTERM");
-    const stopped = await source.next(15_000);
-    if (stopped.stopped !== true || stopped.signal !== "SIGTERM") {
-      throw new Error(`sidecar phase A: expected stopped line, got ${JSON.stringify(stopped)}`);
+      child.kill("SIGTERM");
+      const stopped = await source.next(15_000);
+      if (stopped.stopped !== true || stopped.signal !== "SIGTERM") {
+        throw new Error(`sidecar phase A: expected stopped line, got ${JSON.stringify(stopped)}`);
+      }
+      const exit = await waitExit(child, 15_000);
+      if (exit.code !== 0) {
+        throw new Error(`sidecar phase A: exit code ${exit.code} (expected 0); stderr: ${stderr.slice(-500)}`);
+      }
+      return { ready, healthBody: health.body, stoppedLine: stopped, exitCode: exit.code };
+    } catch (err) {
+      // 失败必附子进程可观测状态（run 40872208364 windows 腿 EOF 时 stderr 全丢，无法定位）
+      const message = err instanceof Error ? err.message : String(err);
+      throw new Error(`${message} [${describeChildDiagnostics(child, stderr, source)}]`);
     }
-    const exit = await waitExit(child, 15_000);
-    if (exit.code !== 0) {
-      throw new Error(`sidecar phase A: exit code ${exit.code} (expected 0); stderr: ${stderr.slice(-500)}`);
-    }
-    return { ready, healthBody: health.body, stoppedLine: stopped, exitCode: exit.code };
   } finally {
     if (child !== undefined && child.exitCode === null && child.signalCode === null) {
       child.kill("SIGKILL");

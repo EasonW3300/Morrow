@@ -13,7 +13,7 @@
  * 这是 bun compile 对生产依赖树的直接验证，也是 ADR-0006 的实测证据来源。
  */
 import { spawn, type ChildProcess } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { binaryFileName } from "./target.ts";
@@ -237,6 +237,52 @@ export function waitExit(
   });
 }
 
+// --- 失败诊断与 spawn 前自愈 ---------------------------------------------------
+
+/**
+ * spawn 前自愈可执行位（posix）：actions/download-artifact 的上传/下载不保留 mode 位，
+ * CI 产物落盘后不可执行（run 40872208364 的 linux/macos gate 腿双探针 EACCES）。
+ * 放在探针 spawn 层而非 workflow chmod 步骤：可执行位属于产物消费方职责，
+ * gate / pnpm probe:runtime:* / 将来发布验证等所有调用方一并受益；Windows 无
+ * 可执行位概念，直接跳过。文件缺失的错误由调用方的存在性检查先行呈现。
+ */
+export function ensureExecutable(binaryPath: string): void {
+  if (process.platform === "win32") return;
+  try {
+    chmodSync(binaryPath, 0o755);
+  } catch {
+    // chmod 失败不掩盖后续 spawn 的原生报错（EACCES/ENOENT 更接近真实原因）
+  }
+}
+
+/**
+ * 探针失败时的子进程状态诊断（附在错误信息尾部）：
+ * 退出码/信号 + stderr 尾部 + stdout 非对象噪声行。EOF 类失败（如 Windows
+ * sidecar 阶段 A 的 "json line source EOF"）原样丢失 stderr，排障无从下手——
+ * CI 可维护性：任何探针失败都必须带出子进程的可观测状态。
+ */
+export function describeChildDiagnostics(
+  child: ChildProcess | undefined,
+  stderr: string,
+  source: JsonLineSource,
+): string {
+  const parts: string[] = [];
+  if (child === undefined) {
+    parts.push("child not spawned");
+  } else if (child.exitCode !== null) {
+    parts.push(`child exit=${child.exitCode}`);
+  } else if (child.signalCode !== null) {
+    parts.push(`child killed by signal ${child.signalCode}`);
+  } else {
+    parts.push("child still running");
+  }
+  const stderrTail = stderr.trim();
+  if (stderrTail !== "") parts.push(`stderr tail: ${stderrTail.slice(-800)}`);
+  const noise = source.noise.slice(-5);
+  if (noise.length > 0) parts.push(`stdout noise: ${JSON.stringify(noise)}`);
+  return parts.join("; ");
+}
+
 /** 对话探针的请求级契约断言（mock 服务器捕获视角；与 pi-adapter 契约测试同口径） */
 export function assertMockContract(requests: MockOpenAIRequest[]): void {
   if (requests.length !== 1) {
@@ -270,6 +316,7 @@ export async function runEmbeddedProbe(opts: EmbeddedProbeOptions): Promise<Embe
   const dataDir = mkdtempSync(join(tmpdir(), "morrow-probe-"));
   let child: ChildProcess | undefined;
   try {
+    ensureExecutable(opts.binaryPath);
     child = spawn(opts.binaryPath, ["--probe"], {
       env: {
         ...process.env,
@@ -288,7 +335,16 @@ export async function runEmbeddedProbe(opts: EmbeddedProbeOptions): Promise<Embe
     });
     child.once("close", () => source.end());
 
-    const readyRaw = await source.next(opts.readyTimeoutMs ?? 20_000);
+    let readyRaw: Record<string, unknown>;
+    try {
+      readyRaw = await source.next(opts.readyTimeoutMs ?? 20_000);
+    } catch (err) {
+      // EOF/超时不带子进程状态，排障无从下手（run 40872208364 windows 腿同款盲区）
+      const message = err instanceof Error ? err.message : String(err);
+      throw new Error(
+        `${message} [${describeChildDiagnostics(child, stderr, source)}]`,
+      );
+    }
     const ready = asReadyEvent(readyRaw);
     if (ready === undefined) {
       throw new Error(`first stdout json line is not a ready event: ${JSON.stringify(readyRaw)}`);
