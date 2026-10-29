@@ -1,0 +1,14 @@
+/Users/wys3300/Desktop/project/Morrow-wt/t6/apps/desktop/src-tauri/target/debug/deps/serde-cd4e632278c103a0.d: /Users/wys3300/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs /Users/wys3300/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/integer128.rs /Users/wys3300/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/mod.rs /Users/wys3300/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/de.rs /Users/wys3300/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/ser.rs /Users/wys3300/Desktop/project/Morrow-wt/t6/apps/desktop/src-tauri/target/debug/build/serde-a7a1cc5a50185c7e/out/private.rs
+
+/Users/wys3300/Desktop/project/Morrow-wt/t6/apps/desktop/src-tauri/target/debug/deps/libserde-cd4e632278c103a0.rlib: /Users/wys3300/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs /Users/wys3300/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/integer128.rs /Users/wys3300/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/mod.rs /Users/wys3300/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/de.rs /Users/wys3300/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/ser.rs /Users/wys3300/Desktop/project/Morrow-wt/t6/apps/desktop/src-tauri/target/debug/build/serde-a7a1cc5a50185c7e/out/private.rs
+
+/Users/wys3300/Desktop/project/Morrow-wt/t6/apps/desktop/src-tauri/target/debug/deps/libserde-cd4e632278c103a0.rmeta: /Users/wys3300/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs /Users/wys3300/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/integer128.rs /Users/wys3300/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/mod.rs /Users/wys3300/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/de.rs /Users/wys3300/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/ser.rs /Users/wys3300/Desktop/project/Morrow-wt/t6/apps/desktop/src-tauri/target/debug/build/serde-a7a1cc5a50185c7e/out/private.rs
+
+/Users/wys3300/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs:
+/Users/wys3300/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/integer128.rs:
+/Users/wys3300/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/mod.rs:
+/Users/wys3300/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/de.rs:
+/Users/wys3300/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/ser.rs:
+/Users/wys3300/Desktop/project/Morrow-wt/t6/apps/desktop/src-tauri/target/debug/build/serde-a7a1cc5a50185c7e/out/private.rs:
+
+# env-dep:OUT_DIR=/Users/wys3300/Desktop/project/Morrow-wt/t6/apps/desktop/src-tauri/target/debug/build/serde-a7a1cc5a50185c7e/out

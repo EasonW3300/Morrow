@@ -50,6 +50,11 @@ Agent Loop 经 PiAdapter 接口注入（`startRuntime(config, { agentAdapterFact
 错误统一 `{ error: { code, message } }`；未匹配路径 404，路径命中但方法不符 405，
 body 非法 400 `invalid_body`，未知会话 404。node:http + 极简路由，不引框架——为 T8 bun compile 留路。
 
+CORS（票 T6）：桌面 WebView 与浏览器联调是跨源客户端；本地来源
+（`http(s)://(localhost|127.0.0.1|tauri.localhost)`、`tauri://localhost`）放行，
+preflight OPTIONS → 204，白名单含 `content-type` 与 `last-event-id`（SSE 断线重连）。
+非本地来源不带 CORS 头，浏览器直接拦截——互联网页面不可读写本地控制面。
+
 ## SSE 会话事件流
 
 每帧三类：

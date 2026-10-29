@@ -1,0 +1,10 @@
+/Users/wys3300/Desktop/project/Morrow-wt/t6/apps/desktop/src-tauri/target/release/deps/toml_datetime-78516505609e0d1d.d: /Users/wys3300/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/toml_datetime-1.1.2+spec-1.1.0/src/lib.rs /Users/wys3300/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/toml_datetime-1.1.2+spec-1.1.0/src/datetime.rs /Users/wys3300/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/toml_datetime-1.1.2+spec-1.1.0/src/de.rs /Users/wys3300/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/toml_datetime-1.1.2+spec-1.1.0/src/ser.rs
+
+/Users/wys3300/Desktop/project/Morrow-wt/t6/apps/desktop/src-tauri/target/release/deps/libtoml_datetime-78516505609e0d1d.rlib: /Users/wys3300/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/toml_datetime-1.1.2+spec-1.1.0/src/lib.rs /Users/wys3300/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/toml_datetime-1.1.2+spec-1.1.0/src/datetime.rs /Users/wys3300/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/toml_datetime-1.1.2+spec-1.1.0/src/de.rs /Users/wys3300/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/toml_datetime-1.1.2+spec-1.1.0/src/ser.rs
+
+/Users/wys3300/Desktop/project/Morrow-wt/t6/apps/desktop/src-tauri/target/release/deps/libtoml_datetime-78516505609e0d1d.rmeta: /Users/wys3300/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/toml_datetime-1.1.2+spec-1.1.0/src/lib.rs /Users/wys3300/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/toml_datetime-1.1.2+spec-1.1.0/src/datetime.rs /Users/wys3300/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/toml_datetime-1.1.2+spec-1.1.0/src/de.rs /Users/wys3300/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/toml_datetime-1.1.2+spec-1.1.0/src/ser.rs
+
+/Users/wys3300/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/toml_datetime-1.1.2+spec-1.1.0/src/lib.rs:
+/Users/wys3300/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/toml_datetime-1.1.2+spec-1.1.0/src/datetime.rs:
+/Users/wys3300/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/toml_datetime-1.1.2+spec-1.1.0/src/de.rs:
+/Users/wys3300/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/toml_datetime-1.1.2+spec-1.1.0/src/ser.rs:

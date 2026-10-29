@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"M0 桌面壳默认能力：前端只调用自定义命令（sidecar_status），核心权限取默认集","local":true,"windows":["main"],"permissions":["core:default"]}}

@@ -10,6 +10,8 @@
   "bin": "./src/main.ts",
   "scripts": {
     "start": "node --experimental-sqlite --experimental-strip-types src/main.ts",
+    "build": "pnpm run build:dist",
+    "build:dist": "esbuild src/main.ts --bundle --platform=node --format=esm --target=node22 --outfile=dist/main.js",
     "typecheck": "tsc --noEmit",
     "test": "tsc --noEmit && node --experimental-sqlite --test --experimental-strip-types \"test/*.test.ts\""
   },
@@ -20,6 +22,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
+    "esbuild": "^0.25.0",
     "typescript": "^5.7.0"
   }
 }

@@ -147,6 +147,23 @@ function defaultAgentFactory(provider: ProviderConfig | null): ((sessionId: stri
 }
 
 function routeRequest(req: IncomingMessage, res: ServerResponse, ctx: RequestContext): void {
+  // CORS：桌面 WebView 与浏览器联调是跨源客户端（PRD §6.1「渠道适配器亦为 API 客户端」）。
+  // 只对本地来源（localhost / 127.0.0.1 / tauri://）放行——互联网页面的 Origin 不在列表内，
+  // 不能读写本地控制面；跨设备鉴权头是后续票的事。last-event-id 供 EventSource 断线重连
+  // 携带（非 safelist 头，需进 preflight 白名单）。
+  const origin = req.headers.origin;
+  if (typeof origin === "string" && isLocalOrigin(origin)) {
+    res.setHeader("access-control-allow-origin", origin);
+    res.setHeader("vary", "origin");
+    res.setHeader("access-control-allow-headers", "content-type, last-event-id");
+    res.setHeader("access-control-allow-methods", "GET, POST, OPTIONS");
+  }
+  if ((req.method ?? "").toUpperCase() === "OPTIONS") {
+    res.writeHead(204);
+    res.end();
+    return;
+  }
+
   let url: URL;
   try {
     url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
@@ -235,6 +252,17 @@ function handleEvents(_req: IncomingMessage, res: ServerResponse, url: URL, ctx:
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
   res.writeHead(status, { "content-type": "application/json; charset=utf-8" });
   res.end(JSON.stringify(body));
+}
+
+/** 本地控制面的放行来源：桌面壳（tauri://localhost、http://tauri.localhost）与浏览器联调 */
+function isLocalOrigin(origin: string): boolean {
+  try {
+    const url = new URL(origin);
+    const localHost = url.hostname === "localhost" || url.hostname === "127.0.0.1" || url.hostname === "tauri.localhost";
+    return localHost && (url.protocol === "http:" || url.protocol === "https:" || url.protocol === "tauri:");
+  } catch {
+    return false;
+  }
 }
 
 function sendError(res: ServerResponse, status: number, code: string, message: string): void {

@@ -1,0 +1,10 @@
+/Users/wys3300/Desktop/project/Morrow-wt/t6/apps/desktop/src-tauri/target/release/deps/zerovec_derive-a9b0921ae5968942.d: /Users/wys3300/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zerovec-derive-0.11.7/src/lib.rs /Users/wys3300/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zerovec-derive-0.11.7/src/make_ule.rs /Users/wys3300/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zerovec-derive-0.11.7/src/make_varule.rs /Users/wys3300/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zerovec-derive-0.11.7/src/ule.rs /Users/wys3300/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zerovec-derive-0.11.7/src/utils.rs /Users/wys3300/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zerovec-derive-0.11.7/src/varule.rs
+
+/Users/wys3300/Desktop/project/Morrow-wt/t6/apps/desktop/src-tauri/target/release/deps/libzerovec_derive-a9b0921ae5968942.dylib: /Users/wys3300/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zerovec-derive-0.11.7/src/lib.rs /Users/wys3300/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zerovec-derive-0.11.7/src/make_ule.rs /Users/wys3300/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zerovec-derive-0.11.7/src/make_varule.rs /Users/wys3300/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zerovec-derive-0.11.7/src/ule.rs /Users/wys3300/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zerovec-derive-0.11.7/src/utils.rs /Users/wys3300/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zerovec-derive-0.11.7/src/varule.rs
+
+/Users/wys3300/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zerovec-derive-0.11.7/src/lib.rs:
+/Users/wys3300/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zerovec-derive-0.11.7/src/make_ule.rs:
+/Users/wys3300/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zerovec-derive-0.11.7/src/make_varule.rs:
+/Users/wys3300/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zerovec-derive-0.11.7/src/ule.rs:
+/Users/wys3300/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zerovec-derive-0.11.7/src/utils.rs:
+/Users/wys3300/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zerovec-derive-0.11.7/src/varule.rs:
