@@ -171,8 +171,9 @@ export async function detectContainerRuntime(
   const exec: ExecFn =
     timeoutMs === undefined
       ? rawExec
-      : (file, args) =>
-          Promise.race([
+      : (file, args) => {
+          let timer: NodeJS.Timeout | undefined;
+          return Promise.race([
             // exec 自身以 reject 表达「被杀」（defaultExec 的 SIGTERM 超时同款）→ 按超时哨兵
             // 归类：探测有界的语义是「界内无结论」，reject 与哨兵同为无结论（不区分成因）
             rawExec(file, args).catch(
@@ -184,13 +185,19 @@ export async function detectContainerRuntime(
                 }) as ExecResult,
             ),
             new Promise<ExecResult>((resolve) => {
-              const timer = setTimeout(
+              // 超时哨兵必须保持 ref'd：race 的败者可能不持有任何事件循环句柄（挂起的
+              // 注入桩、句柄已被收走的进程），unref 会让事件循环先空、race 永不 settle
+              //（node:test 报 "Promise resolution is still pending"——node 22/24 时序差异根因）。
+              timer = setTimeout(
                 () => resolve({ stdout: "", stderr: `${file} ${args.join(" ")} timed out after ${timeoutMs}ms`, exitCode: PROBE_TIMED_OUT_EXIT_CODE }),
                 timeoutMs,
               );
-              if (typeof timer.unref === "function") timer.unref();
             }),
-          ]);
+          ]).finally(() => {
+            // 胜出路径清掉 ref'd 哨兵：不 clear 会把进程空拖到界才退出（探测尾部延迟）
+            if (timer !== undefined) clearTimeout(timer);
+          });
+        };
 
   let daemonDown = false;
   let probeTimedOut = false;
