@@ -5,6 +5,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { TaskNodeRecord, TaskStatus } from "@morrow/protocol";
+import type { TaskEventEnvelope } from "./api.ts";
 import {
   dagLayers,
   eventPageState,
@@ -14,7 +15,6 @@ import {
   taskStatusLabel,
   taskStatusTone,
   validateReviseForm,
-  type TaskEnvelope,
 } from "./task-ui.ts";
 
 function node(partial: Partial<TaskNodeRecord> & { key: string }): TaskNodeRecord {
@@ -30,7 +30,7 @@ function node(partial: Partial<TaskNodeRecord> & { key: string }): TaskNodeRecor
   };
 }
 
-function envelope(eventType: string, payload: Record<string, unknown>, sequence: number): { sequence: number; envelope: TaskEnvelope } {
+function envelope(eventType: string, payload: Record<string, unknown>, sequence: number): { sequence: number; envelope: TaskEventEnvelope } {
   return {
     sequence,
     envelope: { event_id: `e${sequence}`, event_type: eventType, occurred_at: "2026-11-02T00:00:00Z", payload },
