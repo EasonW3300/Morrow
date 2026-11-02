@@ -28,6 +28,28 @@ export {
   type SessionHistory,
   type SessionSummary,
 } from "./sessions.ts";
+export {
+  TaskService,
+  TaskError,
+  TASK_EVENT_TYPES,
+  TASK_TRANSITIONS,
+  PLANNER_SYSTEM_PROMPT,
+  validatePlannedDag,
+  planWithRuntime,
+} from "./tasks.ts";
+export type {
+  PlannerFactory,
+  PlannedNodeInput,
+  PlannedNode,
+  PlannedDag,
+  TaskServiceOptions,
+  TransitionOptions,
+  TransitionResult,
+  TaskErrorCode,
+} from "./tasks.ts";
+export { TaskScheduler, DEFAULT_TASK_CONCURRENCY } from "./scheduler.ts";
+export type { NodeAgentFactory, TaskNodeExecInput, TaskSchedulerOptions } from "./scheduler.ts";
+export { ensureTaskTables, TASK_TABLES_SQL } from "./task-migrations.ts";
 export { probeSandbox } from "./health.ts";
 export type { SandboxProbe, SandboxStatus } from "./health.ts";
 export { uuidv7 } from "./uuid-v7.ts";

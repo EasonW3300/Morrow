@@ -201,3 +201,49 @@ test("closed ledger rejects every operation with an honest ledger_closed code (n
   }
   removeDir(dir);
 });
+
+// --- T4 任务事件（Issue #16）：task_id 专列 + 索引 ------------------------------
+
+test("append stores task_id from the envelope; scan/list filter by it", () => {
+  const dir = tmpDir();
+  const ledger = EventLedger.open(dir);
+  const taskA = uuidv7();
+  const taskB = uuidv7();
+  const a1 = makeEvent({ event_type: "task.created", task_id: taskA, payload: { goal: "a" } });
+  const a2 = makeEvent({ event_type: "task.node_started", task_id: taskA, payload: {} });
+  const b1 = makeEvent({ event_type: "task.created", task_id: taskB, payload: { goal: "b" } });
+  const plain = makeEvent({ event_type: "session.created", payload: {} });
+  for (const e of [a1, a2, b1, plain]) ledger.append(e);
+
+  const scanned = ledger.scan({ taskId: taskA });
+  assert.deepEqual(scanned.map((s) => s.envelope.event_id), [a1.event_id, a2.event_id]);
+  assert.equal(ledger.scan({ taskId: taskA, eventType: "task.node_started" }).length, 1);
+
+  const page = ledger.list({ taskId: taskA, limit: 1, offset: 1 });
+  assert.equal(page.total, 2);
+  assert.deepEqual(page.events.map((e) => e.event_id), [a2.event_id]);
+  assert.equal(page.limit, 1);
+  assert.equal(page.offset, 1);
+
+  // 非任务事件（无 task_id）不被任务过滤捞到
+  assert.equal(ledger.scan({ taskId: taskB }).length, 1);
+  ledger.close();
+  removeDir(dir);
+});
+
+test("ledger migrated from a pre-task schema still opens and filters task events", () => {
+  const dir = tmpDir();
+  // 用旧 schema（无 task_id 列）建库并写入一条事件
+  const old = EventLedger.open(dir);
+  old.append(makeEvent({ payload: {} }));
+  old.close();
+  // 重新打开（T4 代码路径执行 ALTER 迁移）后可正常使用
+  const ledger = EventLedger.open(dir);
+  const taskId = uuidv7();
+  ledger.append(makeEvent({ event_type: "task.created", task_id: taskId, payload: {} }));
+  assert.equal(ledger.scan({ taskId }).length, 1);
+  assert.equal(ledger.list({ taskId }).total, 1);
+  assert.equal(ledger.count(), 2);
+  ledger.close();
+  removeDir(dir);
+});

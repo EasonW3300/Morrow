@@ -13,6 +13,14 @@ export type {
   ProviderCompatConfig,
   ProviderRecord,
 } from "./api-contracts.ts";
+export type {
+  SideEffectClass,
+  TaskDetail,
+  TaskNodeRecord,
+  TaskNodeStatus,
+  TaskStatus,
+  TaskSummary,
+} from "./task-contracts.ts";
 export {
   canonicalJson,
   computeIntegrityHash,
