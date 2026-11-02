@@ -78,6 +78,32 @@ export type {
   RestoreOutcome,
 } from "./checkpoint.ts";
 export { ensureTaskTables, TASK_TABLES_SQL } from "./task-migrations.ts";
+export {
+  PermissionEngine,
+  CapabilityError,
+  CAPABILITY_EVENT_TYPES,
+  EMPTY_GRANT,
+  checkPermissionsWithinGrants,
+  computeSourceHash,
+  filesystemGlobWithin,
+  networkTargetWithin,
+  parseHostPort,
+  pathWithinGlob,
+  shellCategoryWithin,
+  validateManifest,
+  validatePermissionGrant,
+} from "./capabilities/engine.ts";
+export type {
+  CapabilityErrorCode,
+  PermissionEngineOptions,
+  RegisterResult,
+  RuntimeUseDecision,
+} from "./capabilities/engine.ts";
+export { CapabilityStore } from "./capabilities/store.ts";
+export type { CapabilityRow, CapabilityVersionRow, CapabilityListFilter } from "./capabilities/store.ts";
+export { ensureCapabilityTables, CAPABILITY_TABLES_SQL } from "./capabilities/migrations.ts";
+export { capabilityRoutes } from "./capabilities/routes.ts";
+export { ensureBuiltinCapabilities, builtinCapabilityManifests, MEMORY_WRITE_CAPABILITY_MANIFEST } from "./capabilities/builtin.ts";
 export { MemoryStore, normalizeForFts, buildFtsQuery } from "./memory/store.ts";
 export type {
   CandidateStatus,
