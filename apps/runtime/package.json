@@ -15,7 +15,9 @@
     "typecheck": "tsc --noEmit",
     "test": "tsc --noEmit && node --experimental-sqlite --test --experimental-strip-types \"test/*.test.ts\"",
     "test:sandbox": "node --experimental-sqlite --test --experimental-strip-types \"test/sandbox.*.test.ts\"",
-    "memory:ac03": "node --experimental-sqlite --experimental-strip-types scripts/memory-ac03.ts"
+    "memory:ac03": "node --experimental-sqlite --experimental-strip-types scripts/memory-ac03.ts",
+    "factory:ac06": "node --experimental-sqlite --experimental-strip-types scripts/factory-ac06.ts",
+    "factory:harness:container": "node --experimental-sqlite --test --experimental-strip-types \"test/capability-factory.harness.container.test.ts\""
   },
   "dependencies": {
     "@morrow/pi-adapter": "workspace:*",
