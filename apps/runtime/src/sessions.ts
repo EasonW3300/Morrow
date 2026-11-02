@@ -56,9 +56,21 @@ export type AgentAdapterFactory = (
  * 记忆观察面（票 M1-T1 / Issue #13）：message.user 落账后由 SessionManager 调用，
  * 命中高价值规则即写候选 + memory.* 事件。窄结构接口——SessionManager 不依赖
  * memory 模块内部（MemoryService 结构匹配），注入失败不阻断会话主流程。
+ *
+ * observeTurnEnd（票 M1-T2 / Issue #14）：message.assistant 落账后触发后台抽取
+ * （会话轮次结束即触发点）。实现方自行 fire-and-forget；SessionManager 仍捕获
+ * 同步异常记日志——记忆是增强路径，不得影响会话主链路。
  */
 export interface MemoryObserver {
   observeUserMessage(input: { sessionId: string; userEventId: string; occurredAt: string; text: string }): void;
+  observeTurnEnd?(input: {
+    sessionId: string;
+    userEventId: string;
+    /** 本轮 message.assistant 账本事件 id（memory.extracted 的 causation 触发点） */
+    assistantEventId: string;
+    occurredAt: string;
+    text: string;
+  }): void;
 }
 
 /** 会话事件流上的一帧：账本事件（带序号，SSE 里作 id）/ 文本增量 / 本轮结束标记 */
@@ -459,13 +471,28 @@ export class SessionManager {
         break;
       }
       case "agent_end": {
-        this.#append(
+        const assistant = this.#append(
           sessionId,
           SESSION_EVENT_TYPES.messageAssistant,
           "agent:runtime",
           { message_id: uuidv7(), text: ctx.getText(), stop_reason: event.stopReason },
           input.userEventId,
         );
+        // 后台抽取触发（票 M1-T2）：轮次收尾（message.assistant 已落账）→ fire-and-forget。
+        // 失败只记日志：记忆是增强路径，不得吞掉本轮已持久化的会话事件。
+        if (this.#memory?.observeTurnEnd !== undefined) {
+          try {
+            this.#memory.observeTurnEnd({
+              sessionId,
+              userEventId: input.userEventId,
+              assistantEventId: assistant.envelope.event_id,
+              occurredAt: assistant.envelope.occurred_at,
+              text: input.text,
+            });
+          } catch (err) {
+            console.error("[morrow] memory turn-end observe failed:", err);
+          }
+        }
         break;
       }
     }

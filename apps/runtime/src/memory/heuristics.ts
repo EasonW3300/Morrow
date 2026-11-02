@@ -47,12 +47,28 @@ const SENTENCE_SPLIT_RE = /[。！？!?\n]+/;
  * 无命中（闲聊、提问、请求）返回 null。
  */
 export function detectHighValue(text: string): HighValueMatch | null {
+  return detectAllHighValue(text)[0] ?? null;
+}
+
+/**
+ * 多句全量扫描（票 M1-T2 / Issue #14 后台抽取用）：逐句按规则优先级取第一个命中，
+ * 返回全部命中句（每句至多一条——句内规则优先级取高）。T1 即时写入取首条（detectHighValue），
+ * T2 后台抽取取全部——同一轮里被即时路径写走的首条由 MemoryService 按来源+内容去重，
+ * 后台路径负责补上其余高价值句子。
+ */
+export function detectAllHighValue(text: string): HighValueMatch[] {
   const trimmed = text.trim();
-  if (trimmed.length === 0) return null;
+  if (trimmed.length === 0) return [];
   const sentences = trimmed.split(SENTENCE_SPLIT_RE).map((s) => s.trim()).filter((s) => s.length > 0);
-  return matchSentences(sentences, REMEMBER_RE, "explicit-remember", "fact", 0.9, extractAfterKeyword)
-    ?? matchSentences(sentences, PREFERENCE_RE, "preference-statement", "preference", 0.8)
-    ?? matchSentences(sentences, FACT_RE, "fact-statement", "profile", 0.7);
+  const matches: HighValueMatch[] = [];
+  for (const sentence of sentences) {
+    const match =
+      matchSentences([sentence], REMEMBER_RE, "explicit-remember", "fact", 0.9, extractAfterKeyword) ??
+      matchSentences([sentence], PREFERENCE_RE, "preference-statement", "preference", 0.8) ??
+      matchSentences([sentence], FACT_RE, "fact-statement", "profile", 0.7);
+    if (match !== null) matches.push(match);
+  }
+  return matches;
 }
 
 function matchSentences(

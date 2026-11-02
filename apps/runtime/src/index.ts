@@ -54,13 +54,41 @@ export type { NodeAgentFactory, TaskNodeExecInput, TaskSchedulerOptions } from "
 export { ensureTaskTables, TASK_TABLES_SQL } from "./task-migrations.ts";
 export { MemoryStore, normalizeForFts, buildFtsQuery } from "./memory/store.ts";
 export type {
+  CandidateStatus,
+  ConflictReason,
+  ConflictResolution,
   CreateCandidateInput,
   MemoryCandidateRow,
+  MemoryConflictRow,
+  MemoryFactRow,
+  MemoryRevisionRow,
   MemorySearchHit,
   MemorySourceRow,
 } from "./memory/store.ts";
-export { MemoryService, MemoryWriteError, MEMORY_EVENT_TYPES, MEMORY_WRITE_RULE } from "./memory/service.ts";
-export type { MemoryWriteResult, ObserveUserMessageInput } from "./memory/service.ts";
+export {
+  MemoryService,
+  MemoryWriteError,
+  MemoryControlError,
+  MEMORY_EVENT_TYPES,
+  MEMORY_WRITE_RULE,
+  AUTO_CONSOLIDATE_MIN_CONFIDENCE,
+} from "./memory/service.ts";
+export type {
+  MemoryWriteResult,
+  ObserveUserMessageInput,
+  MemoryControlErrorCode,
+  ConsolidationRunSummary,
+} from "./memory/service.ts";
+export { HeuristicExtractor } from "./memory/extraction.ts";
+export type { ExtractedCandidate, ExtractionInput, MemoryExtractor } from "./memory/extraction.ts";
+export { DefaultConsolidator, salientTokens } from "./memory/consolidator.ts";
+export type {
+  ConsolidationAction,
+  ConsolidationCandidateView,
+  ConsolidationFactView,
+  ConsolidationInput,
+  MemoryConsolidator,
+} from "./memory/consolidator.ts";
 export { createMemoryWriteTool, MEMORY_WRITE_TOOL_NAME } from "./memory/tool.ts";
 export { detectHighValue } from "./memory/heuristics.ts";
 export type { HighValueMatch, HighValueRule } from "./memory/heuristics.ts";
