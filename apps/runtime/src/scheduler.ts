@@ -204,12 +204,15 @@ export class TaskScheduler {
   }
 
   /**
-   * 介入后重新驱动（M1-T6）：Owner 完成接管节点（completeNode）或交还（releaseNode）
-   * 后调用。仅 waiting_input 会被迁回 running（task.resumed，payload.reason 记录介入
-   * 动作）并入队继续；其余状态（running 自会在跑、planned/paused 走显式 resume、
-   * 终端态无可驱动）为无操作。未知任务抛 not_found。
+   * 介入后重新驱动（M1-T6）：Owner 完成接管节点（completeNode）、交还（releaseNode）
+   * 或补充上下文（supply，FR-TASK-3）后调用。仅 waiting_input 会被迁回 running
+   * （task.resumed，payload.reason 记录介入动作）并入队继续；其余状态（running 自会
+   * 在跑、planned/paused 走显式 resume、终端态无可驱动）为无操作。未知任务抛 not_found。
    */
-  async kick(taskId: string, reason: "owner_node_completed" | "owner_node_released" = "owner_node_completed"): Promise<TaskSummary> {
+  async kick(
+    taskId: string,
+    reason: "owner_node_completed" | "owner_node_released" | "context_supplied" = "owner_node_completed",
+  ): Promise<TaskSummary> {
     const task = this.#tasks.getTask(taskId);
     if (task === null) {
       throw new TaskError("not_found", `task ${taskId} does not exist`);

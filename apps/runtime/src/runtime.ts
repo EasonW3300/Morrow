@@ -167,8 +167,10 @@ const routes: Route[] = [
   { method: "POST", re: /^\/v1\/tasks\/([^/]+)\/restore$/, handler: handleRestoreTask },
   { method: "GET", re: /^\/v1\/tasks\/([^/]+)\/checkpoints$/, handler: handleListCheckpoints },
   // M1-T6 介入端点（FR-TASK-3 修改/接管半边）：revise 修改未完成节点（版本+1+重算下游
-  // +新 checkpoint）；节点级 takeover/complete/release（actor=owner 审计）
+  // +新 checkpoint）；supply 补充上下文（追加节点描述/任务目标，DAG 不变不升版本）；
+  // 节点级 takeover/complete/release（actor=owner 审计）
   { method: "POST", re: /^\/v1\/tasks\/([^/]+)\/revise$/, handler: handleReviseTask },
+  { method: "POST", re: /^\/v1\/tasks\/([^/]+)\/supply$/, handler: handleSupplyTask },
   { method: "POST", re: /^\/v1\/tasks\/([^/]+)\/nodes\/([^/]+)\/takeover$/, handler: handleTakeoverNode },
   { method: "POST", re: /^\/v1\/tasks\/([^/]+)\/nodes\/([^/]+)\/complete$/, handler: handleCompleteNode },
   { method: "POST", re: /^\/v1\/tasks\/([^/]+)\/nodes\/([^/]+)\/release$/, handler: handleReleaseNode },
@@ -1022,8 +1024,47 @@ function handleReviseTask(req: IncomingMessage, res: ServerResponse, _url: URL, 
   })();
 }
 
-function handleTakeoverNode(_req: IncomingMessage, res: ServerResponse, _url: URL, ctx: RequestContext, params: string[]): void {
+interface SupplyBody {
+  node_id?: unknown;
+  context?: unknown;
+}
+
+/**
+ * 补充上下文（FR-TASK-3）：context 追加节点描述（node_id 给定）或任务目标（缺省），
+ * task.context_supplied（actor=owner）留痕；任务 waiting_input 时自动 kick 重新驱动
+ * （语义同 complete/release：状态迁移同步完成，驱动 fire-and-forget）。DAG 不变，
+ * 不升 task_version、不落 checkpoint。守卫：任务/节点未知 404、终端态或已完成节点 409、
+ * body 非法 400。
+ */
+function handleSupplyTask(req: IncomingMessage, res: ServerResponse, _url: URL, ctx: RequestContext, params: string[]): void {
   void (async () => {
+    const body = await readJsonBody(req, res);
+    if (body === null) return;
+    const { node_id: nodeId, context } = body as SupplyBody;
+    if (typeof context !== "string" || context.trim().length === 0) {
+      sendError(res, 400, "invalid_body", "context must be a non-empty string");
+      return;
+    }
+    if (nodeId !== undefined && (typeof nodeId !== "string" || nodeId.trim().length === 0)) {
+      sendError(res, 400, "invalid_body", "node_id must be a non-empty string when present");
+      return;
+    }
+    try {
+      const result = ctx.tasks.supplyContext(params[0], {
+        context: context.trim(),
+        ...(typeof nodeId === "string" ? { nodeId } : {}),
+      });
+      await ctx.scheduler.kick(params[0], "context_supplied").catch((err: unknown) => {
+        console.error("[morrow] task kick after context supply crashed:", err);
+      });
+      sendJson(res, 200, { task: ctx.tasks.getTask(params[0]) ?? result.task, supplied: result.supplied });
+    } catch (err) {
+      handleTaskError(res, err);
+    }
+  })();
+}
+
+function handleTakeoverNode(_req: IncomingMessage, res: ServerResponse, _url: URL, ctx: RequestContext, params: string[]): void {  void (async () => {
     try {
       const task = ctx.tasks.takeoverNode(params[0], params[1]);
       sendJson(res, 200, { task });

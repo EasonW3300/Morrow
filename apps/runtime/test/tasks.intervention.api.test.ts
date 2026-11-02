@@ -359,6 +359,235 @@ test("takeover parks a running task in waiting_input (owner_intervention); relea
   }
 });
 
+// --- supply 端点（FR-TASK-3「补充上下文」，M1 code-review 补齐） -------------------
+
+test("POST supply to node: goal appended, owner audit event, waiting_input auto-kick re-drives", async () => {
+  const h = await openRuntime({
+    plan: SERIAL_PLAN,
+    nodeScripts: {
+      a: [{ kind: "tool", toolName: "slow" }, { kind: "text", deltas: ["a-ok"] }],
+      // b 无脚本 → 回显 goal：执行结果应携带补充后的描述
+    },
+    tools: [slowTool(600)],
+  });
+  try {
+    const created = await json<TaskDetail>(await post(h, "/v1/tasks", { goal: "补充上下文演示" }));
+    await waitFor("node a running", async () => (await getTask(h, created.task_id)).nodes.find((n) => n.key === "a")?.status === "running");
+    const bNode = (await getTask(h, created.task_id)).nodes.find((n) => n.key === "b") as NonNullable<(typeof created.nodes)[number]>;
+    await post(h, `/v1/tasks/${created.task_id}/nodes/${bNode.node_id}/takeover`);
+    await waitFor("waiting_input", async () => (await getTask(h, created.task_id)).status === "waiting_input");
+
+    // 补充到节点 b：goal 追加、DAG 不变（task_version 不动）
+    const supplied = await post(h, `/v1/tasks/${created.task_id}/supply`, {
+      node_id: bNode.node_id,
+      context: "输出必须带验收清单",
+    });
+    assert.equal(supplied.status, 200);
+    const body = await json<{ task: TaskDetail; supplied: { target: string; node_id: string; key: string } }>(supplied);
+    assert.equal(body.supplied.target, "node");
+    assert.equal(body.supplied.node_id, bNode.node_id);
+    const bAfter = body.task.nodes.find((n) => n.key === "b") as NonNullable<(typeof body.task.nodes)[number]>;
+    assert.ok(bAfter.goal?.includes("输出必须带验收清单"), "context 追加进节点描述");
+    assert.equal(body.task.task_version, 1, "补充不是计划修改：task_version 不升");
+
+    // 审计事件：task.context_supplied actor=owner
+    const events = await json<LedgerPageBody>(
+      await fetch(`${h.base}/v1/tasks/${created.task_id}/events?limit=200`),
+    );
+    const supplyEvent = events.events.filter((e) => e.event_type === "task.context_supplied").at(-1);
+    assert.ok(supplyEvent !== undefined);
+    assert.equal(supplyEvent.actor_id, "owner");
+    assert.equal(supplyEvent.payload.target, "node");
+    assert.equal(supplyEvent.payload.node_id, bNode.node_id);
+    assert.equal(supplyEvent.payload.context, "输出必须带验收清单");
+
+    // waiting_input 自动 kick：task.resumed（reason=context_supplied）证明重新驱动已触发。
+    // 节点仍 owner 接管中，重新评估后回到 waiting_input 等 Owner 放行——语义同
+    // complete/release 的 kick（kick 只在 waiting_input 生效，重新评估不变则回挂起）
+    const resumedAfterSupply = events.events
+      .filter((e) => e.event_type === "task.resumed" && e.payload.reason === "context_supplied")
+      .at(-1);
+    assert.ok(resumedAfterSupply !== undefined, "supply 对 waiting_input 触发自动 kick");
+
+    // Owner 放行（release）→ 调度器以补充后的 goal 执行 b → 完成（结果携带补充内容）
+    const released = await post(h, `/v1/tasks/${created.task_id}/nodes/${bNode.node_id}/release`);
+    assert.equal(released.status, 200);
+    await waitFor("task completes after supply + release", async () => (await getTask(h, created.task_id)).status === "completed");
+    const final = await getTask(h, created.task_id);
+    assert.equal(final.nodes.find((n) => n.key === "b")?.result, "do b\n\n[Owner 补充] 输出必须带验收清单");
+  } finally {
+    await h.close();
+  }
+});
+
+test("POST supply without node_id appends to the task goal (paused task; no auto-kick)", async () => {
+  const h = await openRuntime({
+    plan: SERIAL_PLAN,
+    nodeScripts: {
+      a: [{ kind: "tool", toolName: "slow" }, { kind: "text", deltas: ["a-ok"] }],
+      b: [{ kind: "text", deltas: ["b-ok"] }],
+    },
+    tools: [slowTool(500)],
+  });
+  try {
+    const paused = await pausedTaskWithCompletedA(h);
+    const goalBefore = paused.goal;
+    const supplied = await post(h, `/v1/tasks/${paused.task_id}/supply`, { context: "客户要求周五前交付" });
+    assert.equal(supplied.status, 200);
+    const body = await json<{ task: TaskDetail; supplied: { target: string } }>(supplied);
+    assert.equal(body.supplied.target, "task");
+    assert.ok(body.task.goal.includes("[Owner 补充] 客户要求周五前交付"), "context 追加进任务目标");
+    assert.ok(body.task.goal.startsWith(goalBefore), "原目标在前，追加在后");
+
+    const events = await json<LedgerPageBody>(
+      await fetch(`${h.base}/v1/tasks/${paused.task_id}/events?limit=200`),
+    );
+    const supplyEvent = events.events.filter((e) => e.event_type === "task.context_supplied").at(-1);
+    assert.ok(supplyEvent !== undefined);
+    assert.equal(supplyEvent.actor_id, "owner");
+    assert.equal(supplyEvent.payload.target, "task");
+
+    // paused 不被 supply 改动（kick 仅对 waiting_input 生效）；显式 resume 跑完
+    assert.equal((await getTask(h, paused.task_id)).status, "paused");
+    const resume = await post(h, `/v1/tasks/${paused.task_id}/resume`);
+    assert.equal(resume.status, 202);
+    await waitFor("task completes", async () => (await getTask(h, paused.task_id)).status === "completed");
+  } finally {
+    await h.close();
+  }
+});
+
+test("POST supply guards: 400 invalid body, 404 unknown task/node, 409 terminal or completed node", async () => {
+  const h = await openRuntime({
+    plan: SERIAL_PLAN,
+    nodeScripts: {
+      a: [{ kind: "text", deltas: ["a-ok"] }],
+      // b 慢工具：a 完成后任务仍 running（b 在途）——「节点已完成、任务未终态」的宽窗口
+      b: [{ kind: "tool", toolName: "slow" }, { kind: "text", deltas: ["b-ok"] }],
+    },
+    tools: [slowTool(800)],
+  });
+  try {
+    // 400：context 缺失/空、node_id 空串
+    const created = await json<TaskDetail>(await post(h, "/v1/tasks", { goal: "守卫演示" }));
+    const noContext = await post(h, `/v1/tasks/${created.task_id}/supply`, { node_id: created.nodes[0]?.node_id });
+    assert.equal(noContext.status, 400);
+    assert.equal(((await json<ApiError>(noContext)).error).code, "invalid_body");
+    const emptyContext = await post(h, `/v1/tasks/${created.task_id}/supply`, { context: "   " });
+    assert.equal(emptyContext.status, 400);
+    const emptyNode = await post(h, `/v1/tasks/${created.task_id}/supply`, { node_id: "", context: "x" });
+    assert.equal(emptyNode.status, 400);
+
+    // 404：未知任务；未知节点（任务存在且未终态）
+    const unknownTask = await post(h, "/v1/tasks/00000000-0000-0000-0000-000000000000/supply", { context: "x" });
+    assert.equal(unknownTask.status, 404);
+    assert.equal(((await json<ApiError>(unknownTask)).error).code, "task_not_found");
+    const unknownNode = await post(h, `/v1/tasks/${created.task_id}/supply`, { node_id: "no-such-node", context: "x" });
+    assert.equal(unknownNode.status, 404);
+    assert.equal(((await json<ApiError>(unknownNode)).error).code, "task_not_found");
+
+    // 409：已完成节点拒绝追加（a 先完成、任务仍在跑 b —— 非终态）
+    const aId = created.nodes.find((n) => n.key === "a")?.node_id as string;
+    await waitFor("node a completed", async () => (await getTask(h, created.task_id)).nodes.find((n) => n.key === "a")?.status === "completed");
+    const doneNode = await post(h, `/v1/tasks/${created.task_id}/supply`, { node_id: aId, context: "x" });
+    assert.equal(doneNode.status, 409);
+    assert.equal(((await json<ApiError>(doneNode)).error).code, "task_immutable_node");
+
+    // 409：终端态任务拒绝补充（terminal 守卫先于节点级守卫）
+    await waitFor("task completes", async () => (await getTask(h, created.task_id)).status === "completed");
+    const doneTask = await post(h, `/v1/tasks/${created.task_id}/supply`, { context: "x" });
+    assert.equal(doneTask.status, 409);
+    assert.equal(((await json<ApiError>(doneTask)).error).code, "task_invalid_transition");
+  } finally {
+    await h.close();
+  }
+});
+
+// --- AC-12 补缺（M1 gate report §5-1）：revise 正向 +1、release 正向 +1 ------------
+
+test("[AC12] revise removes a pending node; resume completes the reduced DAG end to end", async () => {
+  const h = await openRuntime({
+    plan: SERIAL_PLAN,
+    nodeScripts: {
+      a: [{ kind: "tool", toolName: "slow" }, { kind: "text", deltas: ["a-ok"] }],
+      b: [{ kind: "text", deltas: ["b-ok"] }],
+    },
+    tools: [slowTool(500)],
+  });
+  try {
+    const paused = await pausedTaskWithCompletedA(h);
+    assert.equal(paused.nodes.length, 2);
+
+    // 正向修订：移除未完成节点 b → 版本+1 + task.revised（actor owner）+ 新 checkpoint
+    const revised = await post(h, `/v1/tasks/${paused.task_id}/revise`, { remove: ["b"] });
+    assert.equal(revised.status, 200);
+    const body = await json<{ task: TaskDetail; revision: Record<string, unknown>; checkpoint: CheckpointRecord }>(revised);
+    assert.equal(body.task.task_version, 2);
+    assert.ok(!body.task.nodes.some((n) => n.key === "b"), "节点 b 已从 DAG 移除");
+    assert.deepEqual(body.revision.removed_keys, ["b"]);
+    assert.equal(body.checkpoint.reason, "revise");
+    assert.equal(body.checkpoint.task_version, 2);
+
+    // 恢复 → 只剩 a（已完成，不重跑）→ 任务完成
+    const resume = await post(h, `/v1/tasks/${paused.task_id}/resume`);
+    assert.equal(resume.status, 202);
+    await waitFor("task completes", async () => (await getTask(h, paused.task_id)).status === "completed");
+    const final = await getTask(h, paused.task_id);
+    assert.equal(final.nodes.length, 1);
+    assert.equal(final.nodes[0]?.result, "a-ok", "已完成节点不重跑");
+
+    const events = await json<LedgerPageBody>(
+      await fetch(`${h.base}/v1/tasks/${paused.task_id}/events?limit=200`),
+    );
+    const revisedEvent = events.events.filter((e) => e.event_type === "task.revised").at(-1);
+    assert.ok(revisedEvent !== undefined);
+    assert.equal(revisedEvent.actor_id, "owner");
+  } finally {
+    await h.close();
+  }
+});
+
+test("[AC12] release: pause → takeover pending node → release → explicit resume completes", async () => {
+  const h = await openRuntime({
+    plan: SERIAL_PLAN,
+    nodeScripts: {
+      a: [{ kind: "tool", toolName: "slow" }, { kind: "text", deltas: ["a-ok"] }],
+      b: [{ kind: "text", deltas: ["b-ok"] }],
+    },
+    tools: [slowTool(500)],
+  });
+  try {
+    const paused = await pausedTaskWithCompletedA(h);
+    const b = paused.nodes.find((n) => n.key === "b") as NonNullable<(typeof paused.nodes)[number]>;
+
+    // 接管 → 交还（正向 release 执行；paused 任务不被 kick 改状态，走显式 resume）
+    const taken = await post(h, `/v1/tasks/${paused.task_id}/nodes/${b.node_id}/takeover`);
+    assert.equal(taken.status, 200);
+    const released = await post(h, `/v1/tasks/${paused.task_id}/nodes/${b.node_id}/release`);
+    assert.equal(released.status, 200);
+    const releasedTask = await json<{ task: TaskDetail }>(released);
+    assert.equal(releasedTask.task.nodes.find((n) => n.key === "b")?.actor, undefined, "actor 已清空");
+    assert.equal(releasedTask.task.status, "paused");
+
+    // 恢复 → b 由调度器执行 → 任务完成
+    const resume = await post(h, `/v1/tasks/${paused.task_id}/resume`);
+    assert.equal(resume.status, 202);
+    await waitFor("task completes", async () => (await getTask(h, paused.task_id)).status === "completed");
+    const final = await getTask(h, paused.task_id);
+    assert.equal(final.nodes.find((n) => n.key === "b")?.status, "completed");
+
+    const events = await json<LedgerPageBody>(
+      await fetch(`${h.base}/v1/tasks/${paused.task_id}/events?limit=200`),
+    );
+    const releaseEvent = events.events.filter((e) => e.event_type === "task.node_released").at(-1);
+    assert.ok(releaseEvent !== undefined);
+    assert.equal(releaseEvent.actor_id, "owner");
+    assert.equal(releaseEvent.payload.node_id, b.node_id);
+  } finally {
+    await h.close();
+  }
+});
+
 // --- session 关联（Chat 任务卡片地基） -------------------------------------------
 
 test("POST /v1/tasks accepts session_id; GET /v1/tasks?session_id filters; unknown session 400", async () => {
