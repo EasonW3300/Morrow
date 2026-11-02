@@ -1,4 +1,4 @@
-import type { AgentRuntime, MorrowAgentEvent } from "@morrow/pi-adapter";
+import type { AgentRuntime, MorrowAgentEvent, MorrowTool } from "@morrow/pi-adapter";
 import type { EventEnvelope } from "@morrow/protocol";
 import { buildEventEnvelope } from "./envelope.ts";
 import type { EventLedger, LedgerEntry } from "./ledger.ts";
@@ -39,8 +39,27 @@ export const SESSION_EVENT_TYPES = {
 
 /** 生产默认 createPiAdapter；测试注入 FakePi（同构 AgentRuntime 接口）。
  *  provider 为会话解析出的运行时配置（ProviderResolver 未配置时为 null）；
+ *  extras.tools 为会话可用的工具（M1-T1：memory.write，经 PiAdapter tools 通道注册）；
  *  注入工厂可忽略该参数（少参函数在 TS 中可赋值给多参签名，旧测试无需改动）。 */
-export type AgentAdapterFactory = (sessionId: string, provider: ResolvedProvider | null) => Promise<AgentRuntime>;
+export interface AgentRuntimeExtras {
+  /** 会话运行时可用的工具（缺省 []） */
+  tools?: MorrowTool[];
+}
+
+export type AgentAdapterFactory = (
+  sessionId: string,
+  provider: ResolvedProvider | null,
+  extras?: AgentRuntimeExtras,
+) => Promise<AgentRuntime>;
+
+/**
+ * 记忆观察面（票 M1-T1 / Issue #13）：message.user 落账后由 SessionManager 调用，
+ * 命中高价值规则即写候选 + memory.* 事件。窄结构接口——SessionManager 不依赖
+ * memory 模块内部（MemoryService 结构匹配），注入失败不阻断会话主流程。
+ */
+export interface MemoryObserver {
+  observeUserMessage(input: { sessionId: string; userEventId: string; occurredAt: string; text: string }): void;
+}
 
 /** 会话事件流上的一帧：账本事件（带序号，SSE 里作 id）/ 文本增量 / 本轮结束标记 */
 export type SessionFrame =
@@ -105,6 +124,10 @@ export interface SessionManagerOptions {
   providerRequired?: boolean;
   /** factory 为 null 时给客户端的说明 */
   factoryUnavailableReason?: string;
+  /** 记忆观察面（票 M1-T1 / Issue #13）；缺省 null = 不观察 */
+  memory?: MemoryObserver | null;
+  /** 会话运行时的工具工厂（M1-T1：按会话构建 memory.write 工具，经工厂 extras 注入） */
+  agentTools?: (sessionId: string) => MorrowTool[];
 }
 
 export class SessionManager {
@@ -114,6 +137,8 @@ export class SessionManager {
   readonly #providers: ProviderResolver | null;
   readonly #providerRequired: boolean;
   readonly #factoryUnavailableReason: string;
+  readonly #memory: MemoryObserver | null;
+  readonly #agentTools: ((sessionId: string) => MorrowTool[]) | null;
   readonly #states = new Map<string, SessionState>();
   #disposed = false;
 
@@ -123,6 +148,8 @@ export class SessionManager {
     this.#factory = options.factory;
     this.#providers = options.providers ?? null;
     this.#providerRequired = options.providerRequired ?? false;
+    this.#memory = options.memory ?? null;
+    this.#agentTools = options.agentTools ?? null;
     this.#factoryUnavailableReason =
       options.factoryUnavailableReason ??
       "no model provider configured (register one via POST /v1/providers or set MORROW_PROVIDER_BASE_URL / MORROW_PROVIDER_API_KEY / MORROW_PROVIDER_MODEL)";
@@ -240,6 +267,20 @@ export class SessionManager {
       { message_id: messageId, text },
       null,
     );
+    // 记忆即时写入（票 M1-T1 / Issue #13）：用户消息已落账本，命中高价值规则即写候选。
+    // 失败只记日志：候选是增强路径，不得吞掉已持久化的用户消息或打断本轮。
+    if (this.#memory !== null) {
+      try {
+        this.#memory.observeUserMessage({
+          sessionId,
+          userEventId: envelope.envelope.event_id,
+          occurredAt: envelope.envelope.occurred_at,
+          text,
+        });
+      } catch (err) {
+        console.error("[morrow] memory observe failed:", err);
+      }
+    }
     state.queue.push({ userEventId: envelope.envelope.event_id, messageId, text });
     if (state.running) {
       return { status: "queued", messageId, eventId: envelope.envelope.event_id, sequence: envelope.sequence };
@@ -328,7 +369,11 @@ export class SessionManager {
         let runtime = state.runtime;
         if (runtime === null) {
           try {
-            runtime = await (this.#factory as AgentAdapterFactory)(sessionId, await this.#providerFor(sessionId));
+            runtime = await (this.#factory as AgentAdapterFactory)(
+              sessionId,
+              await this.#providerFor(sessionId),
+              { tools: this.#agentTools?.(sessionId) ?? [] },
+            );
           } catch (err) {
             this.#append(sessionId, SESSION_EVENT_TYPES.agentError, "agent:runtime", { message: errorMessage(err) }, input.userEventId);
             this.#broadcast(state, { kind: "done" });

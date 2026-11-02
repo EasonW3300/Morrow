@@ -23,6 +23,8 @@ export {
   SessionManager,
   SESSION_EVENT_TYPES,
   type AgentAdapterFactory,
+  type AgentRuntimeExtras,
+  type MemoryObserver,
   type MessageRecord,
   type SessionFrame,
   type SessionHistory,
@@ -50,6 +52,18 @@ export type {
 export { TaskScheduler, DEFAULT_TASK_CONCURRENCY } from "./scheduler.ts";
 export type { NodeAgentFactory, TaskNodeExecInput, TaskSchedulerOptions } from "./scheduler.ts";
 export { ensureTaskTables, TASK_TABLES_SQL } from "./task-migrations.ts";
+export { MemoryStore, normalizeForFts, buildFtsQuery } from "./memory/store.ts";
+export type {
+  CreateCandidateInput,
+  MemoryCandidateRow,
+  MemorySearchHit,
+  MemorySourceRow,
+} from "./memory/store.ts";
+export { MemoryService, MemoryWriteError, MEMORY_EVENT_TYPES, MEMORY_WRITE_RULE } from "./memory/service.ts";
+export type { MemoryWriteResult, ObserveUserMessageInput } from "./memory/service.ts";
+export { createMemoryWriteTool, MEMORY_WRITE_TOOL_NAME } from "./memory/tool.ts";
+export { detectHighValue } from "./memory/heuristics.ts";
+export type { HighValueMatch, HighValueRule } from "./memory/heuristics.ts";
 export { probeSandbox } from "./health.ts";
 export type { SandboxProbe, SandboxStatus } from "./health.ts";
 export { uuidv7 } from "./uuid-v7.ts";

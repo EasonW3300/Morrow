@@ -50,3 +50,27 @@ export type ConnectivityResult =
   | { result: "auth_failed"; http_status: number; latency_ms: number }
   | { result: "unreachable"; kind: "timeout" | "connect_error"; detail: string; latency_ms: number }
   | { result: "error"; http_status: number; latency_ms: number };
+
+// --- 记忆（票 M1-T1 / Issue #13；GLOSSARY Memory* 与 PRD §6.4 对齐）------------
+
+/** 敏感等级（GLOSSARY: Sensitivity Level）；新记忆默认 private */
+export type SensitivityLevel = "public" | "private" | "locked";
+
+/** 记忆条目类型（PRD §6.4 frontmatter `type` 字段的取值集合） */
+export type MemoryEntryKind = "fact" | "preference" | "profile" | "procedural";
+
+/**
+ * memory.write 工具入参（经 PiAdapter tools 通道注册，M1-T1）。
+ * confidence/sensitivity 省略时的默认值由 runtime 侧定义：confidence 0.9（显式写入）、
+ * sensitivity private（GLOSSARY：新记忆默认仅 Owner 会话可读）。
+ */
+export interface MemoryWriteInput {
+  /** 记忆内容（非空陈述） */
+  content: string;
+  /** 条目类型；缺省 fact */
+  kind?: MemoryEntryKind;
+  /** 置信度 [0,1]；缺省 0.9 */
+  confidence?: number;
+  /** 敏感等级；缺省 private */
+  sensitivity?: SensitivityLevel;
+}
