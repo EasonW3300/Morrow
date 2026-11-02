@@ -1,8 +1,10 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { MemoryControlError, MemoryService, type ConsolidationRunSummary } from "./service.ts";
+import { MarkdownParseError, type MemoryProjector } from "./projection.ts";
 
 /**
- * 记忆控制面路由（票 M1-T1 / Issue #13 检索 + M1-T2 / Issue #14 候选/冲突，PRD §6.2）：
+ * 记忆控制面路由（票 M1-T1 / Issue #13 检索 + M1-T2 / Issue #14 候选/冲突 + M1-T3 /
+ * Issue #15 投影/导入/删除，PRD §6.2）：
  *
  *   GET  /v1/memory/facts?q=关键词             FTS5 关键词检索（候选与事实统一索引），
  *                                              命中条目带 sources（来源账本 event_id 数组）
@@ -13,6 +15,14 @@ import { MemoryControlError, MemoryService, type ConsolidationRunSummary } from 
  *   GET  /v1/memory/conflicts?status=          冲突列表（open = 待确认队列，FR-MEM-5）
  *   POST /v1/memory/conflicts/:id/resolve      裁决：keep_new / keep_old / merge
  *                                              （merge 需 content）→ 修订 + 修订事件
+ *   POST /v1/memory/import                     受控导入（FR-MEM-6）：编辑后的 §6.4
+ *                                              Markdown 全文 → 版本化修订；冲突进队列；
+ *                                              frontmatter version 落后 → 409 stale_version
+ *   DELETE /v1/memory/facts/:id[?confirm=true] 删除标记（FR-MEM-8 单机前置）：tombstone
+ *                                              事件 + 软删 + 投影文件移除；locked 默认
+ *                                              拒绝（409），?confirm=true 显式确认
+ *   POST /v1/memory/project                    投影再生成命令（幂等：同状态同字节，
+ *                                              只写差异文件 + 清理孤儿投影）
  *
  * 独立成文件以收拢记忆路由与 runtime.ts 的并行票改动面；错误信封形状与 runtime.ts
  * 全局约定一致（`{ error: { code, message } }`）。
@@ -28,6 +38,8 @@ export interface MemoryRoute {
 
 export interface MemoryRouteContext {
   memory: MemoryService;
+  /** 投影器（票 M1-T3）：/v1/memory/project 命令的执行体 */
+  projector: MemoryProjector;
 }
 
 const CANDIDATE_STATUSES = ["pending", "consolidated", "dismissed", "conflicted"] as const;
@@ -58,6 +70,21 @@ export const memoryRoutes: MemoryRoute[] = [
     method: "POST",
     re: /^\/v1\/memory\/conflicts\/([^/]+)\/resolve$/,
     handler: handleResolveConflict,
+  },
+  {
+    method: "POST",
+    re: /^\/v1\/memory\/import$/,
+    handler: handleMemoryImport,
+  },
+  {
+    method: "DELETE",
+    re: /^\/v1\/memory\/facts\/([^/]+)$/,
+    handler: handleDeleteFact,
+  },
+  {
+    method: "POST",
+    re: /^\/v1\/memory\/project$/,
+    handler: handleMemoryProject,
   },
 ];
 
@@ -168,7 +195,54 @@ function consolidationOutcome(run: ConsolidationRunSummary): Record<string, unkn
   return { kind: "no_action" };
 }
 
-/** MemoryControlError → HTTP：invalid_input 400、not_found 404、invalid_state 409；其余上抛 500 */
+// --- T3 投影 / 受控导入 / 删除标记 handlers（票 M1-T3 / Issue #15）----------------
+
+interface ImportBody {
+  markdown?: unknown;
+}
+
+/** 受控导入：body = { markdown: §6.4 投影文件全文 }（解析失败的 400 在此转译） */
+async function handleMemoryImport(req: IncomingMessage, res: ServerResponse, _url: URL, ctx: MemoryRouteContext): Promise<void> {
+  const body = await readJsonBody(req, res);
+  if (body === null) return;
+  const { markdown } = body as ImportBody;
+  if (typeof markdown !== "string" || markdown.trim().length === 0) {
+    sendError(res, 400, "invalid_body", "markdown must be a non-empty string (the full text of a §6.4 projection file)");
+    return;
+  }
+  try {
+    // 200 = 请求本身成立；updated / conflict（进待确认队列）/ unchanged 三态见响应体
+    sendJson(res, 200, ctx.memory.importMarkdown(markdown));
+  } catch (err) {
+    if (err instanceof MarkdownParseError) {
+      sendError(res, 400, "memory_invalid_input", err.message);
+      return;
+    }
+    handleMemoryControlError(res, err);
+  }
+}
+
+/** 删除标记：locked 默认拒绝（409），?confirm=true 显式确认放行 */
+function handleDeleteFact(_req: IncomingMessage, res: ServerResponse, url: URL, ctx: MemoryRouteContext, params: string[]): void {
+  const confirmRaw = url.searchParams.get("confirm");
+  try {
+    const result = ctx.memory.deleteFact(params[0], confirmRaw === null ? {} : { confirm: confirmRaw === "true" });
+    sendJson(res, 200, result);
+  } catch (err) {
+    handleMemoryControlError(res, err);
+  }
+}
+
+/** 投影再生成命令（幂等）：只写差异文件 + 清理孤儿投影（外来文件不动） */
+function handleMemoryProject(_req: IncomingMessage, res: ServerResponse, _url: URL, ctx: MemoryRouteContext): void {
+  const result = ctx.projector.projectAll();
+  sendJson(res, 200, { directory: ctx.projector.dir, ...result });
+}
+
+/**
+ * MemoryControlError → HTTP：invalid_input 400、not_found 404；invalid_state /
+ * stale_version（导入防覆盖）/ locked_confirm（locked 删除未确认）409；其余上抛 500。
+ */
 function handleMemoryControlError(res: ServerResponse, err: unknown): void {
   if (err instanceof MemoryControlError) {
     const status = err.code === "not_found" ? 404 : err.code === "invalid_input" ? 400 : 409;
