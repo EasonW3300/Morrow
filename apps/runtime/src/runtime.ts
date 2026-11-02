@@ -7,8 +7,12 @@ import { DeviceRegistry, type DeviceRecord } from "./devices.ts";
 import { detectSecretStore, type SecretStore } from "./keyring.ts";
 import { probeSandbox } from "./health.ts";
 import { EventLedger } from "./ledger.ts";
+import { MemoryService } from "./memory/service.ts";
+import { MemoryStore } from "./memory/store.ts";
+import { createMemoryWriteTool } from "./memory/tool.ts";
+import { memoryFactsRoute } from "./memory/routes.ts";
 import { ProviderRegistry, ProviderRegistryError, ENV_PROVIDER_ID, type ProviderResolver, type ResolvedProvider } from "./providers.ts";
-import { SessionManager, type SessionFrame } from "./sessions.ts";
+import { SessionManager, type AgentRuntimeExtras, type SessionFrame } from "./sessions.ts";
 import { buildEventEnvelope } from "./envelope.ts";
 import { computeIntegrityHash, type EventEnvelope } from "@morrow/protocol";
 import { UUID_RE } from "./uuid-v7.ts";
@@ -38,6 +42,7 @@ interface RequestContext {
   sessions: SessionManager;
   providers: ProviderRegistry;
   devices: DeviceRegistry;
+  memory: MemoryService;
 }
 
 type Handler = (
@@ -76,6 +81,8 @@ export interface RuntimeHandle {
   devices: DeviceRegistry;
   /** 会话管理器（库形态可直用：abort / 订阅等测试与宿主 seam） */
   sessions: SessionManager;
+  /** 记忆服务（票 M1-T1 / Issue #13：候选写入 + FTS 检索，库形态可直用） */
+  memory: MemoryService;
   /** Provider 注册表（库形态可直用：CRUD / 默认 / env 回退解析） */
   providers: ProviderRegistry;
   /**
@@ -101,6 +108,7 @@ const routes: Route[] = [
   { method: "GET", re: /^\/v1\/sessions\/([^/]+)\/messages$/, handler: handleHistory },
   { method: "POST", re: /^\/v1\/sessions\/([^/]+)\/messages$/, handler: handleSendMessage },
   { method: "GET", re: /^\/v1\/sessions\/([^/]+)\/stream$/, handler: handleStream },
+  memoryFactsRoute,
 ];
 
 export async function startRuntime(config: RuntimeConfig, options: RuntimeOptions = {}): Promise<RuntimeHandle> {
@@ -109,6 +117,9 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
   // 不做配对/撤销（M3 范围）
   const devices = DeviceRegistry.open(config.dataDir);
   devices.touch(config.replicaId);
+  // 记忆存储（票 M1-T1 / Issue #13）：与账本同库；候选即时写入 + FTS5 检索
+  const memoryStore = MemoryStore.open(config.dataDir);
+  const memory = new MemoryService({ store: memoryStore, ledger, replicaId: config.replicaId });
   const providers = new ProviderRegistry({
     dataDir: config.dataDir,
     secretStore: options.secretStore ?? detectSecretStore().store,
@@ -121,8 +132,11 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     providers,
     // 注入工厂（测试/宿主自带 Agent Loop）时不做 Provider 预检（T4 语义）；默认工厂要求有 Provider
     providerRequired: options.agentAdapterFactory === undefined,
+    // 记忆（M1-T1）：高价值规则即时写候选；memory.write 工具按会话注入 Agent Loop
+    memory,
+    agentTools: (sessionId) => [createMemoryWriteTool({ service: memory, sessionId })],
   });
-  const ctx: RequestContext = { ledger, replicaId: config.replicaId, sessions, providers, devices };
+  const ctx: RequestContext = { ledger, replicaId: config.replicaId, sessions, providers, devices, memory };
   const server = createServer((req, res) => {
     routeRequest(req, res, ctx);
   });
@@ -131,6 +145,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
   try {
     port = await listen(server, config.host, config.port);
   } catch (err) {
+    memoryStore.close();
     devices.close();
     ledger.close();
     throw err;
@@ -152,6 +167,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     sessions,
     providers,
     devices,
+    memory,
     async close(signal?: string): Promise<void> {
       if (closing) return;
       closing = true;
@@ -173,14 +189,20 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
         console.error("[morrow] failed to append runtime.stopped:", err);
       }
       devices.close();
+      memoryStore.close();
       ledger.close();
     },
   };
 }
 
-/** 生产默认工厂：按会话解析的 Provider → createPiAdapter（OpenAI 兼容协议，ADR-0002） */
-function defaultAgentFactory(): (sessionId: string, provider: ResolvedProvider | null) => Promise<AgentRuntime> {
-  return async (_sessionId, provider) => {
+/** 生产默认工厂：按会话解析的 Provider → createPiAdapter（OpenAI 兼容协议，ADR-0002）。
+ *  extras.tools（M1-T1：memory.write）经 tools 通道注册进 Agent Loop。 */
+function defaultAgentFactory(): (
+  sessionId: string,
+  provider: ResolvedProvider | null,
+  extras?: AgentRuntimeExtras,
+) => Promise<AgentRuntime> {
+  return async (_sessionId, provider, extras) => {
     if (provider === null) {
       throw new Error("no model provider configured");
     }
@@ -191,6 +213,7 @@ function defaultAgentFactory(): (sessionId: string, provider: ResolvedProvider |
       apiKey: provider.apiKey.length > 0 ? provider.apiKey : "unused",
       model: { id: provider.modelId, contextWindow: provider.contextWindow, maxTokens: provider.maxTokens },
       ...(provider.compat !== undefined ? { compat: provider.compat } : {}),
+      tools: extras?.tools ?? [],
     });
   };
 }

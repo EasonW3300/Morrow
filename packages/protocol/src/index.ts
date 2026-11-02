@@ -10,8 +10,11 @@ export type {
 } from "./event-envelope.ts";
 export type {
   ConnectivityResult,
+  MemoryEntryKind,
+  MemoryWriteInput,
   ProviderCompatConfig,
   ProviderRecord,
+  SensitivityLevel,
 } from "./api-contracts.ts";
 export {
   canonicalJson,

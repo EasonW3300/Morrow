@@ -4,6 +4,8 @@ Runtime 骨架 + 事件账本 v1（票 T2 / Issue #3）+ 对话贯通（票 T4 /
 凭据库与切换（票 T5 / Issue #6）。核心 Node 应用：任务编排、Agent Loop、记忆管线、能力工厂、
 控制 API 的宿主；打包为单二进制，桌面 sidecar 与 Ubuntu 服务器同一代码（ADR-0003）。
 T5 交付 Provider CRUD + OS 凭据库 + 连通性测试端点 + 会话级 Provider 切换与失败隔离。
+M1-T1（Issue #13）交付记忆垂直切片：memory.write 工具 + 高价值规则即时写入候选 +
+`GET /v1/memory/facts` FTS5 检索（表结构一次到位，fact 巩固写路径留 T2）。
 
 ## 运行与测试
 
@@ -14,6 +16,10 @@ pnpm --filter @morrow/runtime test    # tsc --noEmit + node:test（测试框架�
 
 Node 22.13 以下需要 `--experimental-sqlite` 标志（22.13+ 起默认开启，标志保留无害）；
 TS 语法限定在可擦除子集（无 enum / namespace / 参数属性），与 type stripping 兼容。
+**FTS5 依赖（M1-T1）**：记忆检索用 SQLite FTS5，Node 内建 SQLite 在 **22.16+ / 24** 才编入
+FTS5 模块——更老的小版本（如 22.12）起服务/跑测试会在建表时报 `no such module: fts5`
+（MemoryStore.open 会转译为带版本的提示）。CI（`node-version: 22` 解析到最新 22.x）与
+本地开发请用满足该条件的 Node。
 
 ## 配置（环境变量）
 
@@ -61,6 +67,7 @@ provider 参数）；凭据库可经 `startRuntime(config, { secretStore })` 注
 | POST | `/v1/providers/:id/default` | 把默认 Provider 切到该 id → 200 `{ default_provider_id }` |
 | POST | `/v1/providers/:id/test` | 连通性测试 → `{ result: "ok" \| "auth_failed" \| "unreachable" \| "error", ... }`（`unreachable` 带 `kind: "timeout" \| "connect_error"` 结构化类别，见下文） |
 | GET | `/v1/devices` | 本副本已知设备记录（只读；M0 最小实现，见下文「Device 记录」）→ `{ devices: [{ replica_id, label, created_at, last_seen_at }] }` |
+| GET | `/v1/memory/facts` | 记忆检索（M1-T1）：`q`（必填非空关键词，FTS5 短语查询，中英文均可）→ `{ q, facts: [{ id, stage, type, content, sensitivity, confidence?, version, sources, created_at }] }`；`sources` 为来源账本事件 id 数组（回链），缺 q/空 q → 400 `invalid_query` |
 
 错误统一 `{ error: { code, message } }`；未匹配路径 404，路径命中但方法不符 405，
 body 非法 400 `invalid_body`，body 的 content-type 非 application/json 一律 415
@@ -167,6 +174,7 @@ M0 不设队列上限（单用户本地场景）。
 | `tool.finished` | `agent:runtime` | 对应 tool.started | `{ tool_call_id, tool_name, text, is_error, duration_ms? }` |
 | `agent.error` | `agent:runtime` | message.user | `{ message }` |
 | `message.assistant` | `agent:runtime` | message.user | `{ message_id, text, stop_reason }` |
+| `memory.candidate_created` | `agent:runtime` | 来源 message.user | `{ candidate_id, content, kind, sensitivity, confidence, source_id, source_event_id, rule }`（M1-T1；rule = 命中的启发式规则或 `memory.write`） |
 
 信封 `session_id` 关联会话；全部过 protocol JSON Schema + integrity_hash 复算后入账本
 （append-only 三层防线见下）。`text_delta` 不入账本（易失，见 SSE 一节）。
@@ -183,6 +191,48 @@ M0 不设队列上限（单用户本地场景）。
 - 窄事件 → 账本：`tool_start` → `tool.started`；`tool_end` → `tool.finished`；`error` →
   `agent.error`；`agent_end` → `message.assistant`（stop_reason 透传）；`text_delta` → SSE。
 - 未配置 Provider 时发消息在 HTTP 层即 503，不记账（用户输入不会被静默吞掉）。
+- 会话可用工具经工厂 extras 注入（M1-T1：`agentTools(sessionId)` → `AgentRuntimeExtras.tools`，
+  生产默认工厂透传给 `createPiAdapter` 的 tools 通道；注入测试工厂可忽略该参数）。
+
+## 记忆管线（M1-T1，Issue #13）
+
+**表结构**（与事件账本同库 `events.sqlite`，表可变、不影响 events 的 append-only；
+迁移全 `CREATE TABLE IF NOT EXISTS`，可重复执行；表结构一次到位）：
+
+| 表 | 用途 | 本票 |
+| --- | --- | --- |
+| `memory_sources` | 记忆来源（回链账本 event_id；GLOSSARY: MemorySource「事实必须可回链到来源」） | ✅ 写入 |
+| `memory_candidates` | 候选记忆（来源/观察时间/发生时间/置信度/敏感等级/版本/status，GLOSSARY: MemoryCandidate） | ✅ 写入 |
+| `memory_facts` | 长期记忆（版本与有效期，GLOSSARY: MemoryFact） | 只建表（巩固写路径留 T2） |
+| `memory_fact_sources` | 事实↔来源多对多（巩固聚合多条来源） | 只建表 |
+| `memory_revisions` | 事实版本历史（FR-MEM-5） | 只建表 |
+| `memory_fts` | FTS5 索引（content + entry_id/entry_kind UNINDEXED），候选与事实统一索引 | ✅ 写入 |
+
+**两条写入路径，一个出口**（`MemoryService.#persist`：先落行（来源+候选+FTS 同一事务），后记账本事件）：
+
+1. **观察路径**：`message.user` 落账后 SessionManager 同步调用 `MemoryObserver.observeUserMessage`
+   → `heuristics.ts` 确定性高价值规则（不依赖模型）命中即写候选。规则按优先级取首个命中：
+   `explicit-remember`（置信度 0.9，内容 = 关键词之后部分）> `preference-statement`（0.8，整句）
+   > `fact-statement`（0.7，整句）；闲聊/提问不命中，零副作用。观察失败只记日志，不阻断会话主流程。
+2. **工具路径**：`memory.write` 工具经 PiAdapter tools 通道注册（入参 schema = protocol
+   `MemoryWriteInput`），模型显式调用；来源 = 会话最新一条 `message.user`；非法入参以
+   `isError` 文本返回给模型而非抛异常。缺省 `kind=fact`、`confidence=0.9`、`sensitivity=private`。
+
+**事件族**（event_type 清单只增不减）：`memory.candidate_created`（上表）；
+`memory.fact_created` 本票只登记类型名，T2 巩固产出事实时启用。事件过统一信封
+（protocol JSON Schema + integrity_hash 复算），`causation_id` 指向来源 `message.user` 事件——
+「记忆可回链」在账本侧由 causation 承载，在检索侧由 `sources` 数组承载。顺序约定：
+行先于事件（行是可重建投影，事件缺失即本次写入未生效，不静默吞掉）。
+
+**检索**：`GET /v1/memory/facts?q=` → FTS5 短语查询（用户输入经 CJK 逐字插空格归一化 +
+引号转义：unicode61 下连续中文成词，短语查询即子串匹配，零 native 分词依赖），按 rank 排序
+上限 50，候选/事实统一索引，命中带 `sources` 回链。**默认敏感级**：新记忆一律
+`sensitivity=private`（GLOSSARY: Sensitivity Level，仅 Owner 会话可读），工具入参可显式覆盖。
+
+**边界（如实）**：本票只写候选——后台抽取（FR-MEM-3）、巩固（FR-MEM-4）、冲突处理（FR-MEM-5）、
+Markdown 投影（FR-MEM-6）是 T2+ 的票；启发式按句匹配、不懂语义（反讽/引用有误报漏报），
+由 T2 巩固的置信度整合与冲突审核兜底；`memory.*` 事件经账本入 SSE 重放（session_id 关联），
+不入会话易失帧；FTS5 为硬依赖（Node 22.16+/24，见文首）。
 
 ## 真实 Provider 冒烟（手动，不进测试套件）
 
@@ -252,6 +302,12 @@ src/
   envelope.ts    事件信封工厂（T2 生命周期事件与 T4 会话事件共用）
   db.ts          SQLite 薄 facade（node:sqlite 绑定收敛点）
   devices.ts     DeviceRegistry：devices 表（replica_id 主键）+ 启动种子（M0 最小实现，票 #3）
+  memory/        记忆垂直切片（M1-T1 / Issue #13）：
+                   heuristics.ts 高价值规则（确定性纯函数，explicit-remember/preference/fact）
+                   store.ts      MemoryStore：记忆五表 + FTS5 迁移与检索（同库 events.sqlite）
+                   service.ts    MemoryService：两条写入路径统一出口 + memory.* 事件记账
+                   tool.ts       memory.write 工具（PiAdapter tools 通道注册）
+                   routes.ts     GET /v1/memory/facts（FTS5 检索 + 来源回链）
   config.ts      环境变量解析（含 Provider 三元组 env 回退种子）+ 副本身份持久化
   health.ts      沙箱可用性探针（M0 桩）
   uuid-v7.ts     UUID v7 生成 + 小写 uuid 形态正则 UUID_RE（config / runtime 共用）
@@ -259,5 +315,6 @@ src/
 scripts/
   smoke-real-provider.ts  真实 Provider 冒烟（手动执行，读环境变量，不进测试套件）
 test/         node:test：ledger / server / config / lifecycle / sessions / keyring / providers /
-              providers.api / connectivity / provider-switch / cors / devices 等 seam
+              providers.api / connectivity / provider-switch / cors / devices / memory.*
+              （heuristics / store / service / api 四 seam）
 ```
