@@ -258,3 +258,46 @@ test("pause returns 504 when an in-flight node never settles; task stays running
   }
   }
 );
+
+// --- M1 code-review（票 #17 字段填实）：session_ids / tool_versions 取真实来源 -------
+
+test("[AC12-adjacent] checkpoint fills session_ids from the task's source session and tool_versions from real versions", async () => {
+  const h = await openRuntime({
+    plan: SERIAL_PLAN,
+    nodeScripts: {
+      a: [{ kind: "tool", toolName: "slow" }, { kind: "text", deltas: ["a-ok"] }],
+      b: [{ kind: "text", deltas: ["b-ok"] }],
+    },
+    tools: [slowTool(700)],
+  });
+  try {
+    // 创建来源会话 → 任务挂到该会话（tasks.session_id）
+    const session = await json<{ session_id: string }>(
+      await post(h, "/v1/sessions", {}),
+    );
+    const created = await json<TaskDetail>(
+      await post(h, "/v1/tasks", { goal: "来源会话演示", session_id: session.session_id }),
+    );
+    await waitFor("node a running", async () => (await getTask(h, created.task_id)).nodes.find((n) => n.key === "a")?.status === "running");
+    const pauseRes = await post(h, `/v1/tasks/${created.task_id}/pause`);
+    assert.equal(pauseRes.status, 200);
+    const { checkpoint } = await json<{ checkpoint: CheckpointRecord }>(pauseRes);
+
+    // session_ids：创建来源会话入表（节点执行在 M1 为一次性 AgentRuntime，无可记来源）
+    assert.deepEqual(checkpoint.snapshot.session_ids, [session.session_id]);
+
+    // execution 字段来自真实来源：runtime 版本非空、工具版本表带 pi-adapter 版本
+    const execution = checkpoint.snapshot.execution;
+    assert.ok(
+      typeof execution.runtime_version === "string" && execution.runtime_version.length > 0,
+      "runtime_version 非空（包 VERSION 来源）",
+    );
+    assert.ok(
+      typeof execution.tool_versions["pi-adapter"] === "string" &&
+        execution.tool_versions["pi-adapter"].length > 0,
+      "tool_versions[pi-adapter] 非空（pi-adapter 包版本来源）",
+    );
+  } finally {
+    await h.close();
+  }
+});

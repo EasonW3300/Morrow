@@ -1,6 +1,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { createPiAdapter, type AgentRuntime } from "@morrow/pi-adapter";
 import packageJson from "../package.json" with { type: "json" };
+import piAdapterPackageJson from "../../../packages/pi-adapter/package.json" with { type: "json" };
 import type { RuntimeConfig } from "./config.ts";
 import { testProviderConnectivity } from "./connectivity.ts";
 import { DeviceRegistry, type DeviceRecord } from "./devices.ts";
@@ -46,6 +47,9 @@ import { UUID_RE } from "./uuid-v7.ts";
 
 /** 版本号唯一来源：本包 package.json（main.ts 的 ready 行也从这里取——不再双真相源） */
 export const VERSION: string = packageJson.version;
+
+/** pi-adapter 包版本（checkpoint 快照 execution.tool_versions 的可证来源；M1 code-review 填实） */
+export const PI_ADAPTER_VERSION: string = piAdapterPackageJson.version;
 
 interface RequestContext {
   ledger: EventLedger;
@@ -232,13 +236,15 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     providerRequired: !taskPlannerInjected,
   });
   // Checkpoint 域（M1-T5 / Issue #17）：FR-TASK-5 快照 + 恢复落地；执行配置采集注入
-  // runtime 版本与默认 Provider 投影（绝不含密钥）。
+  // runtime 版本、默认 Provider 投影（绝不含密钥）与工具版本表（M1 code-review 填实：
+  // pi-adapter 版本可证；逐工具版本无来源——任务执行无工具通道，留空待后续票交付）。
   const checkpoints = new CheckpointService({
     tasks,
     dataDir: config.dataDir,
     ledger,
     replicaId: config.replicaId,
     executionInfo: async () => {
+      const toolVersions = { "pi-adapter": PI_ADAPTER_VERSION };
       try {
         const provider = await providers.resolve();
         return {
@@ -247,9 +253,10 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
             provider === null
               ? null
               : { provider_id: provider.providerId, model_id: provider.modelId, base_url: provider.baseUrl },
+          tool_versions: toolVersions,
         };
       } catch {
-        return { runtime_version: VERSION, provider: null };
+        return { runtime_version: VERSION, provider: null, tool_versions: toolVersions };
       }
     },
   });
