@@ -89,7 +89,7 @@
 | 默认只绑回环地址 | Runtime 默认 `127.0.0.1`、端口随机（0）；M0 部署形态（桌面 sidecar）中 UI 与 Runtime 同机，无网络暴露面 | `apps/runtime/src/config.ts`（host 默认 127.0.0.1） |
 | 私有网络优先 | 传输安全由隧道层（Tailscale/WireGuard）保证，Runtime 不直接暴露公网；公网 ACME 模式预留不验收 | ADR-0004 |
 | 配对协议定版 | 一次性配对码（5 分钟）+ 双端设备指纹确认 + 公钥入 OS 凭据库 | PRD §5.2 流程 1、FR-DEP-2 |
-| 浏览器网页 CSRF 向量（M0 code-review 补登） | 互联网页面虽拿不到跨源读（CORS 白名单仅本地来源），但**不带自定义头的 simple POST（text/plain）不经 preflight、请求本身会到达**——防线第二道：写端点（POST/PUT 带 body 的控制面 API）强制 `content-type: application/json`，撒谎/缺失一律 415 拒收（application/json 在 CORS safelist 外，合法浏览器跨源请求必被强制 preflight，白名单不放行即空） | `apps/runtime/src/runtime.ts`（routeRequest 注释 + readJsonBody）；`apps/runtime/test/cors.test.ts`（text/plain simple POST → 415 且无副作用） |
+| 浏览器网页 CSRF 向量（M0 code-review 补登；M1 复审补 memory 路由面） | 互联网页面虽拿不到跨源读（CORS 白名单仅本地来源），但**不带自定义头的 simple POST（text/plain）不经 preflight、请求本身会到达**——防线第二道：写端点（POST/PUT/DELETE 带 body 的控制面 API）强制 `content-type: application/json`，撒谎/缺失一律 415 拒收（application/json 在 CORS safelist 外，合法浏览器跨源请求必被强制 preflight，白名单不放行即空）。防线第二防线面覆盖 memory 族写端点（candidates decide / conflicts resolve / import / project）：M1 期间 memory/routes.ts 与 runtime.ts 各持一份同语义 `readJsonBody` 副本，M1 code-review 收敛为共享单源（`http-util.ts`）——两族写端点面对同一实现，新增写端点接入即继承防线，副本漂移风险消除 | `apps/runtime/src/http-util.ts`（readJsonBody/CSRF 注释单源）；`apps/runtime/src/runtime.ts`（任务族写端点共用）；`apps/runtime/src/memory/routes.ts`（memory 写端点共用）；`apps/runtime/test/cors.test.ts`（text/plain simple POST → 415 且无副作用） |
 
 **残余风险**：
 
@@ -112,7 +112,7 @@
 | R2 | 密钥 argv 暴露窗口 | 接受并记录（各 OS CLI 固有限制，keyring.ts 头注） | M3 复审 |
 | R3 | 账本 hash 无签名 | 接受至 M3（设备密钥就绪后升级为签名） | M3 |
 | R4 | 本地控制面无鉴权 | 接受至 M3（多设备形态前必须加设备鉴权头）；M0 已加最小 CSRF 防护（写端点强制 application/json） | M3 |
-| R7 | 浏览器网页 CSRF 向量（simple POST 可达本地控制面） | 最小防护已落地（415 拒收非 JSON 写请求），GET 类只读与无 body POST 的副作用面接受至 M3 鉴权 | M3 |
+| R7 | 浏览器网页 CSRF 向量（simple POST 可达本地控制面） | 最小防护已落地（415 拒收非 JSON 写请求；M1 code-review 把防线收敛为共享单源，第二防线面覆盖任务族与 memory 族全部写端点），GET 类只读与无 body POST 的副作用面接受至 M3 鉴权 | M3 |
 | R5 | 沙箱未建即引入生成代码 | 禁令已定（无沙箱禁用），M2 交付完整对策 | M2 |
 | R6 | 提示注入绕过信任层 | 契约已定（权限层兜底，非提示层），M4 落地 | M4/M1 |
 
