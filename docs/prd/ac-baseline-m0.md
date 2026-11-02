@@ -74,3 +74,21 @@ CI 侧：node 22（runner 托管）、bun 1.4.4（oven-sh setup-bun pin）、Rus
 | 其余（AC-03/05/07/08/09/10/12/13/14/15） | 按 PRD §8 | 属性待定 | 各自里程碑交付时建立测试数据集与方法（登记到 §5） |
 
 > 校准动作本身（跑多少轮、怎么统计三类成功率分母）在 M1 第一个校准票里定稿；本文件只锁定环境与前置条件。
+
+## 7. M1 校准注记（2026-11-02，M1-T7 / Issue #19 合并态实测）
+
+基线补记（PRD §8「M1 校准」的 M1 部分，环境仍以 §1/§2 为准）：
+
+**工具链补充（§2 的 M1 边界）**：
+
+| 项 | 值 | 备注 |
+|---|---|---|
+| node（homebrew，M1 记忆/测试套件实际使用） | v24.22.1 | `/opt/homebrew/bin/node`，FTS5 可用 |
+| node（`~/.local/node`，M0 登记值） | v22.12.0 | **无 FTS5**：跑记忆套件建表报 `no such module: fts5` |
+
+- **FTS5 的 Node 版本要求（新约束）**：Node 内建 SQLite 在 **22.16+ / 24** 才编入 FTS5 模块。M1 起凡涉及记忆检索的运行/测试/打包（含桌面壳 `MORROW_SIDECAR_COMMAND` 注入与 CI runner node 版本）须满足 ≥22.16，否则 AC-03 路径不可用。
+- **测试规模（M1 合并态 c690a77 实测）**：runtime 283（M0 时点 61 → M1 合并态 283）；全 workspace node:test 合计 **449**（runtime 283 + protocol 40 + pi-adapter 31 + desktop 39 + packaging 56）+ desktop sidecar Rust 9，全部绿（exit 0）。
+- **故障注入结果（AC-07 前置数据集，登记入 §5 测试数据）**：`apps/runtime/test/checkpoint.faults.test.ts`，两层注入（进程级 kill -9 + 进程内半写/损坏），**25 点 = 20 恢复 + 5 守卫，合并态复跑 25/25 通过**（耗时 8.4s）。AC-07「≥19 恢复」的分母由此固定为 20 个恢复点。
+- **AC-03 测试数据集（登记入 §5）**：`apps/runtime/scripts/memory-ac03.ts`（`pnpm --filter @morrow/runtime memory:ac03`），100 条设计记录 写入→抽取→巩固→投影→检索→回链→hash 全断言，确定性可重复，合并态复跑 100/100 通过（0.66s）。
+- **AC-12 现状**：介入操作端到端覆盖盘点见 `docs/gates/m1-gate-report.md` §3——暂停/接管/恢复达标；修改正向 4 次、切模型独立场景 3 个、交还正向 4 次，尚不足 5（缺口如实登记，M6 全量验收前补齐）。AC-12 正式验收形态（含桌面 UI 人工走查）在 M6。
+- **仍未校准**：AC-03/05/07/12 的正式阈值校准（成功率分类统计等）待多轮实测数据，本节只登记 M1 实测现状与新增环境约束；真实 LLM 抽取冒烟仍待 Owner 密钥（§4）。

@@ -2,7 +2,7 @@
 
 单主人、长期记忆、可自主生成能力的个人 Agent。
 
-**当前状态**：M0 收官（冒烟门全绿，见 [M0 门禁报告](docs/gates/m0-gate-report.md)）。
+**当前状态**：M1 收官（两项主线门槛达成，见 [M1 门禁报告](docs/gates/m1-gate-report.md)；M0 冒烟门全绿，见 [M0 门禁报告](docs/gates/m0-gate-report.md)）。
 
 ## 文档导航
 
@@ -10,8 +10,9 @@
 - [GLOSSARY](GLOSSARY.md) —— 领域统一语言
 - [ADR 目录](docs/adr/) —— 工程决策记录（含 0007 桌面壳裁决）
 - [M0 门禁报告](docs/gates/m0-gate-report.md) —— CI 三平台 + 真机门禁证据、PRD §9 门槛核对
+- [M1 门禁报告](docs/gates/m1-gate-report.md) —— 记忆回链 / 故障注入 / 人工介入覆盖盘点、PRD §9 M1 门槛核对
 - [威胁模型](docs/security/threat-model.md) —— 四域威胁、对策与残余风险（PRD §7）
-- [M0 验收基线](docs/prd/ac-baseline-m0.md) —— 参考硬件/网络/模型/测试数据（PRD §8 校准基准）
+- [M0 验收基线](docs/prd/ac-baseline-m0.md) —— 参考硬件/网络/模型/测试数据（PRD §8 校准基准；§7 为 M1 校准注记）
 - [决策稿 V0.6](docs/history/decision-baseline-v0.6.md) —— 归档的 PRD 输入基线
 
 ## 仓库结构
