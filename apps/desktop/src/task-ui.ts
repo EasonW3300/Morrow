@@ -8,7 +8,7 @@
  *   - 事件分页窗口（最新页优先 + 向更早翻页）；
  *   - 修订表单校验（与服务端 validateRevision 同口径的前端防线）。
  */
-import type { TaskNodeRecord, TaskNodeStatus, TaskStatus } from "@morrow/protocol";
+import type { TaskNodeRecord, TaskNodeStatus, TaskStatus } from "@morrow/protocol/browser";
 // 任务账本事件信封：单一真相源在 api.ts（GET /v1/tasks/:id/events 的 events 元素；
 // M1 code-review 收敛——原先本文件自持一份同形 TaskEnvelope 拷贝）
 import type { TaskEventEnvelope } from "./api.ts";

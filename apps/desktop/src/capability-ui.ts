@@ -21,8 +21,8 @@ import type {
   CapabilityStatus,
   PermissionGrant,
   ShellCommandCategory,
-} from "@morrow/protocol";
-import { CAPABILITY_CHANNELS, SHELL_COMMAND_CATEGORIES } from "@morrow/protocol";
+} from "@morrow/protocol/browser";
+import { CAPABILITY_CHANNELS, SHELL_COMMAND_CATEGORIES } from "@morrow/protocol/browser";
 
 /** 能力域类型的 UI 侧唯一出口（唯一真相源在 @morrow/protocol；同 api.ts 的 re-export 模式） */
 export type {
@@ -31,7 +31,7 @@ export type {
   CapabilityRecord,
   CapabilityVersionRecord,
   PermissionGrant,
-} from "@morrow/protocol";
+} from "@morrow/protocol/browser";
 
 // --- 1. 五维权限展示映射 ------------------------------------------------------
 

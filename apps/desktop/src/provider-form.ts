@@ -1,4 +1,4 @@
-import type { ProviderRecord } from "@morrow/protocol";
+import type { ProviderRecord } from "@morrow/protocol/browser";
 
 /**
  * Provider 表单：状态类型 + 校验 + payload 映射（票 T7 / Issue #8）。

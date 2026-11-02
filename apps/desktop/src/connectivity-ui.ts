@@ -10,8 +10,8 @@
  * 摘要，其措辞不是合约；M0 code-review / Issue #11）。
  */
 
-export type { ConnectivityResult } from "@morrow/protocol";
-import type { ConnectivityResult } from "@morrow/protocol";
+export type { ConnectivityResult } from "@morrow/protocol/browser";
+import type { ConnectivityResult } from "@morrow/protocol/browser";
 
 /** UI 归类：tone 决定颜色档（绿=可用，橙=环境问题，红=配置必须改），advice 是下一步动作 */
 export interface ConnectivityPresentation {

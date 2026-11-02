@@ -14,7 +14,7 @@ import type {
   TaskDetail,
   TaskNodeRecord,
   TaskSummary,
-} from "@morrow/protocol";
+} from "@morrow/protocol/browser";
 export type { CapabilityRecord, CapabilityVersionRecord, ConnectivityResult, PermissionGrant, ProviderRecord, TaskDetail, TaskNodeRecord, TaskSummary };
 // 能力域 UI 侧类型（SkillSummary/SkillProposal 在 capability-ui 定义；工厂投影在本文件）
 import type { SkillProposal, SkillSummary } from "./capability-ui.ts";

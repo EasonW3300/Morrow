@@ -31,7 +31,7 @@ import {
   type GrantsFormErrors,
   type GrantsFormValues,
 } from "./capability-ui.ts";
-import { CAPABILITY_CHANNELS, SHELL_COMMAND_CATEGORIES } from "@morrow/protocol";
+import { CAPABILITY_CHANNELS, SHELL_COMMAND_CATEGORIES } from "@morrow/protocol/browser";
 
 /**
  * 能力管理页（票 M2-T6 / Issue #27，PRD §5.1 设置→能力管理）：四个子面板——
