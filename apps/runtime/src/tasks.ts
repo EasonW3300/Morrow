@@ -44,6 +44,8 @@ import { uuidv7 } from "./uuid-v7.ts";
  * 人工介入（M1-T6）：revise 是终端态回卷的正道——failed 任务经 reviseTask 回卷为
  * planned（不走 transition 表，terminal 直接迁移依旧全部拒绝）；running 任务 revise
  * 被拒（PRD §5.2 流程 2：先暂停再修改）；completed/cancelled 不可逆拒绝。
+ * supplyContext（FR-TASK-3「补充上下文」）：context 追加节点描述/任务目标，DAG 不变
+ * 不升版本；waiting_input 的自动重驱动在 HTTP 层经 scheduler.kick 完成。
  * takeover：节点 actor=owner，调度器跳过派发；Owner 经 complete 提交结果或 release
  * 交还调度，全部操作留 owner actor 审计事件（AC-12 前置）。
  */
@@ -64,6 +66,7 @@ export const TASK_EVENT_TYPES = {
   taskPlanningFailed: "task.planning_failed",
   // M1-T6 人工介入族（actor 一律 owner——AC-12 审计前置）
   taskRevised: "task.revised",
+  taskContextSupplied: "task.context_supplied",
   taskNodeTakenOver: "task.node_taken_over",
   taskNodeReleased: "task.node_released",
   taskNodeCompletedByOwner: "task.node_completed_by_owner",
@@ -560,6 +563,8 @@ export class TaskStore {
   #updateNodeStmt;
   #updateNodePlanStmt;
   #setNodeActorStmt;
+  #updateTaskGoalStmt;
+  #updateNodeGoalStmt;
   #deleteNodeStmt;
   #deleteEdgesTouchingStmt;
   #deleteEdgesToStmt;
@@ -599,6 +604,13 @@ export class TaskStore {
     );
     this.#setNodeActorStmt = db.prepare(
       "UPDATE task_nodes SET actor = ?, updated_at = ? WHERE node_id = ?",
+    );
+    // 补充上下文（FR-TASK-3）：goal 追加，其余字段不动（DAG 不变，版本不升）
+    this.#updateTaskGoalStmt = db.prepare(
+      "UPDATE tasks SET goal = ?, updated_at = ? WHERE task_id = ?",
+    );
+    this.#updateNodeGoalStmt = db.prepare(
+      "UPDATE task_nodes SET goal = ?, updated_at = ? WHERE node_id = ?",
     );
     this.#deleteNodeStmt = db.prepare("DELETE FROM task_nodes WHERE node_id = ?");
     this.#deleteEdgesTouchingStmt = db.prepare(
@@ -709,6 +721,16 @@ export class TaskStore {
   /** 接管/交还：节点责任方标记（NULL = 调度器，'owner' = Owner） */
   setNodeActor(nodeId: string, actor: string | null, now: string): void {
     this.#setNodeActorStmt.run(actor, now, nodeId);
+  }
+
+  /** 补充上下文（FR-TASK-3）：任务目标追加（node_id 缺省的补充目标） */
+  updateTaskGoal(taskId: string, goal: string, now: string): void {
+    this.#updateTaskGoalStmt.run(goal, now, taskId);
+  }
+
+  /** 补充上下文（FR-TASK-3）：节点描述（goal）追加，其余字段不动 */
+  updateNodeGoal(nodeId: string, goal: string, now: string): void {
+    this.#updateNodeGoalStmt.run(goal, now, nodeId);
   }
 
   /** 移除节点及其全部关联边（修订移除；仅未完成节点走到这里） */
@@ -1092,6 +1114,69 @@ export class TaskService {
         status_rolled_back: rolledBack,
         event_id: revised.eventId,
         sequence: revised.sequence,
+      },
+    };
+  }
+
+  /**
+   * 补充上下文（FR-TASK-3「补充上下文」，M1 code-review 补齐）：
+   * - node_id 给定 → context 追加到该节点的描述（goal；goal 缺省时以 title 为基）；
+   *   节点不存在 → not_found（404），已完成节点 → immutable_node（409）；
+   * - node_id 缺省 → 追加到任务目标（tasks.goal）。
+   * task.context_supplied（actor=owner）留痕；DAG 不变故不升 task_version、不落
+   * checkpoint（恢复基准不受影响——与 revise 的「版本+1+新 checkpoint」刻意区分：
+   * 补充不是计划修改）。waiting_input 的自动重新驱动在 HTTP 编排层经 scheduler.kick
+   * 完成（语义同 complete/release：202 前同步迁移，驱动 fire-and-forget）。
+   * running 节点也接受追加：在跑尝试的 prompt 已在途，追加内容自下次派发/重试生效。
+   */
+  supplyContext(
+    taskId: string,
+    input: { nodeId?: string; context: string },
+  ): { task: TaskDetail; supplied: { target: "node" | "task"; node_id?: string; key?: string; event_id: string; sequence: number } } {
+    const row = this.#store.getTask(taskId);
+    if (row === null) {
+      throw new TaskError("not_found", `task ${taskId} does not exist`);
+    }
+    const status = row.status as TaskStatus;
+    if (status === "failed" || status === "completed" || status === "cancelled") {
+      throw new TaskError(
+        "invalid_transition",
+        `task ${taskId} is terminal (${status}); context cannot be supplied`,
+        { from: status },
+      );
+    }
+    const now = new Date().toISOString();
+    const suffix = `[Owner 补充] ${input.context}`;
+    let target: "node" | "task" = "task";
+    let nodeId: string | undefined;
+    let key: string | undefined;
+    if (input.nodeId !== undefined) {
+      const node = this.#store.getNode(input.nodeId);
+      if (node === null || node.task_id !== taskId) {
+        throw new TaskError("not_found", `node ${input.nodeId} does not exist in task ${taskId}`);
+      }
+      if (node.status === "completed") {
+        throw new TaskError("immutable_node", `node "${node.node_key}" is completed; context cannot be appended`);
+      }
+      target = "node";
+      nodeId = node.node_id;
+      key = node.node_key;
+      this.#store.updateNodeGoal(node.node_id, `${node.goal ?? node.title}\n\n${suffix}`, now);
+    } else {
+      this.#store.updateTaskGoal(taskId, `${row.goal}\n\n${suffix}`, now);
+    }
+    const event = this.#appendTaskEvent(taskId, TASK_EVENT_TYPES.taskContextSupplied, "owner", {
+      target,
+      ...(nodeId !== undefined ? { node_id: nodeId, key } : {}),
+      context: input.context,
+    }, null);
+    return {
+      task: this.getTask(taskId) as TaskDetail,
+      supplied: {
+        target,
+        ...(nodeId !== undefined ? { node_id: nodeId, key } : {}),
+        event_id: event.eventId,
+        sequence: event.sequence,
       },
     };
   }

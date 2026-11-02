@@ -24,6 +24,14 @@ export interface RuntimeConfig {
    * 默认；null 表示未配置——会话可建，发消息返回 503）。
    */
   provider: ProviderConfig | null;
+  /**
+   * 后台记忆抽取器选择（M1 code-review / Issue #14 补齐，FR-MEM-3）：
+   * "heuristic"（默认，确定性启发式，零网络）| "llm"（经 PiAdapter 一次 prompt 的
+   * LlmMemoryExtractor——需默认 Provider 可解析，工厂不可用/坏输出返回空候选不抛）。
+   * 缺省 = heuristic（loadConfig 由 MORROW_MEMORY_EXTRACTOR 解析，缺省同样 heuristic；
+   * 库形态/测试可经 RuntimeOptions.memoryExtractor 注入任意实现，优先于本配置）。
+   */
+  memoryExtractor?: "heuristic" | "llm";
 }
 
 /** OpenAI Chat Completions 兼容端点配置（GLOSSARY: Provider） */
@@ -52,7 +60,19 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   if (!UUID_RE.test(replicaId)) {
     throw new Error(`invalid MORROW_REPLICA_ID: "${replicaId}" (lowercase uuid expected)`);
   }
-  return { host, port, dataDir, replicaId, provider: parseProviderConfig(env) };
+  return { host, port, dataDir, replicaId, provider: parseProviderConfig(env), memoryExtractor: parseMemoryExtractor(env) };
+}
+
+/**
+ * 记忆抽取器选择（MORROW_MEMORY_EXTRACTOR，默认 heuristic）：显式选择 llm 但 Provider
+ * 未配置时不在此拒绝（启动可用性不因可选后台管线锁死）——抽取时工厂解析失败按坏输出
+ * 处理返回空候选。未知取值抛错（宁可启动失败，不静默回退改变行为口径）。
+ */
+function parseMemoryExtractor(env: Record<string, string | undefined>): "heuristic" | "llm" {
+  const raw = env.MORROW_MEMORY_EXTRACTOR;
+  if (raw === undefined || raw === "") return "heuristic";
+  if (raw === "heuristic" || raw === "llm") return raw;
+  throw new Error(`invalid MORROW_MEMORY_EXTRACTOR: "${raw}" ("heuristic" or "llm" expected)`);
 }
 
 /**

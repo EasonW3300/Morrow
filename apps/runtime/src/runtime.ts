@@ -1,6 +1,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { createPiAdapter, type AgentRuntime } from "@morrow/pi-adapter";
 import packageJson from "../package.json" with { type: "json" };
+import piAdapterPackageJson from "../../../packages/pi-adapter/package.json" with { type: "json" };
 import type { RuntimeConfig } from "./config.ts";
 import { testProviderConnectivity } from "./connectivity.ts";
 import { DeviceRegistry, type DeviceRecord } from "./devices.ts";
@@ -12,7 +13,7 @@ import { MemoryStore } from "./memory/store.ts";
 import { createMemoryWriteTool } from "./memory/tool.ts";
 import { memoryRoutes } from "./memory/routes.ts";
 import { MemoryProjector } from "./memory/projection.ts";
-import type { MemoryExtractor } from "./memory/extraction.ts";
+import { LlmMemoryExtractor, LLM_EXTRACTOR_SYSTEM_PROMPT, type MemoryExtractor } from "./memory/extraction.ts";
 import { ProviderRegistry, ProviderRegistryError, ENV_PROVIDER_ID, type ProviderResolver, type ResolvedProvider } from "./providers.ts";
 import { SessionManager, type AgentRuntimeExtras, type SessionFrame } from "./sessions.ts";
 import { TaskScheduler, type NodeAgentFactory, type TaskNodeExecInput } from "./scheduler.ts";
@@ -21,6 +22,7 @@ import { PLANNER_SYSTEM_PROMPT, TaskError, TaskService, type PlannerFactory } fr
 import { buildEventEnvelope } from "./envelope.ts";
 import { computeIntegrityHash, type EventEnvelope } from "@morrow/protocol";
 import { UUID_RE } from "./uuid-v7.ts";
+import { parsePaging, readJsonBody, sendError, sendJson } from "./http-util.ts";
 
 /**
  * Runtime HTTP 服务（PRD §6.2 的 M0 子集 + M1-T4 任务族）。
@@ -46,6 +48,9 @@ import { UUID_RE } from "./uuid-v7.ts";
 
 /** 版本号唯一来源：本包 package.json（main.ts 的 ready 行也从这里取——不再双真相源） */
 export const VERSION: string = packageJson.version;
+
+/** pi-adapter 包版本（checkpoint 快照 execution.tool_versions 的可证来源；M1 code-review 填实） */
+export const PI_ADAPTER_VERSION: string = piAdapterPackageJson.version;
 
 interface RequestContext {
   ledger: EventLedger;
@@ -163,8 +168,10 @@ const routes: Route[] = [
   { method: "POST", re: /^\/v1\/tasks\/([^/]+)\/restore$/, handler: handleRestoreTask },
   { method: "GET", re: /^\/v1\/tasks\/([^/]+)\/checkpoints$/, handler: handleListCheckpoints },
   // M1-T6 介入端点（FR-TASK-3 修改/接管半边）：revise 修改未完成节点（版本+1+重算下游
-  // +新 checkpoint）；节点级 takeover/complete/release（actor=owner 审计）
+  // +新 checkpoint）；supply 补充上下文（追加节点描述/任务目标，DAG 不变不升版本）；
+  // 节点级 takeover/complete/release（actor=owner 审计）
   { method: "POST", re: /^\/v1\/tasks\/([^/]+)\/revise$/, handler: handleReviseTask },
+  { method: "POST", re: /^\/v1\/tasks\/([^/]+)\/supply$/, handler: handleSupplyTask },
   { method: "POST", re: /^\/v1\/tasks\/([^/]+)\/nodes\/([^/]+)\/takeover$/, handler: handleTakeoverNode },
   { method: "POST", re: /^\/v1\/tasks\/([^/]+)\/nodes\/([^/]+)\/complete$/, handler: handleCompleteNode },
   { method: "POST", re: /^\/v1\/tasks\/([^/]+)\/nodes\/([^/]+)\/release$/, handler: handleReleaseNode },
@@ -177,9 +184,16 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
   // 不做配对/撤销（M3 范围）
   const devices = DeviceRegistry.open(config.dataDir);
   devices.touch(config.replicaId);
+  const providers = new ProviderRegistry({
+    dataDir: config.dataDir,
+    secretStore: options.secretStore ?? detectSecretStore().store,
+    envFallback: config.provider,
+  });
   // 记忆存储（票 M1-T1 / Issue #13）：与账本同库；候选即时写入 + FTS5 检索。
   // 抽取/巩固管线（M1-T2 / Issue #14）：MemoryService 内含可注入 Extractor/Consolidator
   // （默认确定性实现），轮次收尾（message.assistant 落账）由 SessionManager 触发后台抽取。
+  // 抽取器选择（M1 code-review 补齐）：注入 > config.memoryExtractor=llm（经 PiAdapter
+  // 一次 prompt）> 默认启发式（MemoryService 内建）。
   const memoryStore = MemoryStore.open(config.dataDir);
   // 记忆投影器（票 M1-T3 / Issue #15，FR-MEM-6）：facts → dataDir/memory/*.md；
   // 注入 MemoryService（导入修订后单事实刷新 / 删除后投影文件移除），投影命令走路由。
@@ -189,12 +203,16 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     ledger,
     replicaId: config.replicaId,
     projector,
-    ...(options.memoryExtractor !== undefined ? { extractor: options.memoryExtractor } : {}),
-  });
-  const providers = new ProviderRegistry({
-    dataDir: config.dataDir,
-    secretStore: options.secretStore ?? detectSecretStore().store,
-    envFallback: config.provider,
+    ...(options.memoryExtractor !== undefined
+      ? { extractor: options.memoryExtractor }
+      : config.memoryExtractor === "llm"
+        ? {
+            // 默认 Provider + 抽取系统提示词（goal 形参在此工厂路径不消费，传空占位）
+            extractor: new LlmMemoryExtractor(
+              async () => defaultTaskRuntimeFactory(providers, LLM_EXTRACTOR_SYSTEM_PROMPT)("", undefined),
+            ),
+          }
+        : {}),
   });
   const sessions = new SessionManager({
     ledger,
@@ -221,13 +239,15 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     providerRequired: !taskPlannerInjected,
   });
   // Checkpoint 域（M1-T5 / Issue #17）：FR-TASK-5 快照 + 恢复落地；执行配置采集注入
-  // runtime 版本与默认 Provider 投影（绝不含密钥）。
+  // runtime 版本、默认 Provider 投影（绝不含密钥）与工具版本表（M1 code-review 填实：
+  // pi-adapter 版本可证；逐工具版本无来源——任务执行无工具通道，留空待后续票交付）。
   const checkpoints = new CheckpointService({
     tasks,
     dataDir: config.dataDir,
     ledger,
     replicaId: config.replicaId,
     executionInfo: async () => {
+      const toolVersions = { "pi-adapter": PI_ADAPTER_VERSION };
       try {
         const provider = await providers.resolve();
         return {
@@ -236,9 +256,10 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
             provider === null
               ? null
               : { provider_id: provider.providerId, model_id: provider.modelId, base_url: provider.baseUrl },
+          tool_versions: toolVersions,
         };
       } catch {
-        return { runtime_version: VERSION, provider: null };
+        return { runtime_version: VERSION, provider: null, tool_versions: toolVersions };
       }
     },
   });
@@ -449,7 +470,7 @@ function handleListDevices(_req: IncomingMessage, res: ServerResponse, _url: URL
 }
 
 function handleEvents(_req: IncomingMessage, res: ServerResponse, url: URL, ctx: RequestContext): void {
-  const page = parsePageParams(url, res);
+  const page = parsePaging(url, res, { defaultLimit: 50 });
   if (page === null) return;
   let replicaId: string | undefined;
 
@@ -465,36 +486,6 @@ function handleEvents(_req: IncomingMessage, res: ServerResponse, url: URL, ctx:
   sendJson(res, 200, ctx.ledger.list({ replicaId, limit: page.limit, offset: page.offset }));
 }
 
-/** 分页公共参数（limit 1–200 默认 50、offset ≥ 0）；非法时写出 400 并返回 null */
-function parsePageParams(url: URL, res: ServerResponse): { limit: number; offset: number } | null {
-  const params = url.searchParams;
-  let limit = 50;
-  let offset = 0;
-
-  const limitRaw = params.get("limit");
-  if (limitRaw !== null) {
-    if (!/^\d+$/.test(limitRaw) || Number(limitRaw) < 1 || Number(limitRaw) > 200) {
-      sendError(res, 400, "invalid_query", "limit must be an integer between 1 and 200");
-      return null;
-    }
-    limit = Number(limitRaw);
-  }
-  const offsetRaw = params.get("offset");
-  if (offsetRaw !== null) {
-    if (!/^\d+$/.test(offsetRaw)) {
-      sendError(res, 400, "invalid_query", "offset must be a non-negative integer");
-      return null;
-    }
-    offset = Number(offsetRaw);
-  }
-  return { limit, offset };
-}
-
-function sendJson(res: ServerResponse, status: number, body: unknown): void {
-  res.writeHead(status, { "content-type": "application/json; charset=utf-8" });
-  res.end(JSON.stringify(body));
-}
-
 /** 本地控制面的放行来源：桌面壳（tauri://localhost、http://tauri.localhost）与浏览器联调 */
 function isLocalOrigin(origin: string): boolean {
   try {
@@ -504,10 +495,6 @@ function isLocalOrigin(origin: string): boolean {
   } catch {
     return false;
   }
-}
-
-function sendError(res: ServerResponse, status: number, code: string, message: string): void {
-  sendJson(res, status, { error: { code, message } });
 }
 
 function listen(server: Server, host: string, port: number): Promise<number> {
@@ -860,7 +847,7 @@ function handleTaskEvents(_req: IncomingMessage, res: ServerResponse, url: URL, 
     sendError(res, 404, "task_not_found", `task "${taskId}" not found`);
     return;
   }
-  const page = parsePageParams(url, res);
+  const page = parsePaging(url, res, { defaultLimit: 50 });
   if (page === null) return;
   sendJson(res, 200, ctx.ledger.list({ taskId, limit: page.limit, offset: page.offset }));
 }
@@ -1004,8 +991,47 @@ function handleReviseTask(req: IncomingMessage, res: ServerResponse, _url: URL, 
   })();
 }
 
-function handleTakeoverNode(_req: IncomingMessage, res: ServerResponse, _url: URL, ctx: RequestContext, params: string[]): void {
+interface SupplyBody {
+  node_id?: unknown;
+  context?: unknown;
+}
+
+/**
+ * 补充上下文（FR-TASK-3）：context 追加节点描述（node_id 给定）或任务目标（缺省），
+ * task.context_supplied（actor=owner）留痕；任务 waiting_input 时自动 kick 重新驱动
+ * （语义同 complete/release：状态迁移同步完成，驱动 fire-and-forget）。DAG 不变，
+ * 不升 task_version、不落 checkpoint。守卫：任务/节点未知 404、终端态或已完成节点 409、
+ * body 非法 400。
+ */
+function handleSupplyTask(req: IncomingMessage, res: ServerResponse, _url: URL, ctx: RequestContext, params: string[]): void {
   void (async () => {
+    const body = await readJsonBody(req, res);
+    if (body === null) return;
+    const { node_id: nodeId, context } = body as SupplyBody;
+    if (typeof context !== "string" || context.trim().length === 0) {
+      sendError(res, 400, "invalid_body", "context must be a non-empty string");
+      return;
+    }
+    if (nodeId !== undefined && (typeof nodeId !== "string" || nodeId.trim().length === 0)) {
+      sendError(res, 400, "invalid_body", "node_id must be a non-empty string when present");
+      return;
+    }
+    try {
+      const result = ctx.tasks.supplyContext(params[0], {
+        context: context.trim(),
+        ...(typeof nodeId === "string" ? { nodeId } : {}),
+      });
+      await ctx.scheduler.kick(params[0], "context_supplied").catch((err: unknown) => {
+        console.error("[morrow] task kick after context supply crashed:", err);
+      });
+      sendJson(res, 200, { task: ctx.tasks.getTask(params[0]) ?? result.task, supplied: result.supplied });
+    } catch (err) {
+      handleTaskError(res, err);
+    }
+  })();
+}
+
+function handleTakeoverNode(_req: IncomingMessage, res: ServerResponse, _url: URL, ctx: RequestContext, params: string[]): void {  void (async () => {
     try {
       const task = ctx.tasks.takeoverNode(params[0], params[1]);
       sendJson(res, 200, { task });
@@ -1053,48 +1079,4 @@ function handleReleaseNode(_req: IncomingMessage, res: ServerResponse, _url: URL
       handleTaskError(res, err);
     }
   })();
-}
-
-
-/**
- * 读取并解析 JSON 请求体；非法时写出 400/413/415 并返回 null。
- *
- * content-type 必须显式为 application/json：application/json 不在 CORS「简单请求」
- * safelist 内，跨源页面伪造的 simple POST（text/plain）会被强制走 preflight——
- * 这是写端点的 CSRF 防线之一（威胁模型域 4「浏览器网页 CSRF 向量」；曾不校验
- * content-type，M0 code-review / Issue #11 补上）。
- */
-async function readJsonBody(req: IncomingMessage, res: ServerResponse, maxBytes = 1_000_000): Promise<Record<string, unknown> | null> {
-  const contentType = req.headers["content-type"];
-  if (contentType === undefined || !/^application\/json\b/i.test(contentType.trim())) {
-    sendError(res, 415, "unsupported_media_type", "content-type must be application/json");
-    return null;
-  }
-  const chunks: Buffer[] = [];
-  let size = 0;
-  for await (const chunk of req) {
-    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as string);
-    size += buf.length;
-    if (size > maxBytes) {
-      sendError(res, 413, "payload_too_large", `request body exceeds ${maxBytes} bytes`);
-      return null;
-    }
-    chunks.push(buf);
-  }
-  const raw = Buffer.concat(chunks).toString("utf8");
-  if (raw.trim().length === 0) {
-    sendError(res, 400, "invalid_body", "a JSON object body is required");
-    return null;
-  }
-  try {
-    const parsed: unknown = JSON.parse(raw);
-    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-      sendError(res, 400, "invalid_body", "a JSON object body is required");
-      return null;
-    }
-    return parsed as Record<string, unknown>;
-  } catch {
-    sendError(res, 400, "invalid_body", "malformed JSON body");
-    return null;
-  }
 }

@@ -138,3 +138,53 @@ test("HeuristicExtractor（默认抽取器）：输出即候选形态，sensitiv
   );
   assert.ok(candidates.every((c) => c.confidence > 0 && c.confidence <= 1));
 });
+
+// --- M1 code-review / Issue #14 补齐：procedure-statement（第 4 规则，procedural 0.7）---
+
+test("程序性陈述（中文）：『以后/下次/每次都/记得先』→ procedural 0.7", () => {
+  for (const text of [
+    "以后提交前都先跑一遍测试",
+    "下次开会带上演示环境",
+    "每次都先同步再动手写代码",
+    "记得先拉最新分支再改",
+  ]) {
+    const hit = detectHighValue(text);
+    assert.ok(hit !== null, `应命中程序性规则: ${text}`);
+    assert.equal(hit.rule, "procedure-statement");
+    assert.equal(hit.kind, "procedural");
+    assert.equal(hit.confidence, 0.7);
+    assert.equal(hit.content, text);
+  }
+});
+
+test("程序性陈述（英文）：always / next time / from now on", () => {
+  for (const text of [
+    "Always run the linter before committing",
+    "Next time deploy to staging first",
+    "From now on we pair-review every PR",
+  ]) {
+    const hit = detectHighValue(text);
+    assert.ok(hit !== null, `应命中程序性规则: ${text}`);
+    assert.equal(hit.rule, "procedure-statement");
+    assert.equal(hit.kind, "procedural");
+    assert.equal(hit.confidence, 0.7);
+  }
+});
+
+test("规则优先级：『记住以后……』按 explicit-remember 处理（程序性排最后）", () => {
+  const hit = detectHighValue("记住以后每天站会前看板");
+  assert.ok(hit !== null);
+  assert.equal(hit.rule, "explicit-remember");
+  assert.equal(hit.content, "以后每天站会前看板");
+});
+
+test("detectAllHighValue：程序性句与偏好句并存（各句各取，多句全量）", () => {
+  const matches = detectAllHighValue("我偏好深色主题。以后改配置前先备份。");
+  assert.deepEqual(
+    matches.map((m) => [m.rule, m.kind, m.confidence]),
+    [
+      ["preference-statement", "preference", 0.8],
+      ["procedure-statement", "procedural", 0.7],
+    ],
+  );
+});

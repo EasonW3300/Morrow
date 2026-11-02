@@ -121,6 +121,27 @@ export interface TaskRevisionBody {
   remove?: string[];
 }
 
+/** POST /v1/tasks/:id/{resume,restore} 202 载荷（与 runtime scheduler ResumeResult 同形投影） */
+export interface TaskResumeResult {
+  task: TaskSummary;
+  checkpoint_id: string | null;
+  /** 恢复决策（runtime planReconcile 的投影；UI 只读展示用） */
+  reconcile: {
+    actions: Array<{
+      node_id: string;
+      key: string;
+      side_effect: string;
+      from_status: string;
+      checkpoint_status: string | null;
+      to_status: string;
+      action: string;
+    }>;
+    pending_review_keys: string[];
+    pending_compensations: Array<{ key: string; side_effect: string; note: string }>;
+    replay_keys: string[];
+  };
+}
+
 const JSON_HEADERS = { "content-type": "application/json" };
 
 export const api = {
@@ -223,12 +244,12 @@ export const api = {
     return request(base, `/v1/tasks/${encodeURIComponent(taskId)}/pause`, { method: "POST" });
   },
 
-  resumeTask(base: string, taskId: string): Promise<unknown> {
-    return request(base, `/v1/tasks/${encodeURIComponent(taskId)}/resume`, { method: "POST" });
+  resumeTask(base: string, taskId: string): Promise<TaskResumeResult> {
+    return request<TaskResumeResult>(base, `/v1/tasks/${encodeURIComponent(taskId)}/resume`, { method: "POST" });
   },
 
-  restoreTask(base: string, taskId: string, checkpointId: string): Promise<unknown> {
-    return request(base, `/v1/tasks/${encodeURIComponent(taskId)}/restore`, {
+  restoreTask(base: string, taskId: string, checkpointId: string): Promise<TaskResumeResult> {
+    return request<TaskResumeResult>(base, `/v1/tasks/${encodeURIComponent(taskId)}/restore`, {
       method: "POST",
       headers: JSON_HEADERS,
       body: JSON.stringify({ checkpoint_id: checkpointId }),

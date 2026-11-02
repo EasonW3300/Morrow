@@ -3,6 +3,7 @@ import type { MemoryEntryKind, SensitivityLevel } from "@morrow/protocol";
 import { DB_FILE_NAME } from "../ledger.ts";
 import { openSqlite, type SqliteDatabase } from "../db.ts";
 import { uuidv7 } from "../uuid-v7.ts";
+import type { ConflictReason } from "./consolidator.ts";
 
 /**
  * 记忆存储（票 M1-T1 / Issue #13；巩固写路径 M1-T2 / Issue #14 激活。
@@ -73,8 +74,12 @@ export interface CreateCandidateInput {
 /** 候选生命周期（T2 起 conflicted = 冲突待确认，裁决走 memory_conflicts） */
 export type CandidateStatus = "pending" | "consolidated" | "dismissed" | "conflicted";
 
-/** 冲突上报原因（FR-MEM-5：重大事实 / locked / 敏感等级，与 Consolidator 口径一致） */
-export type ConflictReason = "fact_conflict" | "locked" | "sensitivity_change";
+/**
+ * 冲突上报原因（FR-MEM-5：重大事实 / locked / 敏感等级）。
+ * 单一真相源在 consolidator.ts（冲突判定矩阵的产出语义）；此处 re-export 供存储行类型
+ * 与既有引用面沿用（M1 code-review：删除本文件重复定义，防双处漂移）。
+ */
+export type { ConflictReason };
 
 /** 冲突裁决（Owner 三选一：采纳新值 / 保留旧值 / 合并） */
 export type ConflictResolution = "keep_new" | "keep_old" | "merge";

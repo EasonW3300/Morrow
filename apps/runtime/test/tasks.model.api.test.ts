@@ -30,13 +30,20 @@ const PLAN = planJson([
   { key: "c", title: "C", goal: "do c", depends_on: [], model: "ghost-provider" },
 ]);
 
+/** AC-12 补缺用两节点串行计划（均无 model；a 的慢响应给 pause→revise 留确定性窗口） */
+const SERIAL_NO_MODEL_PLAN = planJson([
+  { key: "a", title: "A", goal: "do a", depends_on: [] },
+  { key: "b", title: "B", goal: "do b", depends_on: ["a"] },
+]);
+
 interface MockRequest {
   model: string | undefined;
   lastUserText: string | undefined;
 }
 
-/** OpenAI 兼容 loopback mock：记录每次 chat/completions 的 model 与末条 user 消息 */
-function serveOpenAIMock(records: MockRequest[]): Promise<Server> {
+/** OpenAI 兼容 loopback mock：记录每次 chat/completions 的 model 与末条 user 消息；
+ *  delayMs > 0 时响应前挂起——给 pause 留确定性窗口（a 在途，pause 等安全点） */
+function serveOpenAIMock(records: MockRequest[], delayMs = 0): Promise<Server> {
   const server = createServer((req, res) => {
     if (req.method === "POST" && (req.url ?? "").endsWith("/chat/completions")) {
       const chunks: Buffer[] = [];
@@ -62,12 +69,20 @@ function serveOpenAIMock(records: MockRequest[]): Promise<Server> {
           // 记录不了就不记录（断言侧会看到缺请求）
         }
         records.push({ model, lastUserText });
-        // pi-ai 的 openai-completions 客户端走 SSE 流式解析，终止条件是 finish_reason
-        res.writeHead(200, { "content-type": "text/event-stream" });
-        res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: "mock-ok" } }] })}\n\n`);
-        res.write(`data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: "stop" }] })}\n\n`);
-        res.write("data: [DONE]\n\n");
-        res.end();
+        const respond = () => {
+          // pi-ai 的 openai-completions 客户端走 SSE 流式解析，终止条件是 finish_reason
+          res.writeHead(200, { "content-type": "text/event-stream" });
+          res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: "mock-ok" } }] })}\n\n`);
+          res.write(`data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: "stop" }] })}\n\n`);
+          res.write("data: [DONE]\n\n");
+          res.end();
+        };
+        if (delayMs > 0) {
+          const timer = setTimeout(respond, delayMs);
+          if (typeof timer.unref === "function") timer.unref();
+        } else {
+          respond();
+        }
       });
       return;
     }
@@ -150,4 +165,91 @@ test("default node factory resolves node.model to the registered provider; unkno
     mock.close();
     removeDir(dir);
   }
+});
+
+// --- AC-12 补缺（M1 gate report §5-1）：切模型独立场景 +2（经 revise 改 node.model，
+// pause 窗口确定性修订；命中 = 注册 Provider 的 model_id、回退 = 未注册模型回默认） ---
+
+/** 共同骨架：两 Provider（p-a 默认 / p-b 侧翼）+ a 慢响应窗口 → pause → revise 改 b.model */
+async function reviseModelScenario(targetModel: string, expectedBModel: string): Promise<void> {
+  const records: MockRequest[] = [];
+  const mock = await serveOpenAIMock(records, 600);
+  const mockPort = (mock.address() as { port: number }).port;
+  const dir = tmpDir("morrow-model-revise-");
+  try {
+    const runtime = await startRuntime(
+      { host: "127.0.0.1", port: 0, dataDir: dir, replicaId: REPLICA, provider: null },
+      {
+        secretStore: createInMemorySecretStore(),
+        taskPlannerFactory: async () => createFakePi({ script: planScript(SERIAL_NO_MODEL_PLAN) }),
+      },
+    );
+    try {
+      const base = `http://127.0.0.1:${runtime.port}`;
+      const post = async (path: string, body: Record<string, unknown>): Promise<Response> =>
+        fetch(`${base}${path}`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+        });
+      await post("/v1/providers", {
+        provider_id: "p-a",
+        name: "Default P",
+        base_url: `http://127.0.0.1:${mockPort}/v1`,
+        model: "model-default",
+        api_key: "sk-test",
+      });
+      await post("/v1/providers", {
+        provider_id: "p-b",
+        name: "Side P",
+        base_url: `http://127.0.0.1:${mockPort}/v1`,
+        model: "model-side-b",
+        api_key: "sk-test",
+      });
+      await post("/v1/providers/p-a/default", {});
+
+      const created = await json<TaskDetail>(await post("/v1/tasks", { goal: "切模型修订" }));
+      await waitFor("task running", async () => {
+        const r = await fetch(`${base}/v1/tasks/${created.task_id}`);
+        return (await json<TaskDetail>(r)).status === "running";
+      });
+      // pause 等安全点：a 的慢响应在 600ms 后到达 → a 完成 → paused（b 仍 pending）
+      const paused = await post("/v1/tasks/" + created.task_id + "/pause", {});
+      assert.equal(paused.status, 200, `pause 应成功: ${paused.status}`);
+
+      const bId = (await json<TaskDetail>(await fetch(`${base}/v1/tasks/${created.task_id}`)))
+        .nodes.find((n) => n.key === "b")?.node_id as string;
+      const revised = await post(`/v1/tasks/${created.task_id}/revise`, {
+        update: [{ key: "b", model: targetModel }],
+      });
+      assert.equal(revised.status, 200, `revise 应成功: ${revised.status}`);
+
+      const resume = await post(`/v1/tasks/${created.task_id}/resume`, {});
+      assert.equal(resume.status, 202);
+      await waitFor("task completes", async () => {
+        const r = await fetch(`${base}/v1/tasks/${created.task_id}`);
+        const detail = await json<TaskDetail>(r);
+        return detail.status === "completed" || detail.status === "failed";
+      });
+      const detail = await json<TaskDetail>(await fetch(`${base}/v1/tasks/${created.task_id}`));
+      assert.equal(detail.status, "completed", JSON.stringify(detail.error ?? ""));
+
+      const bRequest = records.find((r) => r.lastUserText?.includes("do b"));
+      assert.ok(bRequest !== undefined, "节点 b 的请求应到达 mock");
+      assert.equal(bRequest.model, expectedBModel, `revise 改 model=${targetModel} 后 b 的解析结果`);
+    } finally {
+      await runtime.close();
+    }
+  } finally {
+    mock.close();
+    removeDir(dir);
+  }
+}
+
+test("[AC12] model switch via revise hits the registered provider (node.model=p-b → model-side-b)", async () => {
+  await reviseModelScenario("p-b", "model-side-b");
+});
+
+test("[AC12] model switch via revise falls back to default provider for unregistered model (ghost → model-default)", async () => {
+  await reviseModelScenario("ghost-provider", "model-default");
 });

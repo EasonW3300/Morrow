@@ -89,3 +89,14 @@ test("loadConfig carries the parsed provider into the runtime config", () => {
   assert.equal(config.provider?.modelId, "gpt-test");
   removeDir(dir);
 });
+
+// 记忆抽取器选择（M1 code-review / Issue #14 补齐）：默认启发式，显式可选 llm。
+test("MORROW_MEMORY_EXTRACTOR: heuristic default, llm opt-in, unknown value rejected", () => {
+  const dir = tmpDir("morrow-extractor-");
+  const fallback = loadConfig({ MORROW_DATA_DIR: dir });
+  assert.equal(fallback.memoryExtractor, "heuristic");
+  const llm = loadConfig({ MORROW_DATA_DIR: dir, MORROW_MEMORY_EXTRACTOR: "llm" });
+  assert.equal(llm.memoryExtractor, "llm");
+  assert.throws(() => loadConfig({ MORROW_DATA_DIR: dir, MORROW_MEMORY_EXTRACTOR: "gpt-5" }), /MORROW_MEMORY_EXTRACTOR/);
+  removeDir(dir);
+});

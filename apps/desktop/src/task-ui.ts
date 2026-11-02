@@ -9,6 +9,9 @@
  *   - 修订表单校验（与服务端 validateRevision 同口径的前端防线）。
  */
 import type { TaskNodeRecord, TaskNodeStatus, TaskStatus } from "@morrow/protocol";
+// 任务账本事件信封：单一真相源在 api.ts（GET /v1/tasks/:id/events 的 events 元素；
+// M1 code-review 收敛——原先本文件自持一份同形 TaskEnvelope 拷贝）
+import type { TaskEventEnvelope } from "./api.ts";
 
 // --- 状态呈现映射 ----------------------------------------------------------------
 
@@ -135,15 +138,6 @@ export function looksLikeDiff(text: string): boolean {
 
 // --- 任务事件流归约 ----------------------------------------------------------------
 
-/** 任务账本事件信封（与 GET /v1/tasks/:id/events 的 events 元素同形） */
-export interface TaskEnvelope {
-  event_id: string;
-  event_type: string;
-  occurred_at: string;
-  task_id?: string;
-  payload: Record<string, unknown>;
-}
-
 export type TaskEventItem =
   | {
       kind: "lifecycle";
@@ -164,7 +158,7 @@ export type TaskEventItem =
       sequence: number;
     };
 
-export function projectTaskEvents(events: Array<{ sequence: number; envelope: TaskEnvelope }>): TaskEventItem[] {
+export function projectTaskEvents(events: Array<{ sequence: number; envelope: TaskEventEnvelope }>): TaskEventItem[] {
   const items: TaskEventItem[] = [];
   for (const { sequence, envelope } of events) {
     const payload = envelope.payload;

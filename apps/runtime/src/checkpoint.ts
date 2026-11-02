@@ -91,10 +91,18 @@ export interface CheckpointSnapshot {
     provider: { provider_id: string; model_id: string; base_url: string } | null;
     /** 节点建议模型（M1 仅记录不执行） */
     node_models: Record<string, string>;
-    /** 工具版本表（M1 任务执行无工具通道；memory tool 为会话级）——占位空表 */
+    /**
+     * 工具版本表（M1 code-review 填实）：pi-adapter 版本由 startRuntime 注入（可证来源）；
+     * 逐工具版本无来源——M1 任务执行无工具通道（memory tool 为会话级），留空待
+     * 后续票交付工具通道时补记。
+     */
     tool_versions: Record<string, string>;
   };
-  /** Task↔Session 关联（后续票交付）；M1 恒空数组占位 */
+  /**
+   * Task↔Session 关联（M1 code-review 填实）：创建来源会话（tasks.session_id）；
+   * 节点执行在 M1 为一次性 AgentRuntime、不建会话，无来源可记——执行会话关联由
+   * 后续票交付时追加。
+   */
   session_ids: string[];
   pending_side_effects: CheckpointPendingSideEffect[];
 }
@@ -344,9 +352,14 @@ export interface CheckpointServiceOptions {
   replicaId: string;
   /**
    * 执行配置采集（FR-TASK-5「执行配置/模型与工具版本」）：生产由 startRuntime 注入
-   * （runtime 版本 + 默认 Provider 投影，绝不含密钥）；缺省为 null 字段。
+   * （runtime 版本 + 默认 Provider 投影 + 工具版本表，绝不含密钥）；缺省为 null 字段。
    */
-  executionInfo?: () => Promise<{ runtime_version: string | null; provider: CheckpointSnapshot["execution"]["provider"] }>;
+  executionInfo?: () => Promise<{
+    runtime_version: string | null;
+    provider: CheckpointSnapshot["execution"]["provider"];
+    /** 工具版本表（可证来源的条目；注入方决定口径，缺省空表） */
+    tool_versions?: Record<string, string>;
+  }>;
 }
 
 export interface RestoreOutcome {
@@ -359,7 +372,8 @@ export interface RestoreOutcome {
 }
 
 export class CheckpointService {
-  ledger: EventLedger;
+  /** 账本私有（M1 code-review：原先公有可变字段暴露 append 面被外部误写的风险；内部专用） */
+  readonly #ledger: EventLedger;
   readonly #replicaId: string;
   readonly #tasks: CheckpointTaskView;
   readonly #store: CheckpointStore;
@@ -368,7 +382,7 @@ export class CheckpointService {
   #closed = false;
 
   constructor(options: CheckpointServiceOptions) {
-    this.ledger = options.ledger;
+    this.#ledger = options.ledger;
     this.#replicaId = options.replicaId;
     this.#tasks = options.tasks;
     this.#executionInfo = options.executionInfo ?? null;
@@ -472,7 +486,7 @@ export class CheckpointService {
       },
       causationId: record === null ? null : this.#checkpointEventId(record.checkpoint_id),
     });
-    const { sequence } = this.ledger.append(envelope);
+    const { sequence } = this.#ledger.append(envelope);
     return {
       report,
       eventId: envelope.event_id,
@@ -509,7 +523,7 @@ export class CheckpointService {
   }
 
   #checkpointEventId(checkpointId: string): string | null {
-    const entry = this.ledger
+    const entry = this.#ledger
       .scan({ taskId: undefined, eventType: TASK_CHECKPOINT_EVENT_TYPES.checkpointCreated })
       .find((e) => e.envelope.payload.checkpoint_id === checkpointId);
     return entry?.envelope.event_id ?? null;
@@ -517,12 +531,12 @@ export class CheckpointService {
 
   async #buildSnapshot(taskId: string, detail: TaskDetail): Promise<CheckpointSnapshot> {
     const execution = this.#executionInfo === null
-      ? { runtime_version: null, provider: null }
+      ? { runtime_version: null, provider: null, tool_versions: {} }
       : await this.#executionInfo();
 
     // 输出引用：每个已完成节点最近一次 task.node_finished(completed) 事件 id
     const outputRefs: Record<string, string> = {};
-    const nodeFinished = this.ledger.scan({ taskId, eventType: "task.node_finished" });
+    const nodeFinished = this.#ledger.scan({ taskId, eventType: "task.node_finished" });
     for (const node of detail.nodes) {
       if (node.status !== "completed") continue;
       const finished = [...nodeFinished]
@@ -532,11 +546,11 @@ export class CheckpointService {
     }
 
     // run 根事件：最近一次 task.started / task.resumed
-    const started = this.ledger.scan({ taskId, eventType: "task.started" });
-    const resumed = this.ledger.scan({ taskId, eventType: "task.resumed" });
+    const started = this.#ledger.scan({ taskId, eventType: "task.started" });
+    const resumed = this.#ledger.scan({ taskId, eventType: "task.resumed" });
     const roots = [...started, ...resumed].sort((x, y) => x.sequence - y.sequence);
     const runRoot = roots.at(-1)?.envelope.event_id ?? null;
-    const allEvents = this.ledger.scan({ taskId });
+    const allEvents = this.#ledger.scan({ taskId });
     const eventCursor = allEvents.at(-1)?.sequence ?? 0;
 
     const nodeModels: Record<string, string> = {};
@@ -585,9 +599,9 @@ export class CheckpointService {
         runtime_version: execution.runtime_version,
         provider: execution.provider,
         node_models: nodeModels,
-        tool_versions: {},
+        tool_versions: execution.tool_versions ?? {},
       },
-      session_ids: [],
+      session_ids: detail.session_id === undefined ? [] : [detail.session_id],
       pending_side_effects: detail.nodes.map((node) => ({
         key: node.key,
         side_effect: node.side_effect,
@@ -605,7 +619,7 @@ export class CheckpointService {
       payload,
       causationId: null,
     });
-    this.ledger.append(envelope);
+    this.#ledger.append(envelope);
   }
 }
 
