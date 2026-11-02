@@ -106,3 +106,33 @@ describe("detectContainerRuntime：探测桩注入的三 OS 口径", () => {
     assert.equal(r.runtime?.command, "docker.exe");
   });
 });
+
+describe("detectContainerRuntime：有界探测（timeoutMs，#23 修复批）", () => {
+  it("探测命令挂起（不 resolve）→ 超时界内归类不可用 + probeTimedOut=true（诚实 skip 的依据）", async () => {
+    const started = Date.now();
+    const hangingExec = (_file: string, _args: string[]): Promise<{ stdout: string; stderr: string; exitCode: number }> =>
+      new Promise(() => {}); // 永不 resolve：模拟 docker CLI 挂起
+    const r = await detectContainerRuntime({ exec: hangingExec, platform: "darwin", timeoutMs: 50 });
+    const elapsed = Date.now() - started;
+    assert.equal(r.available, false);
+    assert.equal(r.probeTimedOut, true, "CLI 挂起与『确实无运行时』诚实区分");
+    assert.ok(elapsed < 5_000, `探测有界返回（实际 ${elapsed}ms）`);
+  });
+
+  it("探测正常返回 → probeTimedOut 缺省不置位（available 与否皆然）", async () => {
+    const fake = fakeExec([
+      { match: isInfo("docker"), reply: { stdout: "Operating System: Docker Desktop\n" } },
+    ]);
+    const ok = await detectContainerRuntime({ exec: fake.exec, platform: "darwin", timeoutMs: 1_000 });
+    assert.equal(ok.available, true);
+    assert.equal(ok.probeTimedOut, undefined);
+
+    const unavailable = await detectContainerRuntime({
+      exec: async () => ({ stdout: "", stderr: "not found", exitCode: 127 }),
+      platform: "darwin",
+      timeoutMs: 1_000,
+    });
+    assert.equal(unavailable.available, false);
+    assert.equal(unavailable.probeTimedOut, undefined, "快速失败 ≠ 超时");
+  });
+});

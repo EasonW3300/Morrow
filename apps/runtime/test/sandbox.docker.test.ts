@@ -15,11 +15,16 @@ import { detectContainerRuntime } from "../src/sandbox/detect.ts";
 import { normalizeSandboxContract, type SandboxContract } from "../src/sandbox/contract.ts";
 import { FIXTURE_TOOL, type FixtureMode } from "./fixtures/sandbox-fixture-input.ts";
 
-const availability = await detectContainerRuntime();
-const SKIP_REASON = availability.available
+// 探测有界（#23 修复批）：docker CLI 挂起（而非快速失败）时探测在 10s 内归类为超时，
+// 套件诚实 skip 并注明理由——绝不无限等待探测。
+const availability = await detectContainerRuntime({ timeoutMs: 10_000 });
+const SKIP_REASON: string | false = availability.available
   ? false
-  : "本 runner 无可用容器运行时——真实容器测试跳过（CI 仅 ubuntu 腿跑；" +
-    `install-hint: ${availability.installHint ?? "n/a"}）`;
+  : availability.probeTimedOut === true
+    ? "容器运行时探测超时（docker CLI 挂起，10s 无响应）——真实容器测试诚实跳过而非挂死 " +
+      "（CI 仅 ubuntu 腿跑真实容器；本机 docker 恢复后重跑）"
+    : "本 runner 无可用容器运行时——真实容器测试跳过（CI 仅 ubuntu 腿跑；" +
+      `install-hint: ${availability.installHint ?? "n/a"}）`;
 
 const cleanupDirs: string[] = [];
 after(() => {

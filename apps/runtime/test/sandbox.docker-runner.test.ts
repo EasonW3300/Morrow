@@ -135,3 +135,57 @@ describe("DockerRunner（fake exec）：执行与结果分类", () => {
     );
   });
 });
+
+describe("DockerRunner：有界辅助调用（#23 修复批——daemon 卡死不挂死调用方）", () => {
+  function hangingExecHarness(hangArgs: (args: string[]) => boolean) {
+    const exec = async (file: string, args: string[], options?: { input?: string }) => {
+      if (hangArgs(args)) {
+        await new Promise(() => {}); // 永不 resolve：模拟 daemon 卡死
+      }
+      if (args.includes("info")) return { stdout: "Operating System: Docker Desktop\n", stderr: "", exitCode: 0 };
+      if (args.includes("--format")) return { stdout: "27.3.1\n", stderr: "", exitCode: 0 };
+      if (args.includes("inspect")) return { stdout: "", stderr: "image missing", exitCode: 1 };
+      if (args.includes("run")) return { stdout: '{"ok":true,"result":1}\n', stderr: "", exitCode: 0 };
+      return { stdout: "", stderr: `unexpected: ${args.join(" ")}`, exitCode: 127 };
+    };
+    return { exec };
+  }
+
+  it("image inspect 挂起 → 有界内抛 sandbox_unavailable（daemon wedged 语义 + 修复指引）", async () => {
+    const { exec } = hangingExecHarness((args) => args.includes("inspect"));
+    const started = Date.now();
+    await assert.rejects(
+      new DockerRunner({ exec: exec as never, auxTimeoutMs: 50, bundleDirRoot: mkdtempSync(join(tmpdir(), "morrow-sb-test-")) }).run(
+        { name: "x", kind: "typescript", entry: makeToolPackage(join(mkdtempSync(join(tmpdir(), "morrow-pkg-")), "src")).entry },
+        {},
+        CONTRACT,
+      ),
+      (err: unknown) => {
+        assert.ok(err instanceof SandboxError);
+        assert.equal(err.code, "sandbox_unavailable");
+        assert.match(err.message, /wedged|docker info/);
+        return true;
+      },
+    );
+    assert.ok(Date.now() - started < 5_000, "有界返回而非无限等待");
+  });
+
+  it("image pull 挂起 → 有界内抛 image_pull_failed（503 族，非无限等待）", async () => {
+    const { exec } = hangingExecHarness((args) => args.includes("pull"));
+    const started = Date.now();
+    await assert.rejects(
+      new DockerRunner({ exec: exec as never, auxTimeoutMs: 50, pullTimeoutMs: 50, bundleDirRoot: mkdtempSync(join(tmpdir(), "morrow-sb-test-")) }).run(
+        { name: "x", kind: "typescript", entry: makeToolPackage(join(mkdtempSync(join(tmpdir(), "morrow-pkg-")), "src")).entry },
+        {},
+        CONTRACT,
+      ),
+      (err: unknown) => {
+        assert.ok(err instanceof SandboxError);
+        assert.equal(err.code, "image_pull_failed");
+        assert.match(err.message, /did not respond within/);
+        return true;
+      },
+    );
+    assert.ok(Date.now() - started < 5_000, "有界返回而非无限等待");
+  });
+});
