@@ -372,7 +372,8 @@ export interface RestoreOutcome {
 }
 
 export class CheckpointService {
-  ledger: EventLedger;
+  /** 账本私有（M1 code-review：原先公有可变字段暴露 append 面被外部误写的风险；内部专用） */
+  readonly #ledger: EventLedger;
   readonly #replicaId: string;
   readonly #tasks: CheckpointTaskView;
   readonly #store: CheckpointStore;
@@ -381,7 +382,7 @@ export class CheckpointService {
   #closed = false;
 
   constructor(options: CheckpointServiceOptions) {
-    this.ledger = options.ledger;
+    this.#ledger = options.ledger;
     this.#replicaId = options.replicaId;
     this.#tasks = options.tasks;
     this.#executionInfo = options.executionInfo ?? null;
@@ -485,7 +486,7 @@ export class CheckpointService {
       },
       causationId: record === null ? null : this.#checkpointEventId(record.checkpoint_id),
     });
-    const { sequence } = this.ledger.append(envelope);
+    const { sequence } = this.#ledger.append(envelope);
     return {
       report,
       eventId: envelope.event_id,
@@ -522,7 +523,7 @@ export class CheckpointService {
   }
 
   #checkpointEventId(checkpointId: string): string | null {
-    const entry = this.ledger
+    const entry = this.#ledger
       .scan({ taskId: undefined, eventType: TASK_CHECKPOINT_EVENT_TYPES.checkpointCreated })
       .find((e) => e.envelope.payload.checkpoint_id === checkpointId);
     return entry?.envelope.event_id ?? null;
@@ -545,11 +546,11 @@ export class CheckpointService {
     }
 
     // run 根事件：最近一次 task.started / task.resumed
-    const started = this.ledger.scan({ taskId, eventType: "task.started" });
-    const resumed = this.ledger.scan({ taskId, eventType: "task.resumed" });
+    const started = this.#ledger.scan({ taskId, eventType: "task.started" });
+    const resumed = this.#ledger.scan({ taskId, eventType: "task.resumed" });
     const roots = [...started, ...resumed].sort((x, y) => x.sequence - y.sequence);
     const runRoot = roots.at(-1)?.envelope.event_id ?? null;
-    const allEvents = this.ledger.scan({ taskId });
+    const allEvents = this.#ledger.scan({ taskId });
     const eventCursor = allEvents.at(-1)?.sequence ?? 0;
 
     const nodeModels: Record<string, string> = {};
@@ -618,7 +619,7 @@ export class CheckpointService {
       payload,
       causationId: null,
     });
-    this.ledger.append(envelope);
+    this.#ledger.append(envelope);
   }
 }
 
