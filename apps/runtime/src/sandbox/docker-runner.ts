@@ -216,12 +216,15 @@ export class DockerRunner implements SandboxRunner {
    * CLI 挂起不再拖垮调用方（超时结果 exitCode 124 + timedOut 标记，调用方按语义归类）。
    */
   private safeExec(args: string[], timeoutMs: number): Promise<ExecResult & { timedOut: boolean }> {
+    let timer: NodeJS.Timeout | undefined;
     const timeout = new Promise<ExecResult & { timedOut: boolean }>((resolve) => {
-      const timer = setTimeout(
+      // 超时哨兵必须保持 ref'd：race 的败者可能不持有任何事件循环句柄（挂起的注入桩、
+      // 句柄已被收走的进程），unref 会让事件循环先空、race 永不 settle
+      //（node:test 报 "Promise resolution is still pending"——node 22/24 时序差异根因）。
+      timer = setTimeout(
         () => resolve({ stdout: "", stderr: `docker call timed out after ${timeoutMs}ms: ${args.join(" ")}`, exitCode: 124, timedOut: true }),
         timeoutMs,
       );
-      if (typeof timer.unref === "function") timer.unref();
     });
     return Promise.race([
       this.exec("docker", args).then(
@@ -229,7 +232,10 @@ export class DockerRunner implements SandboxRunner {
         () => ({ stdout: "", stderr: "exec failed", exitCode: 127, timedOut: false }),
       ),
       timeout,
-    ]);
+    ]).finally(() => {
+      // 胜出路径清掉 ref'd 哨兵：不 clear 会把进程空拖到界才退出
+      if (timer !== undefined) clearTimeout(timer);
+    });
   }
 
   private async runContainer(
@@ -242,11 +248,12 @@ export class DockerRunner implements SandboxRunner {
     let timedOut = false;
     // 超时强杀：按容器名 docker kill（杀 CLI 客户端不杀容器）；杀完 --rm 自动清理，
     // 再补一刀 rm 防竞态残留。kill/rm 为 fire-and-forget，但同样有界（防 daemon 卡死泄漏）。
+    // kill/hard 哨兵保持 ref'd：与 safeExec 同理，exec 败者可能不持有任何事件循环句柄
+    //（挂起桩），unref 会让循环先空、run 的 race 永不 settle；两哨兵在 finally 均 clearTimeout。
     const killTimer = setTimeout(() => {
       timedOut = true;
       void this.safeExec(["kill", containerName], this.auxTimeoutMs);
     }, timeoutMs);
-    if (typeof killTimer.unref === "function") killTimer.unref();
     // 兜底硬停：kill 失败（容器已退出等）也不让调用方无限等——以超时分类收尾
     let hardTimer: NodeJS.Timeout | undefined;
     const hardStop = new Promise<never>((_, reject) => {
@@ -254,7 +261,6 @@ export class DockerRunner implements SandboxRunner {
         () => reject(new SandboxError("tool_timeout", `container kill grace (${KILL_GRACE_MS}ms) elapsed`)),
         timeoutMs + KILL_GRACE_MS,
       );
-      if (hardTimer !== undefined && typeof hardTimer.unref === "function") hardTimer.unref();
     });
 
     try {
