@@ -1104,3 +1104,423 @@ body {
   font-size: 11px;
   opacity: 0.65;
 }
+
+/* --- 能力管理（票 M2-T6 / Issue #27）------------------------------------------------ */
+
+/* 设置页子页签（Provider 与模型 | 能力管理；以及能力管理内的四个子面板） */
+.settings-subnav,
+.subnav-row {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+
+.subnav-item {
+  border: 1px solid var(--border);
+  background: transparent;
+  color: inherit;
+  border-radius: 999px;
+  padding: 4px 14px;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+
+.subnav-item.selected {
+  border-color: var(--accent);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+/* 能力清单 */
+.capability-list {
+  list-style: none;
+  margin: 0 0 14px;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.capability-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 12px;
+  flex-wrap: wrap;
+}
+
+.capability-title {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  background: transparent;
+  border: none;
+  color: inherit;
+  cursor: pointer;
+  padding: 0;
+  font: inherit;
+}
+
+.capability-title:hover strong {
+  color: var(--accent);
+}
+
+.capability-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.badge-author-human {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.badge-author-ai {
+  border-color: #b8860b;
+  color: #d4a017;
+}
+
+.badge-runtime {
+  font-family: var(--mono, monospace);
+  font-size: 11px;
+}
+
+/* 确认门（破坏性操作二次确认） */
+.confirm-gate {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.confirm-reason {
+  font-size: 12px;
+  color: #d4a017;
+  max-width: 420px;
+}
+
+/* 详情卡 */
+.capability-detail h4 {
+  margin: 16px 0 6px;
+}
+
+.detail-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.detail-badges {
+  display: flex;
+  gap: 6px;
+  margin: 6px 0 4px;
+}
+
+.dimension-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 8px;
+}
+
+.dimension-card {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  min-width: 0;
+}
+
+.dimension-card.dimension-empty {
+  opacity: 0.55;
+}
+
+.dimension-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 6px;
+}
+
+.dimension-hint {
+  font-size: 11px;
+  opacity: 0.6;
+  margin: 2px 0 6px;
+}
+
+.dimension-item {
+  display: inline-block;
+  font-family: var(--mono, monospace);
+  font-size: 11.5px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 6px;
+  margin: 2px 4px 2px 0;
+  overflow-wrap: anywhere;
+}
+
+.sandbox-line {
+  font-size: 12px;
+  margin: 4px 0;
+}
+
+.tests-list {
+  margin: 4px 0;
+  padding-left: 18px;
+  font-size: 12.5px;
+}
+
+.schema-pair {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.schema-pair pre {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px;
+  font-size: 11.5px;
+  max-height: 180px;
+  overflow: auto;
+  margin: 4px 0 0;
+}
+
+.schema-label {
+  font-size: 11.5px;
+  opacity: 0.7;
+  margin: 0;
+}
+
+/* 版本历史时间线 */
+.version-timeline {
+  list-style: none;
+  margin: 8px 0;
+  padding: 0 0 0 6px;
+  border-left: 2px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.version-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  position: relative;
+  padding-left: 10px;
+}
+
+.version-row.current {
+  font-weight: 600;
+}
+
+.version-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--border);
+  position: absolute;
+  left: -7px;
+}
+
+.version-row.current .version-dot {
+  background: var(--accent);
+}
+
+.version-hash {
+  font-size: 11px;
+  opacity: 0.65;
+}
+
+.version-time {
+  font-size: 11.5px;
+  opacity: 0.65;
+}
+
+/* 预授权编辑 */
+.grants-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.grants-grid textarea {
+  font-family: var(--mono, monospace);
+  font-size: 12px;
+}
+
+.audit-note {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 12px;
+  margin-top: 10px;
+  opacity: 0.75;
+}
+
+.audit-note.audit-dirty {
+  border-color: #b8860b;
+  opacity: 1;
+}
+
+.banner-ok {
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 12.5px;
+  margin-bottom: 10px;
+}
+
+/* 工厂（T3 接缝壳） */
+.factory-steps {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin: 8px 0;
+}
+
+.factory-step {
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 3px 12px;
+  font-size: 12px;
+  opacity: 0.55;
+}
+
+.factory-step.done {
+  border-color: var(--accent);
+  opacity: 0.85;
+}
+
+.factory-step.active {
+  border-color: var(--accent);
+  color: var(--accent);
+  font-weight: 600;
+  opacity: 1;
+}
+
+.factory-step.failed {
+  border-color: #c0392b;
+  color: #c0392b;
+  opacity: 1;
+}
+
+.verification-list {
+  list-style: none;
+  margin: 4px 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.verification-list li {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 10px;
+  font-size: 12.5px;
+}
+
+.verification-list li.tone-error {
+  border-color: #c0392b;
+}
+
+.verification-state {
+  font-weight: 700;
+}
+
+.verification-summary {
+  opacity: 0.75;
+}
+
+/* Skill 与提案（T5 接缝） */
+.skill-list,
+.proposal-list {
+  list-style: none;
+  margin: 4px 0 14px;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.skill-row,
+.proposal-row {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.proposal-row.tone-border-warn {
+  border-color: #b8860b;
+}
+
+.proposal-row.tone-border-ok {
+  border-color: var(--accent);
+}
+
+.proposal-head {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.proposal-note {
+  font-size: 12px;
+  margin: 0;
+  opacity: 0.8;
+}
+
+.proposal-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.skill-composed {
+  font-size: 12px;
+  display: flex;
+  gap: 4px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+/* Task 节点能力引用卡（票 M2-T6） */
+.capability-refs {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin: 4px 0;
+}
+
+.capability-refs-label {
+  font-size: 11.5px;
+  opacity: 0.65;
+}
+
+.capability-ref-chip {
+  display: inline-flex;
+  gap: 5px;
+  align-items: baseline;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  background: transparent;
+  border-radius: 999px;
+  padding: 2px 10px;
+  font-size: 11.5px;
+  cursor: pointer;
+}
+
+.capability-ref-chip:hover {
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}

@@ -1,6 +1,6 @@
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
-import type { SideEffectClass, TaskDetail, TaskNodeStatus, TaskStatus } from "@morrow/protocol";
+import type { NodeResources, SideEffectClass, TaskDetail, TaskNodeStatus, TaskStatus } from "@morrow/protocol";
 import { buildEventEnvelope } from "./envelope.ts";
 import { DB_FILE_NAME, type EventLedger } from "./ledger.ts";
 import { ensureCheckpointTable } from "./task-migrations.ts";
@@ -46,6 +46,8 @@ export interface CheckpointNodeSnapshot {
   model: string | null;
   retriable: boolean;
   side_effect: SideEffectClass;
+  /** 资源声明（M2-T4 / Issue #25）：git_repo/lock；未声明为 null（只加演进） */
+  resources: NodeResources | null;
   status: TaskNodeStatus;
   attempts: number;
   result: string | null;
@@ -577,6 +579,7 @@ export class CheckpointService {
           model: node.model ?? null,
           retriable: node.retriable,
           side_effect: node.side_effect,
+          resources: node.resources ?? null,
           status: node.status,
           attempts: node.attempts,
           result: node.result ?? null,
@@ -594,7 +597,7 @@ export class CheckpointService {
       },
       workspace: null,
       workspace_note:
-        "M1 tasks have no isolated workspace (FR-TASK-8, P1); file snapshot is null by design",
+        "code nodes (resources.git_repo) execute in dedicated git worktrees under <dataDir>/worktrees (FR-TASK-8, M2-T4); worktree state is external to the snapshot (re-prepared per attempt on replay), so the file snapshot stays null by design",
       execution: {
         runtime_version: execution.runtime_version,
         provider: execution.provider,

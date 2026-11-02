@@ -13,6 +13,7 @@ import type { SqliteDatabase } from "./db.ts";
  * M1-T6（Issue #18）演进：tasks.session_id（创建来源会话，Chat 任务卡片关联）与
  * task_nodes.actor（节点责任方：NULL = 调度器，'owner' = Owner 接管）。列只增不改名；
  * 旧库经 ensureColumn 幂等 ALTER（CREATE IF NOT EXISTS 不会给已存在的表补列）。
+ * M2-T4（Issue #25）演进：task_nodes.resources（节点资源声明 JSON：git_repo/lock）。
  */
 export const TASK_TABLES_SQL = `
 CREATE TABLE IF NOT EXISTS tasks (
@@ -71,11 +72,15 @@ CREATE TABLE IF NOT EXISTS task_checkpoints (
 CREATE INDEX IF NOT EXISTS task_checkpoints_task_idx ON task_checkpoints (task_id, created_at, checkpoint_id);
 `;
 
-/** 幂等建表（CREATE IF NOT EXISTS）+ 旧库补列（M1-T6 的 actor / session_id）；由 tasks.ts 的 TaskStore 调用 */
+/**
+ * 幂等建表（CREATE IF NOT EXISTS）+ 旧库补列（M1-T6 的 actor / session_id、M2-T4 的
+ * resources）；由 tasks.ts 的 TaskStore 调用
+ */
 export function ensureTaskTables(db: SqliteDatabase): void {
   db.exec(TASK_TABLES_SQL);
   ensureColumn(db, "tasks", "session_id", "TEXT");
   ensureColumn(db, "task_nodes", "actor", "TEXT");
+  ensureColumn(db, "task_nodes", "resources", "TEXT");
 }
 
 /** 列存在则跳过（pragma table_info）；演进规则：只加列不改名不删列 */
@@ -85,7 +90,27 @@ function ensureColumn(db: SqliteDatabase, table: string, column: string, decl: s
   db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${decl}`);
 }
 
+/**
+ * 资源锁表（M2-T4 / Issue #25，FR-TASK-8「非代码任务用资源锁」）：lock_key 单持有者
+ * （PRIMARY KEY），acquire = 全拿或全不拿，release 按 (task_id, node_id) 粒度。
+ * 崩溃残留：进程死亡不清行，启动时经 LockTable.sweepStale 清扫（执行租约语义——
+ * 同一 Run 全局单点执行，新进程启动时不可能有合法的旧持有者）。
+ */
+export const TASK_LOCKS_SQL = `
+CREATE TABLE IF NOT EXISTS task_locks (
+  lock_key    TEXT PRIMARY KEY,
+  task_id     TEXT NOT NULL,
+  node_id     TEXT NOT NULL,
+  acquired_at TEXT NOT NULL
+);
+`;
+
 /** 幂等建 checkpoint 表（CREATE IF NOT EXISTS）；由 checkpoint.ts 的 CheckpointStore 调用 */
 export function ensureCheckpointTable(db: SqliteDatabase): void {
   db.exec(TASK_CHECKPOINTS_SQL);
+}
+
+/** 幂等建锁表（CREATE IF NOT EXISTS）；由 locks.ts 的 LockTable 调用 */
+export function ensureLockTable(db: SqliteDatabase): void {
+  db.exec(TASK_LOCKS_SQL);
 }

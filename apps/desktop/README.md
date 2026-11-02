@@ -95,6 +95,35 @@ node --experimental-sqlite --experimental-strip-types apps/desktop/scripts/task-
    全部介入操作在事件流里以 actor=owner 审计事件可查（task.revised /
    task.node_taken_over / task.node_completed_by_owner / task.node_released）。
 
+### 能力管理联调（票 M2-T6 / Issue #27）
+
+```bash
+node --experimental-sqlite --experimental-strip-types apps/desktop/scripts/capability-fixture.ts
+# 打开 http://127.0.0.1:1420/?runtime=http://127.0.0.1:<前置端口>（stdout ready JSON 给出）
+```
+
+夹具 = 真实 Runtime（能力注册表 / 授权面 / 生命周期全走 T1 真实端点）+ 预置演示数据
+（memory.write builtin、web.fetch 双版本历史、log.archive 停用态、report.render；授权面
+先 PUT 覆盖演示能力——注册校验 permissions ⊆ grants 真实生效）+ 前置端口透明代理 +
+T3 工厂接缝 mock 与 T5 Skill 接缝 mock（T3/T5 合入后删除对应 mock 段即可，UI 路径即合约）。
+浏览器级全流程验证：
+
+1. 设置 → 能力管理 → 能力清单：核对徽标（author human|ai、runtime、启停态）；点开
+   web.fetch 详情——五维权限分组、input/output schema、tests 清单、版本历史时间线、
+   source_hash；点「回滚到此版本」→ 二次确认 → 当前版本指针回移（确认门：armed 态展示
+   后果说明，取消无副作用）；对 log.archive「启用」、对已启用能力「停用」（同样过确认门）。
+2. 预授权页签：改 filesystem 多行文本 / 勾选 shell 类别与渠道 → 保存区实时呈现 diff 与
+   审计提示（收窄立即约束运行时复核）→ 保存 → GET /v1/capabilities/grants 反映新授权面，
+   capability.grants_updated 审计事件落账本；把 grant 收窄到覆盖不了某能力声明时，
+   该能力重新注册会被 400 escalation 拒绝（真实校验）。
+3. 工厂页签：提交需求描述 → 进度区走 检索→规划→构建→验证→待确认（约 8s）→ 验证报告
+   四类测试（schema/越权/功能/沙箱）→ 候选 manifest 核对 → 「确认注册」→ csv.export
+   真实注册进注册表（ai 默认停用，回清单启用）。
+4. Skill 页签：清单呈现组合的能力芯片；提案批准/拒绝——prop-dangling（引用未注册的
+   mail.send）点「批准」→ 409 skill_dangling_reference → 行内呈现悬空引用拒绝理由。
+5. Task 视图（配合 task-fixture）：节点执行用到注册表能力时，节点面板出现能力引用芯片
+   （名称+版本），点击跳设置→能力管理并预选该能力详情。
+
 ## 已知边界（M0）
 
 - 历史回看来自 `GET /v1/sessions/:id/messages` 投影（user/assistant 消息）；历史轮次的
