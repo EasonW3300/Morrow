@@ -225,7 +225,8 @@ test("sending a message drives the agent loop: ledger records user+assistant, hi
 
     const events = await sessionEvents(runtime.port);
     const types = events.map((e) => e.event_type);
-    assert.deepEqual(types, ["session.created", "message.user", "message.assistant"]);
+    // M1-T2：轮次收尾后账本追加 memory.extracted（后台抽取运行留痕）
+    assert.deepEqual(types, ["session.created", "message.user", "message.assistant", "memory.extracted"]);
 
     const userEvent = events[1];
     assert.equal(userEvent.actor_id, "owner");
@@ -263,7 +264,7 @@ test("tool runs record tool.started/tool.finished with a causation chain", async
     const events = await sessionEvents(runtime.port);
     assert.deepEqual(
       events.map((e) => e.event_type),
-      ["session.created", "message.user", "tool.started", "tool.finished", "message.assistant"],
+      ["session.created", "message.user", "tool.started", "tool.finished", "message.assistant", "memory.extracted"],
     );
 
     const [user, toolStart, toolEnd, assistant] = events.slice(1);
@@ -305,7 +306,7 @@ test("tool failures are recorded with is_error, and provider errors record agent
     const events = await sessionEvents(runtime.port);
     assert.deepEqual(
       events.map((e) => e.event_type),
-      ["session.created", "message.user", "tool.started", "tool.finished", "agent.error", "message.assistant"],
+      ["session.created", "message.user", "tool.started", "tool.finished", "agent.error", "message.assistant", "memory.extracted"],
     );
 
     const toolEnd = events[3];
@@ -420,6 +421,7 @@ test("SSE after a run: frames replay the ledger in sequence order and end with d
         { id: String(created.sequence + 2), event: "tool.started" },
         { id: String(created.sequence + 3), event: "tool.finished" },
         { id: String(created.sequence + 4), event: "message.assistant" },
+        { id: String(created.sequence + 5), event: "memory.extracted" },
         { id: null, event: "done" },
       ],
       "durable frames carry the ledger seq as id, in ledger order, then done",
@@ -511,7 +513,7 @@ test("Last-Event-ID resumes the stream: only ledger events after the given seq a
     const durable = frames.filter((f) => f.id !== null);
     assert.deepEqual(
       durable.map((f) => f.event),
-      ["tool.started", "tool.finished", "message.assistant"],
+      ["tool.started", "tool.finished", "message.assistant", "memory.extracted"],
       "events up to last-event-id are not replayed",
     );
     for (const frame of durable) assert.ok(Number(frame.id) > lastId);
@@ -573,7 +575,7 @@ test("an aborted run records a partial assistant turn and the session continues 
     const afterAbort = await sessionEvents(runtime.port);
     assert.deepEqual(
       afterAbort.map((e) => e.event_type),
-      ["session.created", "message.user", "message.assistant"],
+      ["session.created", "message.user", "message.assistant", "memory.extracted"],
     );
     assert.equal(afterAbort[2].payload.stop_reason, "aborted");
 
@@ -592,7 +594,15 @@ test("an aborted run records a partial assistant turn and the session continues 
     const events = await sessionEvents(runtime.port);
     assert.deepEqual(
       events.map((e) => e.event_type),
-      ["session.created", "message.user", "message.assistant", "message.user", "message.assistant"],
+      [
+        "session.created",
+        "message.user",
+        "message.assistant",
+        "memory.extracted",
+        "message.user",
+        "message.assistant",
+        "memory.extracted",
+      ],
       "interrupted turn keeps its record; next turn appends after it",
     );
   } finally {

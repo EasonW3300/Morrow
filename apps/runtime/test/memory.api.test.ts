@@ -85,6 +85,18 @@ async function waitAssistant(port: number): Promise<void> {
   );
 }
 
+/** 等本轮后台管线落定：memory.extracted 且 causation 指向最新 message.assistant
+ *  （M1-T2：轮次收尾触发抽取→巩固，同一同步块内落账，看到 extracted 即整轮完成） */
+async function waitTurnSettled(port: number): Promise<void> {
+  await waitAssistant(port);
+  const assistantId = (await allEvents(port))
+    .filter((e) => e.event_type === "message.assistant")
+    .at(-1)?.event_id;
+  await waitFor("memory.extracted for this turn", async () =>
+    (await allEvents(port)).some((e) => e.event_type === "memory.extracted" && e.causation_id === assistantId),
+  );
+}
+
 test("端到端：显式『请记住 X』→ 候选 → FTS 检索 → 回链原始 message.user 事件；默认 private", async () => {
   const dir = tmpDir("morrow-mem-e2e-");
   const runtime = await startRuntime(testConfig(dir), {
@@ -93,7 +105,8 @@ test("端到端：显式『请记住 X』→ 候选 → FTS 检索 → 回链原
   try {
     const sessionId = await createSession(runtime.port);
     await send(runtime.port, sessionId, "请记住：我喜欢用 TypeScript 写脚本");
-    await waitAssistant(runtime.port);
+    // M1-T2：0.9 显式候选达巩固准入线，轮次收尾自动巩固成事实——等管线落定再断言
+    await waitTurnSettled(runtime.port);
 
     // 账本里有 memory.candidate_created，causation 指向 message.user
     const events = await allEvents(runtime.port);
@@ -109,25 +122,30 @@ test("端到端：显式『请记住 X』→ 候选 → FTS 检索 → 回链原
     assert.equal(candidateEvent.payload.sensitivity, "private", "新记忆默认 private");
     assert.equal(candidateEvent.payload.rule, "explicit-remember");
 
-    // 检索命中并回链
+    // 检索命中并回链（M1-T2 巩固后：候选与事实统一索引，两条命中并存）
     const { status, body } = await getFacts(runtime.port, "TypeScript");
     assert.equal(status, 200);
     const facts = (body as MemoryFactsBody).facts;
-    assert.equal(facts.length, 1);
-    assert.equal(facts[0].stage, "candidate");
-    assert.equal(facts[0].type, "fact");
-    assert.equal(facts[0].content, "我喜欢用 TypeScript 写脚本");
-    assert.equal(facts[0].sensitivity, "private");
-    assert.deepEqual(facts[0].sources, [userEvent.event_id], "sources 数组含原始事件 event_id");
-    assert.equal(typeof facts[0].confidence, "number");
-    assert.equal(facts[0].version, 1);
+    assert.equal(facts.length, 2);
+    const factHit = facts.find((f) => f.stage === "fact");
+    const candidateHit = facts.find((f) => f.stage === "candidate");
+    assert.ok(factHit !== undefined && candidateHit !== undefined, "候选与事实同时命中");
+    assert.equal(factHit.type, "fact");
+    assert.equal(factHit.content, "我喜欢用 TypeScript 写脚本");
+    assert.equal(factHit.sensitivity, "private");
+    assert.deepEqual(factHit.sources, [userEvent.event_id], "事实 sources 回链原始事件 event_id");
+    assert.equal(factHit.confidence, undefined, "事实无置信度（候选才有）");
+    assert.equal(factHit.version, 1, "巩固后事实 v1");
+    assert.equal(candidateHit.content, "我喜欢用 TypeScript 写脚本");
+    assert.equal(typeof candidateHit.confidence, "number");
+    assert.equal(candidateHit.version, 1);
   } finally {
     await runtime.close();
     removeDir(dir);
   }
 });
 
-test("端到端：闲聊不产生候选，检索无结果，账本无 memory.* 事件", async () => {
+test("端到端：闲聊不产生候选，检索无结果，账本无记忆产出事件（仅抽取空运行留痕）", async () => {
   const dir = tmpDir("morrow-mem-chat-");
   const runtime = await startRuntime(testConfig(dir), {
     agentAdapterFactory: fakeFactory([{ kind: "text", deltas: ["今天多云转晴"] }]),
@@ -135,12 +153,17 @@ test("端到端：闲聊不产生候选，检索无结果，账本无 memory.* �
   try {
     const sessionId = await createSession(runtime.port);
     await send(runtime.port, sessionId, "今天天气怎么样？");
-    await waitAssistant(runtime.port);
+    await waitTurnSettled(runtime.port);
 
     const { body } = await getFacts(runtime.port, "天气");
     assert.deepEqual((body as MemoryFactsBody).facts, []);
     const memoryEvents = (await allEvents(runtime.port)).filter((e) => e.event_type.startsWith("memory."));
-    assert.deepEqual(memoryEvents, [], "闲聊不得产生 memory.* 事件");
+    // M1-T2：抽取运行事件永远留痕（extracted_count=0 证明管线跑过且一无所获），
+    // 其余 memory.* 事件（候选/巩固/事实/冲突）闲聊下一律不产生
+    assert.deepEqual(
+      memoryEvents.map((e) => [e.event_type, e.payload.extracted_count, e.payload.skipped_duplicates]),
+      [["memory.extracted", 0, 0]],
+    );
   } finally {
     await runtime.close();
     removeDir(dir);
@@ -158,7 +181,8 @@ test("端到端：memory.write 经 PiAdapter tools 通道被模型调用 → 候
   try {
     const sessionId = await createSession(runtime.port);
     await send(runtime.port, sessionId, "我的时区是东八区，记一下");
-    await waitAssistant(runtime.port);
+    // M1-T2：工具写入的 0.9 候选在轮次收尾被自动巩固——等管线落定再断言
+    await waitTurnSettled(runtime.port);
 
     // 工具确实经 tools 通道执行（tool.started / tool.finished 在账本）
     const events = await allEvents(runtime.port);
@@ -170,11 +194,12 @@ test("端到端：memory.write 经 PiAdapter tools 通道被模型调用 → 候
 
     const { body } = await getFacts(runtime.port, "Shanghai");
     const facts = (body as MemoryFactsBody).facts;
-    assert.equal(facts.length, 1);
-    assert.equal(facts[0].content, "Owner 的时区是 Asia/Shanghai");
-    assert.equal(facts[0].sensitivity, "public", "工具入参显式 sensitivity 透传");
-    assert.equal((body as MemoryFactsBody).facts[0].sources.length, 1);
-    const sourceEvent = events.find((e) => e.event_id === facts[0].sources[0]);
+    const factHit = facts.find((f) => f.stage === "fact");
+    assert.ok(factHit !== undefined, "工具写入候选经巩固成为事实");
+    assert.equal(factHit.content, "Owner 的时区是 Asia/Shanghai");
+    assert.equal(factHit.sensitivity, "public", "工具入参显式 sensitivity 透传");
+    assert.equal(factHit.sources.length, 1);
+    const sourceEvent = events.find((e) => e.event_id === factHit.sources[0]);
     assert.equal(sourceEvent?.event_type, "message.user");
     assert.equal(sourceEvent?.session_id, sessionId);
   } finally {
@@ -213,7 +238,7 @@ test("重启幂等：同 dataDir 重开 runtime，迁移不抛错且既有记忆
   try {
     sessionId = await createSession(first.port);
     await send(first.port, sessionId, "记住仓库备用钥匙放在门框上");
-    await waitAssistant(first.port);
+    await waitTurnSettled(first.port);
     const events = await allEvents(first.port);
     sourceEventId = events.find((e) => e.event_type === "message.user")?.event_id ?? "";
   } finally {
@@ -225,8 +250,9 @@ test("重启幂等：同 dataDir 重开 runtime，迁移不抛错且既有记忆
     });
     const { body } = await getFacts(reopened.port, "钥匙");
     const facts = (body as MemoryFactsBody).facts;
-    assert.equal(facts.length, 1, "重启后 FTS 与数据仍在");
-    assert.deepEqual(facts[0].sources, [sourceEventId]);
+    const factHit = facts.find((f) => f.stage === "fact");
+    assert.ok(factHit !== undefined, "重启后 FTS 与数据仍在（事实可检索）");
+    assert.deepEqual(factHit.sources, [sourceEventId]);
     await reopened.close();
   } finally {
     removeDir(dir);
