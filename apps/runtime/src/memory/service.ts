@@ -8,6 +8,7 @@ import {
   type ConsolidationCandidateView,
   type ConsolidationFactView,
   DefaultConsolidator,
+  normalizeForComparison,
   type MemoryConsolidator,
 } from "./consolidator.ts";
 import {
@@ -15,6 +16,11 @@ import {
   HeuristicExtractor,
   type MemoryExtractor,
 } from "./extraction.ts";
+import {
+  MarkdownParseError,
+  parseFactMarkdown,
+  type MemoryProjector,
+} from "./projection.ts";
 import {
   type CandidateStatus,
   type ConflictResolution,
@@ -28,7 +34,8 @@ import {
 import { detectHighValue } from "./heuristics.ts";
 
 /**
- * 记忆服务（票 M1-T1 / Issue #13；抽取/巩固管线 M1-T2 / Issue #14）。
+ * 记忆服务（票 M1-T1 / Issue #13；抽取/巩固管线 M1-T2 / Issue #14；投影/受控导入/删除
+ * 标记 M1-T3 / Issue #15）。
  * 候选写入的三条路径共用一个落库+记账出口：
  *
  *   1. observeUserMessage —— 对话中命中高价值规则（heuristics.ts，确定性启发式）时，
@@ -55,6 +62,8 @@ import { detectHighValue } from "./heuristics.ts";
  *   memory.fact_updated       事实版本链推进（T2；自动偏好更新 / 冲突裁决采纳新值或合并）
  *   memory.conflict_detected  冲突上报进待确认队列（T2）
  *   memory.conflict_resolved  冲突裁决落定（T2；keep_old 只留此事件，事实不动）
+ *   memory.import_received    受控导入证据事件（T3 / Issue #15；人工编辑的来源回链目标）
+ *   memory.fact_deleted       删除标记 tombstone（T3；软删 + 投影移除，M3 同步传播的单机前置）
  *
  * 顺序约定：先落行（事务），后记账本事件；账本 append 失败向调用方抛错（后台路径
  * 由 fire-and-forget 捕获记日志）——行是可重建投影，事件缺失即本次写入未生效。
@@ -68,10 +77,15 @@ export const MEMORY_EVENT_TYPES = {
   factUpdated: "memory.fact_updated",
   conflictDetected: "memory.conflict_detected",
   conflictResolved: "memory.conflict_resolved",
+  importReceived: "memory.import_received",
+  factDeleted: "memory.fact_deleted",
 } as const;
 
 /** memory.write 工具路径在事件 payload.rule 里的标注值 */
 export const MEMORY_WRITE_RULE = "memory.write";
+
+/** 受控导入（票 M1-T3）的 rule/reason 标注值：候选 payload.rule 与修订 reason 共用 */
+export const MEMORY_IMPORT_RULE = "manual_import";
 
 /**
  * 自动巩固准入线（票 M1-T2）：抽取产生的候选 confidence ≥ 此值时随抽取运行自动巩固；
@@ -80,8 +94,12 @@ export const MEMORY_WRITE_RULE = "memory.write";
  */
 export const AUTO_CONSOLIDATE_MIN_CONFIDENCE = 0.8;
 
-/** 候选/冲突控制面错误（decideCandidate / resolveConflict / 列表参数）→ HTTP 400/404/409 */
-export type MemoryControlErrorCode = "not_found" | "invalid_input" | "invalid_state";
+/**
+ * 候选/冲突控制面错误（decideCandidate / resolveConflict / 列表参数 / 受控导入 / 删除）
+ * → HTTP 400/404/409。stale_version 与 locked_confirm 都是 409：前者防覆盖（库内版本
+ * 已领先 frontmatter），后者要求显式确认（locked 记忆删除需 Owner 确认）。
+ */
+export type MemoryControlErrorCode = "not_found" | "invalid_input" | "invalid_state" | "stale_version" | "locked_confirm";
 
 export class MemoryControlError extends Error {
   code: MemoryControlErrorCode;
@@ -102,6 +120,38 @@ export interface ConsolidationRunSummary {
   conflictIds: string[];
   /** memory.consolidated 事件 id */
   consolidatedEventId: string;
+}
+
+/** 受控导入结果（票 M1-T3）：
+ *   updated   版本化修订已落（revision_id + fact_updated 事件 id）
+ *   conflict  编辑与 locked/敏感分级冲突，进待确认队列（conflict_id + reason），未直写
+ *   unchanged 归一化内容与分级均未变，只留 memory.import_received 证据事件
+ */
+export interface MemoryImportResult {
+  status: "updated" | "conflict" | "unchanged";
+  fact_id: string;
+  /** 操作后事实版本（conflict/unchanged = 库内原版本） */
+  version: number;
+  /** memory.import_received 证据事件 id（候选来源与修订 causation 的回链目标） */
+  import_event_id: string;
+  /** status=updated：MemoryRevision id */
+  revision_id?: string;
+  /** status=updated：memory.fact_updated 事件 id */
+  event_id?: string;
+  /** status=conflict：待确认冲突 id 与原因 */
+  conflict_id?: string;
+  reason?: ConflictReason;
+}
+
+/** 删除标记结果（memory.fact_deleted tombstone 的同构投影） */
+export interface MemoryDeleteResult {
+  deleted: true;
+  fact_id: string;
+  /** 删除时事实版本（tombstone payload 同值） */
+  version: number;
+  deleted_at: string;
+  /** memory.fact_deleted 事件 id */
+  event_id: string;
 }
 
 /** 工具入参非法（空内容 / 越界 confidence / 未知 sensitivity 或 kind） */
@@ -138,6 +188,9 @@ export class MemoryService {
   readonly #replicaId: string;
   readonly #extractor: MemoryExtractor;
   readonly #consolidator: MemoryConsolidator;
+  /** 投影器（票 M1-T3，可选）：导入修订后单事实刷新、删除后投影文件移除由服务回调，
+   *  保证导入/删除与投影目录一致；缺省（单元测试）时跳过文件操作。 */
+  readonly #projector: MemoryProjector | null;
 
   constructor(deps: {
     store: MemoryStore;
@@ -147,12 +200,15 @@ export class MemoryService {
     extractor?: MemoryExtractor;
     /** 巩固器注入 seam（票 M1-T2）；缺省 = 确定性决策矩阵（DefaultConsolidator） */
     consolidator?: MemoryConsolidator;
+    /** 投影器注入 seam（票 M1-T3）；缺省 = 不维护投影文件（全量投影经 MemoryProjector 命令） */
+    projector?: MemoryProjector;
   }) {
     this.#store = deps.store;
     this.#ledger = deps.ledger;
     this.#replicaId = deps.replicaId;
     this.#extractor = deps.extractor ?? new HeuristicExtractor();
     this.#consolidator = deps.consolidator ?? new DefaultConsolidator();
+    this.#projector = deps.projector ?? null;
   }
 
   /**
@@ -218,6 +274,222 @@ export class MemoryService {
     const last = entries.at(-1);
     if (last === undefined) return null;
     return { event_id: last.envelope.event_id, occurred_at: last.envelope.occurred_at };
+  }
+
+  // --- Markdown 投影 / 受控导入 / 删除标记（票 M1-T3 / Issue #15）-----------------
+
+  /**
+   * 受控导入（FR-MEM-6）：人工编辑的 §6.4 Markdown 全文（投影文件原样回贴）转为版本化
+   * 修订，不绕过冲突检测。body 形态取「编辑后的 Markdown 全文」（{markdown} 包裹）——
+   * 一次携带全部 frontmatter（id/version/sensitivity），与投影文件互为往返；结构化
+   * {fact_id, content} 形态会绕过 §6.4 解析与 frontmatter 版本对账，不做。
+   *
+   * 流程（先证据事件，后行，行后动作事件——来源回链目标必须已在账本）：
+   *   1. 解析 frontmatter + 正文 → id 定位事实（不存在/已删 404）；version 与库内不一致
+   *      → stale_version 409（防覆盖：编辑基于旧投影时拒绝，要求重投影后再改）；
+   *   2. memory.import_received 证据事件入账；
+   *   3. 内容与分级均未变 → unchanged（只留证据事件，不写候选不推进版本）；
+   *   4. 变更 = 一次显式写入：来源（import 事件）+ 候选（confidence 1，人工编辑即
+   *      Owner 授权）+ candidate_created 事件；
+   *   5. 与 T2 巩固同一冲突口径（按序判定）：locked 且有任何变更 → escalate "locked"；
+   *      分级不同 → escalate "sensitivity_change"（纯分级变更也算——可见性不静默改，
+   *      比 T2 更严：T2 只在内容不同时比分级，这里编辑显式写了分级就照单对账）；
+   *      其余 → 版本+1 + MemoryRevision（reason=manual_import）+ fact_updated 事件
+   *      + 投影单事实刷新。
+   *
+   * frontmatter 其余字段（type/confidence/valid_from/valid_until/sources/created_at/
+   * updated_at）为投影只读面：type 在 v1 不可变（不一致忽略，kind 恒取库内），confidence
+   * 是候选属性，sources/时间戳是审计事实——一律以库内为准，不因导入改写。
+   */
+  importMarkdown(markdown: string): MemoryImportResult {
+    let parsed: { fields: Record<string, string>; body: string };
+    try {
+      parsed = parseFactMarkdown(markdown);
+    } catch (err) {
+      if (err instanceof MarkdownParseError) {
+        throw new MemoryControlError("invalid_input", `malformed memory markdown: ${err.message}`);
+      }
+      throw err;
+    }
+    const id = parsed.fields.id?.trim();
+    if (id === undefined || id.length === 0) {
+      throw new MemoryControlError("invalid_input", "frontmatter `id` is required for import");
+    }
+    const versionRaw = parsed.fields.version;
+    if (versionRaw === undefined || !/^\d+$/.test(versionRaw) || Number(versionRaw) < 1) {
+      throw new MemoryControlError("invalid_input", "frontmatter `version` must be a positive integer");
+    }
+    const baseVersion = Number(versionRaw);
+    const fact = this.#store.getFact(id);
+    if (fact === null || fact.deleted_at !== null) {
+      throw new MemoryControlError("not_found", `fact "${id}" does not exist`);
+    }
+    if (fact.version !== baseVersion) {
+      throw new MemoryControlError(
+        "stale_version",
+        `frontmatter version ${baseVersion} does not match current fact version ${fact.version}; re-project and edit the current version`,
+      );
+    }
+    const newContent = parsed.body.trim();
+    if (newContent.length === 0) {
+      throw new MemoryControlError("invalid_input", "markdown body (the memory content) must be non-empty");
+    }
+    const sensitivityRaw = parsed.fields.sensitivity;
+    if (sensitivityRaw !== undefined && !SENSITIVITY_LEVELS.includes(sensitivityRaw as SensitivityLevel)) {
+      throw new MemoryControlError("invalid_input", `unknown sensitivity: ${sensitivityRaw}`);
+    }
+    const newSensitivity = (sensitivityRaw as SensitivityLevel | undefined) ?? fact.sensitivity;
+
+    const contentEqual = normalizeForComparison(newContent) === normalizeForComparison(fact.content);
+    const sensitivityEqual = newSensitivity === fact.sensitivity;
+
+    // 导入证据事件先行：候选来源与修订 causation 都回链到它（人工编辑也是证据）
+    const importEnvelope = buildEventEnvelope({
+      replicaId: this.#replicaId,
+      actorId: "agent:runtime",
+      eventType: MEMORY_EVENT_TYPES.importReceived,
+      payload: {
+        fact_id: fact.fact_id,
+        base_version: baseVersion,
+        content: newContent,
+        sensitivity: newSensitivity,
+      },
+    });
+    this.#ledger.append(importEnvelope);
+
+    if (contentEqual && sensitivityEqual) {
+      return { status: "unchanged", fact_id: fact.fact_id, version: fact.version, import_event_id: importEnvelope.event_id };
+    }
+
+    // 编辑 = 一次显式记忆写入（候选先落行，candidate_created 随后；来源 = import 事件）
+    const { candidate } = this.#persist({
+      sessionId: null,
+      sourceEventId: importEnvelope.event_id,
+      content: newContent,
+      // type 在 v1 不可变：frontmatter type 与库内不一致时忽略，恒按库内 kind
+      kind: fact.kind,
+      confidence: 1,
+      sensitivity: newSensitivity,
+      occurredAt: importEnvelope.occurred_at,
+      rule: MEMORY_IMPORT_RULE,
+      sourceKind: "import",
+    });
+
+    // 与 T2 巩固同一冲突口径（按序判定），escalate 后绝不直写
+    let reason: ConflictReason | null = null;
+    if (fact.sensitivity === "locked") {
+      reason = "locked"; // GLOSSARY：locked 禁止一切自动改写，任何变更（内容或分级）都经 Owner 确认
+    } else if (!sensitivityEqual) {
+      reason = "sensitivity_change"; // 可见性分级升级与放宽都不静默变更
+    }
+    if (reason !== null) {
+      const conflict = this.#store.escalateConflict({
+        candidateId: candidate.candidate_id,
+        factId: fact.fact_id,
+        reason,
+        existingContent: fact.content,
+        incomingContent: newContent,
+        existingSensitivity: fact.sensitivity,
+        incomingSensitivity: newSensitivity,
+        sourceId: candidate.source_id,
+      });
+      this.#appendMemoryEvent(MEMORY_EVENT_TYPES.conflictDetected, {
+        conflict_id: conflict.conflict_id,
+        fact_id: conflict.fact_id,
+        candidate_id: conflict.candidate_id,
+        reason: conflict.reason,
+        existing_content: conflict.existing_content,
+        incoming_content: conflict.incoming_content,
+        source_event_id: importEnvelope.event_id,
+      }, importEnvelope.event_id);
+      return {
+        status: "conflict",
+        fact_id: fact.fact_id,
+        version: fact.version,
+        conflict_id: conflict.conflict_id,
+        reason,
+        import_event_id: importEnvelope.event_id,
+      };
+    }
+
+    // 无冲突：版本化修订（版本+1 + MemoryRevision + FTS 刷新 + 来源多对多）
+    const { fact: updated, revision } = this.#store.updateFact({
+      factId: fact.fact_id,
+      content: newContent,
+      sensitivity: newSensitivity,
+      reason: MEMORY_IMPORT_RULE,
+      candidateId: candidate.candidate_id,
+      sourceId: candidate.source_id,
+    });
+    const updatedEnvelope = buildEventEnvelope({
+      replicaId: this.#replicaId,
+      actorId: "agent:runtime",
+      eventType: MEMORY_EVENT_TYPES.factUpdated,
+      payload: {
+        fact_id: updated.fact_id,
+        version: updated.version,
+        content: updated.content,
+        sensitivity: updated.sensitivity,
+        revision_id: revision.revision_id,
+        reason: MEMORY_IMPORT_RULE,
+        candidate_id: candidate.candidate_id,
+        source_event_id: importEnvelope.event_id,
+      },
+      causationId: importEnvelope.event_id,
+    });
+    this.#ledger.append(updatedEnvelope);
+    // 投影单事实刷新：文件跟随版本链头部（幂等——下次全量投影字节不变）
+    this.#projector?.writeFact(updated.fact_id);
+    return {
+      status: "updated",
+      fact_id: updated.fact_id,
+      version: updated.version,
+      import_event_id: importEnvelope.event_id,
+      revision_id: revision.revision_id,
+      event_id: updatedEnvelope.event_id,
+    };
+  }
+
+  /**
+   * 删除标记（FR-MEM-8 的 M1 单机前置）：软删——facts 行标记 deleted_at（不物理删，
+   * 行/修订/来源多对多保留作回链审计）+ FTS 索引移除（检索面立即退出）+
+   * memory.fact_deleted tombstone 事件入账本（M3 同步传播的证据，payload 带事实终态）
+   * + 投影文件移除；重投影只认现存事实，不复活已删记忆。
+   *
+   * locked 记忆删除需确认：默认拒绝（409 locked_confirm，提示带 confirm 参数重试），
+   * 显式 `?confirm=true`（HTTP 层）放行——locked 的语义是「变更必须经 Owner 确认」，
+   * 删除是不可逆变更，宁可多问一次。
+   */
+  deleteFact(factId: string, options: { confirm?: boolean } = {}): MemoryDeleteResult {
+    const fact = this.#store.getFact(factId);
+    if (fact === null || fact.deleted_at !== null) {
+      throw new MemoryControlError("not_found", `fact "${factId}" does not exist`);
+    }
+    if (fact.sensitivity === "locked" && options.confirm !== true) {
+      throw new MemoryControlError(
+        "locked_confirm",
+        `fact "${factId}" is locked; locked memories require explicit confirmation to delete — retry with ?confirm=true`,
+      );
+    }
+    const { fact: deleted, deleted_at } = this.#store.deleteFact(factId);
+    // tombstone causation 指向事实最近一次来源事件（回链审计；无来源时为 null）
+    const sourceEventIds = this.#store.factSourceEventIds(factId);
+    const tombstone = buildEventEnvelope({
+      replicaId: this.#replicaId,
+      actorId: "agent:runtime",
+      eventType: MEMORY_EVENT_TYPES.factDeleted,
+      payload: {
+        fact_id: deleted.fact_id,
+        version: deleted.version,
+        content: deleted.content,
+        sensitivity: deleted.sensitivity,
+        deleted_at,
+      },
+      causationId: sourceEventIds.at(-1) ?? null,
+    });
+    this.#ledger.append(tombstone);
+    this.#projector?.removeFact(factId);
+    return { deleted: true, fact_id: deleted.fact_id, version: deleted.version, deleted_at, event_id: tombstone.event_id };
   }
 
   // --- 抽取/巩固管线（票 M1-T2 / Issue #14）------------------------------------
@@ -627,7 +899,8 @@ export class MemoryService {
   }
 
   #persist(input: {
-    sessionId: string;
+    /** 会话 id；受控导入（票 M1-T3）无会话上下文，传 null（信封不带 session_id） */
+    sessionId: string | null;
     sourceEventId: string;
     content: string;
     kind: MemoryEntryKind;
@@ -635,6 +908,8 @@ export class MemoryService {
     sensitivity: SensitivityLevel;
     occurredAt: string;
     rule: string;
+    /** 来源证据形态；缺省 "message"（对话路径），受控导入传 "import" */
+    sourceKind?: string;
   }): MemoryWriteResult {
     const createInput: CreateCandidateInput = {
       content: input.content,
@@ -642,7 +917,7 @@ export class MemoryService {
       confidence: input.confidence,
       sensitivity: input.sensitivity,
       occurredAt: input.occurredAt,
-      source: { kind: "message", eventId: input.sourceEventId, sessionId: input.sessionId },
+      source: { kind: input.sourceKind ?? "message", eventId: input.sourceEventId, sessionId: input.sessionId },
     };
     const { source, candidate } = this.#store.createCandidate(createInput);
     const envelope = buildEventEnvelope({

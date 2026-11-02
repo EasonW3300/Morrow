@@ -79,7 +79,12 @@ export type ConflictReason = "fact_conflict" | "locked" | "sensitivity_change";
 /** 冲突裁决（Owner 三选一：采纳新值 / 保留旧值 / 合并） */
 export type ConflictResolution = "keep_new" | "keep_old" | "merge";
 
-/** 长期事实（GLOSSARY: MemoryFact；版本链头部） */
+/**
+ * 长期事实（GLOSSARY: MemoryFact；版本链头部）。deleted_at 非空 = 删除标记（票 M1-T3）：
+ * 软删不物理删——行与 memory_revisions/memory_fact_sources 保留作回链审计，
+ * 事实从 listFacts（巩固匹配面/投影面）与 FTS（检索面）退出，删除经 memory.fact_deleted
+ * tombstone 事件传播（M3 同步的单机前置）。
+ */
 export interface MemoryFactRow {
   fact_id: string;
   content: string;
@@ -90,6 +95,7 @@ export interface MemoryFactRow {
   valid_until: string | null;
   created_at: string;
   updated_at: string;
+  deleted_at: string | null;
 }
 
 /** 事实版本历史条目（GLOSSARY: MemoryRevision；FR-MEM-5 自动更新留历史） */
@@ -183,7 +189,8 @@ CREATE TABLE IF NOT EXISTS memory_facts (
   valid_from  TEXT NOT NULL,
   valid_until TEXT,
   created_at  TEXT NOT NULL,
-  updated_at  TEXT NOT NULL
+  updated_at  TEXT NOT NULL,
+  deleted_at  TEXT
 );
 
 CREATE TABLE IF NOT EXISTS memory_fact_sources (
@@ -261,6 +268,17 @@ function migrateCandidateStatuses(db: SqliteDatabase): void {
   db.exec(CANDIDATES_MIGRATION_SQL);
 }
 
+/**
+ * 事实表删除标记列迁移（票 M1-T3）：deleted_at 非空 = 软删。新库由 CREATE_SQL 直接带列；
+ * 既有库走 ALTER ADD COLUMN（SQLite 允许，NULL 缺省，不触碰既有行）——与账本 task_id
+ * 专列同一迁移模式（PRAGMA table_info 判定，幂等可重复执行）。
+ */
+function migrateFactDeletedAt(db: SqliteDatabase): void {
+  const columns = db.prepare("PRAGMA table_info(memory_facts)").all() as Array<{ name: string }>;
+  if (columns.some((c) => c.name === "deleted_at")) return;
+  db.exec("ALTER TABLE memory_facts ADD COLUMN deleted_at TEXT");
+}
+
 /** CJK 表意文字 + 假名 + 谚文（unicode61 之下需要拆字的区段） */
 const CJK_RE = /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af]/;
 
@@ -314,6 +332,7 @@ export class MemoryStore {
   #updateFactStmt;
   #insertRevisionStmt;
   #listFactsStmt;
+  #deleteFactStmt;
   #deleteFtsEntryStmt;
   #insertConflictStmt;
   #getConflictStmt;
@@ -324,8 +343,10 @@ export class MemoryStore {
   private constructor(db: SqliteDatabase) {
     this.#db = db;
     db.exec(CREATE_SQL);
-    // T1 旧库先重建候选表（此时没有任何表引用它，RENAME 无波及），再建冲突队列
+    // T1 旧库先重建候选表（此时没有任何表引用它，RENAME 无波及），再建冲突队列；
+    // 事实表补 deleted_at 列（票 M1-T3 软删，幂等）
     migrateCandidateStatuses(db);
+    migrateFactDeletedAt(db);
     db.exec(CONFLICTS_CREATE_SQL);
     this.#insertSourceStmt = db.prepare(
       "INSERT INTO memory_sources (source_id, kind, event_id, session_id, created_at) VALUES (?, ?, ?, ?, ?)",
@@ -350,7 +371,7 @@ export class MemoryStore {
       "SELECT source_id, kind, event_id, session_id, created_at FROM memory_sources WHERE source_id = ?",
     );
     this.#factByIdStmt = db.prepare(
-      `SELECT fact_id, content, kind, sensitivity, version, valid_from, valid_until, created_at, updated_at
+      `SELECT fact_id, content, kind, sensitivity, version, valid_from, valid_until, created_at, updated_at, deleted_at
        FROM memory_facts WHERE fact_id = ?`,
     );
     this.#factSourcesStmt = db.prepare(
@@ -391,8 +412,11 @@ export class MemoryStore {
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
     );
     this.#listFactsStmt = db.prepare(
-      `SELECT fact_id, content, kind, sensitivity, version, valid_from, valid_until, created_at, updated_at
-       FROM memory_facts WHERE valid_until IS NULL ORDER BY created_at, fact_id`,
+      `SELECT fact_id, content, kind, sensitivity, version, valid_from, valid_until, created_at, updated_at, deleted_at
+       FROM memory_facts WHERE valid_until IS NULL AND deleted_at IS NULL ORDER BY created_at, fact_id`,
+    );
+    this.#deleteFactStmt = db.prepare(
+      "UPDATE memory_facts SET deleted_at = ? WHERE fact_id = ? AND deleted_at IS NULL",
     );
     this.#deleteFtsEntryStmt = db.prepare(
       "DELETE FROM memory_fts WHERE entry_id = ? AND entry_kind = ?",
@@ -553,10 +577,38 @@ export class MemoryStore {
     return row ?? null;
   }
 
-  /** 现存有效事实（巩固器匹配视图）；created_at 升序（并列匹配的确定性 tie-break） */
+  /** 现存有效事实（巩固器匹配视图 + 投影面）；created_at 升序（并列匹配的确定性 tie-break）。
+   *  已删（deleted_at 非空）与已过期（valid_until 非空）事实都不在视图内——重投影不复活已删记忆。 */
   listFacts(): MemoryFactRow[] {
     this.#assertOpen();
     return this.#listFactsStmt.all() as unknown as MemoryFactRow[];
+  }
+
+  /**
+   * 删除标记（票 M1-T3，FR-MEM-8 的单机前置）：软删——deleted_at 落值 + FTS 索引移除
+   * （检索面立即退出），行/修订/来源多对多保留（回链审计）。单事务；重复删除或未知
+   * 事实抛错（服务层先经 getFact 判定，此为竞态兜底）。tombstone 事件由 MemoryService
+   * 在行落定之后记账（memory.fact_deleted）。
+   */
+  deleteFact(factId: string): { fact: MemoryFactRow; deleted_at: string } {
+    this.#assertOpen();
+    const now = new Date().toISOString();
+    return this.#tx(() => {
+      const fact = this.#getFactInTx(factId);
+      const result = this.#deleteFactStmt.run(now, factId);
+      if (Number(result.changes) !== 1) {
+        throw new Error(`fact ${factId} is already deleted`);
+      }
+      this.#deleteFtsEntryStmt.run(factId, "fact");
+      return { fact: this.#getFactInTx(factId), deleted_at: now };
+    });
+  }
+
+  /** 事实的全部来源账本事件 id（投影 frontmatter `sources` 与 tombstone causation 用），按来源创建时间升序 */
+  factSourceEventIds(factId: string): string[] {
+    this.#assertOpen();
+    const rows = this.#factSourcesStmt.all(factId) as unknown as Array<{ event_id: string }>;
+    return rows.map((row) => row.event_id);
   }
 
   /** 巩固新建事实：事实 v1 + 来源多对多 + FTS + 候选转 consolidated（单事务） */
@@ -574,6 +626,7 @@ export class MemoryStore {
         valid_until: null,
         created_at: now,
         updated_at: now,
+        deleted_at: null,
       };
       this.#insertFactStmt.run(
         fact.fact_id,

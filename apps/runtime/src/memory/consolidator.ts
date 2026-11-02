@@ -100,8 +100,9 @@ export function salientTokens(content: string): Set<string> {
   return tokens;
 }
 
-/** 归一化内容：印证判定用（去全部空白 + 小写；CJK 文本中的空格是排版噪声） */
-function normalizeContent(content: string): string {
+/** 归一化内容：印证判定用（去全部空白 + 小写；CJK 文本中的空格是排版噪声）。
+ *  受控导入（票 M1-T3）的内容变更比对复用同一口径——「与 T2 巩固相同的冲突判定」。 */
+export function normalizeForComparison(content: string): string {
   return content.replace(/\s+/g, "").toLowerCase();
 }
 
@@ -137,7 +138,7 @@ export class DefaultConsolidator implements MemoryConsolidator {
       };
     }
     const fact = best.fact;
-    if (normalizeContent(candidate.content) === normalizeContent(fact.content)) {
+    if (normalizeForComparison(candidate.content) === normalizeForComparison(fact.content)) {
       return { action: "corroborate", factId: fact.factId, candidateId: candidate.candidateId };
     }
     if (fact.sensitivity === "locked") {

@@ -14,6 +14,11 @@ M1-T2（Issue #14）交付后台抽取与巩固管线：轮次收尾异步抽取
 启发式）→ 巩固（可注入 Consolidator，默认确定性决策矩阵）产出 MemoryFact + MemoryRevision
 版本链；常规偏好冲突自动更新留历史，重大事实 / locked / 敏感等级冲突进待确认队列；
 候选/冲突控制面端点与 `memory.extracted` / `memory.consolidated` 等运行事件。
+M1-T3（Issue #15）交付 Markdown 投影、受控导入与删除标记：长期记忆投影为 §6.4 格式的
+`dataDir/memory/*.md`（再生成幂等），`POST /v1/memory/import` 把人工编辑转版本化修订
+（不绕过冲突检测，frontmatter 版本对账防覆盖），`DELETE /v1/memory/facts/:id` 软删 +
+`memory.fact_deleted` tombstone + 投影移除（重投影不复活），AC-03 前置脚本 100 条记录
+回链断言（`memory:ac03`）。
 
 ## 运行与测试
 
@@ -84,6 +89,9 @@ provider 参数）；凭据库可经 `startRuntime(config, { secretStore })` 注
 | POST | `/v1/memory/candidates/:id/decide` | Owner 决定（M1-T2）：body `{ decision: "accept" \| "dismiss" }`；accept → 立即巩固该候选（绕过置信度准入线）→ 200 `{ candidate_id, decision, outcome: { kind: "fact_created" \| "fact_updated" \| "corroborated" \| "conflict", fact_id?/conflict_id? }, run }`；dismiss → 状态置 dismissed；未知 id 404 `memory_not_found`、非 pending 409 `memory_invalid_state`（conflicted 候选走冲突裁决端点）、decision 非法 400 |
 | GET | `/v1/memory/conflicts` | 冲突列表（M1-T2）：`status` 可选（`open` 待确认队列 / `resolved`）+ 分页 → `{ conflicts: [{ conflict_id, candidate_id, fact_id, reason, existing_content, incoming_content, existing_sensitivity, incoming_sensitivity, status, resolution?, resolved_content?, created_at, resolved_at? }] }` |
 | POST | `/v1/memory/conflicts/:id/resolve` | 冲突裁决（M1-T2，FR-MEM-5 的出口）：body `{ resolution: "keep_new" \| "keep_old" \| "merge", content? }`；keep_new → 采纳候选值（版本+1 + 修订 `conflict_resolved` + `memory.fact_updated`）；keep_old → 事实不动、候选 dismissed（只留 `memory.conflict_resolved`）；merge → 必须携带非空 `content`（Owner 合并文本）进版本链（修订 `conflict_merged`，敏感性维持既有分级）→ 200 `{ conflict_id, fact_id, resolution, version, revision_id, factUpdatedEventId, conflictResolvedEventId }`；未知 404、已裁决 409、merge 缺 content / resolution 非法 400 |
+| POST | `/v1/memory/import` | 受控导入（M1-T3 / Issue #15，FR-MEM-6）：body `{ markdown }` = 编辑后的 §6.4 投影文件全文 → 200 `{ status: "updated" \| "conflict" \| "unchanged", fact_id, version, import_event_id, ... }`；合法编辑转版本化修订（版本+1 + MemoryRevision `manual_import` + `memory.fact_updated`，投影文件同步刷新）；locked / 敏感分级变更进待确认队列不直写（status=`conflict` + `conflict_id`/`reason`，裁决走 resolve 端点）；frontmatter `version` 落后库内 → 409 `memory_stale_version`（防覆盖）；未知/已删事实 404、缺 frontmatter / 缺 `markdown` 400 |
+| DELETE | `/v1/memory/facts/:id` | 删除标记（M1-T3，FR-MEM-8 单机前置）：tombstone 事件 `memory.fact_deleted` 入账本 + facts 行软删（`deleted_at` 标记；修订/来源多对多保留作回链审计）+ FTS 索引移除 + 投影文件移除 → 200 `{ deleted: true, fact_id, version, deleted_at, event_id }`；重投影不复活已删记忆；locked 记忆默认拒绝 409 `memory_locked_confirm`，`?confirm=true` 显式确认后删除；未知/已删 404 |
+| POST | `/v1/memory/project` | 投影再生成命令（M1-T3，幂等）：现存有效事实 → `<dataDir>/memory/{fact_id}.md`（§6.4 frontmatter），只写差异文件（同状态产出同字节）+ 清理孤儿投影文件（外来文件不动）→ 200 `{ directory, written, unchanged, removed }` |
 
 错误统一 `{ error: { code, message } }`；未匹配路径 404，路径命中但方法不符 405，
 body 非法 400 `invalid_body`，body 的 content-type 非 application/json 一律 415
@@ -325,10 +333,42 @@ FR-TASK-3 的范围；客户端轮询详情与事件观察执行进度（curl �
 上限 50，候选/事实统一索引，命中带 `sources` 回链。**默认敏感级**：新记忆一律
 `sensitivity=private`（GLOSSARY: Sensitivity Level，仅 Owner 会话可读），工具入参可显式覆盖。
 
+**Markdown 投影 / 受控导入 / 删除标记（M1-T3 / Issue #15，FR-MEM-6/8）**：
+
+1. **投影**：现存有效事实 → `<dataDir>/memory/{fact_id}.md`（文件名 = fact_id），frontmatter
+   严格按 PRD §6.4 十字段（id/type/sensitivity/confidence/valid_from/valid_until/sources/
+   created_at/updated_at/version），正文 = 事实内容原文。值格式两处刻意偏差取无损/一致性：
+   `id` 用 fact_id 原文（与检索 API、文件名同一真相源，不带示例中的 `mem_` 前缀）、时间戳
+   用完整 ISO 8601 UTC；`confidence` 对事实恒为 `null`（置信度是候选属性，字段按 §6.4
+   字段集保留）。**幂等**：渲染是 store 状态的纯函数——同状态产出同字节（统一 LF + 尾随
+   换行，无需换行归一层），projectAll 只写差异文件并清理孤儿 `{uuid}.md`（外来文件不动）；
+   再生成命令 `POST /v1/memory/project`。已删/已过期事实不投影。
+2. **受控导入**：`POST /v1/memory/import`，body = `{ markdown }`（编辑后的投影文件全文——
+   一次携带全部 frontmatter，与投影互为往返；结构化 `{fact_id, content}` 形态会绕过 §6.4
+   解析与版本对账，不做）。流程：id 定位事实（不存在/已删 404）→ version 对账（落后即 409
+   `memory_stale_version` 防覆盖）→ `memory.import_received` 证据事件 → 内容与分级均未变
+   → `unchanged`；否则候选（confidence 1，人工编辑即 Owner 授权）+ 与 T2 巩固同一冲突口径：
+   locked 任何变更 → 冲突队列（`locked`），分级变更 → 冲突队列（`sensitivity_change`，纯
+   分级变更也算，比巩固器更严），其余 → 版本+1 + MemoryRevision（`manual_import`）+
+   `memory.fact_updated` + 投影单事实刷新。frontmatter 其余字段是投影只读面（type 不可变、
+   sources/时间戳以库内为准），不因导入改写。
+3. **删除标记**：`DELETE /v1/memory/facts/:id` → facts 行软删（`deleted_at`；修订/来源保留
+   作回链审计）+ FTS 索引移除（检索面立即退出）+ `memory.fact_deleted` tombstone 事件
+   （payload 带事实终态，M3 同步传播的证据）+ 投影文件移除；重投影只认现存事实，不复活
+   已删记忆。**locked 删除需确认**：默认 409 `memory_locked_confirm`，`?confirm=true`
+   显式放行（locked = 变更须经 Owner 确认，删除是不可逆变更，宁可多问）。
+
+**AC-03 前置脚本**：`pnpm --filter @morrow/runtime memory:ac03`
+（`scripts/memory-ac03.ts`）——100 条设计记录端到端（词元两两不相交的确定性内容）：
+写入→抽取→巩固→投影（幂等断言）→检索→逐条回链断言（全部 100 条投影 frontmatter 的
+sources 非空且指向存在的账本事件）→账本完整性校验→受控导入/删除抽查。确定性、零网络、
+可重复执行（临时数据目录即建即清）。
+
 **边界（如实）**：抽取/巩固默认实现是确定性启发式——按句匹配、不懂语义（反讽/引用有
 误报漏报），同主题判定靠词元交集（过宽多问、过窄多建事实，均可经控制面纠偏）；LLM 抽取/
-巩固后续经同接口替换（`MemoryExtractor` / `MemoryConsolidator`），无需动写路径；Markdown
-投影（FR-MEM-6）与保留/删除（FR-MEM-8）是后续票；`memory.*` 事件经账本入 SSE 重放
+巩固后续经同接口替换（`MemoryExtractor` / `MemoryConsolidator`），无需动写路径；投影为
+单向导出（`POST /v1/memory/project` 再生成），尚无编辑器文件监听/自动重投影；删除的跨
+副本传播是 M3（本票只落单机 tombstone）；`memory.*` 事件经账本入 SSE 重放
 （session_id 关联），不进会话实时帧；FTS5 为硬依赖（Node 22.16+/24，见文首）。
 
 ## 真实 Provider 冒烟（手动，不进测试套件）
