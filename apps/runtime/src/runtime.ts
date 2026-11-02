@@ -14,6 +14,7 @@ import { memoryFactsRoute } from "./memory/routes.ts";
 import { ProviderRegistry, ProviderRegistryError, ENV_PROVIDER_ID, type ProviderResolver, type ResolvedProvider } from "./providers.ts";
 import { SessionManager, type AgentRuntimeExtras, type SessionFrame } from "./sessions.ts";
 import { TaskScheduler, type NodeAgentFactory, type TaskNodeExecInput } from "./scheduler.ts";
+import { CheckpointError, CheckpointService } from "./checkpoint.ts";
 import { PLANNER_SYSTEM_PROMPT, TaskError, TaskService, type PlannerFactory } from "./tasks.ts";
 import { buildEventEnvelope } from "./envelope.ts";
 import { computeIntegrityHash, type EventEnvelope } from "@morrow/protocol";
@@ -48,6 +49,8 @@ interface RequestContext {
   tasks: TaskService;
   /** 任务调度器（POST /v1/tasks 规划成功后的后台触发点；生命周期归 startRuntime） */
   scheduler: TaskScheduler;
+  /** Checkpoint 服务（M1-T5：pause/resume/restore/checkpoints 端点背后的快照与恢复） */
+  checkpoints: CheckpointService;
   memory: MemoryService;
 }
 
@@ -107,6 +110,8 @@ export interface RuntimeHandle {
   providers: ProviderRegistry;
   /** 任务服务（库形态可直用：createTask / 详情 / 状态机迁移；调度经 HTTP 自动触发） */
   tasks: TaskService;
+  /** Checkpoint 服务（库形态可直用：createCheckpoint / 列表 / restore 落地；M1-T5） */
+  checkpoints: CheckpointService;
   /**
    * 优雅停止：停止接收请求 → 中止并释放会话运行时与在跑任务节点 → 记账 runtime.stopped
    * → 关闭任务投影库与账本（WAL checkpoint）。signal 传入收到的 POSIX 信号名，
@@ -135,6 +140,11 @@ const routes: Route[] = [
   { method: "GET", re: /^\/v1\/tasks$/, handler: handleListTasks },
   { method: "GET", re: /^\/v1\/tasks\/([^/]+)$/, handler: handleGetTask },
   { method: "GET", re: /^\/v1\/tasks\/([^/]+)\/events$/, handler: handleTaskEvents },
+  // M1-T5 介入端点（FR-TASK-3 暂停/恢复半边 + FR-TASK-5/6 Checkpoint 与恢复语义）
+  { method: "POST", re: /^\/v1\/tasks\/([^/]+)\/pause$/, handler: handlePauseTask },
+  { method: "POST", re: /^\/v1\/tasks\/([^/]+)\/resume$/, handler: handleResumeTask },
+  { method: "POST", re: /^\/v1\/tasks\/([^/]+)\/restore$/, handler: handleRestoreTask },
+  { method: "GET", re: /^\/v1\/tasks\/([^/]+)\/checkpoints$/, handler: handleListCheckpoints },
   memoryFactsRoute,
 ];
 
@@ -176,14 +186,37 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     providers,
     providerRequired: !taskPlannerInjected,
   });
+  // Checkpoint 域（M1-T5 / Issue #17）：FR-TASK-5 快照 + 恢复落地；执行配置采集注入
+  // runtime 版本与默认 Provider 投影（绝不含密钥）。
+  const checkpoints = new CheckpointService({
+    tasks,
+    dataDir: config.dataDir,
+    ledger,
+    replicaId: config.replicaId,
+    executionInfo: async () => {
+      try {
+        const provider = await providers.resolve();
+        return {
+          runtime_version: VERSION,
+          provider:
+            provider === null
+              ? null
+              : { provider_id: provider.providerId, model_id: provider.modelId, base_url: provider.baseUrl },
+        };
+      } catch {
+        return { runtime_version: VERSION, provider: null };
+      }
+    },
+  });
   const scheduler = new TaskScheduler({
     tasks,
     ledger,
     replicaId: config.replicaId,
     nodeAgentFactory: options.taskNodeAgentFactory ?? ((node: TaskNodeExecInput) => defaultNodeRuntime(node.goal)),
+    checkpoints,
     ...(options.taskConcurrency === undefined ? {} : { concurrency: options.taskConcurrency }),
   });
-  const ctx: RequestContext = { ledger, replicaId: config.replicaId, sessions, providers, devices, tasks, scheduler, memory };
+  const ctx: RequestContext = { ledger, replicaId: config.replicaId, sessions, providers, devices, tasks, scheduler, checkpoints, memory };
   const server = createServer((req, res) => {
     routeRequest(req, res, ctx);
   });
@@ -216,6 +249,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     providers,
     devices,
     tasks,
+    checkpoints,
     memory,
     async close(signal?: string): Promise<void> {
       if (closing) return;
@@ -227,6 +261,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
       // 任务调度：拒绝排队任务、中止在跑节点（收尾上限 2s），然后关任务投影库
       await scheduler.dispose();
       tasks.close();
+      checkpoints.close();
       try {
         ledger.append(
           buildEventEnvelope({
@@ -774,15 +809,102 @@ function handleTaskEvents(_req: IncomingMessage, res: ServerResponse, url: URL, 
   sendJson(res, 200, ctx.ledger.list({ taskId, limit: page.limit, offset: page.offset }));
 }
 
-/** TaskError → HTTP：not_found 404、invalid_transition 409、planner_unavailable 503；其余上抛 500 */
+/** TaskError → HTTP：not_found 404、invalid_transition 409、planner_unavailable 503、timeout 504；其余上抛 500 */
 function handleTaskError(res: ServerResponse, err: unknown): void {
   if (err instanceof TaskError) {
-    const status = err.code === "not_found" ? 404 : err.code === "invalid_transition" ? 409 : err.code === "planner_unavailable" ? 503 : 500;
+    const status =
+      err.code === "not_found"
+        ? 404
+        : err.code === "invalid_transition"
+          ? 409
+          : err.code === "planner_unavailable"
+            ? 503
+            : err.code === "timeout"
+              ? 504
+              : 500;
     sendError(res, status, `task_${err.code}`, err.message);
+    return;
+  }
+  if (err instanceof CheckpointError) {
+    const status = err.code === "checkpoint_not_found" ? 404 : err.code === "task_not_found" ? 404 : 409;
+    sendError(res, status, err.code, err.message);
     return;
   }
   throw err;
 }
+
+// --- M1-T5 任务介入端点（票 #17，PRD §6.2 pause/resume/restore/checkpoints）-----
+// 语义：pause 同步等安全点（在跑节点到边界）后返回 200 + checkpoint；resume/restore
+// 完成 reconcile 与状态迁移后 202，后台驱动经返回的 drive promise fire-and-forget
+// （失败路径已全部落账本，这里的 catch 只防未处理拒绝）。
+
+function handlePauseTask(_req: IncomingMessage, res: ServerResponse, _url: URL, ctx: RequestContext, params: string[]): void {
+  void (async () => {
+    try {
+      const { task, checkpoint } = await ctx.scheduler.pause(params[0]);
+      sendJson(res, 200, { task, checkpoint });
+    } catch (err) {
+      handleTaskError(res, err);
+    }
+  })();
+}
+
+function handleResumeTask(_req: IncomingMessage, res: ServerResponse, _url: URL, ctx: RequestContext, params: string[]): void {
+  void (async () => {
+    try {
+      const result = await ctx.scheduler.resume(params[0]);
+      void result.drive.catch((err: unknown) => {
+        console.error("[morrow] task resume drive crashed:", err);
+      });
+      sendJson(res, 202, {
+        task: result.task,
+        checkpoint_id: result.checkpoint_id,
+        reconcile: result.report,
+      });
+    } catch (err) {
+      handleTaskError(res, err);
+    }
+  })();
+}
+
+interface RestoreBody {
+  checkpoint_id?: unknown;
+}
+
+function handleRestoreTask(req: IncomingMessage, res: ServerResponse, _url: URL, ctx: RequestContext, params: string[]): void {
+  void (async () => {
+    const body = await readJsonBody(req, res);
+    if (body === null) return; // 响应已在 readJsonBody 里写出
+    const { checkpoint_id: checkpointId } = body as RestoreBody;
+    if (typeof checkpointId !== "string" || checkpointId.trim().length === 0) {
+      sendError(res, 400, "invalid_body", "checkpoint_id must be a non-empty string");
+      return;
+    }
+    try {
+      const result = await ctx.scheduler.restore(params[0], checkpointId);
+      void result.drive.catch((err: unknown) => {
+        console.error("[morrow] task restore drive crashed:", err);
+      });
+      sendJson(res, 202, {
+        task: result.task,
+        checkpoint_id: result.checkpoint_id,
+        reconcile: result.report,
+      });
+    } catch (err) {
+      handleTaskError(res, err);
+    }
+  })();
+}
+
+/** checkpoint 列表（新→旧；快照全量返回——M1 量级小，任务工作台直接可渲染） */
+function handleListCheckpoints(_req: IncomingMessage, res: ServerResponse, _url: URL, ctx: RequestContext, params: string[]): void {
+  if (ctx.tasks.getTask(params[0]) === null) {
+    sendError(res, 404, "task_not_found", `task "${params[0]}" not found`);
+    return;
+  }
+  sendJson(res, 200, { checkpoints: ctx.checkpoints.listCheckpoints(params[0]) });
+}
+
 
 /**
  * 读取并解析 JSON 请求体；非法时写出 400/413/415 并返回 null。

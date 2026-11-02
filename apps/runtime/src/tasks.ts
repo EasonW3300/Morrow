@@ -58,6 +58,12 @@ export const TASK_EVENT_TYPES = {
   taskPlanningFailed: "task.planning_failed",
 } as const;
 
+/**
+ * Checkpoint 域事件族（M1-T5 / Issue #17；定义在 checkpoint.ts，此处 re-export 保持
+ * 「任务事件清单只增不减」的单一查阅点）。
+ */
+export { TASK_CHECKPOINT_EVENT_TYPES } from "./checkpoint.ts";
+
 /** 合法迁移表（含义见文件头）；测试逐项覆盖 */
 export const TASK_TRANSITIONS: Readonly<Record<TaskStatus, readonly TaskStatus[]>> = {
   created: ["planned", "failed", "cancelled"],
@@ -86,7 +92,8 @@ export type TaskErrorCode =
   | "invalid_transition"
   | "not_found"
   | "planner_unavailable"
-  | "invalid_plan";
+  | "invalid_plan"
+  | "timeout";
 
 export class TaskError extends Error {
   readonly code: TaskErrorCode;
@@ -432,10 +439,6 @@ export class TaskStore {
     return this.#edgesOfStmt.all(taskId) as unknown as EdgeRow[];
   }
 
-  getNode(nodeId: string): NodeRow | null {
-    return (this.#getNodeStmt.get(nodeId) as NodeRow | undefined) ?? null;
-  }
-
   /** 节点行更新（调度器窄接缝：认领 = running+attempts；收尾 = 终态+结果/错误） */
   updateNode(
     nodeId: string,
@@ -443,6 +446,16 @@ export class TaskStore {
     now: string,
   ): void {
     this.#updateNodeStmt.run(patch.status, patch.attempts, patch.result, patch.error, now, nodeId);
+  }
+
+  /** 节点行只读快照（调度器 attempt 基准：跨恢复累计时读现值） */
+  getNodeState(nodeId: string): { status: string; attempts: number } | null {
+    const row = this.getNode(nodeId);
+    return row === null ? null : { status: row.status, attempts: row.attempts };
+  }
+
+  getNode(nodeId: string): NodeRow | null {
+    return (this.#getNodeStmt.get(nodeId) as NodeRow | undefined) ?? null;
   }
 
   close(): void {
@@ -630,6 +643,21 @@ export class TaskService {
     return this.#transition(taskId, to, options);
   }
 
+  /**
+   * 中断恢复标记（M1-T5）：stale-running（进程崩溃残留）的 resume 无合法状态迁移
+   * （running→running 非法），以 task.resumed 事件（payload.reason =
+   * recovered_after_interruption）留痕后重新驱动；不改 tasks.status。
+   */
+  markResumedForRecovery(
+    taskId: string,
+    payload: Record<string, unknown>,
+  ): { eventId: string; sequence: number } {
+    if (this.#store.getTask(taskId) === null) {
+      throw new TaskError("not_found", `task ${taskId} does not exist`);
+    }
+    return this.#appendTaskEvent(taskId, TASK_EVENT_TYPES.taskResumed, "agent:runtime", payload, null);
+  }
+
   /** 任务事件分页（账本 task_id 专列过滤）；未知任务返回 null（HTTP 404 依据） */
   taskEvents(taskId: string, options: { limit?: number; offset?: number } = {}): LedgerPage | null {
     if (this.#store.getTask(taskId) === null) return null;
@@ -637,6 +665,12 @@ export class TaskService {
   }
 
   // --- 调度器窄接缝（节点行更新；M1 单机单调度器，无并发争用）---------------------
+
+  /** 节点行只读快照（调度器 attempt 基准：跨恢复累计时读现值；M1-T5） */
+  getNodeState(nodeId: string): { status: string; attempts: number } | null {
+    const row = this.#store.getNode(nodeId);
+    return row === null ? null : { status: row.status, attempts: row.attempts };
+  }
 
   setNodeRunning(nodeId: string, attempt: number): void {
     const now = new Date().toISOString();
@@ -658,6 +692,29 @@ export class TaskService {
         attempts: Math.max(row.attempts, 1),
         result: status === "completed" ? patch.result ?? null : row.result,
         error: status === "failed" ? patch.error ?? null : row.error,
+      },
+      now,
+    );
+  }
+
+  /**
+   * 节点行补丁（恢复接缝，M1-T5）：回卷为 pending 清空结果/错误；pending_review
+   * 保留 result 供人工核对。attempts 保持原值（重放时由调度器在现值上递增）。
+   */
+  setNodeState(
+    nodeId: string,
+    patch: { status: string; result?: string | null; error?: string | null },
+  ): void {
+    const row = this.#store.getNode(nodeId);
+    if (row === null) return;
+    const now = new Date().toISOString();
+    this.#store.updateNode(
+      nodeId,
+      {
+        status: patch.status,
+        attempts: row.attempts,
+        result: patch.result !== undefined ? patch.result : row.result,
+        error: patch.error !== undefined ? patch.error : row.error,
       },
       now,
     );

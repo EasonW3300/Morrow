@@ -75,6 +75,10 @@ provider 参数）；凭据库可经 `startRuntime(config, { secretStore })` 注
 | GET | `/v1/tasks` | 任务列表 → `{ tasks: [{ task_id, goal, status, task_version, created_at, updated_at }] }` |
 | GET | `/v1/tasks/:id` | 任务详情（DAG/状态/版本）→ 200 `{ ...summary, nodes: [{ node_id, key, title, goal?, depends_on, agent_role?, model?, retriable, side_effect, status, attempts, result?, error? }], error? }` / 404 `task_not_found` |
 | GET | `/v1/tasks/:id/events` | 任务执行事件（分页；`task_id` 专列 + 索引）→ `{ events, total, limit, offset }`；query 同 `/v1/events`（`limit` 1–200 默认 50、`offset`）；未知任务 404 |
+| POST | `/v1/tasks/:id/pause` | 安全点暂停（M1-T5 / Issue #17）：停派发 + 等在跑节点到边界（不中止）→ `task.paused` 迁移 → checkpoint 落库 → 200 `{ task, checkpoint }`；非 running 409 `task_invalid_transition`、边界 10s 未收尾 504 `task_timeout` |
+| POST | `/v1/tasks/:id/resume` | 从最新 checkpoint（可为空）reconcile（副作用分类 gate）→ 202 `{ task, checkpoint_id, reconcile }`，后台驱动至终态；接受 paused / waiting_input / planned（调度前崩溃孤儿）/ running（中断残留）；活跃 running 与终端态、created（无计划）409 |
+| POST | `/v1/tasks/:id/restore` | 指定 checkpoint 恢复，body `{ checkpoint_id }`（必填）→ 202 `{ task, checkpoint_id, reconcile }`；未知/他任务 checkpoint 404 `checkpoint_not_found`、版本不匹配 409 `checkpoint_version_mismatch` |
+| GET | `/v1/tasks/:id/checkpoints` | checkpoint 列表（新→旧，快照全量）→ `{ checkpoints: [{ checkpoint_id, task_id, task_version, reason, created_at, snapshot }] }`；未知任务 404 |
 | GET | `/v1/memory/facts` | 记忆检索（M1-T1）：`q`（必填非空关键词，FTS5 短语查询，中英文均可）→ `{ q, facts: [{ id, stage, type, content, sensitivity, confidence?, version, sources, created_at }] }`；`sources` 为来源账本事件 id 数组（回链），缺 q/空 q → 400 `invalid_query` |
 
 错误统一 `{ error: { code, message } }`；未匹配路径 404，路径命中但方法不符 405，
@@ -234,6 +238,53 @@ FR-TASK-3 的范围；客户端轮询详情与事件观察执行进度（curl �
 （tasks/task_nodes/task_edges）是与账本同库的可变投影表（迁移见 `task-migrations.ts`），
 账本仍是唯一事实源。优雅退出：`close()` 中止在跑节点、拒绝未开跑的排队任务后落盘。
 
+## M1 Checkpoint 与中断恢复（票 M1-T5 / Issue #17，PRD §4.3 FR-TASK-5/6、§6）
+
+**暂停语义（安全点）**：`pause` = 受理即停派发（drive 主循环让位，不会并发把任务迁到终态）
++ 等在跑节点到边界（自然收尾，不中止——在跑节点的工作不浪费、事件流保持真实）→
+`task.paused` 迁移 → checkpoint 落库 → 返回。边界 10s 未收尾（节点悬挂）→ 504，任务保持
+running。pause 在等待期间任务被并发终结（completed/failed）→ 409（任务状态为准）。
+
+**Checkpoint（FR-TASK-5 字段集）**：`task_checkpoints` 表（与任务投影同库，JSON 快照 +
+元数据）+ `task.checkpoint_created` 事件。快照 `morrow.checkpoint/1`：Task Graph（节点/边/
+状态/task_version）、Run 状态（status、run 根事件、账本 event_cursor、已完成节点的输出
+引用 = `task.node_finished(completed)` 账本事件 id）、workspace（M1 恒 null——无工作区，
+FR-TASK-8 未实现，`workspace_note` 说明）、execution（runtime 版本 + 默认 Provider 投影，
+绝不含密钥；节点建议模型；工具版本表 M1 占位空）、session_ids（Task↔Session 关联后续票，
+恒空）、待处理副作用清单（按分类：not_delivered / delivered_unverified / compensation_pending）。
+写入顺序：先行后事件；事件写失败补偿删行（不留孤儿），任务保持 paused 可重试。
+
+**恢复语义（FR-TASK-6，分类 → 动作）**：恢复的危险是「重复送达」而非「首跑」——从未执行
+的节点照常调度；只有已完成/在跑（半写）节点被回卷重执行时按副作用分类 gate（决策函数
+`planReconcile`，resume 与 restore 同一管线）：
+
+| 节点状态 | side_effect | 动作 |
+| --- | --- | --- |
+| completed（checkpoint 亦记 completed 或无 checkpoint） | 任意 | keep_completed，不重放 |
+| pending / pending_review / failed | 任意 | 原状保持（pending_review 即人工核对队列） |
+| checkpoint 后才完成 / 半写 running | reversible | 回卷 pending，重放 |
+| 同上 | compensatable | 回卷 pending 重放 + 登记待补偿（M1 只记录，真实补偿在 M4） |
+| 同上 | irreversible / delivery_unknown | **不自动重发**：置 `pending_review`（节点级人工核对态，保留原 result 供核对）；无可跑节点时任务转 `waiting_input`（`reconciliation_required`） |
+
+选择节点级 `pending_review` 而非任务级 `needs_reconcile`：任务级冻结会让可继续的兄弟节点
+陪停，且核对范围本来就是节点级；`needs_reconcile` 留给 M3 执行租约冲突。`pending_review`
+的放行是 FR-TASK-3 的审核 UI；库形态可经 `TaskService.setNodeState` 决策后 resume。
+
+**resume / restore**：`resume` = 最新 checkpoint（可为空）reconcile → `task.restored`（无
+checkpoint 时 causation 为 null）→ 迁回 running（planned 记 `task.started`、paused/
+waiting_input 记 `task.resumed`、中断残留 running 补 `task.resumed`
+`recovered_after_interruption`）→ 重新入队驱动。`restore` 指定 checkpoint（校验归属与
+task_version，不匹配 409）。终端态（completed/failed/cancelled）与 created（无计划）一律
+409——回卷经 FR-TASK-3 修订流程。跨恢复的 attempts 在节点行上单调递增（半写那次也计入）。
+
+**故障注入套件**（`test/checkpoint.faults.test.ts`，AC-07 前置，25 个注入点 / 20 个恢复
+成功 + 5 个守卫）：进程级以真实子进程（`test/fixtures/task-child-runtime.ts`，FakePi 注入
+零网络）kill -9 注入——节点执行中（四类副作用各一）、pause 等边界窗口、pause 完成后、DAG
+中段、resume 驱动中、并行兄弟、规划中、连续两次 kill、restore 跨重启；进程内注入——
+checkpoint 事件写中断（补偿删行）、attempts 膨胀半写、反向半写（结果落行事件未落）、
+checkpoint 行丢失、失败节点收敛、并发双 resume/双 pause、waiting_input 幂等、无漂移
+restore。套件可重复执行（临时目录 + 显式脚本）。
+
 ## Agent Loop 与会话运行时
 
 - 每会话一个 `AgentRuntime`（PiAdapter 接口，惰性创建、驻内存）：对话历史由 Pi agent state
@@ -349,7 +400,8 @@ src/
   sessions.ts    SessionManager：会话事件族 → 账本 + Agent Loop（串行队列）+ 会话帧广播 + Provider 绑定解析
   tasks.ts       TaskService：任务生命周期 + 规划（Agent Loop + JSON 计划校验）+ DAG 投影 + 任务状态机 + task.* 事件族
   scheduler.ts   TaskScheduler：单机调度器（依赖拓扑 + 并发上限 + retriable 重试；节点执行 = 一次 Agent Loop）
-  task-migrations.ts 任务域三表 DDL（tasks/task_nodes/task_edges，与账本同库的可变投影）
+  checkpoint.ts Checkpoint 域（M1-T5）：FR-TASK-5 快照 + task_checkpoints 表 + planReconcile 恢复决策 + task.checkpoint_created/task.restored 事件
+  task-migrations.ts 任务域表 DDL（tasks/task_nodes/task_edges/task_checkpoints，与账本同库的可变投影）
   providers.ts   ProviderRegistry：三元组 CRUD + 默认指针 + env 回退解析（元数据 → providers.json，密钥 → 凭据库）
   keyring.ts     OS 凭据库统一封装（macOS security 实测 / Windows cmdkey+PowerShell / Linux secret-tool / 内存桩）
   connectivity.ts Provider 连通性测试（最小 OpenAI 兼容请求；unreachable 带 timeout/connect_error 结构化 kind）
@@ -371,7 +423,7 @@ scripts/
   smoke-real-provider.ts  真实 Provider 冒烟（手动执行，读环境变量，不进测试套件）
 test/         node:test：ledger / server / config / lifecycle / sessions / keyring / providers /
               providers.api / connectivity / provider-switch / cors / devices / tasks（服务层）/
-              tasks.api（HTTP 任务族）等 seam
-              providers.api / connectivity / provider-switch / cors / devices / memory.*
-              （heuristics / store / service / api 四 seam）
+              tasks.api（HTTP 任务族）/ checkpoint（快照字段集与恢复决策）/ checkpoint.scheduler
+              （pause/resume/restore 编排）/ checkpoint.api（HTTP 介入端点）/
+              checkpoint.faults（故障注入套件，AC-07）/ memory.* 等 seam
 ```

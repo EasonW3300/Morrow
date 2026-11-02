@@ -48,7 +48,29 @@ CREATE TABLE IF NOT EXISTS task_edges (
 CREATE INDEX IF NOT EXISTS task_edges_task_idx ON task_edges (task_id);
 `;
 
+/**
+ * Checkpoint 表（M1-T5 / Issue #17，FR-TASK-5）：JSON 快照 + 元数据，与任务投影同库。
+ * checkpoint 是可恢复快照（GLOSSARY: Checkpoint），行可补偿删除（写入中断时不留孤儿，
+ * 见 checkpoint.ts）；账本侧以 task.checkpoint_created / task.restored 事件留痕。
+ */
+export const TASK_CHECKPOINTS_SQL = `
+CREATE TABLE IF NOT EXISTS task_checkpoints (
+  checkpoint_id TEXT PRIMARY KEY,
+  task_id       TEXT NOT NULL,
+  task_version  INTEGER NOT NULL,
+  reason        TEXT NOT NULL,
+  snapshot      TEXT NOT NULL,
+  created_at    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS task_checkpoints_task_idx ON task_checkpoints (task_id, created_at, checkpoint_id);
+`;
+
 /** 幂等建表（CREATE IF NOT EXISTS）；由 tasks.ts 的 TaskStore 调用 */
 export function ensureTaskTables(db: SqliteDatabase): void {
   db.exec(TASK_TABLES_SQL);
+}
+
+/** 幂等建 checkpoint 表（CREATE IF NOT EXISTS）；由 checkpoint.ts 的 CheckpointStore 调用 */
+export function ensureCheckpointTable(db: SqliteDatabase): void {
+  db.exec(TASK_CHECKPOINTS_SQL);
 }
