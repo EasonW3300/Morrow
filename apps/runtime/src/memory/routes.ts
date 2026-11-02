@@ -1,4 +1,5 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { parsePaging, readJsonBody, sendError, sendJson } from "../http-util.ts";
 import { MemoryControlError, MemoryService, type ConsolidationRunSummary } from "./service.ts";
 import { MarkdownParseError, type MemoryProjector } from "./projection.ts";
 
@@ -104,7 +105,7 @@ function handleListCandidates(_req: IncomingMessage, res: ServerResponse, url: U
     sendError(res, 400, "invalid_query", `status must be one of ${CANDIDATE_STATUSES.join(" | ")}`);
     return;
   }
-  const page = parsePaging(url, res);
+  const page = parsePaging(url, res, { defaultLimit: 200 });
   if (page === null) return;
   const candidates = ctx.memory.listCandidates({
     ...(status !== null ? { status: status as (typeof CANDIDATE_STATUSES)[number] } : {}),
@@ -153,7 +154,7 @@ function handleListConflicts(_req: IncomingMessage, res: ServerResponse, url: UR
     sendError(res, 400, "invalid_query", `status must be one of ${CONFLICT_STATUSES.join(" | ")}`);
     return;
   }
-  const page = parsePaging(url, res);
+  const page = parsePaging(url, res, { defaultLimit: 200 });
   if (page === null) return;
   const conflicts = ctx.memory.listConflicts({
     ...(status !== null ? { status: status as (typeof CONFLICT_STATUSES)[number] } : {}),
@@ -250,79 +251,4 @@ function handleMemoryControlError(res: ServerResponse, err: unknown): void {
     return;
   }
   throw err;
-}
-
-/** 分页公共参数（limit 1–200 默认 200、offset ≥ 0）；非法时写出 400 并返回 null */
-function parsePaging(url: URL, res: ServerResponse): { limit: number; offset: number } | null {
-  const params = url.searchParams;
-  let limit = 200;
-  let offset = 0;
-  const limitRaw = params.get("limit");
-  if (limitRaw !== null) {
-    if (!/^\d+$/.test(limitRaw) || Number(limitRaw) < 1 || Number(limitRaw) > 200) {
-      sendError(res, 400, "invalid_query", "limit must be an integer between 1 and 200");
-      return null;
-    }
-    limit = Number(limitRaw);
-  }
-  const offsetRaw = params.get("offset");
-  if (offsetRaw !== null) {
-    if (!/^\d+$/.test(offsetRaw)) {
-      sendError(res, 400, "invalid_query", "offset must be a non-negative integer");
-      return null;
-    }
-    offset = Number(offsetRaw);
-  }
-  return { limit, offset };
-}
-
-function sendJson(res: ServerResponse, status: number, body: unknown): void {
-  res.writeHead(status, { "content-type": "application/json; charset=utf-8" });
-  res.end(JSON.stringify(body));
-}
-
-function sendError(res: ServerResponse, status: number, code: string, message: string): void {
-  sendJson(res, status, { error: { code, message } });
-}
-
-/**
- * 读取并解析 JSON 请求体；非法时写出 400/413/415 并返回 null。
- *
- * 与 runtime.ts readJsonBody 同语义（CSRF 防线：content-type 必须显式 application/json，
- * safelist 外的 simple POST 被强制 preflight 或 415 拒收——威胁模型域 4）。独立成
- * 私有副本避免 memory 路由反向依赖 runtime.ts；若需改动请两处同步。
- */
-async function readJsonBody(req: IncomingMessage, res: ServerResponse, maxBytes = 1_000_000): Promise<Record<string, unknown> | null> {
-  const contentType = req.headers["content-type"];
-  if (contentType === undefined || !/^application\/json\b/i.test(contentType.trim())) {
-    sendError(res, 415, "unsupported_media_type", "content-type must be application/json");
-    return null;
-  }
-  const chunks: Buffer[] = [];
-  let size = 0;
-  for await (const chunk of req) {
-    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as string);
-    size += buf.length;
-    if (size > maxBytes) {
-      sendError(res, 413, "payload_too_large", `request body exceeds ${maxBytes} bytes`);
-      return null;
-    }
-    chunks.push(buf);
-  }
-  const raw = Buffer.concat(chunks).toString("utf8");
-  if (raw.trim().length === 0) {
-    sendError(res, 400, "invalid_body", "a JSON object body is required");
-    return null;
-  }
-  try {
-    const parsed: unknown = JSON.parse(raw);
-    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-      sendError(res, 400, "invalid_body", "a JSON object body is required");
-      return null;
-    }
-    return parsed as Record<string, unknown>;
-  } catch {
-    sendError(res, 400, "invalid_body", "malformed JSON body");
-    return null;
-  }
 }

@@ -22,6 +22,7 @@ import { PLANNER_SYSTEM_PROMPT, TaskError, TaskService, type PlannerFactory } fr
 import { buildEventEnvelope } from "./envelope.ts";
 import { computeIntegrityHash, type EventEnvelope } from "@morrow/protocol";
 import { UUID_RE } from "./uuid-v7.ts";
+import { parsePaging, readJsonBody, sendError, sendJson } from "./http-util.ts";
 
 /**
  * Runtime HTTP 服务（PRD §6.2 的 M0 子集 + M1-T4 任务族）。
@@ -469,7 +470,7 @@ function handleListDevices(_req: IncomingMessage, res: ServerResponse, _url: URL
 }
 
 function handleEvents(_req: IncomingMessage, res: ServerResponse, url: URL, ctx: RequestContext): void {
-  const page = parsePageParams(url, res);
+  const page = parsePaging(url, res, { defaultLimit: 50 });
   if (page === null) return;
   let replicaId: string | undefined;
 
@@ -485,36 +486,6 @@ function handleEvents(_req: IncomingMessage, res: ServerResponse, url: URL, ctx:
   sendJson(res, 200, ctx.ledger.list({ replicaId, limit: page.limit, offset: page.offset }));
 }
 
-/** 分页公共参数（limit 1–200 默认 50、offset ≥ 0）；非法时写出 400 并返回 null */
-function parsePageParams(url: URL, res: ServerResponse): { limit: number; offset: number } | null {
-  const params = url.searchParams;
-  let limit = 50;
-  let offset = 0;
-
-  const limitRaw = params.get("limit");
-  if (limitRaw !== null) {
-    if (!/^\d+$/.test(limitRaw) || Number(limitRaw) < 1 || Number(limitRaw) > 200) {
-      sendError(res, 400, "invalid_query", "limit must be an integer between 1 and 200");
-      return null;
-    }
-    limit = Number(limitRaw);
-  }
-  const offsetRaw = params.get("offset");
-  if (offsetRaw !== null) {
-    if (!/^\d+$/.test(offsetRaw)) {
-      sendError(res, 400, "invalid_query", "offset must be a non-negative integer");
-      return null;
-    }
-    offset = Number(offsetRaw);
-  }
-  return { limit, offset };
-}
-
-function sendJson(res: ServerResponse, status: number, body: unknown): void {
-  res.writeHead(status, { "content-type": "application/json; charset=utf-8" });
-  res.end(JSON.stringify(body));
-}
-
 /** 本地控制面的放行来源：桌面壳（tauri://localhost、http://tauri.localhost）与浏览器联调 */
 function isLocalOrigin(origin: string): boolean {
   try {
@@ -524,10 +495,6 @@ function isLocalOrigin(origin: string): boolean {
   } catch {
     return false;
   }
-}
-
-function sendError(res: ServerResponse, status: number, code: string, message: string): void {
-  sendJson(res, status, { error: { code, message } });
 }
 
 function listen(server: Server, host: string, port: number): Promise<number> {
@@ -880,7 +847,7 @@ function handleTaskEvents(_req: IncomingMessage, res: ServerResponse, url: URL, 
     sendError(res, 404, "task_not_found", `task "${taskId}" not found`);
     return;
   }
-  const page = parsePageParams(url, res);
+  const page = parsePaging(url, res, { defaultLimit: 50 });
   if (page === null) return;
   sendJson(res, 200, ctx.ledger.list({ taskId, limit: page.limit, offset: page.offset }));
 }
@@ -1112,48 +1079,4 @@ function handleReleaseNode(_req: IncomingMessage, res: ServerResponse, _url: URL
       handleTaskError(res, err);
     }
   })();
-}
-
-
-/**
- * 读取并解析 JSON 请求体；非法时写出 400/413/415 并返回 null。
- *
- * content-type 必须显式为 application/json：application/json 不在 CORS「简单请求」
- * safelist 内，跨源页面伪造的 simple POST（text/plain）会被强制走 preflight——
- * 这是写端点的 CSRF 防线之一（威胁模型域 4「浏览器网页 CSRF 向量」；曾不校验
- * content-type，M0 code-review / Issue #11 补上）。
- */
-async function readJsonBody(req: IncomingMessage, res: ServerResponse, maxBytes = 1_000_000): Promise<Record<string, unknown> | null> {
-  const contentType = req.headers["content-type"];
-  if (contentType === undefined || !/^application\/json\b/i.test(contentType.trim())) {
-    sendError(res, 415, "unsupported_media_type", "content-type must be application/json");
-    return null;
-  }
-  const chunks: Buffer[] = [];
-  let size = 0;
-  for await (const chunk of req) {
-    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as string);
-    size += buf.length;
-    if (size > maxBytes) {
-      sendError(res, 413, "payload_too_large", `request body exceeds ${maxBytes} bytes`);
-      return null;
-    }
-    chunks.push(buf);
-  }
-  const raw = Buffer.concat(chunks).toString("utf8");
-  if (raw.trim().length === 0) {
-    sendError(res, 400, "invalid_body", "a JSON object body is required");
-    return null;
-  }
-  try {
-    const parsed: unknown = JSON.parse(raw);
-    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-      sendError(res, 400, "invalid_body", "a JSON object body is required");
-      return null;
-    }
-    return parsed as Record<string, unknown>;
-  } catch {
-    sendError(res, 400, "invalid_body", "malformed JSON body");
-    return null;
-  }
 }
