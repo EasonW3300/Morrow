@@ -12,7 +12,7 @@ import { MemoryStore } from "./memory/store.ts";
 import { createMemoryWriteTool } from "./memory/tool.ts";
 import { memoryRoutes } from "./memory/routes.ts";
 import { MemoryProjector } from "./memory/projection.ts";
-import type { MemoryExtractor } from "./memory/extraction.ts";
+import { LlmMemoryExtractor, LLM_EXTRACTOR_SYSTEM_PROMPT, type MemoryExtractor } from "./memory/extraction.ts";
 import { ProviderRegistry, ProviderRegistryError, ENV_PROVIDER_ID, type ProviderResolver, type ResolvedProvider } from "./providers.ts";
 import { SessionManager, type AgentRuntimeExtras, type SessionFrame } from "./sessions.ts";
 import { TaskScheduler, type NodeAgentFactory, type TaskNodeExecInput } from "./scheduler.ts";
@@ -177,9 +177,16 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
   // 不做配对/撤销（M3 范围）
   const devices = DeviceRegistry.open(config.dataDir);
   devices.touch(config.replicaId);
+  const providers = new ProviderRegistry({
+    dataDir: config.dataDir,
+    secretStore: options.secretStore ?? detectSecretStore().store,
+    envFallback: config.provider,
+  });
   // 记忆存储（票 M1-T1 / Issue #13）：与账本同库；候选即时写入 + FTS5 检索。
   // 抽取/巩固管线（M1-T2 / Issue #14）：MemoryService 内含可注入 Extractor/Consolidator
   // （默认确定性实现），轮次收尾（message.assistant 落账）由 SessionManager 触发后台抽取。
+  // 抽取器选择（M1 code-review 补齐）：注入 > config.memoryExtractor=llm（经 PiAdapter
+  // 一次 prompt）> 默认启发式（MemoryService 内建）。
   const memoryStore = MemoryStore.open(config.dataDir);
   // 记忆投影器（票 M1-T3 / Issue #15，FR-MEM-6）：facts → dataDir/memory/*.md；
   // 注入 MemoryService（导入修订后单事实刷新 / 删除后投影文件移除），投影命令走路由。
@@ -189,12 +196,16 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     ledger,
     replicaId: config.replicaId,
     projector,
-    ...(options.memoryExtractor !== undefined ? { extractor: options.memoryExtractor } : {}),
-  });
-  const providers = new ProviderRegistry({
-    dataDir: config.dataDir,
-    secretStore: options.secretStore ?? detectSecretStore().store,
-    envFallback: config.provider,
+    ...(options.memoryExtractor !== undefined
+      ? { extractor: options.memoryExtractor }
+      : config.memoryExtractor === "llm"
+        ? {
+            // 默认 Provider + 抽取系统提示词（goal 形参在此工厂路径不消费，传空占位）
+            extractor: new LlmMemoryExtractor(
+              async () => defaultTaskRuntimeFactory(providers, LLM_EXTRACTOR_SYSTEM_PROMPT)("", undefined),
+            ),
+          }
+        : {}),
   });
   const sessions = new SessionManager({
     ledger,
