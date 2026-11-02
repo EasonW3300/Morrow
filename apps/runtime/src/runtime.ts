@@ -97,8 +97,8 @@ export interface RuntimeOptions {
   taskPlannerFactory?: PlannerFactory;
   /**
    * 任务节点执行工厂注入 seam：节点 → 一次执行用 AgentRuntime。生产默认 =
-   * 默认 Provider 构建（node.model 仅记录，执行走会话默认 Provider——FR-TASK-3
-   * 换模型时再接）；测试注入 FakePi 脚本。
+   * 默认工厂按注册 Provider id 解析 node.model（未命中回退默认 Provider，M1-T6 /
+   * FR-TASK-3 模型切换）；测试注入 FakePi 脚本。
    */
   taskNodeAgentFactory?: NodeAgentFactory;
   /** 调度器同时在跑节点上限（默认 2，最小 1；调度器级上限，跨任务成立） */
@@ -162,6 +162,12 @@ const routes: Route[] = [
   { method: "POST", re: /^\/v1\/tasks\/([^/]+)\/resume$/, handler: handleResumeTask },
   { method: "POST", re: /^\/v1\/tasks\/([^/]+)\/restore$/, handler: handleRestoreTask },
   { method: "GET", re: /^\/v1\/tasks\/([^/]+)\/checkpoints$/, handler: handleListCheckpoints },
+  // M1-T6 介入端点（FR-TASK-3 修改/接管半边）：revise 修改未完成节点（版本+1+重算下游
+  // +新 checkpoint）；节点级 takeover/complete/release（actor=owner 审计）
+  { method: "POST", re: /^\/v1\/tasks\/([^/]+)\/revise$/, handler: handleReviseTask },
+  { method: "POST", re: /^\/v1\/tasks\/([^/]+)\/nodes\/([^/]+)\/takeover$/, handler: handleTakeoverNode },
+  { method: "POST", re: /^\/v1\/tasks\/([^/]+)\/nodes\/([^/]+)\/complete$/, handler: handleCompleteNode },
+  { method: "POST", re: /^\/v1\/tasks\/([^/]+)\/nodes\/([^/]+)\/release$/, handler: handleReleaseNode },
   ...memoryRoutes,
 ];
 
@@ -240,7 +246,11 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     tasks,
     ledger,
     replicaId: config.replicaId,
-    nodeAgentFactory: options.taskNodeAgentFactory ?? ((node: TaskNodeExecInput) => defaultNodeRuntime(node.goal)),
+    // 节点执行工厂（M1-T6 起执行 node.model）：注入工厂拿到 TaskNodeExecInput.model
+    // 自行决定；默认工厂按注册 Provider id 解析 node.model（未命中回退默认 Provider）
+    nodeAgentFactory:
+      options.taskNodeAgentFactory ??
+      ((node: TaskNodeExecInput) => defaultNodeRuntime(node.goal, node.model)),
     checkpoints,
     ...(options.taskConcurrency === undefined ? {} : { concurrency: options.taskConcurrency }),
   });
@@ -338,11 +348,14 @@ function defaultAgentFactory(): (
  * 任务域默认工厂（M1-T4）：默认 Provider → createPiAdapter；planner 带规划系统提示词
  * （FR-TASK-1 的生产路径），节点执行不带专用提示词。Provider 解析失败抛错——规划路径
  * 由 createTask 转 task.failed 留痕，节点路径由调度器落 node failed，均不静默。
- * node.model 仅记录不执行（FR-TASK-3 换模型时再接），执行统一用默认 Provider。
+ * 模型切换（M1-T6 / FR-TASK-3）：nodeAgentFactory 把 node.model 传入工厂；语义为
+ * 「按注册 Provider id 解析」——命中即用该 Provider 执行，未命中（规划器给的是自由
+ * 模型名而非 Provider id）回退默认 Provider，不让任务因无法解析的建议模型而失败。
  */
-function defaultTaskRuntimeFactory(providers: ProviderRegistry, systemPrompt?: string): (goal: string) => Promise<AgentRuntime> {
-  return async () => {
-    const provider = await providers.resolve();
+function defaultTaskRuntimeFactory(providers: ProviderRegistry, systemPrompt?: string): (goal: string, modelId?: string) => Promise<AgentRuntime> {
+  return async (_goal, modelId) => {
+    // 节点 model → Provider 解析（未命中回退默认）；planner 路径 modelId 恒 undefined
+    const provider = (modelId !== undefined ? await providers.resolve(modelId) : null) ?? (await providers.resolve());
     if (provider === null) {
       throw new Error("no model provider configured");
     }
@@ -777,6 +790,7 @@ async function handleTestProvider(_req: IncomingMessage, res: ServerResponse, _u
 
 interface CreateTaskBody {
   goal?: unknown;
+  session_id?: unknown;
 }
 
 async function handleCreateTask(
@@ -791,14 +805,22 @@ async function handleCreateTask(
   }
   const body = await readJsonBody(req, res);
   if (body === null) return; // 响应已在 readJsonBody 里写出
-  const { goal } = body as CreateTaskBody;
+  const { goal, session_id: sessionId } = body as CreateTaskBody;
   if (typeof goal !== "string" || goal.trim().length === 0) {
     sendError(res, 400, "invalid_body", "goal must be a non-empty string");
     return;
   }
+  if (sessionId !== undefined && (typeof sessionId !== "string" || sessionId.trim().length === 0)) {
+    sendError(res, 400, "invalid_body", "session_id must be a non-empty string when present");
+    return;
+  }
+  if (typeof sessionId === "string" && !ctx.sessions.sessionExists(sessionId)) {
+    sendError(res, 400, "invalid_body", `session "${sessionId}" does not exist`);
+    return;
+  }
   let detail;
   try {
-    detail = await ctx.tasks.createTask(goal.trim());
+    detail = await ctx.tasks.createTask(goal.trim(), sessionId === undefined ? {} : { sessionId });
   } catch (err) {
     handleTaskError(res, err);
     return;
@@ -813,8 +835,13 @@ async function handleCreateTask(
   sendJson(res, 201, detail);
 }
 
-function handleListTasks(_req: IncomingMessage, res: ServerResponse, _url: URL, ctx: RequestContext): void {
-  sendJson(res, 200, { tasks: ctx.tasks.listTasks() });
+function handleListTasks(_req: IncomingMessage, res: ServerResponse, url: URL, ctx: RequestContext): void {
+  const sessionId = url.searchParams.get("session_id");
+  if (sessionId !== null && sessionId.trim().length === 0) {
+    sendError(res, 400, "invalid_query", "session_id must be a non-empty string");
+    return;
+  }
+  sendJson(res, 200, { tasks: ctx.tasks.listTasks(sessionId === null ? undefined : sessionId) });
 }
 
 function handleGetTask(_req: IncomingMessage, res: ServerResponse, _url: URL, ctx: RequestContext, params: string[]): void {
@@ -838,19 +865,22 @@ function handleTaskEvents(_req: IncomingMessage, res: ServerResponse, url: URL, 
   sendJson(res, 200, ctx.ledger.list({ taskId, limit: page.limit, offset: page.offset }));
 }
 
-/** TaskError → HTTP：not_found 404、invalid_transition 409、planner_unavailable 503、timeout 504；其余上抛 500 */
+/** TaskError → HTTP：not_found 404、invalid_transition/immutable_node 409、
+ *  invalid_revision 400、planner_unavailable 503、timeout 504；其余上抛 500 */
 function handleTaskError(res: ServerResponse, err: unknown): void {
   if (err instanceof TaskError) {
     const status =
       err.code === "not_found"
         ? 404
-        : err.code === "invalid_transition"
+        : err.code === "invalid_transition" || err.code === "immutable_node"
           ? 409
-          : err.code === "planner_unavailable"
-            ? 503
-            : err.code === "timeout"
-              ? 504
-              : 500;
+          : err.code === "invalid_revision"
+            ? 400
+            : err.code === "planner_unavailable"
+              ? 503
+              : err.code === "timeout"
+                ? 504
+                : 500;
     sendError(res, status, `task_${err.code}`, err.message);
     return;
   }
@@ -932,6 +962,97 @@ function handleListCheckpoints(_req: IncomingMessage, res: ServerResponse, _url:
     return;
   }
   sendJson(res, 200, { checkpoints: ctx.checkpoints.listCheckpoints(params[0]) });
+}
+
+// --- M1-T6 人工介入端点（票 #18，FR-TASK-3 修改/接管半边）------------------------
+// 语义：revise = 修改未完成节点（task_version+1、下游重算、task.revised 审计事件）+
+// 立即落 reason=revise 的新 checkpoint（旧版本 checkpoint 因版本不匹配自然失效，恢复
+// 口径始终对齐当前 DAG）。takeover/complete/release = 节点 actor=owner 标记 → Owner
+// 提交结果或交还调度；complete/release 在任务 waiting_input 时自动 kick 重新驱动
+// （202 前同步完成状态迁移，驱动 fire-and-forget）。
+
+interface ReviseBody {
+  update?: unknown;
+  add?: unknown;
+  remove?: unknown;
+}
+
+function handleReviseTask(req: IncomingMessage, res: ServerResponse, _url: URL, ctx: RequestContext, params: string[]): void {
+  void (async () => {
+    const body = await readJsonBody(req, res);
+    if (body === null) return;
+    const { update, add, remove } = body as ReviseBody;
+    // 修改集字段形状在此校验（服务层校验语义）；透传前确保是数组形态
+    for (const [field, value] of [["update", update], ["add", add], ["remove", remove]] as const) {
+      if (value !== undefined && !Array.isArray(value)) {
+        sendError(res, 400, "invalid_body", `${field} must be an array when present`);
+        return;
+      }
+    }
+    try {
+      const result = ctx.tasks.reviseTask(params[0], {
+        ...(update === undefined ? {} : { update: update as never }),
+        ...(add === undefined ? {} : { add: add as never }),
+        ...(remove === undefined ? {} : { remove: remove as never }),
+      });
+      // 修订后立即落新 checkpoint：恢复基准对齐新版本 DAG（reason=revise）
+      const checkpoint = await ctx.checkpoints.createCheckpoint(params[0], "revise");
+      sendJson(res, 200, { task: result.task, revision: result.revision, checkpoint });
+    } catch (err) {
+      handleTaskError(res, err);
+    }
+  })();
+}
+
+function handleTakeoverNode(_req: IncomingMessage, res: ServerResponse, _url: URL, ctx: RequestContext, params: string[]): void {
+  void (async () => {
+    try {
+      const task = ctx.tasks.takeoverNode(params[0], params[1]);
+      sendJson(res, 200, { task });
+    } catch (err) {
+      handleTaskError(res, err);
+    }
+  })();
+}
+
+interface CompleteNodeBody {
+  result?: unknown;
+}
+
+function handleCompleteNode(req: IncomingMessage, res: ServerResponse, _url: URL, ctx: RequestContext, params: string[]): void {
+  void (async () => {
+    const body = await readJsonBody(req, res);
+    if (body === null) return;
+    const { result } = body as CompleteNodeBody;
+    if (typeof result !== "string" || result.trim().length === 0) {
+      sendError(res, 400, "invalid_body", "result must be a non-empty string");
+      return;
+    }
+    try {
+      const task = ctx.tasks.completeNode(params[0], params[1], result);
+      // 任务因接管挂起（waiting_input）时自动重新驱动；其余状态由 Owner 显式 resume
+      await ctx.scheduler.kick(params[0], "owner_node_completed").catch((err: unknown) => {
+        console.error("[morrow] task kick after owner completion crashed:", err);
+      });
+      sendJson(res, 200, { task: ctx.tasks.getTask(params[0]) ?? task });
+    } catch (err) {
+      handleTaskError(res, err);
+    }
+  })();
+}
+
+function handleReleaseNode(_req: IncomingMessage, res: ServerResponse, _url: URL, ctx: RequestContext, params: string[]): void {
+  void (async () => {
+    try {
+      const task = ctx.tasks.releaseNode(params[0], params[1]);
+      await ctx.scheduler.kick(params[0], "owner_node_released").catch((err: unknown) => {
+        console.error("[morrow] task kick after owner release crashed:", err);
+      });
+      sendJson(res, 200, { task: ctx.tasks.getTask(params[0]) ?? task });
+    } catch (err) {
+      handleTaskError(res, err);
+    }
+  })();
 }
 
 

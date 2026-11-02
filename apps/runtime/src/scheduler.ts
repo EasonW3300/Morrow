@@ -38,7 +38,11 @@ import { SESSION_EVENT_TYPES } from "./sessions.ts";
  * - 恢复（M1-T5）：resume = 从最新 checkpoint（可为空）reconcile（副作用分类 gate，
  *   见 checkpoint.ts planReconcile）→ task.restored → 迁回 running（或 stale-running
  *   恢复标记）→ 重新入队驱动；restore = 指定 checkpoint 的同一管线。reconcile 后
- *   只剩 pending_review 节点时任务转 waiting_input（reconciliation_required）。
+ *   只剩 pending_review 节点时任务转 waiting_input（reconciliation_required）；
+ * - 接管（M1-T6）：actor=owner 的节点不派发（Owner 手工执行）；无可跑节点且只剩
+ *   owner 节点/待核对节点时任务转 waiting_input（owner_intervention）。Owner 完成
+ *   （completeNode）或交还（releaseNode）后经 kick() 重新驱动：waiting_input →
+ *   running（task.resumed）→ 入队继续。
  *
  * 事件 actor 一律 agent:runtime；全部事件 task_id 关联，可经
  * GET /v1/tasks/:id/events（账本 task_id 专列）查询。
@@ -197,6 +201,31 @@ export class TaskScheduler {
   async restore(taskId: string, checkpointId: string): Promise<ResumeResult> {
     const task = this.#assertResumable(taskId);
     return this.#resumeFrom(task, checkpointId);
+  }
+
+  /**
+   * 介入后重新驱动（M1-T6）：Owner 完成接管节点（completeNode）或交还（releaseNode）
+   * 后调用。仅 waiting_input 会被迁回 running（task.resumed，payload.reason 记录介入
+   * 动作）并入队继续；其余状态（running 自会在跑、planned/paused 走显式 resume、
+   * 终端态无可驱动）为无操作。未知任务抛 not_found。
+   */
+  async kick(taskId: string, reason: "owner_node_completed" | "owner_node_released" = "owner_node_completed"): Promise<TaskSummary> {
+    const task = this.#tasks.getTask(taskId);
+    if (task === null) {
+      throw new TaskError("not_found", `task ${taskId} does not exist`);
+    }
+    if (task.status !== "waiting_input") return task;
+    const rootEventId = this.#tasks.transition(taskId, "running", {
+      payload: { reason },
+    }).eventId;
+    await this.#enqueue(taskId, async () => {
+      try {
+        await this.#drive(taskId, rootEventId);
+      } finally {
+        this.#driving.delete(taskId);
+      }
+    });
+    return this.#tasks.getTask(taskId) ?? task;
   }
 
   /** 优雅退出：拒绝未开跑的排队任务、中止在跑节点运行时并等待收尾（上限 2s） */
@@ -389,8 +418,12 @@ export class TaskScheduler {
 
       const nodes = task.nodes;
       const completedKeys = new Set(nodes.filter((n) => n.status === "completed").map((n) => n.key));
+      // actor=owner 的节点由 Owner 手工执行（M1-T6），调度器跳过派发
       const ready = nodes.filter(
-        (n) => n.status === "pending" && n.depends_on.every((dep) => completedKeys.has(dep)),
+        (n) =>
+          n.status === "pending" &&
+          n.actor !== "owner" &&
+          n.depends_on.every((dep) => completedKeys.has(dep)),
       );
       for (const node of ready) {
         if (inflight.size >= this.#concurrency) break;
@@ -435,16 +468,18 @@ export class TaskScheduler {
           });
           return;
         }
-        // 人工核对项挂起（M1-T5）：pending_review 节点不可派发也不算失败，
-        // 任务转 waiting_input 等 Owner 核对（waiting_input→running 之后仍可恢复）
+        // 人工介入挂起（M1-T5 核对 / M1-T6 接管）：pending_review 节点与 actor=owner
+        // 节点不可派发也不算失败，任务转 waiting_input 等 Owner 处理
+        // （waiting_input→running 之后仍可恢复；kick 是介入后的重新驱动入口）
         const reviewNodes = nodesNow.filter((n) => n.status === "pending_review");
-        if (reviewNodes.length > 0) {
+        const ownedNodes = nodesNow.filter((n) => n.status === "pending" && n.actor === "owner");
+        if (reviewNodes.length > 0 || ownedNodes.length > 0) {
           this.#tasks.transition(taskId, "waiting_input", {
             causeEventId: startedEventId,
             payload: {
-              reason: "reconciliation_required",
-              node_ids: reviewNodes.map((n) => n.node_id),
-              keys: reviewNodes.map((n) => n.key),
+              reason: ownedNodes.length > 0 ? "owner_intervention" : "reconciliation_required",
+              node_ids: [...reviewNodes, ...ownedNodes].map((n) => n.node_id),
+              keys: [...reviewNodes, ...ownedNodes].map((n) => n.key),
             },
           });
           return;

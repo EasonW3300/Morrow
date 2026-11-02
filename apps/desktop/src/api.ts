@@ -5,8 +5,14 @@
  * 跨包类型（ProviderRecord / ConnectivityResult）的唯一真相源在 @morrow/protocol——
  * 此处只 re-export（原先本文件自持一份拷贝，M0 code-review / Issue #11 收敛）。
  */
-import type { ConnectivityResult, ProviderRecord } from "@morrow/protocol";
-export type { ConnectivityResult, ProviderRecord };
+import type {
+  ConnectivityResult,
+  ProviderRecord,
+  TaskDetail,
+  TaskNodeRecord,
+  TaskSummary,
+} from "@morrow/protocol";
+export type { ConnectivityResult, ProviderRecord, TaskDetail, TaskNodeRecord, TaskSummary };
 export class ApiError extends Error {
   constructor(
     readonly status: number,
@@ -80,6 +86,41 @@ export interface HealthPayload {
   ledger: { events: number };
 }
 
+// --- 任务域（票 M1-T6 / Issue #18；类型唯一真相源在 @morrow/protocol，UI 本地投影另行定义） ---
+
+/** 任务账本事件信封（GET /v1/tasks/:id/events 的 events 元素） */
+export interface TaskEventEnvelope {
+  event_id: string;
+  event_type: string;
+  occurred_at: string;
+  task_id?: string;
+  payload: Record<string, unknown>;
+}
+
+/** GET /v1/tasks/:id/events 载荷（账本分页语义与 GET /v1/events 一致） */
+export interface TaskEventsPage {
+  events: TaskEventEnvelope[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+/** checkpoint 列表元素（UI 本地投影：只取渲染所需字段；完整快照在 runtime 侧） */
+export interface TaskCheckpointMeta {
+  checkpoint_id: string;
+  task_id: string;
+  task_version: number;
+  reason: string;
+  created_at: string;
+}
+
+/** 修改集（POST /v1/tasks/:id/revise body；字段语义见 runtime validateRevision） */
+export interface TaskRevisionBody {
+  update?: Array<{ key: string; title?: string; goal?: string | null; model?: string | null; depends_on?: string[] }>;
+  add?: Array<{ key: string; title: string; goal?: string; depends_on?: string[]; model?: string }>;
+  remove?: string[];
+}
+
 const JSON_HEADERS = { "content-type": "application/json" };
 
 export const api = {
@@ -151,5 +192,74 @@ export const api = {
 
   health(base: string): Promise<HealthPayload> {
     return request<HealthPayload>(base, "/v1/health");
+  },
+
+  // --- 任务域（票 M1-T6 / Issue #18）-------------------------------------------
+
+  listTasks(base: string, sessionId?: string): Promise<TaskSummary[]> {
+    const query = sessionId === undefined ? "" : `?session_id=${encodeURIComponent(sessionId)}`;
+    return request<{ tasks: TaskSummary[] }>(base, `/v1/tasks${query}`).then((r) => r.tasks);
+  },
+
+  getTask(base: string, taskId: string): Promise<TaskDetail> {
+    return request<TaskDetail>(base, `/v1/tasks/${encodeURIComponent(taskId)}`);
+  },
+
+  taskEvents(base: string, taskId: string, limit: number, offset: number): Promise<TaskEventsPage> {
+    return request<TaskEventsPage>(
+      base,
+      `/v1/tasks/${encodeURIComponent(taskId)}/events?limit=${limit}&offset=${offset}`,
+    );
+  },
+
+  taskCheckpoints(base: string, taskId: string): Promise<TaskCheckpointMeta[]> {
+    return request<{ checkpoints: TaskCheckpointMeta[] }>(
+      base,
+      `/v1/tasks/${encodeURIComponent(taskId)}/checkpoints`,
+    ).then((r) => r.checkpoints);
+  },
+
+  pauseTask(base: string, taskId: string): Promise<{ task: TaskSummary; checkpoint: TaskCheckpointMeta }> {
+    return request(base, `/v1/tasks/${encodeURIComponent(taskId)}/pause`, { method: "POST" });
+  },
+
+  resumeTask(base: string, taskId: string): Promise<unknown> {
+    return request(base, `/v1/tasks/${encodeURIComponent(taskId)}/resume`, { method: "POST" });
+  },
+
+  restoreTask(base: string, taskId: string, checkpointId: string): Promise<unknown> {
+    return request(base, `/v1/tasks/${encodeURIComponent(taskId)}/restore`, {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ checkpoint_id: checkpointId }),
+    });
+  },
+
+  reviseTask(base: string, taskId: string, revision: TaskRevisionBody): Promise<{ task: TaskDetail }> {
+    return request(base, `/v1/tasks/${encodeURIComponent(taskId)}/revise`, {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify(revision),
+    });
+  },
+
+  takeoverNode(base: string, taskId: string, nodeId: string): Promise<{ task: TaskDetail }> {
+    return request(base, `/v1/tasks/${encodeURIComponent(taskId)}/nodes/${encodeURIComponent(nodeId)}/takeover`, {
+      method: "POST",
+    });
+  },
+
+  completeNode(base: string, taskId: string, nodeId: string, result: string): Promise<{ task: TaskDetail }> {
+    return request(base, `/v1/tasks/${encodeURIComponent(taskId)}/nodes/${encodeURIComponent(nodeId)}/complete`, {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ result }),
+    });
+  },
+
+  releaseNode(base: string, taskId: string, nodeId: string): Promise<{ task: TaskDetail }> {
+    return request(base, `/v1/tasks/${encodeURIComponent(taskId)}/nodes/${encodeURIComponent(nodeId)}/release`, {
+      method: "POST",
+    });
   },
 };

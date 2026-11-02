@@ -28,6 +28,12 @@ export type TaskStatus =
 export type TaskNodeStatus = "pending" | "running" | "completed" | "failed" | "pending_review";
 
 /**
+ * 节点责任方（M1-T6 / Issue #18）：缺省（字段省略）= 调度器自动执行；
+ * "owner" = 已被 Owner 接管（takeover），调度器跳过派发，等 Owner 提交结果或交还。
+ */
+export type TaskNodeActor = "owner";
+
+/**
  * 副作用分类（GLOSSARY: SideEffect；FR-TASK-6）。
  * M1-T4 只随节点记录字段，真实投递与人工核对/补偿在 M4（SideEffectOutbox）。
  */
@@ -45,12 +51,14 @@ export interface TaskNodeRecord {
   depends_on: string[];
   /** 责任 agent 角色（GLOSSARY: Task 的责任 agent；M1 仅记录） */
   agent_role?: string;
-  /** 建议模型（M1 仅记录；节点执行用会话默认 Provider） */
+  /** 建议模型（M1-T6 起执行时按该字段解析 Provider；未命中注册 Provider 回退默认） */
   model?: string;
   /** 可重试性：true 时调度器失败后自动重试一次 */
   retriable: boolean;
   side_effect: SideEffectClass;
   status: TaskNodeStatus;
+  /** 责任方（M1-T6）：省略 = 调度器；"owner" = 已被 Owner 接管 */
+  actor?: TaskNodeActor;
   /** 已尝试次数（含重试） */
   attempts: number;
   result?: string;
@@ -64,6 +72,8 @@ export interface TaskSummary {
   status: TaskStatus;
   /** 任务版本：规划修订（FR-TASK-3 修改未完成节点）时递增；初版恒 1 */
   task_version: number;
+  /** 创建来源会话（M1-T6：POST /v1/tasks 携带 session_id 时记录，Chat 任务卡片据此关联）；缺省无来源 */
+  session_id?: string;
   created_at: string;
   updated_at: string;
 }

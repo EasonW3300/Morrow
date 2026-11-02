@@ -75,6 +75,26 @@ unreachable、500→error）+ 脚本化 Agent（建会话发消息无需真实�
 新增 Provider（密钥框 password 型、保存后不回显）→ 逐一点「测试连通」核对四类结果的归类
 呈现 → 设为默认 → 会话页新建会话发消息 → 健康页核对 /v1/health 全量字段与沙箱桩说明。
 
+### Task 视图与人工介入联调（票 M1-T6 / Issue #18）
+
+```bash
+node --experimental-sqlite --experimental-strip-types apps/desktop/scripts/task-fixture.ts
+# 打开 http://127.0.0.1:1420/?runtime=http://127.0.0.1:<runtime端口>（stdout ready JSON 给出）
+```
+
+夹具 = 真实 Runtime + 脚本化任务（FakePi 规划 3 节点 DAG；节点执行为慢 Agent，每个约 4s，
+给「暂停」留出安全点窗口）+ 预置会话与关联任务（session_id 关联）。浏览器级 AC-12 全流程：
+
+1. Chat 页顶部出现本会话的任务状态卡片，点击跳 Task 视图（列表 → 详情）；
+2. 详情页点「恢复」→ 节点开始执行（约 4s/个，DAG 按依赖层级分组、事件流分页可见）；
+3. 执行中点「暂停」→ 安全点暂停 + checkpoint 落库；
+4. 「修改…」改节点目标/模型、增删未完成节点（已完成节点不可改）→ 提交后
+   task_version+1、自动落 reason=revise 的新 checkpoint；
+5. 「恢复」→ 按新 DAG 跑完 → completed；
+6. 节点级：pending 节点「接管」→ 任务转等待输入 → 「完成…」提交结果或「交还调度」；
+   全部介入操作在事件流里以 actor=owner 审计事件可查（task.revised /
+   task.node_taken_over / task.node_completed_by_owner / task.node_released）。
+
 ## 已知边界（M0）
 
 - 历史回看来自 `GET /v1/sessions/:id/messages` 投影（user/assistant 消息）；历史轮次的
