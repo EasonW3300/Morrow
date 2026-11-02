@@ -11,9 +11,11 @@ import { TaskView } from "./TaskView.tsx";
  * 桌面壳根组件：解析控制面地址（sidecar ready）→ 顶栏导航（会话 / 任务 / 设置 / 健康）。
  * 会话数据都来自控制面 HTTP/SSE（api.ts / EventSource），壳不做私有通道；
  * 设置与健康页（票 T7 / Issue #8）同样只走控制面 API。
- * 导航整合是 M0 简化：PRD §5.1 的「设置 → Provider 与模型」扁平为一级页签。
+ * 导航整合是 M0 简化：PRD §5.1 的「设置 → Provider 与模型」扁平为一级页签；
+ * 「设置 → 能力管理」（票 M2-T6 / Issue #27）落在设置页的子页签。
  * 任务页签（票 M1-T6 / Issue #18）：PRD §5.1 Task 视图简版；Chat 任务卡片经
  * openTaskId 跳转（路由从简：壳内 state 传递，不引路由库）。
+ * 能力引用卡（票 M2-T6）：Task 节点用到的能力芯片经 openCapabilityName 跳到设置→能力管理。
  */
 type View = "chat" | "tasks" | "settings" | "health";
 
@@ -29,6 +31,7 @@ export default function App() {
   const [bootError, setBootError] = useState<string | null>(null);
   const [view, setView] = useState<View>("chat");
   const [openTaskId, setOpenTaskId] = useState<string | null>(null);
+  const [openCapabilityName, setOpenCapabilityName] = useState<string | null>(null);
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [listError, setListError] = useState<string | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -73,6 +76,12 @@ export default function App() {
   const openTask = useCallback((taskId: string) => {
     setOpenTaskId(taskId);
     setView("tasks");
+  }, []);
+
+  /** Task 节点面板的能力引用芯片 → 设置 → 能力管理（预选该能力详情） */
+  const openCapability = useCallback((name: string) => {
+    setOpenCapabilityName(name);
+    setView("settings");
   }, []);
 
   if (bootError !== null) {
@@ -135,12 +144,12 @@ export default function App() {
       )}
       {view === "tasks" && (
         <main className="main page-host">
-          <TaskView base={base} initialTaskId={openTaskId} />
+          <TaskView base={base} initialTaskId={openTaskId} onOpenCapability={openCapability} />
         </main>
       )}
       {view === "settings" && (
         <main className="main page-host">
-          <SettingsView base={base} />
+          <SettingsView base={base} initialCapabilityName={openCapabilityName} />
         </main>
       )}
       {view === "health" && (

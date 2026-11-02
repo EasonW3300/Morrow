@@ -22,6 +22,7 @@ import {
   type ReviseFormState,
   type TaskEventItem,
 } from "./task-ui.ts";
+import { collectCapabilityRefs, type CapabilityRef } from "./capability-ui.ts";
 
 /**
  * Task 视图（票 M1-T6 / Issue #18，PRD §5.1 Task 视图简版、FR-TASK-3/4）：
@@ -33,12 +34,24 @@ import {
  *   SSE 通道（账本 task_id 专列只有 HTTP 分页），轮询让后台调度进度无需手动刷新；
  *   操作后立即 refetch 保证按钮反馈即时；终端态停表。事件流不参与轮询（手动加载
  *   分页窗口，避免大页抖动），轮询只刷新任务投影与检查点。
+ * - 能力引用卡（票 M2-T6 / Issue #27）：节点详情面板展示该节点用到的能力
+ *   （tool.started 的 tool_name 命中能力注册表 → 名称+版本芯片），点击跳设置→能力管理。
  */
 const POLL_INTERVAL_MS = 2000;
 const EVENT_PAGE_SIZE = 50;
+/** 能力引用卡的扫描窗口（账本单页上限 200；引用卡是辅助信息，不做全量回扫） */
+const CAPABILITY_REFS_EVENT_LIMIT = 200;
 const TERMINAL_STATUSES = new Set(["failed", "completed", "cancelled"]);
 
-export function TaskView({ base, initialTaskId }: { base: string; initialTaskId: string | null }) {
+export function TaskView({
+  base,
+  initialTaskId,
+  onOpenCapability,
+}: {
+  base: string;
+  initialTaskId: string | null;
+  onOpenCapability?: (name: string) => void;
+}) {
   const [tasks, setTasks] = useState<TaskSummary[]>([]);
   const [listError, setListError] = useState<string | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(initialTaskId);
@@ -94,7 +107,13 @@ export function TaskView({ base, initialTaskId }: { base: string; initialTaskId:
           {selectedId === null ? (
             <p className="empty-note">从左侧选择任务查看详情。</p>
           ) : (
-            <TaskDetailPanel key={selectedId} base={base} taskId={selectedId} onChanged={refreshList} />
+            <TaskDetailPanel
+              key={selectedId}
+              base={base}
+              taskId={selectedId}
+              onChanged={refreshList}
+              onOpenCapability={onOpenCapability}
+            />
           )}
         </main>
       </div>
@@ -104,7 +123,17 @@ export function TaskView({ base, initialTaskId }: { base: string; initialTaskId:
 
 // --- 任务详情 --------------------------------------------------------------------
 
-function TaskDetailPanel({ base, taskId, onChanged }: { base: string; taskId: string; onChanged: () => void }) {
+function TaskDetailPanel({
+  base,
+  taskId,
+  onChanged,
+  onOpenCapability,
+}: {
+  base: string;
+  taskId: string;
+  onChanged: () => void;
+  onOpenCapability?: (name: string) => void;
+}) {
   const [task, setTask] = useState<TaskDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [opError, setOpError] = useState<string | null>(null);
@@ -133,6 +162,23 @@ function TaskDetailPanel({ base, taskId, onChanged }: { base: string; taskId: st
       .then(setCheckpoints)
       .catch(() => setCheckpoints([]));
   }, [base, taskId, task?.task_version, task?.status]);
+
+  // 能力引用卡（票 M2-T6）：tool.started 的 tool_name 命中能力注册表 → node_id → 芯片。
+  // 注册表/事件任一不可得时静默降级为空（引用卡是增强信息，不阻塞任务详情）。
+  const [capabilityRefs, setCapabilityRefs] = useState<Map<string, CapabilityRef[]>>(new Map());
+  useEffect(() => {
+    void (async () => {
+      try {
+        const [records, events] = await Promise.all([
+          api.listCapabilities(base),
+          api.taskEvents(base, taskId, CAPABILITY_REFS_EVENT_LIMIT, 0),
+        ]);
+        setCapabilityRefs(collectCapabilityRefs(events.events, records));
+      } catch {
+        setCapabilityRefs(new Map());
+      }
+    })();
+  }, [base, taskId]);
 
   const run = useCallback(
     async (what: string, action: () => Promise<unknown>): Promise<void> => {
@@ -203,7 +249,7 @@ function TaskDetailPanel({ base, taskId, onChanged }: { base: string; taskId: st
           }}
         />
       )}
-      <NodeList base={base} task={task} busy={busy} run={run} />
+      <NodeList base={base} task={task} busy={busy} run={run} capabilityRefs={capabilityRefs} onOpenCapability={onOpenCapability} />
       <EventStream base={base} taskId={task.task_id} />
       {checkpoints.length > 0 && (
         <CheckpointList
@@ -226,11 +272,15 @@ function NodeList({
   task,
   busy,
   run,
+  capabilityRefs,
+  onOpenCapability,
 }: {
   base: string;
   task: TaskDetail;
   busy: boolean;
   run: (what: string, action: () => Promise<unknown>) => Promise<void>;
+  capabilityRefs: Map<string, CapabilityRef[]>;
+  onOpenCapability?: (name: string) => void;
 }) {
   const layering = dagLayers(task.nodes);
   return (
@@ -240,7 +290,16 @@ function NodeList({
         <div key={index} className="dag-layer" style={{ marginLeft: index * 20 }}>
           <p className="dag-layer-label">第 {index + 1} 层（依赖已满足顺序）</p>
           {layer.map((node) => (
-            <NodeRow key={node.node_id} base={base} taskId={task.task_id} node={node} busy={busy} run={run} />
+            <NodeRow
+              key={node.node_id}
+              base={base}
+              taskId={task.task_id}
+              node={node}
+              busy={busy}
+              run={run}
+              capabilityRefs={capabilityRefs.get(node.node_id) ?? []}
+              onOpenCapability={onOpenCapability}
+            />
           ))}
         </div>
       ))}
@@ -257,12 +316,16 @@ function NodeRow({
   node,
   busy,
   run,
+  capabilityRefs,
+  onOpenCapability,
 }: {
   base: string;
   taskId: string;
   node: TaskNodeRecord;
   busy: boolean;
   run: (what: string, action: () => Promise<unknown>) => Promise<void>;
+  capabilityRefs: CapabilityRef[];
+  onOpenCapability?: (name: string) => void;
 }) {
   const [completing, setCompleting] = useState(false);
   const [result, setResult] = useState("");
@@ -278,6 +341,22 @@ function NodeRow({
         {owned && <span className="badge tone-warn">Owner 接管中</span>}
       </div>
       {node.goal !== undefined && <p className="node-goal">{node.goal}</p>}
+      {capabilityRefs.length > 0 && (
+        <div className="capability-refs">
+          <span className="capability-refs-label">用到的能力：</span>
+          {capabilityRefs.map((ref) => (
+            <button
+              key={ref.name}
+              className="capability-ref-chip"
+              title={`${ref.name} v${ref.version}——点击查看能力详情`}
+              onClick={() => onOpenCapability?.(ref.name)}
+            >
+              {ref.name}
+              <span className="mono">v{ref.version}</span>
+            </button>
+          ))}
+        </div>
+      )}
       {node.result !== undefined && (
         looksLikeDiff(node.result) ? (
           <pre className="diff-view">{node.result}</pre>
