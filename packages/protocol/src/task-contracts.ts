@@ -39,6 +39,38 @@ export type TaskNodeActor = "owner";
  */
 export type SideEffectClass = "reversible" | "compensatable" | "irreversible" | "delivery_unknown";
 
+/**
+ * 代码任务的仓库资源声明（M2-T4 / Issue #25，FR-TASK-8「Git Worktree 隔离」）：
+ * 节点执行前在 path 仓库上建独立 worktree（独立目录 + 独立分支），节点 Agent 的工作
+ * 目录 = worktree；节点成功后变更合回主区（合并前冲突检测，冲突 → pending_review）。
+ */
+export interface NodeGitRepoResource {
+  /** 仓库主区路径（worktree 的基线仓库） */
+  path: string;
+  /**
+   * 基线分支（diff/合并基准与 worktree 分支的起点；缺省 = 仓库当前 HEAD）。
+   * 注意是「分支名」而不是目标分支切换：调度器不搬动主区分支，只在基线上建 worktree。
+   */
+  branch?: string;
+  /**
+   * 合并验证命令（可选）：合并完成后在主区目录执行（sh -c），非零退出 → 合并验证
+   * 失败（回滚合并、节点按失败留痕）。未声明时以「合并 diff 非空」做最低验证。
+   */
+  verify?: string;
+}
+
+/**
+ * 节点资源声明（M2-T4 / Issue #25，FR-TASK-8）：
+ * - git_repo：代码任务 → Git Worktree 工作区隔离（FR-TASK-8 前半）；
+ * - lock：互斥资源 key 列表 → 同 key 节点串行化（非代码任务的资源锁，FR-TASK-8 后半）。
+ * 两种资源可同时声明（代码任务也可以再要一把锁）。
+ */
+export interface NodeResources {
+  git_repo?: NodeGitRepoResource;
+  /** 互斥资源 key（调度器派发前全拿或全不拿，持锁到节点终态释放） */
+  lock?: string[];
+}
+
 /** DAG 节点（GET /v1/tasks/:id 的 nodes 元素；depends_on 以规划器 key 表示，task 内唯一） */
 export interface TaskNodeRecord {
   node_id: string;
@@ -56,6 +88,11 @@ export interface TaskNodeRecord {
   /** 可重试性：true 时调度器失败后自动重试一次 */
   retriable: boolean;
   side_effect: SideEffectClass;
+  /**
+   * 资源声明（M2-T4 / Issue #25，FR-TASK-8）：git_repo → worktree 隔离；
+   * lock → 互斥串行化。规划器声明，调度器消费；缺省（字段省略）= 无资源约束。
+   */
+  resources?: NodeResources;
   status: TaskNodeStatus;
   /** 责任方（M1-T6）：省略 = 调度器；"owner" = 已被 Owner 接管 */
   actor?: TaskNodeActor;

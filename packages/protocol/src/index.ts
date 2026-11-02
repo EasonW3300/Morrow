@@ -17,6 +17,8 @@ export type {
   SensitivityLevel,
 } from "./api-contracts.ts";
 export type {
+  NodeGitRepoResource,
+  NodeResources,
   SideEffectClass,
   TaskDetail,
   TaskNodeRecord,
