@@ -73,6 +73,22 @@ export interface MemoryObserver {
   }): void;
 }
 
+/**
+ * 工具完成观察面（票 M2-T5 / Issue #26）：tool.finished 落账后由 SessionManager 调用，
+ * 是 Skill 案例收集（成功/失败经验计数）的推送入口。窄结构接口（同 MemoryObserver 模式），
+ * 观察方异常不阻断会话主链路（SessionManager 捕获同步异常记日志）。
+ */
+export interface ToolObserver {
+  observeToolFinished(input: {
+    sessionId: string;
+    /** tool.finished 账本事件 id（案例表的来源事件外键） */
+    toolEventId: string;
+    toolName: string;
+    isError: boolean;
+    occurredAt: string;
+  }): void;
+}
+
 /** 会话事件流上的一帧：账本事件（带序号，SSE 里作 id）/ 文本增量 / 本轮结束标记 */
 export type SessionFrame =
   | { kind: "event"; sequence: number; envelope: EventEnvelope }
@@ -138,6 +154,8 @@ export interface SessionManagerOptions {
   factoryUnavailableReason?: string;
   /** 记忆观察面（票 M1-T1 / Issue #13）；缺省 null = 不观察 */
   memory?: MemoryObserver | null;
+  /** 工具完成观察面（票 M2-T5 / Issue #26：Skill 案例收集）；缺省 = 不观察 */
+  toolObserver?: ToolObserver | null;
   /** 会话运行时的工具工厂（M1-T1：按会话构建 memory.write 工具，经工厂 extras 注入） */
   agentTools?: (sessionId: string) => MorrowTool[];
 }
@@ -150,6 +168,7 @@ export class SessionManager {
   readonly #providerRequired: boolean;
   readonly #factoryUnavailableReason: string;
   readonly #memory: MemoryObserver | null;
+  readonly #toolObserver: ToolObserver | null;
   readonly #agentTools: ((sessionId: string) => MorrowTool[]) | null;
   readonly #states = new Map<string, SessionState>();
   #disposed = false;
@@ -161,6 +180,7 @@ export class SessionManager {
     this.#providers = options.providers ?? null;
     this.#providerRequired = options.providerRequired ?? false;
     this.#memory = options.memory ?? null;
+    this.#toolObserver = options.toolObserver ?? null;
     this.#agentTools = options.agentTools ?? null;
     this.#factoryUnavailableReason =
       options.factoryUnavailableReason ??
@@ -457,13 +477,28 @@ export class SessionManager {
           is_error: event.isError,
         };
         if (event.durationMs !== undefined) payload.duration_ms = event.durationMs;
-        this.#append(
+        const finished = this.#append(
           sessionId,
           SESSION_EVENT_TYPES.toolFinished,
           "agent:runtime",
           payload,
           ctx.toolStarted.get(event.toolCallId) ?? input.userEventId,
         );
+        // 工具完成观察（票 M2-T5：Skill 案例收集）。观察是增强路径：同步异常记日志，
+        // 不阻断会话主链路（MemoryObserver 同款口径）。
+        if (this.#toolObserver !== null) {
+          try {
+            this.#toolObserver.observeToolFinished({
+              sessionId,
+              toolEventId: finished.envelope.event_id,
+              toolName: event.toolName,
+              isError: event.isError,
+              occurredAt: finished.envelope.occurred_at,
+            });
+          } catch (err) {
+            console.error("[morrow] tool observer failed:", err);
+          }
+        }
         break;
       }
       case "error": {

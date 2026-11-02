@@ -6,6 +6,8 @@ import piAdapterPackageJson from "../../../packages/pi-adapter/package.json" wit
 import { ensureBuiltinCapabilities, MEMORY_WRITE_CAPABILITY_MANIFEST } from "./capabilities/builtin.ts";
 import { PermissionEngine } from "./capabilities/engine.ts";
 import { capabilityRoutes } from "./capabilities/routes.ts";
+import { skillRoutes } from "./capabilities/skills/routes.ts";
+import { SkillService } from "./capabilities/skills/service.ts";
 import { factoryRoutes } from "./capabilities/factory/routes.ts";
 import { CapabilityFactory } from "./capabilities/factory/service.ts";
 import { CAPABILITY_FACTORY_SYSTEM_PROMPT, PiCapabilityGenerator, type CapabilityGenerator } from "./capabilities/factory/generator.ts";
@@ -53,7 +55,11 @@ import type { SandboxRunner } from "./sandbox/runner.ts";
  * （POST /v1/memory/import 受控导入、DELETE /v1/memory/facts/:id 删除标记、
  * POST /v1/memory/project 投影再生成）、M2-T1 能力族
  * （POST/GET /v1/capabilities、GET/PUT /v1/capabilities/grants、
- * GET /v1/capabilities/:id、POST /v1/capabilities/:id/{enable,disable,rollback}）。
+ * GET /v1/capabilities/:id、POST /v1/capabilities/:id/{enable,disable,rollback}）、
+ * M2-T5 Skill 族（GET /v1/capabilities/skills[?match=]、GET/POST
+ * /v1/capabilities/skills/cases、POST /v1/capabilities/skills[...]、
+ * POST .../skills/:id/{approve,reject}、POST .../skills/:id/invoke +
+ * T6 api.ts 合约别名 /v1/skills[...]）。
  * 未匹配路径 404，路径命中但方法不符 405（账本 append-only：对事件的任何变更
  * 方法在请求层即被拒绝）。
  * 生命周期：start 先监听后记账 runtime.started（携带实际端口），随后 builtin 工具
@@ -86,6 +92,8 @@ interface RequestContext {
   capabilities: PermissionEngine;
   /** 能力工厂（票 M2-T3：生成闭环编排——检索/规划/构建/验证/确认门） */
   factory: CapabilityFactory;
+  /** Skill 服务（票 M2-T5：案例收集/晋升提案/Owner 决策/重用调用/检索） */
+  skills: SkillService;
 }
 
 type Handler = (
@@ -153,6 +161,16 @@ export interface RuntimeOptions {
    * factory_failed 事件，不以状态码转述）。
    */
   capabilityGenerator?: CapabilityGenerator;
+  /**
+   * Skill 能力调用接缝注入（M2-T5 / Issue #26）：Skill invoke 逐步调用 steps 引用的
+   * capability。缺省 = runtime 的 ToolInvoker（T2 统一调用接缝，执行前运行时复核——
+   * Skill 不绕过安全边界）；测试注入 FakeInvoker（零网络零 docker）。
+   */
+  skillInvoker?: {
+    invoke(name: string, input: unknown, context?: { actorId?: string }): Promise<{ ok: boolean; result?: unknown; error_code?: string; error?: string; via?: string }>;
+  };
+  /** Skill 自动晋升阈值：同组合连续成功 ≥ N 产生提案（默认 2，最小 1） */
+  skillPromotionThreshold?: number;
 }
 
 export interface RuntimeHandle {
@@ -179,6 +197,8 @@ export interface RuntimeHandle {
   sandbox: ToolInvoker;
   /** 能力工厂（M2-T3 / Issue #24：submitRequest / getRequest / confirm，库形态可直用） */
   factory: CapabilityFactory;
+  /** Skill 服务（M2-T5 / Issue #26：recordCase / propose / decide / invoke / matchSkills，库形态可直用） */
+  skills: SkillService;
   /**
    * 优雅停止：停止接收请求 → 中止并释放会话运行时与在跑任务节点 → 记账 runtime.stopped
    * → 关闭任务投影库与账本（WAL checkpoint）。signal 传入收到的 POSIX 信号名，
@@ -220,6 +240,10 @@ const routes: Route[] = [
   { method: "POST", re: /^\/v1\/tasks\/([^/]+)\/nodes\/([^/]+)\/takeover$/, handler: handleTakeoverNode },
   { method: "POST", re: /^\/v1\/tasks\/([^/]+)\/nodes\/([^/]+)\/complete$/, handler: handleCompleteNode },
   { method: "POST", re: /^\/v1\/tasks\/([^/]+)\/nodes\/([^/]+)\/release$/, handler: handleReleaseNode },
+  // M2-T5 Skill 族（GET /v1/capabilities/skills[?match=]、proposals、cases、approve/reject、
+  // invoke + T6 别名 /v1/skills*）——必须先于 capabilityRoutes 展开：GET /v1/capabilities/:id
+  // 的 `[^/]+` 会吞掉 /v1/capabilities/skills（grants 路由同款先具体后通配）
+  ...skillRoutes,
   ...memoryRoutes,
   ...capabilityRoutes,
   // M2-T3 工厂端点（POST /v1/capabilities/request、GET /v1/capabilities/requests/:id、
@@ -272,6 +296,30 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
           }
         : {}),
   });
+  // 沙箱执行 Worker（M2-T2 / Issue #23）：ToolInvoker 统一接缝（先于会话构建——Skill
+  // 服务的缺省 invoker 复用同一实例）。runner 缺省 DockerRunner（每次执行前探测容器运行时；
+  // 无运行时 → sandboxed 调用拒绝 sandbox_unavailable + install-hint）。权限引擎缺省 =
+  // M2-T1 注册表复核适配器（createRegistryPermissionAdapter，本地基线 +
+  // capabilities.assertRuntimeUse 双道）；注入 seam（RuntimeOptions.permissionEngine）
+  // 保留给测试/宿主。Runner 仅服务 sandboxed 类；builtin（Go Worker）不经容器直跑。
+  const workspaceRoot = join(config.dataDir, "workspace");
+  const sandboxRunnerInstance = options.sandboxRunner ?? new DockerRunner();
+  const sandbox = new ToolInvoker({
+    runner: sandboxRunnerInstance,
+    permissionEngine: options.permissionEngine ?? createRegistryPermissionAdapter({ registry: capabilities, workspaceRoot }),
+    workspaceRoot,
+  });
+  // Skill 服务（M2-T5 / Issue #26）：案例收集（tool.finished 观测 + 上报端点）→ 晋升
+  // 提案 → Owner 批准 → invoke 重用。invoker 缺省 = ToolInvoker（T2 统一调用接缝，
+  // 执行前 assertRuntimeUse 复核——Skill 只调用已验证 Tool，不绕过安全边界）。
+  const skills = new SkillService({
+    dataDir: config.dataDir,
+    ledger,
+    replicaId: config.replicaId,
+    capabilities,
+    invoker: options.skillInvoker ?? sandbox,
+    ...(options.skillPromotionThreshold === undefined ? {} : { promotionThreshold: options.skillPromotionThreshold }),
+  });
   // 内置工具实现表（票 M2-T1）：注册表只管 manifest 与启停，实现工厂留在接线层。
   // 新 builtin 工具在此追加工厂并加入 capabilities/builtin.ts 的 manifest 全集。
   const builtinToolFactories: Record<string, (sessionId: string) => MorrowTool> = {
@@ -286,6 +334,23 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     providerRequired: options.agentAdapterFactory === undefined,
     // 记忆（M1-T1）：高价值规则即时写候选；memory.write 工具按会话注入 Agent Loop
     memory,
+    // 工具完成观察（M2-T5）：tool.finished → Skill 案例收集（is_error → failure）。
+    // 观察是增强路径：失败记日志不阻断会话主链路。
+    toolObserver: {
+      observeToolFinished: (input) => {
+        try {
+          skills.recordCase({
+            capability: input.toolName,
+            outcome: input.isError ? "failure" : "success",
+            sourceEventId: input.toolEventId,
+            sessionId: input.sessionId,
+            occurredAt: input.occurredAt,
+          });
+        } catch (err) {
+          console.error("[morrow] skill case collection failed:", err);
+        }
+      },
+    },
     // 工具注入改查注册表（票 M2-T1）：enabled 且有内置实现的 typescript 能力才实例化
     agentTools: (sessionId) =>
       capabilities
@@ -356,18 +421,6 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
   void scheduler.sweepResidue().catch((err: unknown) => {
     console.error("[morrow] startup residue sweep failed:", err);
   });
-  // 沙箱执行 Worker（M2-T2 / Issue #23）：ToolInvoker 统一接缝。runner 缺省 DockerRunner
-  // （每次执行前探测容器运行时；无运行时 → sandboxed 调用拒绝 sandbox_unavailable +
-  // install-hint）。权限引擎缺省 = M2-T1 注册表复核适配器（createRegistryPermissionAdapter，
-  // 本地基线 + capabilities.assertRuntimeUse 双道）；注入 seam（RuntimeOptions.permissionEngine）
-  // 保留给测试/宿主。Runner 仅服务 sandboxed 类；builtin（Go Worker）不经容器直跑。
-  const workspaceRoot = join(config.dataDir, "workspace");
-  const sandboxRunnerInstance = options.sandboxRunner ?? new DockerRunner();
-  const sandbox = new ToolInvoker({
-    runner: sandboxRunnerInstance,
-    permissionEngine: options.permissionEngine ?? createRegistryPermissionAdapter({ registry: capabilities, workspaceRoot }),
-    workspaceRoot,
-  });
   // 能力工厂（M2-T3 / Issue #24）：生成闭环编排。生成器缺省 = 默认 Provider + 工厂系统
   // 提示词（经 PiAdapter 一次 prompt）；注入 seam（RuntimeOptions.capabilityGenerator）供
   // 测试脚本化（FakePi 零网络）。检索注入 MemoryService.search（FR-CAP-1 FTS 记忆半边）。
@@ -384,7 +437,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     memorySearch: (query) => memory.search(query).map((hit) => ({ content: hit.content, entry_kind: hit.stage })),
     workspaceRoot,
   });
-  const ctx: RequestContext = { ledger, replicaId: config.replicaId, sessions, providers, devices, tasks, scheduler, checkpoints, memory, projector, capabilities, factory };
+  const ctx: RequestContext = { ledger, replicaId: config.replicaId, sessions, providers, devices, tasks, scheduler, checkpoints, memory, projector, capabilities, factory, skills };
   const server = createServer((req, res) => {
     routeRequest(req, res, ctx);
   });
@@ -393,6 +446,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
   try {
     port = await listen(server, config.host, config.port);
   } catch (err) {
+    skills.close();
     factory.close();
     tasks.close();
     locks.close();
@@ -413,6 +467,13 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
   // builtin 工具 ensure-registered（票 M2-T1）：首见注册落 capability.registered（actor
   // agent:runtime），已注册同版本同内容 → no-op；builtin 常量与历史账本冲突时抛错（fail-fast）。
   ensureBuiltinCapabilities(capabilities);
+  // Skill 案例回填（票 M2-T5）：重启后扫描历史 tool.finished 补齐案例表
+  // （source_event 唯一约束幂等；streak 由此跨重启延续）。
+  try {
+    skills.ingestFromLedger();
+  } catch (err) {
+    console.error("[morrow] skill case backfill failed:", err);
+  }
 
   let closing = false;
   return {
@@ -429,6 +490,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     capabilities,
     sandbox,
     factory,
+    skills,
     async close(signal?: string): Promise<void> {
       if (closing) return;
       closing = true;
@@ -442,6 +504,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
       locks.close();
       checkpoints.close();
       factory.close();
+      skills.close();
       capabilities.close();
       try {
         ledger.append(
