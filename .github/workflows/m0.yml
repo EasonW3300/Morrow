@@ -234,3 +234,42 @@ jobs:
           name: m0-gate-report
           path: m0-gate-report.md
           if-no-files-found: error
+
+  # 沙箱执行 Worker 真实容器测试（M2-T2 / Issue #23，PRD §2 执行隔离 + FR-CAP-4）。
+  #
+  # 独立 job，不进 T9 门禁依赖图（build → gate → report 的产物门禁链保持原样）——
+  # 沙箱测试是能力域行为测试，不是产物门禁项；M2-T7 门禁收尾时再决定是否纳入。
+  #
+  # 腿标注（票面验收：ubuntu 腿真跑容器测试；无 docker runner 如实 skip）：
+  #   ubuntu-latest：runner 预装 docker → 真实容器路径（network none / workspace-only /
+  #   超时强杀 / 资源限额 / Go Worker 真编译）。
+  #   macos / windows runner：无 docker（macOS runner 无 Docker Desktop；Windows runner
+  #   容器形态不可靠）→ 不设腿。测试内部还有运行时探测兜底：无容器运行时即以理由 skip
+  #   （sandbox.docker.test.ts 顶部 detectContainerRuntime），本地/未来 runner 变化时
+  #   行为自洽，不会假红。
+  sandbox-tests:
+    name: sandbox tests (ubuntu, real containers)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: pnpm/action-setup@v4 # 版本取 package.json packageManager（pnpm@9.12.0）
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      # Go Worker（workers/go）真编译：textstats 经 ToolInvoker 同一注册/调用接口走通
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Install workspace dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run sandbox tests (real containers + injected-stub paths, zero LLM)
+        run: pnpm --filter @morrow/runtime test:sandbox

@@ -120,6 +120,33 @@ export { detectHighValue } from "./memory/heuristics.ts";
 export type { HighValueMatch, HighValueRule } from "./memory/heuristics.ts";
 export { probeSandbox } from "./health.ts";
 export type { SandboxProbe, SandboxStatus } from "./health.ts";
+// 沙箱执行 Worker（M2-T2 / Issue #23）：SandboxRunner 接缝 + 默认容器实现 + 检测器 + 调用接缝
+export { ToolInvoker, UnknownToolError } from "./sandbox/invoker.ts";
+export type { InvocationResult, InvokeContext, ToolRegistration, ToolInvokerOptions } from "./sandbox/invoker.ts";
+export { DockerRunner, DEFAULT_SANDBOX_IMAGE, defaultDockerExec } from "./sandbox/docker-runner.ts";
+export { SandboxError, SandboxUnavailableError } from "./sandbox/runner.ts";
+export type { SandboxErrorCode, SandboxResult, SandboxRunner, SandboxToolPackage } from "./sandbox/runner.ts";
+export { detectContainerRuntime, INSTALL_HINT } from "./sandbox/detect.ts";
+export type {
+  ContainerEngine,
+  ContainerRuntimeInfo,
+  DetectContainerRuntimeOptions,
+  SandboxAvailability,
+} from "./sandbox/detect.ts";
+export { DEFAULT_SANDBOX_RESOURCES, normalizeSandboxContract, SandboxContractError } from "./sandbox/contract.ts";
+export type { SandboxContract, SandboxContractInput, SandboxResources } from "./sandbox/contract.ts";
+export { buildDockerRunArgs } from "./sandbox/docker-args.ts";
+export { errorEnvelope, parseToolEnvelope, resultEnvelope } from "./sandbox/protocol.ts";
+export { runGoWorker } from "./sandbox/go-worker.ts";
+export type { GoWorkerResult } from "./sandbox/go-worker.ts";
+export { createLocalPermissionEngine, PermissionDeniedError } from "./sandbox/permission.ts";
+export type {
+  PermissionEngine,
+  RuntimeUseContext,
+  RuntimeUseRequest,
+  ToolManifestLite,
+  ToolPermissions,
+} from "./sandbox/permission.ts";
 export { uuidv7 } from "./uuid-v7.ts";
 export { openSqlite } from "./db.ts";
 export type { SqliteDatabase, SqliteStatement, SqliteParam } from "./db.ts";
