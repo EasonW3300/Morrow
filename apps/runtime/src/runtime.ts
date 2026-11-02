@@ -9,24 +9,27 @@ import { probeSandbox } from "./health.ts";
 import { EventLedger } from "./ledger.ts";
 import { ProviderRegistry, ProviderRegistryError, ENV_PROVIDER_ID, type ProviderResolver, type ResolvedProvider } from "./providers.ts";
 import { SessionManager, type SessionFrame } from "./sessions.ts";
+import { TaskScheduler, type NodeAgentFactory, type TaskNodeExecInput } from "./scheduler.ts";
+import { PLANNER_SYSTEM_PROMPT, TaskError, TaskService, type PlannerFactory } from "./tasks.ts";
 import { buildEventEnvelope } from "./envelope.ts";
 import { computeIntegrityHash, type EventEnvelope } from "@morrow/protocol";
 import { UUID_RE } from "./uuid-v7.ts";
 
 /**
- * Runtime HTTP 服务（PRD §6.2 的 M0 子集）。
+ * Runtime HTTP 服务（PRD §6.2 的 M0 子集 + M1-T4 任务族）。
  *
  * node:http + 极简路由，不引框架——为 T8 bun compile 单二进制留路（ADR-0003）。
  * 路由面：GET /v1/health、GET /v1/events、GET /v1/devices（M0 只读登记，票 #3）、
  * T4 会话族（POST/GET /v1/sessions、
  * POST/GET /v1/sessions/:id/messages、GET /v1/sessions/:id/stream SSE）、
  * T5 Provider 族（GET/POST /v1/providers、GET/PUT/DELETE /v1/providers/:id、
- * POST /v1/providers/:id/default、POST /v1/providers/:id/test）。
+ * POST /v1/providers/:id/default、POST /v1/providers/:id/test）、
+ * M1-T4 任务族（POST/GET /v1/tasks、GET /v1/tasks/:id、GET /v1/tasks/:id/events）。
  * 未匹配路径 404，路径命中但方法不符 405（账本 append-only：对事件的任何变更
  * 方法在请求层即被拒绝）。
  * 生命周期：start 先监听后记账 runtime.started（携带实际端口）；close 先停收请求，
- * 再中止会话运行并释放 AgentRuntime，然后记账 runtime.stopped（causation 指向
- * started），最后关闭账本落盘。
+ * 再中止会话运行与在跑任务节点并释放 AgentRuntime，然后记账 runtime.stopped
+ * （causation 指向 started），最后关闭任务投影库与账本落盘。
  */
 
 /** 版本号唯一来源：本包 package.json（main.ts 的 ready 行也从这里取——不再双真相源） */
@@ -38,6 +41,9 @@ interface RequestContext {
   sessions: SessionManager;
   providers: ProviderRegistry;
   devices: DeviceRegistry;
+  tasks: TaskService;
+  /** 任务调度器（POST /v1/tasks 规划成功后的后台触发点；生命周期归 startRuntime） */
+  scheduler: TaskScheduler;
 }
 
 type Handler = (
@@ -66,6 +72,20 @@ export interface RuntimeOptions {
    * 未实测）。测试与宿主可注入内存桩避免触碰用户钥匙串。
    */
   secretStore?: SecretStore;
+  /**
+   * 任务规划器工厂注入 seam（M1-T4 / Issue #16）：goal → 一次规划用 AgentRuntime
+   * （系统提示词要求只输出 JSON 计划）。生产默认 = 默认 Provider + 规划系统提示词；
+   * 测试注入 FakePi 脚本。注入时 POST /v1/tasks 不做 Provider 预检（语义对齐会话）。
+   */
+  taskPlannerFactory?: PlannerFactory;
+  /**
+   * 任务节点执行工厂注入 seam：节点 → 一次执行用 AgentRuntime。生产默认 =
+   * 默认 Provider 构建（node.model 仅记录，执行走会话默认 Provider——FR-TASK-3
+   * 换模型时再接）；测试注入 FakePi 脚本。
+   */
+  taskNodeAgentFactory?: NodeAgentFactory;
+  /** 调度器同时在跑节点上限（默认 2，最小 1；调度器级上限，跨任务成立） */
+  taskConcurrency?: number;
 }
 
 export interface RuntimeHandle {
@@ -78,9 +98,12 @@ export interface RuntimeHandle {
   sessions: SessionManager;
   /** Provider 注册表（库形态可直用：CRUD / 默认 / env 回退解析） */
   providers: ProviderRegistry;
+  /** 任务服务（库形态可直用：createTask / 详情 / 状态机迁移；调度经 HTTP 自动触发） */
+  tasks: TaskService;
   /**
-   * 优雅停止：停止接收请求 → 中止并释放会话运行时 → 记账 runtime.stopped →
-   * 关闭账本（WAL checkpoint）。signal 传入收到的 POSIX 信号名，落进 stopped 事件的 payload。
+   * 优雅停止：停止接收请求 → 中止并释放会话运行时与在跑任务节点 → 记账 runtime.stopped
+   * → 关闭任务投影库与账本（WAL checkpoint）。signal 传入收到的 POSIX 信号名，
+   * 落进 stopped 事件的 payload。
    */
   close(signal?: string): Promise<void>;
 }
@@ -101,6 +124,10 @@ const routes: Route[] = [
   { method: "GET", re: /^\/v1\/sessions\/([^/]+)\/messages$/, handler: handleHistory },
   { method: "POST", re: /^\/v1\/sessions\/([^/]+)\/messages$/, handler: handleSendMessage },
   { method: "GET", re: /^\/v1\/sessions\/([^/]+)\/stream$/, handler: handleStream },
+  { method: "POST", re: /^\/v1\/tasks$/, handler: handleCreateTask },
+  { method: "GET", re: /^\/v1\/tasks$/, handler: handleListTasks },
+  { method: "GET", re: /^\/v1\/tasks\/([^/]+)$/, handler: handleGetTask },
+  { method: "GET", re: /^\/v1\/tasks\/([^/]+)\/events$/, handler: handleTaskEvents },
 ];
 
 export async function startRuntime(config: RuntimeConfig, options: RuntimeOptions = {}): Promise<RuntimeHandle> {
@@ -122,7 +149,27 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     // 注入工厂（测试/宿主自带 Agent Loop）时不做 Provider 预检（T4 语义）；默认工厂要求有 Provider
     providerRequired: options.agentAdapterFactory === undefined,
   });
-  const ctx: RequestContext = { ledger, replicaId: config.replicaId, sessions, providers, devices };
+  // 任务域（M1-T4）：规划器/节点工厂注入语义对齐会话——注入时不做 Provider 预检，
+  // 默认工厂路径要求存在可解析的默认 Provider（POST /v1/tasks 预检 503 依据）。
+  const taskPlannerInjected = options.taskPlannerFactory !== undefined;
+  const defaultPlannerRuntime = defaultTaskRuntimeFactory(providers, PLANNER_SYSTEM_PROMPT);
+  const defaultNodeRuntime = defaultTaskRuntimeFactory(providers);
+  const tasks = new TaskService({
+    dataDir: config.dataDir,
+    ledger,
+    replicaId: config.replicaId,
+    factory: options.taskPlannerFactory !== undefined ? options.taskPlannerFactory : defaultPlannerRuntime,
+    providers,
+    providerRequired: !taskPlannerInjected,
+  });
+  const scheduler = new TaskScheduler({
+    tasks,
+    ledger,
+    replicaId: config.replicaId,
+    nodeAgentFactory: options.taskNodeAgentFactory ?? ((node: TaskNodeExecInput) => defaultNodeRuntime(node.goal)),
+    ...(options.taskConcurrency === undefined ? {} : { concurrency: options.taskConcurrency }),
+  });
+  const ctx: RequestContext = { ledger, replicaId: config.replicaId, sessions, providers, devices, tasks, scheduler };
   const server = createServer((req, res) => {
     routeRequest(req, res, ctx);
   });
@@ -131,6 +178,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
   try {
     port = await listen(server, config.host, config.port);
   } catch (err) {
+    tasks.close();
     devices.close();
     ledger.close();
     throw err;
@@ -152,13 +200,17 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     sessions,
     providers,
     devices,
+    tasks,
     async close(signal?: string): Promise<void> {
       if (closing) return;
       closing = true;
       server.closeAllConnections();
       await new Promise<void>((resolve) => server.close(() => resolve()));
-      // 会话运行先收尾（中止在跑的轮次并释放 AgentRuntime），再记账、再关账本
+      // 会话运行先收尾（中止在跑的轮次并释放 AgentRuntime），再记账、再关库
       await sessions.dispose();
+      // 任务调度：拒绝排队任务、中止在跑节点（收尾上限 2s），然后关任务投影库
+      await scheduler.dispose();
+      tasks.close();
       try {
         ledger.append(
           buildEventEnvelope({
@@ -191,6 +243,28 @@ function defaultAgentFactory(): (sessionId: string, provider: ResolvedProvider |
       apiKey: provider.apiKey.length > 0 ? provider.apiKey : "unused",
       model: { id: provider.modelId, contextWindow: provider.contextWindow, maxTokens: provider.maxTokens },
       ...(provider.compat !== undefined ? { compat: provider.compat } : {}),
+    });
+  };
+}
+
+/**
+ * 任务域默认工厂（M1-T4）：默认 Provider → createPiAdapter；planner 带规划系统提示词
+ * （FR-TASK-1 的生产路径），节点执行不带专用提示词。Provider 解析失败抛错——规划路径
+ * 由 createTask 转 task.failed 留痕，节点路径由调度器落 node failed，均不静默。
+ * node.model 仅记录不执行（FR-TASK-3 换模型时再接），执行统一用默认 Provider。
+ */
+function defaultTaskRuntimeFactory(providers: ProviderRegistry, systemPrompt?: string): (goal: string) => Promise<AgentRuntime> {
+  return async () => {
+    const provider = await providers.resolve();
+    if (provider === null) {
+      throw new Error("no model provider configured");
+    }
+    return createPiAdapter({
+      baseUrl: provider.baseUrl,
+      apiKey: provider.apiKey.length > 0 ? provider.apiKey : "unused",
+      model: { id: provider.modelId, contextWindow: provider.contextWindow, maxTokens: provider.maxTokens },
+      ...(provider.compat !== undefined ? { compat: provider.compat } : {}),
+      ...(systemPrompt === undefined ? {} : { systemPrompt }),
     });
   };
 }
@@ -275,28 +349,11 @@ function handleListDevices(_req: IncomingMessage, res: ServerResponse, _url: URL
 }
 
 function handleEvents(_req: IncomingMessage, res: ServerResponse, url: URL, ctx: RequestContext): void {
-  const params = url.searchParams;
-  let limit = 50;
-  let offset = 0;
+  const page = parsePageParams(url, res);
+  if (page === null) return;
   let replicaId: string | undefined;
 
-  const limitRaw = params.get("limit");
-  if (limitRaw !== null) {
-    if (!/^\d+$/.test(limitRaw) || Number(limitRaw) < 1 || Number(limitRaw) > 200) {
-      sendError(res, 400, "invalid_query", "limit must be an integer between 1 and 200");
-      return;
-    }
-    limit = Number(limitRaw);
-  }
-  const offsetRaw = params.get("offset");
-  if (offsetRaw !== null) {
-    if (!/^\d+$/.test(offsetRaw)) {
-      sendError(res, 400, "invalid_query", "offset must be a non-negative integer");
-      return;
-    }
-    offset = Number(offsetRaw);
-  }
-  const replicaRaw = params.get("replica_id");
+  const replicaRaw = url.searchParams.get("replica_id");
   if (replicaRaw !== null) {
     if (!UUID_RE.test(replicaRaw.toLowerCase())) {
       sendError(res, 400, "invalid_query", "replica_id must be a lowercase uuid");
@@ -305,7 +362,32 @@ function handleEvents(_req: IncomingMessage, res: ServerResponse, url: URL, ctx:
     replicaId = replicaRaw.toLowerCase();
   }
 
-  sendJson(res, 200, ctx.ledger.list({ replicaId, limit, offset }));
+  sendJson(res, 200, ctx.ledger.list({ replicaId, limit: page.limit, offset: page.offset }));
+}
+
+/** 分页公共参数（limit 1–200 默认 50、offset ≥ 0）；非法时写出 400 并返回 null */
+function parsePageParams(url: URL, res: ServerResponse): { limit: number; offset: number } | null {
+  const params = url.searchParams;
+  let limit = 50;
+  let offset = 0;
+
+  const limitRaw = params.get("limit");
+  if (limitRaw !== null) {
+    if (!/^\d+$/.test(limitRaw) || Number(limitRaw) < 1 || Number(limitRaw) > 200) {
+      sendError(res, 400, "invalid_query", "limit must be an integer between 1 and 200");
+      return null;
+    }
+    limit = Number(limitRaw);
+  }
+  const offsetRaw = params.get("offset");
+  if (offsetRaw !== null) {
+    if (!/^\d+$/.test(offsetRaw)) {
+      sendError(res, 400, "invalid_query", "offset must be a non-negative integer");
+      return null;
+    }
+    offset = Number(offsetRaw);
+  }
+  return { limit, offset };
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
@@ -597,6 +679,86 @@ async function handleTestProvider(_req: IncomingMessage, res: ServerResponse, _u
   }
   const result = await testProviderConnectivity(resolved);
   sendJson(res, 200, result);
+}
+
+// --- M1-T4 任务族 handlers（票 #16，PRD §6.2 任务端点）------------------------
+// 语义：POST /v1/tasks 同步规划（FakePi/真实 LLM），201 返回规划快照；规划成功后
+// 自动后台调度（PRD 任务族无独立 run 端点；暂停/取消等介入操作是 FR-TASK-3 的范围，
+// 状态机迁移已由 TaskService.transition 支撑，客户端经轮询详情观察执行进度）。
+// 规划失败不 5xx：任务以 failed 状态持久化（task.planning_failed + task.failed 留痕），
+// 响应仍是 201 + failed 详情——创建的资源真实存在，错误在资源与账本里，不靠状态码转述。
+
+interface CreateTaskBody {
+  goal?: unknown;
+}
+
+async function handleCreateTask(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _url: URL,
+  ctx: RequestContext,
+): Promise<void> {
+  if (!ctx.tasks.plannerAvailable) {
+    sendError(res, 503, "planner_unavailable", ctx.tasks.plannerUnavailableReason);
+    return;
+  }
+  const body = await readJsonBody(req, res);
+  if (body === null) return; // 响应已在 readJsonBody 里写出
+  const { goal } = body as CreateTaskBody;
+  if (typeof goal !== "string" || goal.trim().length === 0) {
+    sendError(res, 400, "invalid_body", "goal must be a non-empty string");
+    return;
+  }
+  let detail;
+  try {
+    detail = await ctx.tasks.createTask(goal.trim());
+  } catch (err) {
+    handleTaskError(res, err);
+    return;
+  }
+  // 规划成功即后台调度：fire-and-forget，schedule 的失败路径已全部落账本
+  // （task.failed），这里的 catch 只防未处理拒绝；规则化 POST 立即返回。
+  if (detail.status === "planned") {
+    void ctx.scheduler.schedule(detail.task_id).catch((err: unknown) => {
+      console.error("[morrow] task scheduling crashed:", err);
+    });
+  }
+  sendJson(res, 201, detail);
+}
+
+function handleListTasks(_req: IncomingMessage, res: ServerResponse, _url: URL, ctx: RequestContext): void {
+  sendJson(res, 200, { tasks: ctx.tasks.listTasks() });
+}
+
+function handleGetTask(_req: IncomingMessage, res: ServerResponse, _url: URL, ctx: RequestContext, params: string[]): void {
+  const detail = ctx.tasks.getTask(params[0]);
+  if (detail === null) {
+    sendError(res, 404, "task_not_found", `task "${params[0]}" not found`);
+    return;
+  }
+  sendJson(res, 200, detail);
+}
+
+/** 任务事件分页（账本 task_id 专列 + events_task_idx 索引；分页语义与 GET /v1/events 一致） */
+function handleTaskEvents(_req: IncomingMessage, res: ServerResponse, url: URL, ctx: RequestContext, params: string[]): void {
+  const taskId = params[0];
+  if (ctx.tasks.getTask(taskId) === null) {
+    sendError(res, 404, "task_not_found", `task "${taskId}" not found`);
+    return;
+  }
+  const page = parsePageParams(url, res);
+  if (page === null) return;
+  sendJson(res, 200, ctx.ledger.list({ taskId, limit: page.limit, offset: page.offset }));
+}
+
+/** TaskError → HTTP：not_found 404、invalid_transition 409、planner_unavailable 503；其余上抛 500 */
+function handleTaskError(res: ServerResponse, err: unknown): void {
+  if (err instanceof TaskError) {
+    const status = err.code === "not_found" ? 404 : err.code === "invalid_transition" ? 409 : err.code === "planner_unavailable" ? 503 : 500;
+    sendError(res, status, `task_${err.code}`, err.message);
+    return;
+  }
+  throw err;
 }
 
 /**

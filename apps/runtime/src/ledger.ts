@@ -38,6 +38,8 @@ export class LedgerError extends Error {
 export interface LedgerListOptions {
   /** 按副本 uuid 过滤 */
   replicaId?: string;
+  /** 按信封 task_id 过滤（M1-T4 / Issue #16：专列 + 索引） */
+  taskId?: string;
   /** 页大小；账本层钳制到 [1,200]（HTTP 层负责对非法入参返回 400） */
   limit?: number;
   offset?: number;
@@ -49,10 +51,12 @@ export interface LedgerEntry {
   envelope: EventEnvelope;
 }
 
-/** scan 的选择器；两个条件同时给定时取交集 */
+/** scan 的选择器；多个条件同时给定时取交集 */
 export interface LedgerScanSelector {
   /** 按信封 session_id 过滤（M0 无专列，JSON 扫描；量级：单副本会话事件） */
   sessionId?: string;
+  /** 按信封 task_id 过滤（M1-T4：专列 + 索引，见 CREATE_SQL 下方说明） */
+  taskId?: string;
   /** 按 event_type 过滤（有专列，走索引） */
   eventType?: string;
 }
@@ -106,6 +110,17 @@ BEGIN
 END;
 `;
 
+/**
+ * task_id 专列（M1-T4 / Issue #16）：任务事件查询（GET /v1/tasks/:id/events）从
+ * M0 的 JSON 全扫升级为 `WHERE task_id = ?` 走索引（events_task_idx）。
+ * 迁移只做 ALTER ADD COLUMN——不做回填：task 事件族随本票才出现，既有事件
+ * （runtime 与 session 前缀族）一律无 task_id，回填没有可写的数据。
+ */
+const TASK_ID_MIGRATION_SQL = `
+ALTER TABLE events ADD COLUMN task_id TEXT;
+CREATE INDEX IF NOT EXISTS events_task_idx ON events (task_id, seq);
+`;
+
 export class EventLedger {
   readonly #db: SqliteDatabase;
   #closed = false;
@@ -118,12 +133,23 @@ export class EventLedger {
   #seqRangeAllStmt;
   #byTypeStmt;
   #sampleStmt;
+  #countByTaskStmt;
+  #pageByTaskStmt;
+  #byTaskStmt;
 
   private constructor(db: SqliteDatabase) {
     this.#db = db;
     db.exec(CREATE_SQL);
+    // task_id 专列迁移（M1-T4）：新库由 CREATE_SQL 之外的 ALTER 补列（幂等）；索引随迁移建。
+    // 旧库（M0）同样走这条路径——ALTER 对已有库追加 NULL 列，不触碰既有行（append-only 触发器只锁 UPDATE/DELETE）。
+    const columns = db.prepare("PRAGMA table_info(events)").all() as Array<{ name: string }>;
+    if (!columns.some((c) => c.name === "task_id")) {
+      db.exec(TASK_ID_MIGRATION_SQL);
+    } else {
+      db.exec("CREATE INDEX IF NOT EXISTS events_task_idx ON events (task_id, seq)");
+    }
     this.#insertStmt = db.prepare(
-      "INSERT INTO events (event_id, replica_id, event_type, occurred_at, envelope) VALUES (?, ?, ?, ?, ?)",
+      "INSERT INTO events (event_id, replica_id, event_type, occurred_at, task_id, envelope) VALUES (?, ?, ?, ?, ?, ?)",
     );
     this.#countAllStmt = db.prepare("SELECT COUNT(*) AS n FROM events");
     this.#pageAllStmt = db.prepare("SELECT envelope FROM events ORDER BY seq LIMIT ? OFFSET ?");
@@ -136,6 +162,11 @@ export class EventLedger {
     this.#sampleStmt = db.prepare(
       "SELECT seq, envelope FROM events WHERE (seq % ?) = 0 ORDER BY seq",
     );
+    this.#countByTaskStmt = db.prepare("SELECT COUNT(*) AS n FROM events WHERE task_id = ?");
+    this.#pageByTaskStmt = db.prepare(
+      "SELECT envelope FROM events WHERE task_id = ? ORDER BY seq LIMIT ? OFFSET ?",
+    );
+    this.#byTaskStmt = db.prepare("SELECT seq, envelope FROM events WHERE task_id = ? ORDER BY seq");
   }
 
   /** 打开（必要时创建）数据目录下的账本文件 */
@@ -170,6 +201,7 @@ export class EventLedger {
         envelope.replica_id,
         envelope.event_type,
         envelope.occurred_at,
+        envelope.task_id ?? null,
         canonicalJson(envelope),
       );
       return { sequence: Number(result.lastInsertRowid) };
@@ -183,12 +215,22 @@ export class EventLedger {
 
   /**
    * 全量扫描（seq 升序）并按选择器过滤，返回带写入序号的信封条目。
-   * 会话投影（会话列表/历史/SSE 重放）都走这里；无分页——M0 量级为单副本
-   * 会话事件，会话事件的量随消息数线性增长，分页是 T5+ 同步层的事。
+   * 会话投影（会话列表/历史/SSE 重放）走 sessionId 分支（JSON 扫描）；task 事件
+   * （任务详情/事件页）走 taskId 分支（task_id 专列 + 索引，M1-T4）。
    */
   scan(selector: LedgerScanSelector = {}): LedgerEntry[] {
     this.#assertOpen();
     const eventType = selector.eventType;
+    if (selector.taskId !== undefined) {
+      const rows = this.#byTaskStmt.all(selector.taskId) as Array<{ seq: number | bigint; envelope: string }>;
+      const out: LedgerEntry[] = [];
+      for (const row of rows) {
+        const envelope = JSON.parse(row.envelope) as EventEnvelope;
+        if (eventType !== undefined && envelope.event_type !== eventType) continue;
+        out.push({ sequence: Number(row.seq), envelope });
+      }
+      return out;
+    }
     if (selector.sessionId !== undefined) {
       const rows = this.#seqRangeAllStmt.all() as Array<{ seq: number | bigint; envelope: string }>;
       const out: LedgerEntry[] = [];
@@ -208,19 +250,26 @@ export class EventLedger {
     return rows.map((row) => ({ sequence: Number(row.seq), envelope: JSON.parse(row.envelope) as EventEnvelope }));
   }
 
-  /** 分页查询，按写入顺序（seq 升序）返回信封原文 */
+  /** 分页查询，按写入顺序（seq 升序）返回信封原文；replicaId / taskId 二选一过滤（同给以 taskId 优先） */
   list(options: LedgerListOptions = {}): LedgerPage {
     this.#assertOpen();
     const limit = clampInt(options.limit, 1, 200, 50);
     const offset = clampInt(options.offset, 0, Number.MAX_SAFE_INTEGER, 0);
     const replicaId = options.replicaId;
+    const taskId = options.taskId;
     const rows = (
-      replicaId === undefined
-        ? this.#pageAllStmt.all(limit, offset)
-        : this.#pageByReplicaStmt.all(replicaId, limit, offset)
+      taskId !== undefined
+        ? this.#pageByTaskStmt.all(taskId, limit, offset)
+        : replicaId === undefined
+          ? this.#pageAllStmt.all(limit, offset)
+          : this.#pageByReplicaStmt.all(replicaId, limit, offset)
     ) as Array<{ envelope: string }>;
     const countRow = (
-      replicaId === undefined ? this.#countAllStmt.get() : this.#countByReplicaStmt.get(replicaId)
+      taskId !== undefined
+        ? this.#countByTaskStmt.get(taskId)
+        : replicaId === undefined
+          ? this.#countAllStmt.get()
+          : this.#countByReplicaStmt.get(replicaId)
     ) as { n: number | bigint };
     return {
       events: rows.map((row) => JSON.parse(row.envelope) as EventEnvelope),

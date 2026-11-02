@@ -1,9 +1,10 @@
 # @morrow/runtime
 
 Runtime 骨架 + 事件账本 v1（票 T2 / Issue #3）+ 对话贯通（票 T4 / Issue #5）+ Provider 配置、
-凭据库与切换（票 T5 / Issue #6）。核心 Node 应用：任务编排、Agent Loop、记忆管线、能力工厂、
-控制 API 的宿主；打包为单二进制，桌面 sidecar 与 Ubuntu 服务器同一代码（ADR-0003）。
-T5 交付 Provider CRUD + OS 凭据库 + 连通性测试端点 + 会话级 Provider 切换与失败隔离。
+凭据库与切换（票 T5 / Issue #6）+ 任务 DAG 与调度（M1-T4 / Issue #16）。核心 Node 应用：
+任务编排、Agent Loop、记忆管线、能力工厂、控制 API 的宿主；打包为单二进制，桌面 sidecar
+与 Ubuntu 服务器同一代码（ADR-0003）。T5 交付 Provider CRUD + OS 凭据库 + 连通性测试端点
++ 会话级 Provider 切换与失败隔离；M1-T4 交付任务事件族 + 状态机 + 规划/执行贯通。
 
 ## 运行与测试
 
@@ -61,6 +62,10 @@ provider 参数）；凭据库可经 `startRuntime(config, { secretStore })` 注
 | POST | `/v1/providers/:id/default` | 把默认 Provider 切到该 id → 200 `{ default_provider_id }` |
 | POST | `/v1/providers/:id/test` | 连通性测试 → `{ result: "ok" \| "auth_failed" \| "unreachable" \| "error", ... }`（`unreachable` 带 `kind: "timeout" \| "connect_error"` 结构化类别，见下文） |
 | GET | `/v1/devices` | 本副本已知设备记录（只读；M0 最小实现，见下文「Device 记录」）→ `{ devices: [{ replica_id, label, created_at, last_seen_at }] }` |
+| POST | `/v1/tasks` | 建任务并规划（M1-T4 / Issue #16），body `{ goal }`（非空字符串）→ 201 任务详情（DAG/状态/版本）；规划经 PiAdapter（生产默认 Provider + 规划系统提示词，测试注入 FakePi），规划成功即后台自动调度（见下节）；无 Provider 503 `planner_unavailable`、body 非法 400；坏规划输出不 5xx——任务以 `failed` 状态持久化，响应仍 201 |
+| GET | `/v1/tasks` | 任务列表 → `{ tasks: [{ task_id, goal, status, task_version, created_at, updated_at }] }` |
+| GET | `/v1/tasks/:id` | 任务详情（DAG/状态/版本）→ 200 `{ ...summary, nodes: [{ node_id, key, title, goal?, depends_on, agent_role?, model?, retriable, side_effect, status, attempts, result?, error? }], error? }` / 404 `task_not_found` |
+| GET | `/v1/tasks/:id/events` | 任务执行事件（分页；`task_id` 专列 + 索引）→ `{ events, total, limit, offset }`；query 同 `/v1/events`（`limit` 1–200 默认 50、`offset`）；未知任务 404 |
 
 错误统一 `{ error: { code, message } }`；未匹配路径 404，路径命中但方法不符 405，
 body 非法 400 `invalid_body`，body 的 content-type 非 application/json 一律 415
@@ -174,6 +179,50 @@ M0 不设队列上限（单用户本地场景）。
 再落 `stop_reason: "error"` 的 assistant（text 为已产出前缀）；中断轮 `stop_reason: "aborted"`，
 已产出事件不丢失且不污染后续轮次。
 
+## M1 任务事件族与调度（票 M1-T4 / Issue #16，PRD §4.3 FR-TASK-1/2/6）
+
+**端到端语义**：`POST /v1/tasks` 同步规划（目标描述 → Agent Loop 规划提示词 → JSON 计划 →
+schema + 语义校验（key 唯一/依赖可解析/无环）→ DAG 落表 + `task.planned`），201 返回规划
+快照后**自动后台调度**——任务族无独立 run 端点（PRD §6.2），暂停/补充输入等介入操作是
+FR-TASK-3 的范围；客户端轮询详情与事件观察执行进度（curl 演示：POST → 轮询 GET 详情）。
+规划失败（工厂抛错/输出非法）不 5xx：`task.planning_failed` + `task.failed` 留痕，任务以
+`failed` 状态存在。规划工厂可经 `startRuntime(config, { taskPlannerFactory, taskNodeAgentFactory })`
+注入（测试 FakePi 脚本化，零网络）；节点执行工厂默认用会话默认 Provider（node.model 仅记录）。
+
+**状态机**（决策稿 §6；`needs_reconcile` 留后）：`created → planned → running →
+(paused | waiting_input | failed | completed | cancelled)`，`paused | waiting_input → running`
+的恢复记 `task.resumed`；终端态拒绝一切迁移（非法迁移不落任何事件，服务层
+`TaskService.transition` 抛 `invalid_transition`，HTTP 409 `task_invalid_transition`）。
+
+**事件族**（event_type 清单只增不减；信封 `task_id` 关联任务，全部入账本 `task_id` 专列）：
+
+| event_type | actor_id | causation_id | payload 要点 |
+| --- | --- | --- | --- |
+| `task.created` | `owner` | null | `{ goal }` |
+| `task.planned` | `agent:runtime` | task.created | `{ task_version, edge_count, nodes: [全量 DAG 投影] }` |
+| `task.started` | `agent:runtime` | task.planned | `{}`（planned→running） |
+| `task.resumed` | `agent:runtime` | 触发事件 | `{}`（paused/waiting_input→running 的恢复） |
+| `task.node_started` | `agent:runtime` | task.started | `{ node_id, key, title, goal, attempt }` |
+| `task.node_finished` | `agent:runtime` | 对应 node_started | `{ node_id, key, status, attempt, result?, error?, stop_reason? }` |
+| `tool.started` / `tool.finished` | `agent:runtime` | node_started / 对应 tool.started | 会话族同型 + `{ node_id, key, attempt }`（工具事件复用会话类型，causation 链到节点） |
+| `agent.error` | `agent:runtime` | node_started | `{ message, node_id, key, attempt }` |
+| `task.paused` / `task.waiting_input` | `agent:runtime` | 触发事件 | `{}` |
+| `task.completed` | `agent:runtime` | task.started | `{ nodes_completed, nodes_total }` |
+| `task.failed` | `agent:runtime` | task.started | `{ reason: "node_failed" \| "planning_failed" \| "stalled", node_id?, key?, message }` |
+| `task.cancelled` | `agent:runtime` | 触发事件 | `{}` |
+| `task.planning_failed` | `agent:runtime` | task.created | `{ message }` |
+
+**调度器**（单机版）：就绪 = pending 且依赖全 completed（依赖拓扑定序）；同批就绪节点
+并发执行，同时在跑节点数受 `concurrency` 上限约束（`TaskSchedulerOptions.concurrency`，
+默认 2、最小 1；上限是调度器级资源，`schedule()` 入队 FIFO 逐任务驱动使它跨任务成立，
+任务内并行不受影响）。节点执行 = 一次 Agent Loop（驱动模式与会话同构：窄事件翻译入账本
++ causation 链）；`retriable` 节点失败自动重试一次（attempts=2），最终失败标记节点并使整
+任务 `task.failed`（payload 带失败节点）。节点副作用分类
+`reversible | compensatable | irreversible | delivery_unknown` 随节点记录（保守默认
+`delivery_unknown`；真实投递与补偿在 M4 SideEffectOutbox）。任务/节点表
+（tasks/task_nodes/task_edges）是与账本同库的可变投影表（迁移见 `task-migrations.ts`），
+账本仍是唯一事实源。优雅退出：`close()` 中止在跑节点、拒绝未开跑的排队任务后落盘。
+
 ## Agent Loop 与会话运行时
 
 - 每会话一个 `AgentRuntime`（PiAdapter 接口，惰性创建、驻内存）：对话历史由 Pi agent state
@@ -243,8 +292,11 @@ WAL/busy_timeout pragma）访问。依据 `morrow-research/NOTES-bun.md`：
 ```
 src/
   main.ts        进程入口：配置 → startRuntime → 信号处理（优雅退出）
-  runtime.ts     HTTP 服务 + 极简路由（含 SSE 与 Provider handlers）+ 生命周期编排
+  runtime.ts     HTTP 服务 + 极简路由（含 SSE 与 Provider/任务 handlers）+ 生命周期编排
   sessions.ts    SessionManager：会话事件族 → 账本 + Agent Loop（串行队列）+ 会话帧广播 + Provider 绑定解析
+  tasks.ts       TaskService：任务生命周期 + 规划（Agent Loop + JSON 计划校验）+ DAG 投影 + 任务状态机 + task.* 事件族
+  scheduler.ts   TaskScheduler：单机调度器（依赖拓扑 + 并发上限 + retriable 重试；节点执行 = 一次 Agent Loop）
+  task-migrations.ts 任务域三表 DDL（tasks/task_nodes/task_edges，与账本同库的可变投影）
   providers.ts   ProviderRegistry：三元组 CRUD + 默认指针 + env 回退解析（元数据 → providers.json，密钥 → 凭据库）
   keyring.ts     OS 凭据库统一封装（macOS security 实测 / Windows cmdkey+PowerShell / Linux secret-tool / 内存桩）
   connectivity.ts Provider 连通性测试（最小 OpenAI 兼容请求；unreachable 带 timeout/connect_error 结构化 kind）
@@ -259,5 +311,6 @@ src/
 scripts/
   smoke-real-provider.ts  真实 Provider 冒烟（手动执行，读环境变量，不进测试套件）
 test/         node:test：ledger / server / config / lifecycle / sessions / keyring / providers /
-              providers.api / connectivity / provider-switch / cors / devices 等 seam
+              providers.api / connectivity / provider-switch / cors / devices / tasks（服务层）/
+              tasks.api（HTTP 任务族）等 seam
 ```
