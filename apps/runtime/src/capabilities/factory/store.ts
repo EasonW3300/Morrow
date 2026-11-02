@@ -54,6 +54,7 @@ export class CapabilityFactoryStore {
   #getStmt: SqliteStatement;
   #updateStmt: SqliteStatement;
   #confirmedPlansStmt: SqliteStatement;
+  #confirmedRequestByCapabilityStmt: SqliteStatement;
 
   private constructor(db: SqliteDatabase) {
     this.#db = db;
@@ -96,6 +97,12 @@ export class CapabilityFactoryStore {
     );
     this.#confirmedPlansStmt = db.prepare(
       `SELECT plan_json FROM capability_factory_requests WHERE status = 'confirmed' ORDER BY updated_at DESC LIMIT 500`,
+    );
+    // 能力名 → 最近一次确认请求（#22 修复批：invoke 接线由此定位工厂包目录——
+    // 注册表只存 manifest，执行入口在 dataDir/capability-factory/<requestId>/package/）
+    this.#confirmedRequestByCapabilityStmt = db.prepare(
+      `SELECT request_id FROM capability_factory_requests
+       WHERE status = 'confirmed' AND capability_name = ? ORDER BY updated_at DESC LIMIT 1`,
     );
   }
 
@@ -149,6 +156,13 @@ export class CapabilityFactoryStore {
       }
     }
     return out;
+  }
+
+  /** 能力名 → 最近一次确认的请求 id（invoke 接线定位工厂包目录；无确认记录返回 null） */
+  latestConfirmedRequestIdByCapability(capabilityName: string): string | null {
+    this.#assertOpen();
+    const row = this.#confirmedRequestByCapabilityStmt.get(capabilityName) as { request_id: string } | undefined;
+    return row?.request_id ?? null;
   }
 
   close(): void {

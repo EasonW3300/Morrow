@@ -84,7 +84,23 @@ export const CAPABILITY_EVENT_TYPES = {
   disabled: "capability.disabled",
   rolledBack: "capability.rolled_back",
   grantsUpdated: "capability.grants_updated",
+  used: "capability.used",
 } as const;
+
+/**
+ * 生命周期审计事件（#22 修复批：事件驱动接线的载荷形状）。注册/启停/回滚每次
+ * 迁移的审计事件落账本后同步回调——runtime 用它把 ToolInvoker 注册表与能力
+ * 注册表保持同相（disable 即从调用接缝摘除，enable/rollback 重新登记）。
+ */
+export interface CapabilityLifecycleEvent {
+  eventType:
+    | typeof CAPABILITY_EVENT_TYPES.registered
+    | typeof CAPABILITY_EVENT_TYPES.enabled
+    | typeof CAPABILITY_EVENT_TYPES.disabled
+    | typeof CAPABILITY_EVENT_TYPES.rolledBack;
+  /** 迁移后的当前记录投影（registered 仅 created=true 时回调） */
+  record: CapabilityRecord;
+}
 
 // --- 形态常量 ---------------------------------------------------------------
 
@@ -259,6 +275,17 @@ export function checkPermissionsWithinGrants(
     }
   }
   return violations;
+}
+
+/**
+ * 越权拒绝消息单源（#22 修复批 / C8）：注册预检（PermissionEngine.register）与工厂
+ * 越权预检（CapabilityFactory 管线 plan 阶段）共用同一文案——逐维逐项可读，计数在先。
+ */
+export function escalationMessage(violations: PermissionViolation[]): string {
+  return (
+    `manifest permissions exceed the PermissionGrant (${violations.length} violation(s)): ` +
+    violations.map((v) => `${v.dimension}: ${v.reason}`).join("; ")
+  );
 }
 
 // --- manifest / grant 校验 ---------------------------------------------------
@@ -481,6 +508,12 @@ export interface PermissionEngineOptions {
   dataDir: string;
   ledger: EventLedger;
   replicaId: string;
+  /**
+   * 生命周期观察者（#22 修复批：事件驱动接线）：注册（首见）/启用/停用/回滚的审计
+   * 事件落账本后同步回调——runtime 用它同步 ToolInvoker 调用注册表（disable 即摘除、
+   * enable/rollback 重新登记），调用面与注册表不出现相位移。
+   */
+  onLifecycle?: (event: CapabilityLifecycleEvent) => void;
 }
 
 export interface RegisterResult {
@@ -499,12 +532,14 @@ export class PermissionEngine {
   readonly #store: CapabilityStore;
   readonly #ledger: EventLedger;
   readonly #replicaId: string;
+  readonly #onLifecycle: ((event: CapabilityLifecycleEvent) => void) | undefined;
   #closed = false;
 
   constructor(options: PermissionEngineOptions) {
     this.#store = CapabilityStore.open(options.dataDir);
     this.#ledger = options.ledger;
     this.#replicaId = options.replicaId;
+    this.#onLifecycle = options.onLifecycle;
   }
 
   /**
@@ -514,10 +549,13 @@ export class PermissionEngine {
    * 同版本不同内容 → version_conflict（版本不可变）。
    * 状态默认：author=human → enabled（Owner 批准即注册启用，PRD §5.2）；
    * author=ai → disabled（允许生成 ≠ 允许扩权，Owner enable 后才可调用）。
+   * verified（GLOSSARY「已验证」）：工厂确认路径（options.verified，沙箱逐用例验证
+   * 先于 confirm）与 builtin（options.builtin，Owner 交付的 vetted 内置件）直接为
+   * true；human 注册按 manifest.tests 非空判定；其余（无测试 human、直注 ai）= false。
    */
   register(
     manifestInput: unknown,
-    options: { actorId?: ActorId; builtin?: boolean; now?: Date } = {},
+    options: { actorId?: ActorId; builtin?: boolean; verified?: boolean; now?: Date } = {},
   ): RegisterResult {
     this.#assertOpen();
     const manifest = validateManifest(manifestInput);
@@ -530,14 +568,13 @@ export class PermissionEngine {
     }
     const violations = checkPermissionsWithinGrants(manifest.permissions, this.getGrants());
     if (violations.length > 0) {
-      throw new CapabilityError(
-        "escalation",
-        `manifest permissions exceed the PermissionGrant (${violations.length} violation(s)): ` +
-          violations.map((v) => `${v.dimension}: ${v.reason}`).join("; "),
-        violations,
-      );
+      throw new CapabilityError("escalation", escalationMessage(violations), violations);
     }
     const now = (options.now ?? new Date()).toISOString();
+    const verified: boolean =
+      options.verified === true ||
+      options.builtin === true ||
+      (manifest.author === "human" && manifest.tests.length > 0);
     const existing = this.#store.get(manifest.name);
     if (existing !== null && existing.version === manifest.version) {
       if (existing.source_hash === sourceHash) {
@@ -550,26 +587,25 @@ export class PermissionEngine {
     }
     const manifestJson = canonicalJson({ ...manifest, source_hash: sourceHash });
     const status: CapabilityStatus = manifest.author === "human" ? "enabled" : "disabled";
+    const fields = {
+      name: manifest.name,
+      version: manifest.version,
+      author: manifest.author,
+      runtime: manifest.runtime,
+      verified: verified ? 1 : 0,
+      source_hash: sourceHash,
+      manifest: manifestJson,
+    };
     if (existing === null) {
       this.#store.insertNew({
-        name: manifest.name,
-        version: manifest.version,
-        author: manifest.author,
-        runtime: manifest.runtime,
+        ...fields,
         status,
-        source_hash: sourceHash,
-        manifest: manifestJson,
         created_at: now,
         updated_at: now,
       });
     } else {
       this.#store.appendVersion({
-        name: manifest.name,
-        version: manifest.version,
-        author: manifest.author,
-        runtime: manifest.runtime,
-        source_hash: sourceHash,
-        manifest: manifestJson,
+        ...fields,
         updated_at: now,
       });
     }
@@ -582,12 +618,18 @@ export class PermissionEngine {
         author: manifest.author,
         runtime: manifest.runtime,
         status,
+        verified,
         source_hash: sourceHash,
         ...(options.builtin === true ? { builtin: true } : {}),
       },
     );
     const row = this.#store.get(manifest.name) as CapabilityRow;
-    return { record: this.#project(row), created: true, eventId };
+    const record = this.#project(row);
+    if (existing === null) {
+      // 首见注册才回调生命周期（created:false 幂等路径不重复驱动接线）
+      this.#emitLifecycle({ eventType: CAPABILITY_EVENT_TYPES.registered, record });
+    }
+    return { record, created: true, eventId };
   }
 
   /** 启用（幂等：已启用不重复审计）。审计事件留痕。 */
@@ -632,6 +674,7 @@ export class PermissionEngine {
       version: target.version,
       author: target.author,
       runtime: targetManifest.runtime,
+      verified: target.verified,
       source_hash: target.source_hash,
       manifest: target.manifest,
       updated_at: now,
@@ -641,7 +684,9 @@ export class PermissionEngine {
       options.actorId ?? "owner",
       { name, from_version: row.version, to_version: target.version },
     );
-    return { record: this.#project(this.#store.get(name) as CapabilityRow), from_version: row.version, to_version: target.version };
+    const record = this.#project(this.#store.get(name) as CapabilityRow);
+    this.#emitLifecycle({ eventType: CAPABILITY_EVENT_TYPES.rolledBack, record });
+    return { record, from_version: row.version, to_version: target.version };
   }
 
   /**
@@ -806,7 +851,12 @@ export class PermissionEngine {
       options.actorId ?? "owner",
       { name, version: row.version },
     );
-    return { record: this.#project(this.#store.get(name) as CapabilityRow), changed: true };
+    const record = this.#project(this.#store.get(name) as CapabilityRow);
+    this.#emitLifecycle({
+      eventType: status === "enabled" ? CAPABILITY_EVENT_TYPES.enabled : CAPABILITY_EVENT_TYPES.disabled,
+      record,
+    });
+    return { record, changed: true };
   }
 
   #append(eventType: string, actorId: ActorId, payload: Record<string, unknown>): string {
@@ -820,6 +870,10 @@ export class PermissionEngine {
     return envelope.event_id;
   }
 
+  #emitLifecycle(event: CapabilityLifecycleEvent): void {
+    this.#onLifecycle?.(event);
+  }
+
   #project(row: CapabilityRow): CapabilityRecord {
     const manifest = JSON.parse(row.manifest) as CapabilityManifest;
     return {
@@ -828,6 +882,7 @@ export class PermissionEngine {
       author: row.author as CapabilityAuthor,
       runtime: row.runtime as CapabilityRuntimeKind,
       status: row.status as CapabilityStatus,
+      verified: row.verified === 1,
       source_hash: row.source_hash,
       manifest,
       created_at: row.created_at,

@@ -140,8 +140,11 @@ export { probeSandbox } from "./health.ts";
 export type { SandboxProbe, SandboxStatus } from "./health.ts";
 // 沙箱执行 Worker（M2-T2 / Issue #23）：SandboxRunner 接缝 + 默认容器实现 + 检测器 + 调用接缝
 export { ToolInvoker, UnknownToolError } from "./sandbox/invoker.ts";
-export type { InvocationResult, InvokeContext, ToolRegistration, ToolInvokerOptions } from "./sandbox/invoker.ts";
-export { DockerRunner, DEFAULT_SANDBOX_IMAGE, defaultDockerExec } from "./sandbox/docker-runner.ts";
+export type { InvocationResult, InvokeContext, InProcessTool, ToolRegistration, ToolInvokerOptions } from "./sandbox/invoker.ts";
+export { DockerRunner, DEFAULT_SANDBOX_IMAGE, DEFAULT_AUX_TIMEOUT_MS, DEFAULT_PULL_TIMEOUT_MS, defaultDockerExec } from "./sandbox/docker-runner.ts";
+export { classifyToolRun, stderrTail } from "./sandbox/classify.ts";
+export type { ClassifiedToolRun, ClassifyToolRunOptions, ToolRunRaw } from "./sandbox/classify.ts";
+export { sendInvocationError } from "./invocation-errors.ts";
 export { SandboxError, SandboxUnavailableError } from "./sandbox/runner.ts";
 export type { SandboxErrorCode, SandboxResult, SandboxRunner, SandboxToolPackage } from "./sandbox/runner.ts";
 export { detectContainerRuntime, INSTALL_HINT } from "./sandbox/detect.ts";

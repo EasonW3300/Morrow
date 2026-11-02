@@ -17,6 +17,8 @@ export interface CapabilityRow {
   author: string;
   runtime: string;
   status: string;
+  /** 已验证标记（0/1；GLOSSARY「已验证」——投影层转 boolean） */
+  verified: number;
   source_hash: string;
   manifest: string;
   created_at: string;
@@ -28,6 +30,7 @@ export interface CapabilityVersionRow {
   name: string;
   version: string;
   author: string;
+  verified: number;
   source_hash: string;
   manifest: string;
   created_at: string;
@@ -39,28 +42,63 @@ export interface CapabilityListFilter {
   runtime?: string;
 }
 
-/** 新注册写入（能力行 + 版本行同事务）；name 已存在时由调用方先判定，此处兜底抛错 */
-export interface NewCapabilityInput {
+// --- 共享字段束（Data Clumps 收敛，#22 修复批）---------------------------------
+//
+// 「manifest 字段串」（name/version/author/runtime/verified/source_hash/manifest）在
+// 新注册、登记新版本、回滚三处成组搬运——抽成单一接口 + 绑定 helper，三个写入入口
+// 与 SELECT 列清单共享同一真相源，加列时不再三处同步改。
+
+/** 三处写入共用的 manifest 字段束（能力身份 + 内容哈希 + manifest 全文 + verified） */
+export interface CapabilityManifestFields {
   name: string;
   version: string;
   author: string;
   runtime: string;
-  status: string;
+  verified: number;
   source_hash: string;
   manifest: string;
+}
+
+/** 新注册写入（能力行 + 版本行同事务）；name 已存在时由调用方先判定，此处兜底抛错 */
+export interface NewCapabilityInput extends CapabilityManifestFields {
+  status: string;
   created_at: string;
   updated_at: string;
 }
 
 /** 既有能力登记新版本（版本行追加 + 当前指针前移，同事务；status 不变） */
-export interface NewVersionInput {
-  name: string;
-  version: string;
-  author: string;
-  runtime: string;
-  source_hash: string;
-  manifest: string;
+export interface NewVersionInput extends CapabilityManifestFields {
   updated_at: string;
+}
+
+/** 回滚（当前指针指回历史版本行；字段束随目标版本行原样搬运） */
+export interface RollbackInput extends CapabilityManifestFields {
+  updated_at: string;
+}
+
+/** 当前表 SELECT 列清单（全部 list/get 语句共用；顺序 = CapabilityRow 字段序） */
+const CAPABILITY_ROW_COLUMNS =
+  "name, version, author, runtime, status, verified, source_hash, manifest, created_at, updated_at";
+
+/** 版本表 SELECT 列清单（顺序 = CapabilityVersionRow 字段序） */
+const VERSION_ROW_COLUMNS =
+  "name, version, author, verified, source_hash, manifest, created_at";
+
+/** 身份半边 → 位置参数（当前表 name/version/author/runtime 四元组，INSERT 用） */
+function identityParams(input: CapabilityManifestFields): [string, string, string, string] {
+  return [input.name, input.version, input.author, input.runtime];
+}
+
+/** 当前指针前移/回滚的绑定（UPDATE 无 name 列：version/author/runtime + 内容束 + updated_at + WHERE name） */
+function currentUpdateParams(
+  input: CapabilityManifestFields & { updated_at: string },
+): [string, string, string, number, string, string, string, string] {
+  return [input.version, input.author, input.runtime, ...contentParams(input), input.updated_at, input.name];
+}
+
+/** 内容半边 → 位置参数（verified/source_hash/manifest——三处写入共享的内容束） */
+function contentParams(input: CapabilityManifestFields): [number, string, string] {
+  return [input.verified, input.source_hash, input.manifest];
 }
 
 export class CapabilityStore {
@@ -85,39 +123,39 @@ export class CapabilityStore {
     this.#db = db;
     ensureCapabilityTables(db);
     this.#insertCapabilityStmt = db.prepare(
-      `INSERT INTO capabilities (name, version, author, runtime, status, source_hash, manifest, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO capabilities (name, version, author, runtime, status, verified, source_hash, manifest, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     );
     this.#insertVersionStmt = db.prepare(
-      `INSERT INTO capability_versions (name, version, author, source_hash, manifest, created_at)
-       VALUES (?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO capability_versions (name, version, author, verified, source_hash, manifest, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
     );
     this.#updateCurrentStmt = db.prepare(
       `UPDATE capabilities
-       SET version = ?, author = ?, runtime = ?, source_hash = ?, manifest = ?, updated_at = ?
+       SET version = ?, author = ?, runtime = ?, verified = ?, source_hash = ?, manifest = ?, updated_at = ?
        WHERE name = ?`,
     );
     this.#getStmt = db.prepare(
-      "SELECT name, version, author, runtime, status, source_hash, manifest, created_at, updated_at FROM capabilities WHERE name = ?",
+      `SELECT ${CAPABILITY_ROW_COLUMNS} FROM capabilities WHERE name = ?`,
     );
     this.#listAllStmt = db.prepare(
-      "SELECT name, version, author, runtime, status, source_hash, manifest, created_at, updated_at FROM capabilities ORDER BY created_at, name",
+      `SELECT ${CAPABILITY_ROW_COLUMNS} FROM capabilities ORDER BY created_at, name`,
     );
     this.#listByStatusStmt = db.prepare(
-      "SELECT name, version, author, runtime, status, source_hash, manifest, created_at, updated_at FROM capabilities WHERE status = ? ORDER BY created_at, name",
+      `SELECT ${CAPABILITY_ROW_COLUMNS} FROM capabilities WHERE status = ? ORDER BY created_at, name`,
     );
     this.#listByAuthorStmt = db.prepare(
-      "SELECT name, version, author, runtime, status, source_hash, manifest, created_at, updated_at FROM capabilities WHERE author = ? ORDER BY created_at, name",
+      `SELECT ${CAPABILITY_ROW_COLUMNS} FROM capabilities WHERE author = ? ORDER BY created_at, name`,
     );
     this.#listByRuntimeStmt = db.prepare(
-      "SELECT name, version, author, runtime, status, source_hash, manifest, created_at, updated_at FROM capabilities WHERE runtime = ? ORDER BY created_at, name",
+      `SELECT ${CAPABILITY_ROW_COLUMNS} FROM capabilities WHERE runtime = ? ORDER BY created_at, name`,
     );
     this.#setStatusStmt = db.prepare("UPDATE capabilities SET status = ?, updated_at = ? WHERE name = ?");
     this.#versionsStmt = db.prepare(
-      "SELECT name, version, author, source_hash, manifest, created_at FROM capability_versions WHERE name = ? ORDER BY created_at, version",
+      `SELECT ${VERSION_ROW_COLUMNS} FROM capability_versions WHERE name = ? ORDER BY created_at, version`,
     );
     this.#versionStmt = db.prepare(
-      "SELECT name, version, author, source_hash, manifest, created_at FROM capability_versions WHERE name = ? AND version = ?",
+      `SELECT ${VERSION_ROW_COLUMNS} FROM capability_versions WHERE name = ? AND version = ?`,
     );
     this.#getGrantsStmt = db.prepare("SELECT grants, updated_at FROM capability_grants WHERE id = 1");
     this.#setGrantsStmt = db.prepare(
@@ -136,17 +174,19 @@ export class CapabilityStore {
     this.#assertOpen();
     this.#tx(() => {
       this.#insertCapabilityStmt.run(
-        input.name,
-        input.version,
-        input.author,
-        input.runtime,
+        ...identityParams(input),
         input.status,
-        input.source_hash,
-        input.manifest,
+        ...contentParams(input),
         input.created_at,
         input.updated_at,
       );
-      this.#insertVersionStmt.run(input.name, input.version, input.author, input.source_hash, input.manifest, input.created_at);
+      this.#insertVersionStmt.run(
+        input.name,
+        input.version,
+        input.author,
+        ...contentParams(input),
+        input.created_at,
+      );
     });
   }
 
@@ -154,39 +194,21 @@ export class CapabilityStore {
   appendVersion(input: NewVersionInput): void {
     this.#assertOpen();
     this.#tx(() => {
-      this.#insertVersionStmt.run(input.name, input.version, input.author, input.source_hash, input.manifest, input.updated_at);
-      this.#updateCurrentStmt.run(
+      this.#insertVersionStmt.run(
+        input.name,
         input.version,
         input.author,
-        input.runtime,
-        input.source_hash,
-        input.manifest,
+        ...contentParams(input),
         input.updated_at,
-        input.name,
       );
+      this.#updateCurrentStmt.run(...currentUpdateParams(input));
     });
   }
 
   /** 回滚：当前指针指回历史版本（版本行不增不改——历史不可变） */
-  rollbackTo(input: {
-    name: string;
-    version: string;
-    author: string;
-    runtime: string;
-    source_hash: string;
-    manifest: string;
-    updated_at: string;
-  }): void {
+  rollbackTo(input: RollbackInput): void {
     this.#assertOpen();
-    this.#updateCurrentStmt.run(
-      input.version,
-      input.author,
-      input.runtime,
-      input.source_hash,
-      input.manifest,
-      input.updated_at,
-      input.name,
-    );
+    this.#updateCurrentStmt.run(...currentUpdateParams(input));
   }
 
   get(name: string): CapabilityRow | null {

@@ -153,6 +153,52 @@ test("注册越权：五维各一条负样例 100% 拒绝（400 escalation，逐
   }
 });
 
+test("verified 标记（GLOSSARY 已验证）：human 带测试=1 / 无测试=0 / builtin=1 / ai 直注=0", async (t) => {
+  const dir = tmpDir("morrow-cap-verified-");
+  t.after(() => removeDir(dir));
+  const runtime = await startRuntime(apiConfig(dir));
+  try {
+    const verifiedOf = async (name: string): Promise<{ status: string; verified: boolean }> => {
+      const res = await fetch(`http://127.0.0.1:${runtime.port}/v1/capabilities/${name}`);
+      assert.equal(res.status, 200);
+      return (await json<{ record: { status: string; verified: boolean } }>(res)).record;
+    };
+
+    assert.equal((await register(runtime, makeManifest({ name: "with-tests", tests: ["positive.yaml"] }))).status, 201);
+    assert.equal((await register(runtime, makeManifest({ name: "without-tests" }))).status, 201);
+    assert.equal(
+      (
+        await register(
+          runtime,
+          makeManifest({
+            name: "ai-direct",
+            author: "ai",
+            tests: ["positive.yaml"],
+            sandbox: { type: "container", network: "none", filesystem: "workspace-only" },
+          }),
+        )
+      ).status,
+      201,
+    );
+
+    const withTests = await verifiedOf("with-tests");
+    assert.equal(withTests.status, "enabled");
+    assert.equal(withTests.verified, true, "human + tests → verified");
+
+    const withoutTests = await verifiedOf("without-tests");
+    assert.equal(withoutTests.verified, false, "无测试 human 注册 = 未验证");
+
+    const aiDirect = await verifiedOf("ai-direct");
+    assert.equal(aiDirect.status, "disabled");
+    assert.equal(aiDirect.verified, false, "ai 直注未经工厂沙箱验证 = 未验证");
+
+    const builtin = await verifiedOf("memory.write");
+    assert.equal(builtin.verified, true, "builtin（Owner 交付 vetted）= verified");
+  } finally {
+    await runtime.close();
+  }
+});
+
 test("manifest 形态非法 400；同版本不同内容 409；详情含版本历史", async (t) => {
   const dir = tmpDir("morrow-cap-shape-");
   t.after(() => removeDir(dir));

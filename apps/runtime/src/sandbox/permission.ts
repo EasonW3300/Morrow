@@ -29,9 +29,9 @@ export interface ToolManifestLite {
   author: "human" | "ai";
   runtime: "typescript" | "go";
   permissions?: ToolPermissions;
-  /** manifest.sandbox 原始声明（注册时规范化校验） */
+  /** manifest.sandbox 原始声明（注册时规范化校验；process = 进程内实现） */
   sandbox: {
-    type: "container" | "builtin";
+    type: "container" | "builtin" | "process";
     network?: string;
     filesystem?: string;
     resources?: {
