@@ -15,16 +15,46 @@ import {
   type ProviderFormErrors,
   type ProviderFormValues,
 } from "./provider-form.ts";
+import { CapabilitiesView } from "./CapabilitiesView.tsx";
 
 /**
- * Provider 管理页（票 T7 / Issue #8）：三元组增删改 + 连通性测试 + 设默认。
- *
- * 密钥安全（与 T5 不变量一致）：输入框 type=password 不回显；apiKey 只在表单内存里
- * 存活到保存成功，保存后立即丢弃表单态；列表只呈现 has_api_key 投影；文案不落密钥。
- * env 回退条目（provider_id === "env"）只读：来源是 MORROW_PROVIDER_* 环境变量，
- * 仅允许测试与设默认（CRUD 由 runtime 拒绝）。
+ * 设置页（PRD §5.1 设置区）：子页签「Provider 与模型」（票 T7 / Issue #8）与
+ * 「能力管理」（票 M2-T6 / Issue #27）。能力管理页签可由 Task 视图的能力引用卡
+ * 跳入（initialCapabilityName 预选详情）。
  */
-export function SettingsView({ base }: { base: string }) {
+export function SettingsView({
+  base,
+  initialCapabilityName = null,
+}: {
+  base: string;
+  initialCapabilityName?: string | null;
+}) {
+  const [section, setSection] = useState<"providers" | "capabilities">(initialCapabilityName !== null ? "capabilities" : "providers");
+
+  // 引用卡跳转在页已挂载后到达时，同样切到能力管理
+  useEffect(() => {
+    if (initialCapabilityName !== null) setSection("capabilities");
+  }, [initialCapabilityName]);
+
+  if (section === "capabilities") {
+    return <CapabilitiesView base={base} initialCapabilityName={initialCapabilityName} />;
+  }
+  return (
+    <>
+      <div className="settings-subnav">
+        <button className="subnav-item selected" onClick={() => setSection("providers")}>
+          Provider 与模型
+        </button>
+        <button className="subnav-item" onClick={() => setSection("capabilities")}>
+          能力管理
+        </button>
+      </div>
+      <ProvidersSection base={base} />
+    </>
+  );
+}
+
+function ProvidersSection({ base }: { base: string }) {
   const [providers, setProviders] = useState<ProviderRecord[]>([]);
   const [defaultId, setDefaultId] = useState<string | null>(null);
   const [listError, setListError] = useState<string | null>(null);

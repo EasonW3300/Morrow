@@ -6,13 +6,19 @@
  * 此处只 re-export（原先本文件自持一份拷贝，M0 code-review / Issue #11 收敛）。
  */
 import type {
+  CapabilityRecord,
+  CapabilityVersionRecord,
   ConnectivityResult,
+  PermissionGrant,
   ProviderRecord,
   TaskDetail,
   TaskNodeRecord,
   TaskSummary,
 } from "@morrow/protocol";
-export type { ConnectivityResult, ProviderRecord, TaskDetail, TaskNodeRecord, TaskSummary };
+export type { CapabilityRecord, CapabilityVersionRecord, ConnectivityResult, PermissionGrant, ProviderRecord, TaskDetail, TaskNodeRecord, TaskSummary };
+// 能力域 UI 侧类型（SkillSummary/SkillProposal 在 capability-ui 定义；工厂投影在本文件）
+import type { SkillProposal, SkillSummary } from "./capability-ui.ts";
+export type { SkillProposal, SkillSummary };
 export class ApiError extends Error {
   constructor(
     readonly status: number,
@@ -146,6 +152,48 @@ export interface TaskResumeResult {
     pending_compensations: Array<{ key: string; side_effect: string; note: string }>;
     replay_keys: string[];
   };
+}
+
+// --- 能力域（票 M2-T6 / Issue #27；类型唯一真相源在 @morrow/protocol，UI 本地投影另行定义）---
+
+/** GET /v1/capabilities/:id 载荷（engine.get 投影：当前记录 + 版本历史） */
+export interface CapabilityDetail {
+  record: CapabilityRecord;
+  versions: CapabilityVersionRecord[];
+}
+
+export interface CapabilityRollbackResult {
+  capability: CapabilityRecord;
+  from_version: string;
+  to_version: string;
+}
+
+/**
+ * 工厂请求投影（T3 接缝；形状与 capability-ui 的 FactoryStage / VerificationReportItem 对齐）。
+ * T3 落地后以其真实 schema 为准——本投影只承诺 UI 渲染所需的最小字段集。
+ */
+export interface FactoryRequest {
+  request_id: string;
+  requirement: string;
+  stage:
+    | "retrieval"
+    | "planning"
+    | "building"
+    | "verifying"
+    | "awaiting_confirmation"
+    | "registered"
+    | "failed";
+  /** 阶段说明（进度区副文案；可缺省） */
+  stage_detail?: string;
+  /** awaiting_confirmation 起携带：候选 manifest（确认注册即提交它） */
+  manifest?: Record<string, unknown>;
+  /** verifying/awaiting_confirmation 携带：四类测试结果 */
+  verification?: Array<{
+    category: "schema" | "permission" | "functional" | "sandbox";
+    passed: boolean;
+    summary: string;
+  }>;
+  error?: string;
 }
 
 const JSON_HEADERS = { "content-type": "application/json" };
@@ -286,6 +334,93 @@ export const api = {
 
   releaseNode(base: string, taskId: string, nodeId: string): Promise<{ task: TaskDetail }> {
     return request(base, `/v1/tasks/${encodeURIComponent(taskId)}/nodes/${encodeURIComponent(nodeId)}/release`, {
+      method: "POST",
+    });
+  },
+
+  // --- 能力域（票 M2-T6 / Issue #27；T1 已交付端点，类型唯一真相源在 @morrow/protocol）---
+
+  listCapabilities(
+    base: string,
+    filters?: { status?: "enabled" | "disabled"; author?: "human" | "ai"; runtime?: "typescript" | "go" },
+  ): Promise<CapabilityRecord[]> {
+    const params = new URLSearchParams();
+    if (filters?.status !== undefined) params.set("status", filters.status);
+    if (filters?.author !== undefined) params.set("author", filters.author);
+    if (filters?.runtime !== undefined) params.set("runtime", filters.runtime);
+    const query = params.size === 0 ? "" : `?${params.toString()}`;
+    return request<{ capabilities: CapabilityRecord[] }>(base, `/v1/capabilities${query}`).then((r) => r.capabilities);
+  },
+
+  getCapability(base: string, name: string): Promise<CapabilityDetail> {
+    return request<CapabilityDetail>(base, `/v1/capabilities/${encodeURIComponent(name)}`);
+  },
+
+  setCapabilityStatus(
+    base: string,
+    name: string,
+    action: "enable" | "disable",
+  ): Promise<{ capability: CapabilityRecord; changed: boolean }> {
+    return request(base, `/v1/capabilities/${encodeURIComponent(name)}/${action}`, { method: "POST" });
+  },
+
+  rollbackCapability(base: string, name: string, version: string): Promise<CapabilityRollbackResult> {
+    return request(base, `/v1/capabilities/${encodeURIComponent(name)}/rollback`, {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ version }),
+    });
+  },
+
+  getGrants(base: string): Promise<PermissionGrant> {
+    return request<{ grants: PermissionGrant }>(base, "/v1/capabilities/grants").then((r) => r.grants);
+  },
+
+  putGrants(base: string, grants: PermissionGrant): Promise<{ grants: PermissionGrant; event_id: string | null }> {
+    return request(base, "/v1/capabilities/grants", {
+      method: "PUT",
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ grants }),
+    });
+  },
+
+  // ⚠️ 接缝（票 M2-T6 / Issue #27）：Tool Factory 端点由 T3 交付（PRD §6.2 的
+  // POST /v1/capabilities/request + 进度轮询 + 确认注册）。以下封装在 T3 落地前只会命中
+  // 404（capability-fixture 的 mock 端点提供演示数据）；T3 合入后无需改 UI——路径即合约。
+  requestCapabilityFactory(base: string, requirement: string): Promise<FactoryRequest> {
+    return request<FactoryRequest>(base, "/v1/capabilities/request", {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ requirement }),
+    });
+  },
+
+  getCapabilityFactoryRequest(base: string, requestId: string): Promise<FactoryRequest> {
+    return request<FactoryRequest>(base, `/v1/capabilities/request/${encodeURIComponent(requestId)}`);
+  },
+
+  confirmCapabilityFactory(base: string, requestId: string): Promise<FactoryRequest> {
+    return request<FactoryRequest>(base, `/v1/capabilities/request/${encodeURIComponent(requestId)}/confirm`, {
+      method: "POST",
+    });
+  },
+
+  // ⚠️ 接缝（票 M2-T6 / Issue #27）：Skill 清单与提案端点由 T5 交付。同上：UI 先行，
+  // 404 时界面提示「端点未接入（T5）」；capability-fixture 提供演示数据。
+  listSkills(base: string): Promise<SkillSummary[]> {
+    return request<{ skills: SkillSummary[] }>(base, "/v1/skills").then((r) => r.skills);
+  },
+
+  listSkillProposals(base: string): Promise<SkillProposal[]> {
+    return request<{ proposals: SkillProposal[] }>(base, "/v1/skills/proposals").then((r) => r.proposals);
+  },
+
+  decideSkillProposal(
+    base: string,
+    proposalId: string,
+    decision: "approve" | "reject",
+  ): Promise<SkillProposal> {
+    return request<SkillProposal>(base, `/v1/skills/proposals/${encodeURIComponent(proposalId)}/${decision}`, {
       method: "POST",
     });
   },
