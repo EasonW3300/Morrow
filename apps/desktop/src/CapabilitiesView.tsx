@@ -20,12 +20,12 @@ import {
   describeVerification,
   factoryStageIndex,
   factoryStageLabel,
+  factoryStageOf,
   FACTORY_STAGE_ORDER,
   grantsDiffSummary,
   grantsFormFromGrant,
   parseGrantsForm,
   validateGrantsForm,
-  verificationCategoryLabel,
   type ConfirmAction,
   type ConfirmGateState,
   type GrantsFormErrors,
@@ -43,11 +43,12 @@ import { CAPABILITY_CHANNELS, SHELL_COMMAND_CATEGORIES } from "@morrow/protocol/
  *   预授权    五维 grant 查看 + 编辑（filesystem/network/credentials 多行文本、shell/channels
  *            勾选）；保存走 PUT /v1/capabilities/grants，保存区呈现 diff + 审计提示
  *            （收窄立即约束已注册能力的运行时复核）
- *   工厂      ⚠️ T3 接缝壳：提交需求描述 → 进度轮询（检索→规划→构建→验证→待确认）→
- *            验证报告（四类测试）→ 确认注册。端点由 T3 交付，404 时提示未接入；
- *            capability-fixture 的 mock 端点提供全流程演示数据
- *   Skill     ⚠️ T5 接缝：清单（组合了哪些 capability）+ 提案批准/拒绝（悬空引用提案
- *            被拒有呈现）。同上 404 提示 + 夹具演示
+ *   工厂      真实工厂链路（T3 已合入）：提交需求描述 → 进度轮询（检索→规划→构建→验证→
+ *            待确认，真实 status×stage 双轴投影）→ 验证报告（真实 VerifyReport 逐用例
+ *            归组）→ 确认注册（POST /v1/capabilities/:id/confirm）；检索命中既有
+ *            能力/Skill 时呈现重用路径（FR-CAP-1）
+ *   Skill     真实 Skill 链路（T5 已合入）：清单（组合了哪些 capability）+ 提案批准/
+ *            拒绝（悬空引用提案被拒有呈现）
  */
 export function CapabilitiesView({
   base,
@@ -618,11 +619,12 @@ function GrantsPanel({ base }: { base: string }) {
   );
 }
 
-// --- 工厂入口（T3 接缝壳）---------------------------------------------------------
+// --- 工厂入口（真实链路；T3 已合入）------------------------------------------------
 
 const FACTORY_POLL_MS = 1500;
-/** 需要停轮询的终局阶段（awaiting_confirmation 停表等 Owner；registered/failed 已定局） */
-const FACTORY_SETTLED = new Set(["awaiting_confirmation", "registered", "failed"]);
+
+/** 轮询终态（真实 status 轴）：proposed=等待 Owner 确认；reused=命中重用不新建 */
+const FACTORY_SETTLED = new Set(["proposed", "confirmed", "failed", "reused"]);
 
 function FactoryPanel({ base, onRegistered }: { base: string; onRegistered: () => void }) {
   const [requirement, setRequirement] = useState("");
@@ -647,7 +649,7 @@ function FactoryPanel({ base, onRegistered }: { base: string; onRegistered: () =
           try {
             const next = await api.getCapabilityFactoryRequest(base, requestId);
             setRequest(next);
-            if (FACTORY_SETTLED.has(next.stage)) stopPoll();
+            if (FACTORY_SETTLED.has(next.status)) stopPoll();
           } catch (err) {
             setError(readableError(err, "进度轮询失败"));
             stopPoll();
@@ -670,7 +672,7 @@ function FactoryPanel({ base, onRegistered }: { base: string; onRegistered: () =
       setRequest(created);
       poll(created.request_id);
     } catch (err) {
-      setError(seamError(err, "T3", "提交能力生成需求失败"));
+      setError(readableError(err, "提交能力生成需求失败"));
     } finally {
       setSubmitting(false);
     }
@@ -683,20 +685,20 @@ function FactoryPanel({ base, onRegistered }: { base: string; onRegistered: () =
     try {
       const done = await api.confirmCapabilityFactory(base, request.request_id);
       setRequest(done);
-      if (done.stage === "registered") onRegistered();
-      else poll(request.request_id);
+      if (done.status === "confirmed") onRegistered();
     } catch (err) {
-      setError(seamError(err, "T3", "确认注册失败"));
+      setError(readableError(err, "确认注册失败"));
     } finally {
       setConfirming(false);
     }
   };
 
-  const currentStage = request?.stage;
+  const currentStage = request !== null ? factoryStageOf(request) : undefined;
   const currentIndex = currentStage !== undefined ? factoryStageIndex(currentStage) : -1;
-  const verification = currentStage === "awaiting_confirmation" || currentStage === "registered"
-    ? describeVerification(request?.verification ?? [])
-    : null;
+  const verification =
+    request !== null && (request.status === "proposed" || request.status === "confirmed")
+      ? describeVerification(request.report)
+      : null;
 
   return (
     <>
@@ -720,7 +722,7 @@ function FactoryPanel({ base, onRegistered }: { base: string; onRegistered: () =
           />
         </label>
         <div className="form-actions">
-          <button className="btn primary" disabled={submitting || request?.stage === "awaiting_confirmation"} onClick={() => void submit()}>
+          <button className="btn primary" disabled={submitting || request?.status === "proposed"} onClick={() => void submit()}>
             {submitting ? "提交中…" : "提交需求"}
           </button>
         </div>
@@ -750,10 +752,31 @@ function FactoryPanel({ base, onRegistered }: { base: string; onRegistered: () =
               );
             })}
           </div>
-          {request.stage_detail !== undefined && <p className="hint-inline">{request.stage_detail}</p>}
-          {currentStage === "failed" && <div className="banner-error">工厂失败：{request.error ?? "未知原因"}</div>}
+          {request.status === "failed" && (
+            <div className="banner-error">
+              工厂失败（{request.error?.stage ?? "?"}/{request.error?.code ?? "unknown"}）：{request.error?.detail ?? "未知原因"}
+              {request.error?.violations !== undefined && request.error.violations.length > 0 && (
+                <ul className="verification-list">
+                  {request.error.violations.map((v) => (
+                    <li key={`${v.dimension}:${v.requested}`} className="tone-error">
+                      <strong>{v.dimension}</strong>
+                      <span className="verification-summary">{v.requested}——{v.reason}</span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          )}
+          {request.status === "reused" && (
+            <div className="banner-ok">
+              检索命中既有能力/Skill，无需新建（重用路径）
+              {request.reuse_matches !== undefined && request.reuse_matches.length > 0 && (
+                <>：{request.reuse_matches.map((m) => m.name ?? m.source).join("、")}</>
+              )}
+            </div>
+          )}
 
-          {request.verification !== undefined && verification !== null && (
+          {request.report !== undefined && verification !== null && (
             <>
               <h4>验证报告（四类测试）</h4>
               <ul className="verification-list">
@@ -775,7 +798,7 @@ function FactoryPanel({ base, onRegistered }: { base: string; onRegistered: () =
             </>
           )}
 
-          {currentStage === "awaiting_confirmation" && (
+          {request.status === "proposed" && (
             <div className="form-actions">
               <button
                 className="btn primary"
@@ -790,8 +813,10 @@ function FactoryPanel({ base, onRegistered }: { base: string; onRegistered: () =
               </button>
             </div>
           )}
-          {currentStage === "registered" && (
-            <div className="banner-ok">能力已注册（默认停用）。到「能力清单」启用并核对五维权限。</div>
+          {request.status === "confirmed" && (
+            <div className="banner-ok">
+              能力已注册（默认停用）。到「能力清单」启用并核对五维权限。
+            </div>
           )}
         </div>
       )}
@@ -814,7 +839,7 @@ function SkillsPanel({ base }: { base: string }) {
       setProposals(proposalList);
       setError(null);
     } catch (err) {
-      setError(seamError(err, "T5", "加载 Skill 数据失败"));
+      setError(readableError(err, "加载 Skill 数据失败"));
       setSkills((prev) => prev ?? []);
       setProposals((prev) => prev ?? []);
     }
@@ -945,12 +970,4 @@ function readableError(err: unknown, fallback: string): string {
     return `${fallback}（${err.code}）—— ${err.message}`;
   }
   return `${fallback}：${err instanceof Error ? err.message : String(err)}`;
-}
-
-/** 接缝端点 404 = T3/T5 还没交付：提示差异而不是笼统报错 */
-function seamError(err: unknown, ticket: "T3" | "T5", fallback: string): string {
-  if (err instanceof ApiError && (err.code === "http_404" || err.code === "http_405")) {
-    return `${fallback}：端点尚未接入（${ticket} 交付该端点）。运行 capability-fixture 可查看全流程演示。`;
-  }
-  return readableError(err, fallback);
 }

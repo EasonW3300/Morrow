@@ -2,6 +2,18 @@
 
 CI runner 无音频设备与 GUI 会话，冒烟门清单 #4 的真机项在本机执行；本目录放可重复执行的探针。
 
+## m2-demo.sh（M2 门槛演示：「缺能力 → 造工具 → 安全验证 → 重用」，Issue #28）
+
+```bash
+bash scripts/real-machine/m2-demo.sh
+```
+
+- 自启 capability-fixture（纯透明代理 → 真实 Runtime）后逐步走查：缺能力（注册表）→
+  造工具（工厂 request→进度→验证报告）→ 安全验证（四类用例 + 越权阻断 + Owner 确认门）
+  → 重用（检索命中不新建 + Skill 两次经验→提案→批准→invoke 真实执行）；
+- 逐步 JSON + 结尾 `PASS=n FAIL=0`；退出码 0 = 全过；每次运行全新临时 dataDir，可重复执行；
+- 归档输出：`docs/gates/m2-demo-output.md`；口径与边界见 `docs/gates/m2-gate-report.md`。
+
 ## mic-probe.swift（麦克风捕获探针，AC-11 前置）
 
 ```bash

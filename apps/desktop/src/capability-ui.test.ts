@@ -23,14 +23,14 @@ import {
   describeVerification,
   factoryStageIndex,
   factoryStageLabel,
+  factoryStageOf,
+  FACTORY_STAGE_ORDER,
   grantsFormFromGrant,
   grantsDiffSummary,
   isDestructiveAction,
   parseGrantsForm,
   validateGrantsForm,
-  verificationCategoryLabel,
   type ConfirmAction,
-  type FactoryStage,
   type GrantsFormValues,
   type PermissionGrant,
 } from "./capability-ui.ts";
@@ -283,42 +283,88 @@ describe("validateGrantsForm / parseGrantsForm（预授权编辑校验）", () =
   });
 });
 
-// --- 4. 工厂进度与验证报告 ------------------------------------------------------
+// --- 4. 工厂进度与验证报告（真实 T3 视图投影）-----------------------------------
 
-describe("工厂阶段映射与验证报告（T3 接缝的 UI 投影）", () => {
-  it("主链六阶段有序：检索→规划→构建→验证→待确认→已注册；failed 是旁路", () => {
+describe("factoryStageOf（真实 status×stage 双轴 → 进度线）", () => {
+  it("主链六阶段有序：检索→规划→构建→验证→待确认→已注册；标签为 Owner 可读中文", () => {
     assert.deepEqual(
-      ["retrieval", "planning", "building", "verifying", "awaiting_confirmation", "registered"].map(
-        (s) => factoryStageLabel(s as FactoryStage),
-      ),
+      FACTORY_STAGE_ORDER.map((s) => factoryStageLabel(s)),
       ["检索（记忆与既有能力）", "规划 manifest", "构建与沙箱测试", "验证", "待 Owner 确认", "已注册"],
     );
     assert.equal(factoryStageLabel("failed"), "失败");
-    assert.equal(factoryStageIndex("failed"), -1);
-    assert.equal(factoryStageIndex("awaiting_confirmation"), 4);
   });
 
-  it("验证报告：全过才可确认注册；每类映射为 Owner 可读标签", () => {
-    const allPass = describeVerification([
-      { category: "schema", passed: true, summary: "input/output schema 校验通过" },
-      { category: "permission", passed: true, summary: "越权用例 100% 阻断" },
-      { category: "functional", passed: true, summary: "8/8 功能用例通过" },
-      { category: "sandbox", passed: true, summary: "沙箱内执行成功" },
-    ]);
+  it("submitted 态按 stage 推进：submitted=retrieval 进行中 → built=verifying 进行中", () => {
+    assert.equal(factoryStageOf({ status: "submitted", stage: "submitted" }), "retrieval");
+    assert.equal(factoryStageOf({ status: "submitted", stage: "retrieved" }), "planning");
+    assert.equal(factoryStageOf({ status: "submitted", stage: "planned" }), "building");
+    assert.equal(factoryStageOf({ status: "submitted", stage: "built" }), "verifying");
+  });
+
+  it("proposed → 待确认；confirmed → 已注册；failed → 失败旁路；reused 停在检索位", () => {
+    assert.equal(factoryStageOf({ status: "proposed", stage: "verified" }), "awaiting_confirmation");
+    assert.equal(factoryStageOf({ status: "confirmed", stage: "verified" }), "registered");
+    assert.equal(factoryStageOf({ status: "failed", stage: "built" }), "failed");
+    assert.equal(factoryStageOf({ status: "reused", stage: "submitted" }), "retrieval");
+  });
+
+  it("阶段序位：failed → -1（不入进度线）；awaiting_confirmation 在第 5 位", () => {
+    assert.equal(factoryStageIndex("failed"), -1);
+    assert.equal(factoryStageIndex("awaiting_confirmation"), 4);
+    assert.equal(factoryStageIndex("registered"), 5);
+  });
+});
+
+describe("describeVerification（真实 VerifyReport → 确认注册区呈现）", () => {
+  it("全过报告：越权/功能/反向故障按用例归组，沙箱执行成行；allPassed=true 可确认", () => {
+    const allPass = describeVerification({
+      ok: true,
+      cases: [
+        { case_id: "pos-1", kind: "positive", pass: true, detail: "ok" },
+        { case_id: "neg-1", kind: "negative", pass: true, detail: "ok" },
+        { case_id: "esc-1", kind: "privilege-escalation", pass: true, detail: "blocked" },
+        { case_id: "fault-1", kind: "fault", pass: true, detail: "ok" },
+      ],
+    });
     assert.equal(allPass.allPassed, true);
     assert.deepEqual(
       allPass.rows.map((r) => r.label),
-      ["Schema 校验", "越权测试", "功能测试", "沙箱执行"],
+      ["越权测试", "功能测试", "反向与故障", "沙箱执行"],
     );
+    const escalation = allPass.rows.find((r) => r.label === "越权测试");
+    assert.match(escalation?.summary ?? "", /越权企图 1\/1 通过/);
+  });
 
-    const sandboxFail = describeVerification([
-      { category: "schema", passed: true, summary: "ok" },
-      { category: "permission", passed: true, summary: "ok" },
-      { category: "functional", passed: true, summary: "ok" },
-      { category: "sandbox", passed: false, summary: "容器内执行超时" },
-    ]);
+  it("沙箱故障（sandbox_error）→ 沙箱行未过 + allPassed=false（不可确认注册）", () => {
+    const sandboxFail = describeVerification({
+      ok: false,
+      cases: [{ case_id: "pos-1", kind: "positive", pass: false, detail: "container timed out" }],
+      sandbox_error: "sandbox_unavailable: docker daemon not reachable",
+    });
     assert.equal(sandboxFail.allPassed, false);
-    assert.equal(verificationCategoryLabel("sandbox"), "沙箱执行");
+    const sandboxRow = sandboxFail.rows.find((r) => r.label === "沙箱执行");
+    assert.equal(sandboxRow?.passed, false);
+    assert.match(sandboxRow?.summary ?? "", /docker daemon not reachable/);
+  });
+
+  it("越权用例未全阻断 → 越权行未过并列出失败细节（AC-06 口径：越权 100% 阻断才可注册）", () => {
+    const escalationLeak = describeVerification({
+      ok: false,
+      cases: [
+        { case_id: "esc-1", kind: "privilege-escalation", pass: true, detail: "blocked" },
+        { case_id: "esc-2", kind: "privilege-escalation", pass: false, detail: "fetch to evil.example succeeded" },
+      ],
+    });
+    assert.equal(escalationLeak.allPassed, false);
+    const row = escalationLeak.rows.find((r) => r.label === "越权测试");
+    assert.equal(row?.passed, false);
+    assert.match(row?.summary ?? "", /evil\.example succeeded/);
+  });
+
+  it("无报告（failed 于验证前）→ 空行且不可确认", () => {
+    const empty = describeVerification(undefined);
+    assert.equal(empty.allPassed, false);
+    assert.deepEqual(empty.rows, []);
   });
 });
 

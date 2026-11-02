@@ -169,31 +169,42 @@ export interface CapabilityRollbackResult {
 }
 
 /**
- * 工厂请求投影（T3 接缝；形状与 capability-ui 的 FactoryStage / VerificationReportItem 对齐）。
- * T3 落地后以其真实 schema 为准——本投影只承诺 UI 渲染所需的最小字段集。
+ * 工厂请求视图（真实 T3 合约的 UI 读取面——apps/runtime/src/capabilities/factory/types.ts
+ * FactoryRequestView 的投影，只保留 UI 渲染所需字段）：
+ *   POST /v1/capabilities/request       {description} → 201 {request_id,status,stage}
+ *   GET  /v1/capabilities/requests/:id  进度/报告（轮询观察口径）
+ *   POST /v1/capabilities/:id/confirm   Owner 确认门（:id = request_id；proposed → 注册）
  */
 export interface FactoryRequest {
   request_id: string;
-  requirement: string;
-  stage:
-    | "retrieval"
-    | "planning"
-    | "building"
-    | "verifying"
-    | "awaiting_confirmation"
-    | "registered"
-    | "failed";
-  /** 阶段说明（进度区副文案；可缺省） */
-  stage_detail?: string;
-  /** awaiting_confirmation 起携带：候选 manifest（确认注册即提交它） */
+  status: "submitted" | "reused" | "proposed" | "failed" | "confirmed";
+  stage: "submitted" | "retrieved" | "planned" | "built" | "verified";
+  /** 原始需求描述（POST 201 响应可缺省——只有三元组） */
+  description?: string;
+  /** planned 起携带：候选 manifest（确认注册即注册它） */
   manifest?: Record<string, unknown>;
-  /** verifying/awaiting_confirmation 携带：四类测试结果 */
-  verification?: Array<{
-    category: "schema" | "permission" | "functional" | "sandbox";
-    passed: boolean;
-    summary: string;
-  }>;
-  error?: string;
+  /** built/proposed 携带：逐用例验证报告（capability-ui describeVerification 消费） */
+  report?: {
+    ok: boolean;
+    cases: Array<{
+      case_id: string;
+      kind: "positive" | "negative" | "privilege-escalation" | "fault";
+      pass: boolean;
+      detail: string;
+    }>;
+    sandbox_error?: string;
+  };
+  /** failed 携带：结构化诊断（stage/code/detail，越权带逐维 violations） */
+  error?: {
+    stage: string;
+    code: string;
+    detail: string;
+    violations?: Array<{ dimension: string; requested: string; reason: string }>;
+  };
+  /** reused 携带：命中既有能力/Skill 的摘要（FR-CAP-1 重用路径） */
+  reuse_matches?: Array<{ source: string; name?: string; score: number }>;
+  /** confirmed 后的注册能力名 */
+  capability_name?: string;
 }
 
 const JSON_HEADERS = { "content-type": "application/json" };
@@ -384,29 +395,31 @@ export const api = {
     });
   },
 
-  // ⚠️ 接缝（票 M2-T6 / Issue #27）：Tool Factory 端点由 T3 交付（PRD §6.2 的
-  // POST /v1/capabilities/request + 进度轮询 + 确认注册）。以下封装在 T3 落地前只会命中
-  // 404（capability-fixture 的 mock 端点提供演示数据）；T3 合入后无需改 UI——路径即合约。
+  // 工厂端点（T3 已合入，真实合约）：POST /v1/capabilities/request + 进度轮询
+  // GET /v1/capabilities/requests/:id + 确认注册 POST /v1/capabilities/:id/confirm。
   requestCapabilityFactory(base: string, requirement: string): Promise<FactoryRequest> {
     return request<FactoryRequest>(base, "/v1/capabilities/request", {
       method: "POST",
       headers: JSON_HEADERS,
-      body: JSON.stringify({ requirement }),
+      body: JSON.stringify({ description: requirement }),
     });
   },
 
   getCapabilityFactoryRequest(base: string, requestId: string): Promise<FactoryRequest> {
-    return request<FactoryRequest>(base, `/v1/capabilities/request/${encodeURIComponent(requestId)}`);
+    return request<FactoryRequest>(base, `/v1/capabilities/requests/${encodeURIComponent(requestId)}`);
   },
 
+  /** Owner 确认门：proposed → 注册（author=ai 默认 disabled）。返回确认后的请求视图。 */
   confirmCapabilityFactory(base: string, requestId: string): Promise<FactoryRequest> {
-    return request<FactoryRequest>(base, `/v1/capabilities/request/${encodeURIComponent(requestId)}/confirm`, {
-      method: "POST",
-    });
+    return request<{ request: FactoryRequest }>(
+      base,
+      `/v1/capabilities/${encodeURIComponent(requestId)}/confirm`,
+      { method: "POST" },
+    ).then((r) => r.request);
   },
 
-  // ⚠️ 接缝（票 M2-T6 / Issue #27）：Skill 清单与提案端点由 T5 交付。同上：UI 先行，
-  // 404 时界面提示「端点未接入（T5）」；capability-fixture 提供演示数据。
+  // Skill 端点（T5 已合入）：runtime 侧双路径族——/v1/skills*（UI 合约）与
+  // /v1/capabilities/skills*（能力域家族）同 handler 同形状。
   listSkills(base: string): Promise<SkillSummary[]> {
     return request<{ skills: SkillSummary[] }>(base, "/v1/skills").then((r) => r.skills);
   },

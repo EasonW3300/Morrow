@@ -271,13 +271,19 @@ export function describeGrantsDiff(diffs: GrantsDimensionDiff[]): string {
   return `变更：${parts.join("；")}。保存将写入 capability.grants_updated 审计事件，且收窄立即约束运行时——已注册能力按新授权面复核，不再被覆盖的调用会被拒绝（escalation）。`;
 }
 
-// --- 4. 工厂进度与验证报告（T3 接缝的 UI 侧投影） ------------------------------
-// ⚠️ 接缝（票 M2-T6 / Issue #27）：factory 端点由 T3 交付（POST /v1/capabilities/request、
-// GET /v1/capabilities/request/:id、POST .../confirm，PRD §6.2）。本票只做「提交需求描述 +
-// 进度轮询 + 验证报告 + 确认注册」的壳；阶段枚举与报告形状是 UI 侧投影，T3 落地后以
-// 其真实事件流（factory_* 事件族）为准对齐——见 capability-fixture.ts 的 mock 说明。
+// --- 4. 工厂进度与验证报告（真实工厂投影；T3 已合入，接缝按实现收口） ------------
+// 工厂真实合约（apps/runtime/src/capabilities/factory）：POST /v1/capabilities/request、
+// GET /v1/capabilities/requests/:id、POST /v1/capabilities/:id/confirm；视图为
+// status（submitted/reused/proposed/failed/confirmed）× stage（submitted/retrieved/
+// planned/built/verified）双轴。本节把真实视图投影为 Owner 可读的进度线与验证报告。
 
-/** 工厂请求阶段（UI 侧枚举；fixture 演示状态流转） */
+/** 真实工厂视图的 UI 读取面（api.ts FactoryRequestView 的 status/stage 双轴） */
+export interface FactoryProgress {
+  status: "submitted" | "reused" | "proposed" | "failed" | "confirmed";
+  stage: "submitted" | "retrieved" | "planned" | "built" | "verified";
+}
+
+/** 工厂请求阶段（UI 侧进度线枚举） */
 export type FactoryStage =
   | "retrieval"
   | "planning"
@@ -322,22 +328,36 @@ export function factoryStageIndex(stage: FactoryStage): number {
   return idx === -1 ? -1 : idx;
 }
 
-/** 验证报告条目（四类测试：AC-06 口径——schema/越权/功能/沙箱；T3 落地后以其形状为准） */
-export interface VerificationReportItem {
-  category: "schema" | "permission" | "functional" | "sandbox";
-  passed: boolean;
-  summary: string;
+/** 真实视图（status×stage 双轴）→ 进度线阶段：
+ *  - status confirmed → 已注册；proposed → 待确认；failed → 失败旁路
+ *  - status submitted 按 stage 推进（submitted=retrieval 进行中 → built=verifying 进行中）
+ *  - status reused 停在检索位（命中既有能力/Skill，不新建——banner 单独呈现） */
+export function factoryStageOf(view: FactoryProgress): FactoryStage {
+  if (view.status === "confirmed") return "registered";
+  if (view.status === "proposed") return "awaiting_confirmation";
+  if (view.status === "failed") return "failed";
+  switch (view.stage) {
+    case "retrieved":
+      return "planning";
+    case "planned":
+      return "building";
+    case "built":
+      return "verifying";
+    default:
+      return "retrieval"; // submitted / reused
+  }
 }
 
-const VERIFICATION_CATEGORY_LABELS: Readonly<Record<VerificationReportItem["category"], string>> = {
-  schema: "Schema 校验",
-  permission: "越权测试",
-  functional: "功能测试",
-  sandbox: "沙箱执行",
-};
-
-export function verificationCategoryLabel(category: VerificationReportItem["category"]): string {
-  return VERIFICATION_CATEGORY_LABELS[category];
+/** 真实验证报告（runtime VerifyReport 的 UI 读取面——逐用例 kind/pass + 沙箱故障） */
+export interface FactoryVerifyReport {
+  ok: boolean;
+  cases: Array<{
+    case_id: string;
+    kind: "positive" | "negative" | "privilege-escalation" | "fault";
+    pass: boolean;
+    detail: string;
+  }>;
+  sandbox_error?: string;
 }
 
 export interface VerificationPresentation {
@@ -345,21 +365,45 @@ export interface VerificationPresentation {
   rows: Array<{ label: string; passed: boolean; summary: string }>;
 }
 
-/** 验证报告 → 确认注册区的呈现（任何一类未过 → 不可确认注册） */
-export function describeVerification(items: VerificationReportItem[]): VerificationPresentation {
-  return {
-    allPassed: items.length > 0 && items.every((item) => item.passed),
-    rows: items.map((item) => ({
-      label: VERIFICATION_CATEGORY_LABELS[item.category],
-      passed: item.passed,
-      summary: item.summary,
-    })),
-  };
+function summarizeCases(cases: Array<{ pass: boolean; detail: string }>, passNoun: string): string {
+  const passed = cases.filter((c) => c.pass).length;
+  if (passed === cases.length) return `${passNoun} ${passed}/${cases.length} 通过`;
+  const failed = cases.filter((c) => !c.pass).map((c) => c.detail);
+  return `${passNoun} ${passed}/${cases.length} 通过——失败：${failed.join("；")}`;
 }
 
-// --- 5. Skill 列表与提案呈现（T5 接缝的 UI 侧投影） ---------------------------
-// ⚠️ 接缝（票 M2-T6 / Issue #27）：Skill 与提案端点由 T5 交付（GET /v1/skills、
-// GET/POST /v1/skills/proposals[...]）。本票做列表/批准/拒绝的 UI + 夹具演示。
+/** 真实验证报告 → 确认注册区的呈现（四类用例按 AC-06 口径归组；沙箱故障单独成行） */
+export function describeVerification(report: FactoryVerifyReport | undefined): VerificationPresentation {
+  if (report === undefined) {
+    return { allPassed: false, rows: [] };
+  }
+  const byKind = (kind: FactoryVerifyReport["cases"][number]["kind"]): FactoryVerifyReport["cases"] =>
+    report.cases.filter((c) => c.kind === kind);
+  const escalations = byKind("privilege-escalation");
+  const positives = byKind("positive");
+  const adversarial = [...byKind("negative"), ...byKind("fault")];
+  const rows: VerificationPresentation["rows"] = [];
+  if (escalations.length > 0) {
+    rows.push({ label: "越权测试", passed: escalations.every((c) => c.pass), summary: summarizeCases(escalations, "越权企图") });
+  }
+  if (positives.length > 0) {
+    rows.push({ label: "功能测试", passed: positives.every((c) => c.pass), summary: summarizeCases(positives, "功能用例") });
+  }
+  if (adversarial.length > 0) {
+    rows.push({ label: "反向与故障", passed: adversarial.every((c) => c.pass), summary: summarizeCases(adversarial, "反向/故障用例") });
+  }
+  rows.push({
+    label: "沙箱执行",
+    passed: report.ok === true && report.sandbox_error === undefined,
+    summary: report.sandbox_error ?? `沙箱内用例执行完成（${report.cases.length} 条）`,
+  });
+  return { allPassed: report.ok === true, rows };
+}
+
+// --- 5. Skill 列表与提案呈现（真实 Skill 投影；T5 已合入） ----------------------
+// 真实合约（apps/runtime/src/capabilities/skills/routes.ts）：GET /v1/skills、
+// GET /v1/skills/proposals、POST /v1/skills/proposals/:id/{approve,reject}（双路径族，
+// UI 路径即合约）；runtime 侧 toSkillSummary/toSkillProposal 按 T6 形状投影。
 
 export interface SkillSummary {
   skill_id: string;
