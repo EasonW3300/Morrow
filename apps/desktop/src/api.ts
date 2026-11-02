@@ -77,12 +77,18 @@ export interface ProviderListResponse {
   default_provider_id: string | null;
 }
 
-/** GET /v1/health 载荷（沙箱为 M0 桩：not-configured） */
+/** GET /v1/health 载荷（沙箱探针为四态状态机：not_configured|missing|daemon_down|ready，票 M2-T1） */
 export interface HealthPayload {
   status: string;
   version: string;
   replica_id: string;
-  sandbox: { status: string; detail: string };
+  sandbox: {
+    status: string;
+    detail: string;
+    engine?: string | null;
+    version?: string | null;
+    install_hint?: string | null;
+  };
   ledger: { events: number };
 }
 

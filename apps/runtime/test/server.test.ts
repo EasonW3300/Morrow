@@ -46,7 +46,11 @@ test("GET /v1/health returns ok with the sandbox probe status", async () => {
     assert.match(res.headers.get("content-type") ?? "", /application\/json/);
     const body = await json<HealthBody>(res);
     assert.equal(body.status, "ok");
-    assert.equal(body.sandbox.status, "not-configured");
+    // 票 M2-T1：探针真实化后的四态状态机（本机有无 docker/podman 决定具体态）
+    assert.ok(
+      ["not_configured", "missing", "daemon_down", "ready"].includes(body.sandbox.status),
+      `sandbox status should be one of the four probe states, got ${body.sandbox.status}`,
+    );
     assert.ok(typeof body.sandbox.detail === "string" && body.sandbox.detail.length > 0);
     assert.ok(body.ledger.events >= 1, "startup event should already be recorded");
     assert.equal(body.replica_id, "f47ac10b-58cc-4372-a567-0e02b2c3d479");
@@ -150,7 +154,7 @@ test("mutation methods on /v1/events are rejected at the request layer", async (
       const body = await json<ApiError>(res);
       assert.equal(body.error.code, "method_not_allowed", method);
     }
-    assert.equal(runtime.ledger.list().events.length, 1); // 只剩启动事件，没有被改/删
+    assert.equal(runtime.ledger.list().events.length, 2); // 启动 + builtin 注册（票 M2-T1），没有被改/删
   } finally {
     await runtime.close();
     removeDir(dir);

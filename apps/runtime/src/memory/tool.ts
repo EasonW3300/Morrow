@@ -42,6 +42,9 @@ const TOOL_PARAMETERS = {
   additionalProperties: false,
 } as const;
 
+/** memory.write 的入参 JSON Schema（票 M2-T1：builtin manifest 的 input_schema 单一真相源） */
+export const MEMORY_WRITE_TOOL_PARAMETERS: typeof TOOL_PARAMETERS = TOOL_PARAMETERS;
+
 export function createMemoryWriteTool(deps: { service: MemoryService; sessionId: string }): MorrowTool {
   return {
     name: MEMORY_WRITE_TOOL_NAME,
