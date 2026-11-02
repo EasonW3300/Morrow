@@ -250,6 +250,7 @@ function snapshotWith(nodes: Array<{ key: string; status: string }>): Checkpoint
         model: null,
         retriable: true,
         side_effect: "delivery_unknown",
+        resources: null,
         status: n.status as CheckpointSnapshot["graph"]["nodes"][number]["status"],
         attempts: 1,
         result: null,

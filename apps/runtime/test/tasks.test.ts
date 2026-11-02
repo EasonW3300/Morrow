@@ -5,10 +5,14 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createFakePi, type FakeStep, type MorrowTool } from "@morrow/pi-adapter";
 import type { EventEnvelope, TaskStatus } from "@morrow/protocol";
+import { join } from "node:path";
 import { EventLedger } from "../src/ledger.ts";
 import { TaskScheduler, type NodeAgentFactory } from "../src/scheduler.ts";
 import { CheckpointService } from "../src/checkpoint.ts";
 import { TaskError, TaskService } from "../src/tasks.ts";
+import { LockTable } from "../src/locks.ts";
+import { WorktreeManager } from "../src/worktree.ts";
+import { openSqlite } from "../src/db.ts";
 import { removeDir, tmpDir } from "./helpers.ts";
 
 const REPLICA = "f47ac10b-58cc-4372-a567-0e02b2c3d479";
@@ -24,9 +28,9 @@ function planJson(nodes: unknown): string {
   return JSON.stringify({ nodes });
 }
 
-/** A→B 串行 + C 与 A 并行的脚本化 DAG */
+/** A→B 串行 + C 与 A 并行的脚本化 DAG（a 携带 M2-T4 资源声明样例，与规划提示词同步） */
 const MIXED_PLAN = planJson([
-  { key: "a", title: "节点A", goal: "do a", depends_on: [], agent_role: "researcher", retriable: true, side_effect: "irreversible" },
+  { key: "a", title: "节点A", goal: "do a", depends_on: [], agent_role: "researcher", retriable: true, side_effect: "irreversible", resources: { lock: ["report:weekly"] } },
   { key: "b", title: "节点B", goal: "do b", depends_on: ["a"], retriable: false },
   { key: "c", title: "节点C", goal: "do c", depends_on: [], retriable: true },
 ]);
@@ -34,6 +38,8 @@ const MIXED_PLAN = planJson([
 interface Harness {
   svc: TaskService;
   checkpoints: CheckpointService;
+  worktrees: WorktreeManager;
+  locks: LockTable;
   dir: string;
   close(): void;
 }
@@ -48,7 +54,17 @@ function openService(plannerOutput: string): Harness {
     factory: async () => createFakePi({ script: planScript(plannerOutput) }),
   });
   const checkpoints = new CheckpointService({ tasks: svc, dataDir: dir, ledger, replicaId: REPLICA });
-  return { svc, checkpoints, dir, close: () => { svc.close(); checkpoints.close(); ledger.close(); removeDir(dir); } };
+  // M2-T4 生产接线同构：锁表（同库独立连接）+ worktree 管理器（本文件场景无 git 声明）
+  const locks = new LockTable({ db: openSqlite(join(dir, "events.sqlite")) });
+  const worktrees = new WorktreeManager({ root: join(dir, "worktrees") });
+  return {
+    svc,
+    checkpoints,
+    worktrees,
+    locks,
+    dir,
+    close: () => { svc.close(); locks.close(); checkpoints.close(); ledger.close(); removeDir(dir); },
+  };
 }
 
 function openIdleService(): Harness {
@@ -56,7 +72,16 @@ function openIdleService(): Harness {
   const ledger = EventLedger.open(dir);
   const svc = new TaskService({ dataDir: dir, ledger, replicaId: REPLICA, factory: null });
   const checkpoints = new CheckpointService({ tasks: svc, dataDir: dir, ledger, replicaId: REPLICA });
-  return { svc, checkpoints, dir, close: () => { svc.close(); checkpoints.close(); ledger.close(); removeDir(dir); } };
+  const locks = new LockTable({ db: openSqlite(join(dir, "events.sqlite")) });
+  const worktrees = new WorktreeManager({ root: join(dir, "worktrees") });
+  return {
+    svc,
+    checkpoints,
+    worktrees,
+    locks,
+    dir,
+    close: () => { svc.close(); locks.close(); checkpoints.close(); ledger.close(); removeDir(dir); },
+  };
 }
 
 function nodeFactory(scripts: Record<string, FakeStep[]>, tools: MorrowTool[] = []): NodeAgentFactory {
@@ -70,6 +95,8 @@ function makeScheduler(h: Harness, factory: NodeAgentFactory | null, concurrency
     replicaId: REPLICA,
     nodeAgentFactory: factory,
     checkpoints: h.checkpoints,
+    worktrees: h.worktrees,
+    locks: h.locks,
     ...(concurrency === undefined ? {} : { concurrency }),
   });
 }
@@ -109,6 +136,7 @@ test("createTask plans a scripted DAG and records task.created/task.planned with
     assert.equal(a.side_effect, "irreversible");
     assert.equal(b.retriable, false);
     assert.equal(b.side_effect, "delivery_unknown"); // 规划器缺省 → 保守未知分类
+    assert.deepEqual(a.resources, { lock: ["report:weekly"] }, "资源声明 round-trip（M2-T4）");
     for (const node of detail.nodes) assert.equal(node.status, "pending");
 
     const events = h.svc.taskEvents(detail.task_id)?.events ?? [];

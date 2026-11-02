@@ -27,6 +27,8 @@ import { buildEventEnvelope } from "./envelope.ts";
 import { computeIntegrityHash, type EventEnvelope } from "@morrow/protocol";
 import { UUID_RE } from "./uuid-v7.ts";
 import { parsePaging, readJsonBody, sendError, sendJson } from "./http-util.ts";
+import { LockTable } from "./locks.ts";
+import { WorktreeManager } from "./worktree.ts";
 import { DockerRunner } from "./sandbox/docker-runner.ts";
 import { ToolInvoker } from "./sandbox/invoker.ts";
 import { createRegistryPermissionAdapter, type SandboxPermissionEngine } from "./sandbox/permission.ts";
@@ -307,6 +309,12 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
       }
     },
   });
+  // 工作区隔离与资源锁（M2-T4 / Issue #25，FR-TASK-8）：代码节点（resources.git_repo）
+  // 在 <dataDir>/worktrees 下的独立 git worktree 执行，完成后合回主区（冲突 →
+  // pending_review）；resources.lock 声明经锁表串行化。锁表与任务投影同库
+  // （events.sqlite，独立连接，WAL + busy_timeout 支撑多连接——同 CheckpointService）。
+  const worktrees = new WorktreeManager({ root: join(config.dataDir, "worktrees") });
+  const locks = new LockTable({ dataDir: config.dataDir });
   const scheduler = new TaskScheduler({
     tasks,
     ledger,
@@ -317,7 +325,14 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
       options.taskNodeAgentFactory ??
       ((node: TaskNodeExecInput) => defaultNodeRuntime(node.goal, node.model)),
     checkpoints,
+    worktrees,
+    locks,
     ...(options.taskConcurrency === undefined ? {} : { concurrency: options.taskConcurrency }),
+  });
+  // 启动清扫（M2-T4）：崩溃残留的 worktree/分支/孤儿锁；pending_review 节点的冲突
+  // worktree 是 Owner 调解证据，清扫保留。清扫失败不阻塞启动（下次启动再清）。
+  void scheduler.sweepResidue().catch((err: unknown) => {
+    console.error("[morrow] startup residue sweep failed:", err);
   });
   // 沙箱执行 Worker（M2-T2 / Issue #23）：ToolInvoker 统一接缝。runner 缺省 DockerRunner
   // （每次执行前探测容器运行时；无运行时 → sandboxed 调用拒绝 sandbox_unavailable +
@@ -340,6 +355,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     port = await listen(server, config.host, config.port);
   } catch (err) {
     tasks.close();
+    locks.close();
     capabilities.close();
     memoryStore.close();
     devices.close();
@@ -382,6 +398,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
       // 任务调度：拒绝排队任务、中止在跑节点（收尾上限 2s），然后关任务投影库
       await scheduler.dispose();
       tasks.close();
+      locks.close();
       checkpoints.close();
       capabilities.close();
       try {

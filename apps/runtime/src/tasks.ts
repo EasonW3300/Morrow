@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { Ajv2020 } from "ajv/dist/2020.js";
 import type { AgentRuntime, AgentStopReason } from "@morrow/pi-adapter";
 import type {
+  NodeResources,
   SideEffectClass,
   TaskDetail,
   TaskNodeRecord,
@@ -64,6 +65,9 @@ export const TASK_EVENT_TYPES = {
   taskFailed: "task.failed",
   taskCancelled: "task.cancelled",
   taskPlanningFailed: "task.planning_failed",
+  // M2-T4 工作区隔离（Issue #25 / FR-TASK-8）：worktree 变更合并回主区的留痕与冲突上报
+  taskMerged: "task.merged",
+  taskMergeConflict: "task.merge_conflict",
   // M1-T6 人工介入族（actor 一律 owner——AC-12 审计前置）
   taskRevised: "task.revised",
   taskContextSupplied: "task.context_supplied",
@@ -136,6 +140,7 @@ export interface PlannedNodeInput {
   model?: string;
   retriable?: boolean;
   side_effect?: SideEffectClass;
+  resources?: NodeResources;
 }
 
 /** 归一后的规划节点（retriable/side_effect/depends_on 已补默认；落表与调度消费此形态） */
@@ -148,6 +153,41 @@ export interface PlannedNode {
   model?: string;
   retriable: boolean;
   side_effect: SideEffectClass;
+  resources?: NodeResources;
+}
+
+/**
+ * 资源声明归一（M2-T4 / FR-TASK-8）：schema 已挡住形状，这里补语义校验
+ * （path/branch/lock key 非空字符串）与 lock 去重保序；空 lock 视为未声明。
+ * 非法 → TaskError("invalid_plan")（与 DAG 语义校验同一失败口径）。
+ */
+export function normalizeNodeResources(raw: NodeResources): NodeResources {
+  const out: NodeResources = {};
+  if (raw.git_repo !== undefined) {
+    const { path, branch, verify } = raw.git_repo;
+    if (typeof path !== "string" || path.trim().length === 0) {
+      throw new TaskError("invalid_plan", "resources.git_repo.path must be a non-empty string");
+    }
+    if (branch !== undefined && (typeof branch !== "string" || branch.trim().length === 0)) {
+      throw new TaskError("invalid_plan", "resources.git_repo.branch must be a non-empty string when present");
+    }
+    if (verify !== undefined && (typeof verify !== "string" || verify.trim().length === 0)) {
+      throw new TaskError("invalid_plan", "resources.git_repo.verify must be a non-empty string when present");
+    }
+    out.git_repo = {
+      path,
+      ...(branch === undefined ? {} : { branch }),
+      ...(verify === undefined ? {} : { verify }),
+    };
+  }
+  if (raw.lock !== undefined) {
+    if (!Array.isArray(raw.lock) || raw.lock.some((k) => typeof k !== "string" || k.trim().length === 0)) {
+      throw new TaskError("invalid_plan", "resources.lock must be an array of non-empty strings");
+    }
+    const keys = [...new Set(raw.lock.map((k) => k.trim()))];
+    if (keys.length > 0) out.lock = keys;
+  }
+  return out;
 }
 
 export interface PlannedDag {
@@ -352,8 +392,11 @@ export const PLANNER_SYSTEM_PROMPT = [
   "只输出一个 JSON 对象，不要输出任何解释文字，形如：",
   '{"nodes": [{"key": "短标识(小写字母数字)", "title": "节点标题", "goal": "给执行节点的指令",',
   ' "depends_on": ["依赖节点的 key"], "agent_role": "责任角色", "model": "建议模型(可选)",',
-  ' "retriable": true, "side_effect": "reversible|compensatable|irreversible|delivery_unknown"}]}',
+  ' "retriable": true, "side_effect": "reversible|compensatable|irreversible|delivery_unknown",',
+  ' "resources": {"git_repo": {"path": "仓库路径", "branch": "基线分支(可选)", "verify": "合并验证命令(可选)"}, "lock": ["互斥资源key"]}}]}',
   "规则：key 在任务内唯一；depends_on 只能引用已定义的 key；不得出现环；至少一个节点。",
+  "resources 可选：改代码的节点声明 git_repo（worktree 隔离执行，完成后合回主区）；",
+  "与其它节点互斥的资源（同一文件、同一外部系统）声明 lock；把握不大就都不写（保守默认）。",
   "把握不大的副作用分类一律写 delivery_unknown（保守默认）。",
 ].join("\n");
 
@@ -379,6 +422,23 @@ const PLANNER_OUTPUT_SCHEMA = {
           retriable: { type: "boolean" },
           side_effect: {
             enum: ["reversible", "compensatable", "irreversible", "delivery_unknown"],
+          },
+          resources: {
+            type: "object",
+            additionalProperties: false,
+            properties: {
+              git_repo: {
+                type: "object",
+                required: ["path"],
+                additionalProperties: false,
+                properties: {
+                  path: { type: "string", minLength: 1 },
+                  branch: { type: "string", minLength: 1 },
+                  verify: { type: "string", minLength: 1 },
+                },
+              },
+              lock: { type: "array", items: { type: "string", minLength: 1 } },
+            },
           },
         },
       },
@@ -462,6 +522,7 @@ export function validatePlannedDag(rawText: string): PlannedDag {
       ...(n.model === undefined ? {} : { model: n.model }),
       retriable: n.retriable ?? true,
       side_effect: n.side_effect ?? "delivery_unknown",
+      ...(n.resources === undefined ? {} : { resources: normalizeNodeResources(n.resources) }),
     })),
   };
 }
@@ -532,6 +593,7 @@ interface NodeRow {
   side_effect: string;
   status: string;
   actor: string | null;
+  resources: string | null;
   attempts: number;
   result: string | null;
   error: string | null;
@@ -589,8 +651,8 @@ export class TaskStore {
     );
     this.#insertNodeStmt = db.prepare(
       `INSERT INTO task_nodes
-        (node_id, task_id, node_key, title, goal, agent_role, model, retriable, side_effect, status, attempts, result, error, node_seq, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, NULL, NULL, ?, ?, ?)`,
+        (node_id, task_id, node_key, title, goal, agent_role, model, retriable, side_effect, status, actor, resources, attempts, result, error, node_seq, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, ?, 0, NULL, NULL, ?, ?, ?)`,
     );
     this.#nodesOfStmt = db.prepare("SELECT * FROM task_nodes WHERE task_id = ? ORDER BY node_seq");
     this.#getNodeStmt = db.prepare("SELECT * FROM task_nodes WHERE node_id = ?");
@@ -662,6 +724,7 @@ export class TaskStore {
     model: string | null;
     retriable: boolean;
     sideEffect: string;
+    resources?: NodeResources;
     seq: number;
     now: string;
   }): void {
@@ -675,6 +738,7 @@ export class TaskStore {
       row.model,
       row.retriable ? 1 : 0,
       row.sideEffect,
+      row.resources === undefined ? null : JSON.stringify(row.resources),
       row.seq,
       row.now,
       row.now,
@@ -923,6 +987,7 @@ export class TaskService {
         model: node.model ?? null,
         retriable: node.retriable,
         sideEffect: node.side_effect,
+        ...(node.resources === undefined ? {} : { resources: node.resources }),
         seq: index,
         now: now2,
       });
@@ -1422,6 +1487,7 @@ export class TaskService {
       ...(row.model === null ? {} : { model: row.model }),
       retriable: row.retriable === 1,
       side_effect: row.side_effect as SideEffectClass,
+      ...(row.resources === null ? {} : { resources: JSON.parse(row.resources) as NodeResources }),
       status: row.status as TaskNodeRecord["status"],
       ...(row.actor === null ? {} : { actor: row.actor as TaskNodeRecord["actor"] }),
       attempts: row.attempts,

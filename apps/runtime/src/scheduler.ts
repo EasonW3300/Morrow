@@ -1,7 +1,7 @@
 import type { AgentRuntime, MorrowAgentEvent } from "@morrow/pi-adapter";
 import { buildEventEnvelope } from "./envelope.ts";
 import type { EventLedger } from "./ledger.ts";
-import type { TaskNodeRecord, TaskSummary } from "@morrow/protocol";
+import type { NodeResources, TaskNodeRecord, TaskSummary } from "@morrow/protocol";
 import { TASK_EVENT_TYPES, TaskError, type TaskService } from "./tasks.ts";
 import {
   CheckpointService,
@@ -10,27 +10,40 @@ import {
   type ReconcileReport,
 } from "./checkpoint.ts";
 import { SESSION_EVENT_TYPES } from "./sessions.ts";
+import type { LockTable } from "./locks.ts";
+import type { WorktreeManager, WorktreeRecord } from "./worktree.ts";
 
 /**
  * 单机任务调度器（票 M1-T4 / Issue #16，FR-TASK-1 的调度半边；M1-T5 / Issue #17 扩展
- * pause/resume/restore 的编排）。
+ * pause/resume/restore 的编排；M2-T4 / Issue #25 扩展工作区隔离与资源锁）。
  *
  * 调度模型（M1 单机、单副本）：
  * - 就绪判定：节点 pending 且其全部依赖（task_edges 入边）completed——顺序由依赖
- *   拓扑保证；无资源冲突概念的 M1 版本即「就绪即可跑」，工作区隔离/资源锁是
- *   FR-TASK-8（P1）的事；
+ *   拓扑保证；
  * - 并行：同批就绪节点并发执行，在跑数受 concurrency 上限约束（可配置，默认 2，
  *   最小 1）；同批按 node_seq（规划序）优先派发，行为确定；
+ * - 资源锁（M2-T4 / FR-TASK-8）：节点 resources.lock 声明的 key 在派发前 acquire
+ *   （全拿或全不拿；任一 key 被持有 → 本轮跳过，等持有者释放后重评——锁在节点终态
+ *   finally 释放，故跳过只会等到同批在跑节点收尾，不产生空转）；无锁节点不受影响；
+ * - 工作区隔离（M2-T4 / FR-TASK-8）：声明 resources.git_repo 的代码节点在独立
+ *   Git Worktree 执行（每次尝试前 prepare/重置，工作目录 = worktree，经
+ *   TaskNodeExecInput.workspace 注入节点 Agent 工具装配层——sandboxed 能力调用的
+ *   workspace 据此指向 worktree）；节点成功后变更提交到 worktree 分支并合回主区：
+ *   合并按仓库路径串行化（进程内互斥），先冲突检测（试合并 → 冲突 abort）→ 无冲突
+ *   跑合并验证（git_repo.verify 命令在主区执行，缺省 diff 非空断言）→ 提交；
+ *   冲突 → 节点 pending_review + task.merge_conflict 事件（needs_reconcile 语义的
+ *   节点级落地；冲突 worktree 保留供 Owner 调解，任务转 waiting_input）；
  * - 多任务：schedule()/resume()/restore() 共用一条 FIFO 队列逐任务驱动（同一时刻
  *   至多一个任务在 #drive）——concurrency 是调度器级上限，串行化让它跨任务成立，
  *   任务内节点并行不受影响；
  * - 节点执行 = 一次 Agent Loop（复用 sessions.ts 的驱动模式：subscribe 窄事件 →
  *   账本事件 + causation 链）。工具事件复用既有 tool.started/tool.finished 类型
  *   （只加演进：信封带 task_id），causation 链到 task.node_started；
- * - 失败：节点失败（error 事件 / stop_reason error|aborted / prompt 拒绝 / 工厂抛错）
- *   时 retriable 节点自动重试一次（每次调度运行内最多 2 次；跨恢复的 attempts 在
- *   节点行上累计递增）；最终失败标记节点 failed，等在跑兄弟节点收尾后整任务迁
- *   failed（task.failed payload 带 node_id 与原因）；
+ * - 失败：节点失败（error 事件 / stop_reason error|aborted / prompt 拒绝 / 工厂抛错 /
+ *   合并验证失败）时 retriable 节点自动重试一次（每次调度运行内最多 2 次；跨恢复的
+ *   attempts 在节点行上累计递增）；最终失败标记节点 failed，等在跑兄弟节点收尾后整
+ *   任务迁 failed（task.failed payload 带 node_id 与原因）；冲突不是失败——不重试，
+ *   直接挂起等 Owner；
  * - 暂停（M1-T5）：pause = 停止派发（#pausing 标志即时生效）+ 等在跑节点到边界
  *   （自然收尾，不中止）→ task.paused 迁移 → checkpoint 落库。安全点语义：在跑
  *   节点的工作不浪费、事件流保持真实（不产生 aborted 节点簿记）；pause 一旦受理
@@ -55,6 +68,18 @@ const PAUSE_POLL_MS = 20;
 
 const TERMINAL_TASK_STATUSES = new Set(["failed", "completed", "cancelled"]);
 
+/** 节点执行工作区（M2-T4）：git_repo 代码节点的 worktree（非代码节点缺省无此字段） */
+export interface NodeWorkspaceInfo {
+  /** worktree 检出目录（节点 Agent 的工作目录；sandboxed 调用的 workspace 根） */
+  dir: string;
+  /** 主区仓库顶层（变更合回目标） */
+  repoPath: string;
+  /** worktree 专属分支 morrow/<task_id>/<node_key> */
+  branch: string;
+  /** 基线提交（diff/合并基准） */
+  base: string;
+}
+
 /** 节点执行输入（工厂 seam：生产按 Provider 构建 PiAdapter；测试注入 FakePi 脚本） */
 export interface TaskNodeExecInput {
   taskId: string;
@@ -67,6 +92,14 @@ export interface TaskNodeExecInput {
   model?: string;
   /** 第几次尝试（1 起；跨恢复累计：stale 半写的那次也计入） */
   attempt: number;
+  /** 节点资源声明（M2-T4）：工具装配层可据此感知 git_repo/lock（如验证命令展示） */
+  resources?: NodeResources;
+  /**
+   * 节点工作区（M2-T4 / FR-TASK-8）：仅 resources.git_repo 声明的代码节点有值。
+   * 工具装配层据此把 sandboxed 能力调用的 workspace 指向 worktree（与 M2-T2
+   * SandboxToolPackage.workspaceDir 契约对齐）；非代码节点缺省 = 无隔离工作区。
+   */
+  workspace?: NodeWorkspaceInfo;
 }
 
 export type NodeAgentFactory = (node: TaskNodeExecInput) => Promise<AgentRuntime>;
@@ -81,6 +114,17 @@ export interface TaskSchedulerOptions {
   checkpoints: CheckpointService;
   /** 同时在跑节点上限；默认 2，最小 1 */
   concurrency?: number;
+  /**
+   * Worktree 管理器（M2-T4 / FR-TASK-8）：生产由 startRuntime 注入（root =
+   * <dataDir>/worktrees）。缺省 null = 无隔离执行；代码节点（声明 git_repo）在
+   * 无管理器时派发即失败（诚实留痕，不静默降级到主区执行）。
+   */
+  worktrees?: WorktreeManager | null;
+  /**
+   * 资源锁表（M2-T4 / FR-TASK-8）：生产由 startRuntime 注入（events.sqlite 同库）。
+   * 缺省 null = 无互斥；声明 lock 的节点同样派发即失败。
+   */
+  locks?: LockTable | null;
 }
 
 interface NodeOutcome {
@@ -89,6 +133,12 @@ interface NodeOutcome {
   error?: string;
   stopReason?: string;
 }
+
+/** 节点 worktree → 主区的合并结果（事件由 #runNode 统一按行→事件次序写） */
+type NodeMergeResult =
+  | { kind: "merged"; merged_commit: string; files: string[]; validated_by: "verify_command" | "diff_nonempty" }
+  | { kind: "conflict"; files: string[] }
+  | { kind: "failed"; error: string };
 
 export interface PauseResult {
   task: TaskSummary;
@@ -110,6 +160,8 @@ export class TaskScheduler {
   readonly #factory: NodeAgentFactory | null;
   readonly #checkpoints: CheckpointService;
   readonly #concurrency: number;
+  readonly #worktrees: WorktreeManager | null;
+  readonly #locks: LockTable | null;
   readonly #active = new Set<AgentRuntime>();
   /** 待调度的任务 FIFO（schedule/resume/restore 共用；并发上限按调度器全局记账） */
   readonly #queue: Array<{ run: () => Promise<void>; resolve: () => void; reject: (err: unknown) => void }> = [];
@@ -117,6 +169,8 @@ export class TaskScheduler {
   readonly #pausing = new Set<string>();
   /** 本进程内正在 #drive 的任务（stale-running 判定：running 且不在本集合 = 中断残留） */
   readonly #driving = new Set<string>();
+  /** 主区合并互斥（M2-T4）：按仓库路径串行化 mergeToBase（进程内；跨进程由执行租约排除） */
+  readonly #repoMerges = new Map<string, Promise<void>>();
   #draining = false;
   #disposed = false;
 
@@ -127,6 +181,8 @@ export class TaskScheduler {
     this.#factory = options.nodeAgentFactory;
     this.#checkpoints = options.checkpoints;
     this.#concurrency = Math.max(1, Math.floor(options.concurrency ?? DEFAULT_TASK_CONCURRENCY));
+    this.#worktrees = options.worktrees ?? null;
+    this.#locks = options.locks ?? null;
   }
 
   /**
@@ -245,6 +301,25 @@ export class TaskScheduler {
         new Promise((resolve) => setTimeout(resolve, 2000)),
       ]);
     }
+  }
+
+  /**
+   * 崩溃残留清扫（M2-T4 / FR-TASK-8）：启动时（startRuntime）或运维入口调用——
+   * - worktree：清扫非存活任务的目录与分支。存活 = 本进程正在驱动，或任务中还有
+   *   pending_review 节点（冲突 worktree 是 Owner 调解证据，重启不得丢）；
+   * - 锁：清除不在本进程在跑任务的锁行。租约语义（GLOSSARY）下同一 Run 全局单点
+   *   执行，启动时刻不可能有合法旧持有者 → 启动调用时全清。
+   */
+  async sweepResidue(): Promise<{ worktrees: string[]; locks: number }> {
+    const worktrees = this.#worktrees === null
+      ? []
+      : await this.#worktrees.sweepStale((taskId) => {
+          if (this.#driving.has(taskId)) return true;
+          const detail = this.#tasks.getTask(taskId);
+          return detail !== null && detail.nodes.some((n) => n.status === "pending_review");
+        });
+    const locks = this.#locks === null ? 0 : this.#locks.sweepStale((row) => this.#driving.has(row.task_id));
+    return { worktrees, locks };
   }
 
   // --- 入口辅助 ----------------------------------------------------------------
@@ -430,6 +505,18 @@ export class TaskScheduler {
       );
       for (const node of ready) {
         if (inflight.size >= this.#concurrency) break;
+        // 资源锁（M2-T4）：派发前 acquire（全拿或全不拿）。任一 key 被持有 → 本轮
+        // 跳过（节点留在 pending，等持有者节点收尾释放后下一轮重评——持有者必是本
+        // 批在跑节点，不会空转）。声明 lock 而无锁表 → 派发即失败（不静默降级）。
+        const lockKeys = node.resources?.lock ?? [];
+        if (lockKeys.length > 0) {
+          if (this.#locks === null) {
+            this.#failNodeAtDispatch(taskId, node, startedEventId,
+              "node declares resources.lock but the scheduler has no lock table configured");
+            continue;
+          }
+          if (!this.#locks.acquireAll(lockKeys, taskId, node.node_id, new Date().toISOString())) continue;
+        }
         const entry = { done: false };
         const promise = this.#runNode(taskId, node, startedEventId)
           .catch((err: unknown) => {
@@ -510,39 +597,196 @@ export class TaskScheduler {
     // node_started 的 attempt 编号与账本史一致；本调度运行内 retriable 最多 2 次
     const baseAttempts = this.#tasks.getNodeState(node.node_id)?.attempts ?? 0;
     const totalAttempts = node.retriable ? MAX_ATTEMPTS_RETRIABLE : 1;
+    const gitRepo = node.resources?.git_repo;
+    const lockKeys = node.resources?.lock ?? [];
     let outcome: NodeOutcome = { ok: false, text: "", error: "node did not run" };
-    for (let i = 1; i <= totalAttempts; i++) {
-      const attempt = baseAttempts + i;
-      this.#tasks.setNodeRunning(node.node_id, attempt);
-      const nodeStarted = this.#appendTaskEvent(taskId, TASK_EVENT_TYPES.taskNodeStarted, {
-        node_id: node.node_id,
-        key: node.key,
-        title: node.title,
-        goal: node.goal ?? node.title,
-        attempt,
-      }, startedEventId);
+    let worktree: WorktreeRecord | null = null;
+    let keepWorktreeForReview = false;
+    try {
+      for (let i = 1; i <= totalAttempts; i++) {
+        const attempt = baseAttempts + i;
+        this.#tasks.setNodeRunning(node.node_id, attempt);
 
-      outcome = await this.#attemptNode(taskId, node, attempt, nodeStarted.eventId);
+        // M2-T4：代码节点（resources.git_repo）每次尝试前 prepare worktree——
+        // 幂等（同任务同节点复用同目录）且重置回基线（retry 拿到干净起点）。
+        // prepare 走主区仓库互斥（与合并同一把锁，按声明路径分键）：并发 `git
+        // worktree add` 会在 git 锁文件上竞争，串行化消除该瞬态失败源。
+        let prepareError: string | null = null;
+        if (gitRepo !== undefined) {
+          if (this.#worktrees === null) {
+            prepareError = "node declares resources.git_repo but the scheduler has no worktree manager configured";
+          } else {
+            try {
+              worktree = await this.#withRepoMutex(gitRepo.path, () => this.#worktrees!.prepare({
+                repoPath: gitRepo.path,
+                taskId,
+                nodeId: node.node_id,
+                key: node.key,
+                ...(gitRepo.branch === undefined ? {} : { branch: gitRepo.branch }),
+              }));
+            } catch (err) {
+              worktree = null;
+              prepareError = `worktree prepare failed: ${errorMessage(err)}`;
+            }
+          }
+        }
 
-      const status = outcome.ok ? "completed" : "failed";
-      const payload: Record<string, unknown> = {
-        node_id: node.node_id,
-        key: node.key,
-        status,
-        attempt,
-      };
-      if (outcome.text.length > 0) payload.result = outcome.text;
-      if (!outcome.ok && outcome.error !== undefined) payload.error = outcome.error;
-      if (outcome.stopReason !== undefined) payload.stop_reason = outcome.stopReason;
-      this.#appendTaskEvent(taskId, TASK_EVENT_TYPES.taskNodeFinished, payload, nodeStarted.eventId);
+        const nodeStarted = this.#appendTaskEvent(taskId, TASK_EVENT_TYPES.taskNodeStarted, {
+          node_id: node.node_id,
+          key: node.key,
+          title: node.title,
+          goal: node.goal ?? node.title,
+          attempt,
+          ...(worktree === null ? {} : {
+            worktree: { dir: worktree.dir, branch: worktree.branch, base: worktree.base },
+          }),
+        }, startedEventId);
 
-      if (outcome.ok) {
-        this.#tasks.setNodeFinished(node.node_id, "completed", { result: outcome.text });
-        return;
+        if (prepareError !== null) {
+          outcome = { ok: false, text: "", error: prepareError };
+        } else {
+          outcome = await this.#attemptNode(taskId, node, attempt, nodeStarted.eventId, worktree);
+
+          // M2-T4：Agent Loop 成功的代码节点 → worktree 变更合回主区
+          if (outcome.ok && worktree !== null && gitRepo !== undefined) {
+            const merge = await this.#mergeNodeWorktree(taskId, node, worktree, gitRepo.verify, nodeStarted.eventId);
+            if (merge.kind === "conflict") {
+              // 冲突 → pending_review（needs_reconcile 语义的节点级落地）：不重试，
+              // 等 Owner 核对；worktree/分支保留作调解证据，任务转 waiting_input
+              keepWorktreeForReview = true;
+              this.#tasks.setNodeState(node.node_id, { status: "pending_review", result: outcome.text });
+              this.#appendTaskEvent(taskId, TASK_EVENT_TYPES.taskMergeConflict, {
+                node_id: node.node_id,
+                key: node.key,
+                branch: worktree.branch,
+                base: worktree.base,
+                repo: worktree.repoPath,
+                worktree_dir: worktree.dir,
+                files: merge.files,
+                note: "conflict kept in the worktree branch; reconcile then re-run or complete the node",
+              }, nodeStarted.eventId);
+              this.#appendTaskEvent(taskId, TASK_EVENT_TYPES.taskNodeFinished, {
+                node_id: node.node_id,
+                key: node.key,
+                status: "pending_review",
+                attempt,
+                result: outcome.text,
+              }, nodeStarted.eventId);
+              return;
+            }
+            if (merge.kind === "merged") {
+              this.#appendTaskEvent(taskId, TASK_EVENT_TYPES.taskMerged, {
+                node_id: node.node_id,
+                key: node.key,
+                branch: worktree.branch,
+                base: worktree.base,
+                merged_commit: merge.merged_commit,
+                files: merge.files,
+                validated_by: merge.validated_by,
+                worktree_dir: worktree.dir,
+              }, nodeStarted.eventId);
+            } else {
+              // 合并验证失败（empty_merge / verify_failed / git_failed）→ 按尝试失败走
+              // 重试/终态路径（主区已回滚，下一尝试重置 worktree 从基线重来）
+              outcome = { ok: false, text: outcome.text, error: merge.error };
+            }
+          }
+        }
+
+        const status = outcome.ok ? "completed" : "failed";
+        const payload: Record<string, unknown> = {
+          node_id: node.node_id,
+          key: node.key,
+          status,
+          attempt,
+        };
+        if (outcome.text.length > 0) payload.result = outcome.text;
+        if (!outcome.ok && outcome.error !== undefined) payload.error = outcome.error;
+        if (outcome.stopReason !== undefined) payload.stop_reason = outcome.stopReason;
+        this.#appendTaskEvent(taskId, TASK_EVENT_TYPES.taskNodeFinished, payload, nodeStarted.eventId);
+
+        if (outcome.ok) {
+          this.#tasks.setNodeFinished(node.node_id, "completed", { result: outcome.text });
+          return;
+        }
+        this.#tasks.setNodeFinished(node.node_id, "failed", { error: outcome.error });
+        // retriable 且未用尽尝试 → 继续循环重试；否则保持 failed 由主循环收敛任务状态
       }
-      this.#tasks.setNodeFinished(node.node_id, "failed", { error: outcome.error });
-      // retriable 且未用尽尝试 → 继续循环重试；否则保持 failed 由主循环收敛任务状态
+    } finally {
+      // 资源锁释放：节点到达终态（completed/failed/pending_review）一律释放（M2-T4）
+      if (lockKeys.length > 0 && this.#locks !== null) {
+        this.#locks.releaseAll(taskId, node.node_id);
+      }
+      // worktree 清理：已合并/失败 → 清掉（目录 + 分支）；冲突挂起 → 保留（调解证据）
+      if (worktree !== null && !keepWorktreeForReview && this.#worktrees !== null) {
+        try {
+          await this.#worktrees.cleanup(worktree);
+        } catch (err) {
+          console.error("[morrow] worktree cleanup failed:", err);
+        }
+      }
     }
+  }
+
+  /**
+   * worktree 变更 → 提交到 worktree 分支 → 合回主区（按仓库路径互斥串行化）。
+   * 空变更即合并验证失败（diff 非空断言）；verify 命令由 mergeToBase 在主区执行。
+   */
+  async #mergeNodeWorktree(
+    taskId: string,
+    node: TaskNodeRecord,
+    worktree: WorktreeRecord,
+    verify: string | undefined,
+    nodeStartedEventId: string,
+  ): Promise<NodeMergeResult> {
+    void nodeStartedEventId; // 事件统一由 #runNode 按行→事件次序写；此处仅计算结果
+    let committed: { commit: string | null; files: number };
+    try {
+      committed = await (this.#worktrees as WorktreeManager).commitChanges(
+        worktree,
+        `morrow: node ${node.key} (task ${taskId})`,
+      );
+    } catch (err) {
+      return { kind: "failed", error: `worktree commit failed: ${errorMessage(err)}` };
+    }
+    if (committed.commit === null) {
+      return {
+        kind: "failed",
+        error: "merge validation failed: worktree produced no changes (empty diff against baseline; code nodes must produce changes)",
+      };
+    }
+    return this.#withRepoMutex(worktree.repoPath, async () => {
+      const outcome = await (this.#worktrees as WorktreeManager).mergeToBase(
+        worktree,
+        verify === undefined ? {} : { verify },
+      );
+      if (outcome.ok) {
+        return { kind: "merged", merged_commit: outcome.merged_commit, files: outcome.files, validated_by: outcome.validated_by };
+      }
+      if (outcome.kind === "conflict") {
+        return { kind: "conflict", files: outcome.files ?? [] };
+      }
+      return { kind: "failed", error: `merge ${outcome.kind}: ${outcome.error ?? "unknown"}` };
+    });
+  }
+
+  /** 主区合并互斥：同一仓库的合并串行化（前驱失败不阻塞后续；进程内口径） */
+  #withRepoMutex<T>(repoPath: string, fn: () => Promise<T>): Promise<T> {
+    const prev = this.#repoMerges.get(repoPath) ?? Promise.resolve();
+    const run = prev.then(fn, fn);
+    this.#repoMerges.set(repoPath, run.then(() => undefined, () => undefined));
+    return run;
+  }
+
+  /** 派发期失败（资源配置错误等非尝试性失败）：直接落 failed 留痕，不进尝试循环 */
+  #failNodeAtDispatch(taskId: string, node: TaskNodeRecord, startedEventId: string, message: string): void {
+    this.#tasks.setNodeFinished(node.node_id, "failed", { error: message });
+    this.#appendTaskEvent(taskId, TASK_EVENT_TYPES.taskNodeFinished, {
+      node_id: node.node_id,
+      key: node.key,
+      status: "failed",
+      error: message,
+    }, startedEventId);
   }
 
   /** 单次尝试：取运行时（工厂抛错即失败）→ 驱动 Agent Loop → 产出结果 */
@@ -551,6 +795,7 @@ export class TaskScheduler {
     node: TaskNodeRecord,
     attempt: number,
     nodeStartedEventId: string,
+    worktree: WorktreeRecord | null,
   ): Promise<NodeOutcome> {
     const input: TaskNodeExecInput = {
       taskId,
@@ -561,6 +806,17 @@ export class TaskScheduler {
       ...(node.agent_role === undefined ? {} : { agentRole: node.agent_role }),
       ...(node.model === undefined ? {} : { model: node.model }),
       attempt,
+      ...(node.resources === undefined ? {} : { resources: node.resources }),
+      // 代码节点的工作区（M2-T4）：工具装配层据此把 sandboxed 调用的 workspace
+      // 指向 worktree（SandboxToolPackage.workspaceDir 同一契约）
+      ...(worktree === null ? {} : {
+        workspace: {
+          dir: worktree.dir,
+          repoPath: worktree.repoPath,
+          branch: worktree.branch,
+          base: worktree.base,
+        },
+      }),
     };
     let runtime: AgentRuntime;
     try {
