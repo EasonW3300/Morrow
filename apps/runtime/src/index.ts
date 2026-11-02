@@ -3,8 +3,7 @@
  * 库形态供桌面宿主内嵌与测试使用；独立进程入口是 src/main.ts。
  */
 export { EventLedger, LedgerError, DB_FILE_NAME } from "./ledger.ts";
-export type {
-  IntegrityMismatch,
+export type {  IntegrityMismatch,
   IntegrityReport,
   LedgerEntry,
   LedgerListOptions,
@@ -39,8 +38,7 @@ export {
   validatePlannedDag,
   planWithRuntime,
 } from "./tasks.ts";
-export type {
-  PlannerFactory,
+export type {  PlannerFactory,
   PlannedNodeInput,
   PlannedNode,
   PlannedDag,
@@ -50,8 +48,7 @@ export type {
   TaskErrorCode,
 } from "./tasks.ts";
 export { TaskScheduler, DEFAULT_TASK_CONCURRENCY } from "./scheduler.ts";
-export type {
-  NodeAgentFactory,
+export type {  NodeAgentFactory,
   TaskNodeExecInput,
   TaskSchedulerOptions,
   PauseResult,
@@ -65,8 +62,7 @@ export {
   TASK_CHECKPOINT_EVENT_TYPES,
   planReconcile,
 } from "./checkpoint.ts";
-export type {
-  CheckpointNodeSnapshot,
+export type {  CheckpointNodeSnapshot,
   CheckpointPendingSideEffect,
   CheckpointRecord,
   CheckpointSnapshot,
@@ -93,8 +89,7 @@ export {
   validateManifest,
   validatePermissionGrant,
 } from "./capabilities/engine.ts";
-export type {
-  CapabilityErrorCode,
+export type {  CapabilityErrorCode,
   PermissionEngineOptions,
   RegisterResult,
   RuntimeUseDecision,
@@ -105,8 +100,7 @@ export { ensureCapabilityTables, CAPABILITY_TABLES_SQL } from "./capabilities/mi
 export { capabilityRoutes } from "./capabilities/routes.ts";
 export { ensureBuiltinCapabilities, builtinCapabilityManifests, MEMORY_WRITE_CAPABILITY_MANIFEST } from "./capabilities/builtin.ts";
 export { MemoryStore, normalizeForFts, buildFtsQuery } from "./memory/store.ts";
-export type {
-  CandidateStatus,
+export type {  CandidateStatus,
   ConflictReason,
   ConflictResolution,
   CreateCandidateInput,
@@ -125,8 +119,7 @@ export {
   MEMORY_WRITE_RULE,
   AUTO_CONSOLIDATE_MIN_CONFIDENCE,
 } from "./memory/service.ts";
-export type {
-  MemoryWriteResult,
+export type {  MemoryWriteResult,
   ObserveUserMessageInput,
   MemoryControlErrorCode,
   ConsolidationRunSummary,
@@ -134,8 +127,7 @@ export type {
 export { HeuristicExtractor } from "./memory/extraction.ts";
 export type { ExtractedCandidate, ExtractionInput, MemoryExtractor } from "./memory/extraction.ts";
 export { DefaultConsolidator, salientTokens } from "./memory/consolidator.ts";
-export type {
-  ConsolidationAction,
+export type {  ConsolidationAction,
   ConsolidationCandidateView,
   ConsolidationFactView,
   ConsolidationInput,
@@ -146,6 +138,33 @@ export { detectHighValue } from "./memory/heuristics.ts";
 export type { HighValueMatch, HighValueRule } from "./memory/heuristics.ts";
 export { probeSandbox } from "./health.ts";
 export type { SandboxProbe, SandboxStatus } from "./health.ts";
+// 沙箱执行 Worker（M2-T2 / Issue #23）：SandboxRunner 接缝 + 默认容器实现 + 检测器 + 调用接缝
+export { ToolInvoker, UnknownToolError } from "./sandbox/invoker.ts";
+export type { InvocationResult, InvokeContext, ToolRegistration, ToolInvokerOptions } from "./sandbox/invoker.ts";
+export { DockerRunner, DEFAULT_SANDBOX_IMAGE, defaultDockerExec } from "./sandbox/docker-runner.ts";
+export { SandboxError, SandboxUnavailableError } from "./sandbox/runner.ts";
+export type { SandboxErrorCode, SandboxResult, SandboxRunner, SandboxToolPackage } from "./sandbox/runner.ts";
+export { detectContainerRuntime, INSTALL_HINT } from "./sandbox/detect.ts";
+export type {  ContainerEngine,
+  ContainerRuntimeInfo,
+  DetectContainerRuntimeOptions,
+  SandboxAvailability,
+} from "./sandbox/detect.ts";
+export { DEFAULT_SANDBOX_RESOURCES, normalizeSandboxContract, SandboxContractError } from "./sandbox/contract.ts";
+export type { SandboxContract, SandboxContractInput, SandboxResources } from "./sandbox/contract.ts";
+export { buildDockerRunArgs } from "./sandbox/docker-args.ts";
+export { errorEnvelope, parseToolEnvelope, resultEnvelope } from "./sandbox/protocol.ts";
+export { runGoWorker } from "./sandbox/go-worker.ts";
+export type { GoWorkerResult } from "./sandbox/go-worker.ts";
+export { createLocalPermissionEngine, createRegistryPermissionAdapter, PermissionDeniedError } from "./sandbox/permission.ts";
+export type {
+  RegistryRuntimeChecker,
+  RuntimeUseContext,
+  RuntimeUseRequest,
+  SandboxPermissionEngine,
+  ToolManifestLite,
+  ToolPermissions,
+} from "./sandbox/permission.ts";
 export { uuidv7 } from "./uuid-v7.ts";
 export { openSqlite } from "./db.ts";
 export type { SqliteDatabase, SqliteStatement, SqliteParam } from "./db.ts";
@@ -154,8 +173,7 @@ export {
   ProviderRegistryError,
   ENV_PROVIDER_ID,
 } from "./providers.ts";
-export type {
-  ProviderRecord,
+export type {  ProviderRecord,
   ProviderRegistryOptions,
   ProviderResolver,
   ResolvedProvider,

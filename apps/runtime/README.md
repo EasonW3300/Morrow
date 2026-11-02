@@ -65,7 +65,7 @@ provider 参数）；凭据库可经 `startRuntime(config, { secretStore })` 注
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/v1/health` | `{ status: "ok", version, replica_id, sandbox, ledger: { events } }`；沙箱探针为桩，恒返回 `not-configured`（明确第四态，M0 不装 Docker） |
+| GET | `/v1/health` | `{ status: "ok", version, replica_id, sandbox, ledger: { events } }`；沙箱探针（M2-T1 / Issue #22 真实化）：`not_configured`（MORROW_SANDBOX_PROBE=off）/ `missing` / `daemon_down` / `ready`（带 engine/version，missing/daemon_down 带 install_hint） |
 | GET | `/v1/events` | `{ events: EventEnvelope[], total, limit, offset }`；query：`limit`（1–200，默认 50）、`offset`、`replica_id`（uuid 过滤）；非法入参 400 |
 | POST | `/v1/sessions` | 建会话，body `{ title?, provider_id? }`（provider_id 需已注册，或为 env 回退）→ 201 `{ session_id, event_id, sequence, occurred_at, provider_id?, title? }`；未知 provider_id → 400 `unknown_provider` |
 | GET | `/v1/sessions` | 会话列表（`session.created` 投影，含显式 `provider_id`）→ `{ sessions: [...] }` |
@@ -503,7 +503,10 @@ src/
                    tool.ts       memory.write 工具（PiAdapter tools 通道注册）
                    routes.ts     facts/candidates/conflicts 控制面端点
   config.ts      环境变量解析（含 Provider 三元组 env 回退种子）+ 副本身份持久化
-  health.ts      沙箱可用性探针（M0 桩）
+  sandbox/       沙箱执行 Worker（M2-T2 / Issue #23，详见下节）
+  health.ts      沙箱可用性探针（M2-T1 / Issue #22 真实化：which+daemon 探测四级状态；
+                   M2-T2 的 sandbox/detect.ts 服务 Runner 执行路径，两处口径独立维护）
+  capabilities/  能力注册表与权限模型（M2-T1 / Issue #22）：PermissionEngine 单一入口
   uuid-v7.ts     UUID v7 生成 + 小写 uuid 形态正则 UUID_RE（config / runtime 共用）
   index.ts       公共出口（库形态供桌面宿主内嵌）
 scripts/
@@ -514,5 +517,100 @@ test/         node:test：ledger / server / config / lifecycle / sessions / keyr
               （pause/resume/restore 编排）/ checkpoint.api（HTTP 介入端点）/
               checkpoint.faults（故障注入套件，AC-07）/ memory（heuristics / store / store2 巩固
               写路径 / consolidator 决策矩阵 / pipeline 管线 / api 检索 / pipeline.api 抽取巩固
-              端到端）等 seam
+              端到端）/ sandbox（contract / detect / runner-units / docker-runner / invoker /
+              permission / go-worker / wiring / docker 真实容器套件）等 seam
 ```
+
+## 沙箱执行 Worker（M2-T2 / Issue #23，PRD §2 执行隔离 + FR-CAP-4）
+
+**安全语义（GLOSSARY Sandbox）**：沙箱是运行 AI 生成代码的隔离执行环境；无可用沙箱时
+**拒绝执行生成代码**（fail-closed，不降级直跑）。vetted builtin（human 签发的 Go Worker）
+不经沙箱，不受影响。
+
+### 分层与接缝
+
+```
+ToolInvoker（src/sandbox/invoker.ts）  ← startRuntime 注入 seam：RuntimeOptions.sandboxRunner / permissionEngine
+  │  同一注册（register(manifest, package)）+ 调用（invoke(name, input)）接缝
+  │  固定次序：查注册表 → PermissionEngine.assertRuntimeUse（执行前复核）→ 分发
+  ├─ sandbox.type=builtin → go-worker.ts 直跑（Go 编译产物，stdio JSON，SIGKILL 超时）
+  └─ sandbox.type=container → SandboxRunner.run(pkg, input, contract)
+        └─ DockerRunner（docker-runner.ts）：esbuild 预打包 → docker run → SandboxResult
+```
+
+- **SandboxRunner 接缝**（`src/sandbox/runner.ts`）：`run(toolPackage, input, contract) → Promise<SandboxResult>`。
+  接口注入（`RuntimeOptions.sandboxRunner`）；测试/宿主注入 FakeRunner，本机无 docker 时
+  sandboxed 调用拒绝而 builtin 照常（Runner 仅服务 sandboxed 类）。
+- **契约**（`src/sandbox/contract.ts`）：manifest.sandbox 规范化——`network` v1 仅 `none`
+  （默认）、`filesystem` 仅 `workspace-only`（默认）、`resources` 缺省 `{cpus:1, memoryMb:256,
+  timeoutMs:30000}`；未知取值/超限 → `SandboxContractError`（注册时 fail fast）。
+- **工具回传协议**（`src/sandbox/protocol.ts`）：工具以 stdin 收 JSON 输入、stdout **最后一个
+  非空行**输出单行信封 `{"ok":true,"result":…}` / `{"ok":false,"error":"…"}`；stderr 承载诊断。
+  TS 与 Go 工具同一协议（ADR-0006：沙箱内工具不碰主库，一切结果经协议回传由 Runtime 落账）。
+
+### 容器实现强制项（DockerRunner）
+
+| 契约项 | docker 落地 | 测试证据 |
+| --- | --- | --- |
+| network: none | `--network none` | 容器内 fetch 出网探针失败（`sandbox.docker.test.ts`，失败原因随 result 回传） |
+| filesystem: workspace-only | workspace 挂载（声明 FS 权限 → rw，未声明不挂载）+ 包目录 `:ro` + `--read-only` 根 FS + `/tmp` tmpfs | workspace 内可读可写、workspace 外宿主路径 ENOENT、容器根路径写入 EROFS |
+| resources | `--cpus` / `--memory` | 64MB 上限下分配 160MB → OOM 退出 137 |
+| timeout | 按容器名 `docker kill` 强杀 | sleep 5s / timeout 1.2s → `timed_out` + 退出 137 |
+| 纵深加固 | `--pids-limit 128`、`--security-opt no-new-privileges`、无 tty（stdout 干净） | `sandbox.runner-units.test.ts`（args 纯函数锁旗标） |
+
+镜像拉取策略：`node:22-alpine` 首次执行按需 pull（先 `image inspect`，缺失才 pull，
+结果 `pulled: true` 记录一次拉取；不预拉不阻塞启动）。打包产物为 `.mjs`（容器内无
+package.json，靠扩展名保证按 ESM 执行）。esbuild 经动态 import 引入（devDependency；
+单二进制路线的打包决策留 M2-T3，探针不触发该路径）。
+
+### 拒绝路径（无容器运行时）
+
+`detectContainerRuntime`（`src/sandbox/detect.ts`，探测命令可桩注入）按 docker → podman
+顺序探测；macOS 上 Docker Desktop 与 OrbStack 共用 docker CLI，按 info 的
+OperatingSystem 字段归类 orbstack；Windows 探 docker.exe，缺失再探 WSL2（子系统在但
+无引擎 → WSL2 专项指引）；CLI 在但 daemon 不可达 → 指引点名启动 daemon。
+不可用 → sandboxed 调用抛 `SandboxUnavailableError`：
+
+- code：`sandbox_unavailable`，附对应 OS 的 `installHint`（macOS: Docker Desktop /
+  OrbStack；Linux: Docker Engine / Podman；Windows: WSL2 + Docker Desktop）。
+- HTTP 映射约定（接入路由层时按此执行）：`sandbox_unavailable` → **503**；
+  `permission_denied` → 403；`invalid_sandbox_contract` / `tool_package_unsupported` → 400；
+  `tool_timeout` → 504；`tool_error` / `tool_exit_nonzero` / `tool_protocol_error` /
+  `tool_output_too_large` → 502（工具自身失败）；`image_pull_failed` / `tool_build_failed` → 503/500。
+
+### 运行时权限复核（M2-T1 单一入口，已对齐）
+
+执行前固定调用 `SandboxPermissionEngine.assertRuntimeUse({manifest, contract, input,
+context})`（`src/sandbox/permission.ts`，执行链接缝）。生产默认 = `createRegistryPermissionAdapter`
+双道复核（merger 对齐件）：第一道本地确定性基线（fail-closed：manifest 声明 network 权限
+但契约为 none → 拒绝；输入含 workspace 外绝对路径 → 执行前拒绝；builtin 同样过复核），
+第二道 M2-T1 `PermissionEngine.assertRuntimeUse(name, CapabilityUseRequest)`（存在/enabled/
+五维 ⊆ manifest ∩ grant；workspace:// 输入派生为 workspace 下具体路径传入；
+CapabilityError → PermissionDeniedError）。测试/宿主可经 `RuntimeOptions.permissionEngine`
+注入桩。
+
+### Go Worker 示范（workers/go）
+
+首个真实 Go 工具 `textstats`（行/词/字节统计 + 文本规范化；PRD §2 双语言）：
+
+```bash
+workers/go/build.sh   # CGO_ENABLED=0 go build → bin/textstats（宿主平台；go ≥1.25）
+```
+
+注册形态 `manifest {author:"human", runtime:"go", sandbox:{type:"builtin"}}`，经
+ToolInvoker 同一接缝注册 + 调用（`test/sandbox.go-worker.test.ts`：本机有 go 真编译真跑，
+无 go 且无产物 → skip 并注明理由）。协议与容器内 TS 工具一致（protocol.ts）。
+
+### 测试与 CI
+
+```bash
+pnpm --filter @morrow/runtime test:sandbox   # 仅沙箱族（真实容器路径 + 注入桩路径）
+pnpm --filter @morrow/runtime test           # 全量（含沙箱族）
+```
+
+- 真实容器套件（`sandbox.docker.test.ts`）顶部先探测容器运行时：不可用 → 整套 skip 并
+  注明理由（CI 仅 ubuntu 腿跑：runner 预装 docker；macos/windows runner 无 docker，
+  m0.yml `sandbox-tests` job 已标注）。
+- 其余沙箱测试（契约/检测/args/协议/invoker/权限/wiring/go-worker）零 docker 零网络零
+  LLM——fake exec / FakeRunner / 探测桩注入。
+- 真实容器套件首次运行会拉取 node:22-alpine（约 20–60s），后续复用本地镜像。

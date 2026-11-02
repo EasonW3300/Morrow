@@ -1,4 +1,5 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { join } from "node:path";
 import { createPiAdapter, type AgentRuntime, type MorrowTool } from "@morrow/pi-adapter";
 import packageJson from "../package.json" with { type: "json" };
 import piAdapterPackageJson from "../../../packages/pi-adapter/package.json" with { type: "json" };
@@ -26,6 +27,10 @@ import { buildEventEnvelope } from "./envelope.ts";
 import { computeIntegrityHash, type EventEnvelope } from "@morrow/protocol";
 import { UUID_RE } from "./uuid-v7.ts";
 import { parsePaging, readJsonBody, sendError, sendJson } from "./http-util.ts";
+import { DockerRunner } from "./sandbox/docker-runner.ts";
+import { ToolInvoker } from "./sandbox/invoker.ts";
+import { createRegistryPermissionAdapter, type SandboxPermissionEngine } from "./sandbox/permission.ts";
+import type { SandboxRunner } from "./sandbox/runner.ts";
 
 /**
  * Runtime HTTP 服务（PRD §6.2 的 M0 子集 + M1 任务族 + M2-T1 能力族）。
@@ -122,6 +127,18 @@ export interface RuntimeOptions {
    * LLM 抽取（经 PiAdapter）。
    */
   memoryExtractor?: MemoryExtractor;
+  /**
+   * 沙箱执行 Runner 注入 seam（M2-T2 / Issue #23）：缺省 = DockerRunner（探测本机
+   * 容器运行时 docker/podman/OrbStack；无运行时 → sandboxed 调用拒绝）。测试注入
+   * FakeRunner（零 docker）；Runner 仅服务 sandboxed 类工具，builtin 不经此路径。
+   */
+  sandboxRunner?: SandboxRunner;
+  /**
+   * 权限引擎注入 seam（M2-T2 接口桩，M2-T1 / Issue #22 单一入口合并后接管）：执行前
+   * 运行时复核 assertRuntimeUse。缺省 = 确定性本地判定桩（network 矛盾 / workspace
+   * 越界的 fail-closed 基线）。
+   */
+  permissionEngine?: SandboxPermissionEngine;
 }
 
 export interface RuntimeHandle {
@@ -144,6 +161,8 @@ export interface RuntimeHandle {
   tasks: TaskService;
   /** Checkpoint 服务（库形态可直用：createCheckpoint / 列表 / restore 落地；M1-T5） */
   checkpoints: CheckpointService;
+  /** 沙箱工具调用接缝（M2-T2 / Issue #23：sandboxed 与 builtin Go Worker 的统一注册/调用） */
+  sandbox: ToolInvoker;
   /**
    * 优雅停止：停止接收请求 → 中止并释放会话运行时与在跑任务节点 → 记账 runtime.stopped
    * → 关闭任务投影库与账本（WAL checkpoint）。signal 传入收到的 POSIX 信号名，
@@ -300,6 +319,17 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     checkpoints,
     ...(options.taskConcurrency === undefined ? {} : { concurrency: options.taskConcurrency }),
   });
+  // 沙箱执行 Worker（M2-T2 / Issue #23）：ToolInvoker 统一接缝。runner 缺省 DockerRunner
+  // （每次执行前探测容器运行时；无运行时 → sandboxed 调用拒绝 sandbox_unavailable +
+  // install-hint）。权限引擎缺省 = M2-T1 注册表复核适配器（createRegistryPermissionAdapter，
+  // 本地基线 + capabilities.assertRuntimeUse 双道）；注入 seam（RuntimeOptions.permissionEngine）
+  // 保留给测试/宿主。Runner 仅服务 sandboxed 类；builtin（Go Worker）不经容器直跑。
+  const workspaceRoot = join(config.dataDir, "workspace");
+  const sandbox = new ToolInvoker({
+    runner: options.sandboxRunner ?? new DockerRunner(),
+    permissionEngine: options.permissionEngine ?? createRegistryPermissionAdapter({ registry: capabilities, workspaceRoot }),
+    workspaceRoot,
+  });
   const ctx: RequestContext = { ledger, replicaId: config.replicaId, sessions, providers, devices, tasks, scheduler, checkpoints, memory, projector, capabilities };
   const server = createServer((req, res) => {
     routeRequest(req, res, ctx);
@@ -341,6 +371,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     memory,
     projector,
     capabilities,
+    sandbox,
     async close(signal?: string): Promise<void> {
       if (closing) return;
       closing = true;
