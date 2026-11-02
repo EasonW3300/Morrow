@@ -65,7 +65,8 @@ function registerCapability(capabilities: PermissionEngine, name: string): void 
     input_schema: { type: "object" },
     output_schema: { type: "object" },
     sandbox: { type: "none", network: "none", filesystem: "none" },
-    tests: [],
+    // tests 非空 → verified=true（#22 修复批：Skill 引用校验要求 enabled AND verified）
+    tests: ["positive.yaml"],
   });
 }
 

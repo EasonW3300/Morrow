@@ -146,12 +146,13 @@ function createScriptedGenerator(): CapabilityGenerator {
 }
 
 /**
- * Skill invoke 的真实执行注入（RuntimeOptions.skillInvoker 公开 seam）。
- * 已知缺口（T7 如实报告）：runtime 缺省 invoker = ToolInvoker，但产品代码从未向
- * ToolInvoker 注册任何工具（builtin 实现留在会话层工厂）——缺省 invoke 必然
- * unknown_tool，T5 演示链路仅在注入 invoker 的测试里成立。夹具在此注入 memory.write
- * 的真实 builtin 实现（与 Agent Loop 同一条 createMemoryWriteTool 执行路径，写真实
- * 记忆服务），不伪造结果；运行时复核面（assertRuntimeUse）待 T5 缺口修复后补齐。
+ * Skill invoke 的执行注入（RuntimeOptions.skillInvoker 公开 seam）。
+ * 缺省接线缺口已由 #22 修复批闭合：runtime 启动时把注册表 enabled 能力登记进
+ * ToolInvoker（memory.write 为进程内执行条目），缺省 invoke 不再必然 unknown_tool。
+ * 夹具仍注入自有实现，原因有二：① memory.write 的归属语义要求会话里有 user message——
+ * 夹具懒创建演示会话并补 user message（真实来源回链），缺省链路无会话上下文时由工具
+ * 自身语义拒绝；② 与 Agent Loop 同一条 createMemoryWriteTool 执行路径，写真实记忆服务，
+ * 不伪造结果。
  */
 let runtimeHandle: Awaited<ReturnType<typeof startRuntime>> | null = null;
 /** 懒创建的演示会话（memory.write 的归属语义要求会话里有 user message） */

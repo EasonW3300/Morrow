@@ -2,6 +2,7 @@ import { canonicalJson, type EventEnvelope } from "@morrow/protocol";
 import { buildEventEnvelope } from "../../envelope.ts";
 import type { EventLedger } from "../../ledger.ts";
 import { uuidv7 } from "../../uuid-v7.ts";
+import { CAPABILITY_EVENT_TYPES } from "../engine.ts";
 import { capabilityTokens } from "../factory/retriever.ts";
 import { SkillStore, type SkillCaseRow, type SkillRow } from "./store.ts";
 
@@ -16,9 +17,11 @@ import { SkillStore, type SkillCaseRow, type SkillRow } from "./store.ts";
  *                 自动产生提案（status=proposed + skill.proposed 事件）；失败重置 streak
  *                 （失败过的经验不可靠）。已有同组合 proposed/approved 提案时去重不重复
  *                 提案；被拒后再次达标允许新提案（名称加序号后缀）。
- *   3. 校验       Skill 只能引用 enabled 的已注册 capability——提案创建与批准时都校验，
- *                 悬空/停用引用拒绝（409 skill_dangling_reference）。自动提案来自真实
- *                 成功案例，天然有效；手动提案与中途停用由本校验拦截。
+ *   3. 校验       Skill 只能引用 enabled 且 verified 的已注册 capability（#22 修复批
+ *                 升级：GLOSSARY「已验证」——工厂沙箱验证 / builtin vetted / human 带
+ *                 测试；提案创建与批准时都校验，悬空/停用/未验证引用拒绝
+ *                 409 skill_dangling_reference）。自动提案来自真实成功案例，天然有效；
+ *                 手动提案与中途停用/收验证由本校验拦截。
  *   4. Owner 决策 approve（注册为可调用 Skill + skill.approved 事件）/ reject
  *                 （skill.rejected 事件；悬空引用被拒时记录 missing_capabilities）。
  *   5. 重用路径   invoke：参数模板填充（{{param}}）→ 逐步调用 steps 引用的 capability
@@ -35,6 +38,7 @@ export const SKILL_EVENT_TYPES = {
   proposed: "skill.proposed",
   approved: "skill.approved",
   rejected: "skill.rejected",
+  invoked: "skill.invoked",
 } as const;
 
 export type SkillErrorCode =
@@ -112,9 +116,9 @@ export interface SkillCase {
   occurred_at: string;
 }
 
-/** 能力注册表窄视图（PermissionEngine 结构匹配——校验引用存在且 enabled） */
+/** 能力注册表窄视图（PermissionEngine 结构匹配——校验引用存在、enabled 且 verified） */
 export interface SkillCapabilityLookup {
-  get(name: string): { record: { status: string } } | null;
+  get(name: string): { record: { status: string; verified?: boolean } } | null;
 }
 
 /** 能力调用接缝（ToolInvoker 结构匹配——invoke(name, input, context)） */
@@ -123,7 +127,7 @@ export interface SkillInvoker {
     name: string,
     input: unknown,
     context?: { actorId?: string; sessionId?: string },
-  ): Promise<{ ok: boolean; result?: unknown; error_code?: string; error?: string; via?: string }>;
+  ): Promise<{ ok: boolean; result?: unknown; error_code?: string; error?: string; via?: string; duration_ms?: number }>;
 }
 
 export interface SkillServiceOptions {
@@ -283,7 +287,7 @@ export class SkillService {
     if (missing.length > 0) {
       throw new SkillError(
         "dangling_reference",
-        `skill "${input.name}" references unknown or disabled capabilities: ${missing.join(", ")} (skills may only reference enabled, registered capabilities)`,
+        `skill "${input.name}" references unknown, disabled, or unverified capabilities: ${missing.join(", ")} (skills may only reference enabled, verified, registered capabilities)`,
         missing,
       );
     }
@@ -327,7 +331,7 @@ export class SkillService {
     const steps = JSON.parse(row.steps_json) as SkillStep[];
     const missing = this.#danglingReferences(steps);
     if (missing.length > 0) {
-      const reason = `dangling reference: ${missing.join(", ")} (capability unregistered or disabled since proposal)`;
+      const reason = `dangling reference: ${missing.join(", ")} (capability unregistered, disabled, or unverified since proposal)`;
       this.#applyDecision(row, "rejected", { ...JSON.parse(row.source_json) as Record<string, unknown>, reason, missing_capabilities: missing }, actorId, now, {
         reason,
         missingCapabilities: missing,
@@ -348,8 +352,10 @@ export class SkillService {
    * 上一步结果）→ 逐步调用 steps 引用的 capability 经 invoker（ToolInvoker——执行前
    * 运行时复核，Skill 不绕过安全边界）。arg_mapping 为空映射 = 参数整体透传（自动
    * 提案的默认重用形态）。步骤失败即停（后续不调用），结果按步投影。
+   * 审计（#26/威胁模型域 2，修复批贯通）：每步尝试落 capability.used、整链收尾落
+   * skill.invoked（先落事件后返回，与仓库「行先于事件/账本可追踪」口径一致）。
    */
-  async invoke(skillId: string, params: unknown, options: { actorId?: string } = {}): Promise<SkillInvokeResult> {
+  async invoke(skillId: string, params: unknown, options: { actorId?: string; sessionId?: string } = {}): Promise<SkillInvokeResult> {
     this.#assertOpen();
     const row = this.#store.getSkill(skillId);
     if (row === null) {
@@ -364,8 +370,10 @@ export class SkillService {
     if (typeof params !== "object" || params === null || Array.isArray(params)) {
       throw new SkillError("invalid_input", "params must be a JSON object when present");
     }
+    const actorId = options.actorId ?? "agent:skill";
     const input = params as Record<string, unknown>;
     const steps = JSON.parse(row.steps_json) as SkillStep[];
+    const startedAt = Date.now();
 
     // 前置缺失检查：{{result}} 之外的变量必须已在 params 里（任何调用发出前 400）
     const upfrontMissing = new Set<string>();
@@ -390,7 +398,10 @@ export class SkillService {
         throw new SkillError("missing_params", `skill "${row.name}" step ${index} is missing params: ${fill.missing.join(", ")}`);
       }
       try {
-        const call = await this.#invoker.invoke(step.capability_id, fill.args, { actorId: options.actorId ?? "agent:skill" });
+        const call = await this.#invoker.invoke(step.capability_id, fill.args, {
+          actorId,
+          ...(options.sessionId !== undefined ? { sessionId: options.sessionId } : {}),
+        });
         projected.push({
           index,
           capability_id: step.capability_id,
@@ -401,6 +412,7 @@ export class SkillService {
           ...(call.error !== undefined ? { error: call.error } : {}),
           ...(call.via !== undefined ? { via: call.via } : {}),
         });
+        this.#appendCapabilityUsed(step.capability_id, actorId, call, row.skill_id);
         if (call.ok !== true) {
           failedStep = index;
           break;
@@ -408,12 +420,24 @@ export class SkillService {
         previousResult = call.result;
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
+        const errorCode = err instanceof Error && "code" in err && typeof (err as { code?: unknown }).code === "string" ? (err as { code: string }).code : undefined;
         projected.push({ index, capability_id: step.capability_id, args: fill.args, ok: false, error: message });
+        this.#appendCapabilityUsed(step.capability_id, actorId, { ok: false, ...(errorCode !== undefined ? { error_code: errorCode } : {}), error: message }, row.skill_id);
         failedStep = index;
         break;
       }
     }
-    return { skill_id: row.skill_id, ok: failedStep === null, steps: projected, failed_step: failedStep };
+    const ok = failedStep === null;
+    this.#append(SKILL_EVENT_TYPES.invoked, actorId, {
+      skill_id: row.skill_id,
+      name: row.name,
+      ok,
+      steps: steps.length,
+      executed: projected.length,
+      failed_step: failedStep,
+      duration_ms: Date.now() - startedAt,
+    });
+    return { skill_id: row.skill_id, ok, steps: projected, failed_step: failedStep };
   }
 
   // --- 5. 检索复用（FR-CAP-1：缺能力查询命中已有 Skill → 重用路径而非新建） -------
@@ -596,12 +620,35 @@ export class SkillService {
     }
   }
 
-  /** 悬空/停用引用检测：steps 引用的能力必须已注册且 enabled；返回不合规的能力 id */
+  /** 步级审计：capability.used（actor/结果/耗时/via 随行；来源 Skill id 留链） */
+  #appendCapabilityUsed(
+    capabilityId: string,
+    actorId: string,
+    call: { ok: boolean; result?: unknown; error_code?: string; error?: string; via?: string; duration_ms?: number },
+    skillId: string,
+  ): void {
+    this.#append(CAPABILITY_EVENT_TYPES.used, actorId, {
+      capability: capabilityId,
+      ok: call.ok === true,
+      ...(call.error_code !== undefined ? { error_code: call.error_code } : {}),
+      ...(call.error !== undefined ? { error: call.error } : {}),
+      ...(call.via !== undefined ? { via: call.via } : {}),
+      ...(call.duration_ms !== undefined ? { duration_ms: call.duration_ms } : {}),
+      skill_id: skillId,
+      path: "skill",
+    });
+  }
+
+  /**
+   * 悬空/停用/未验证引用检测（#22 修复批：GLOSSARY「已验证」升级）：steps 引用的能力
+   * 必须已注册、enabled 且 verified（工厂沙箱验证 / builtin vetted / human 带测试）；
+   * 返回不合规的能力 id。
+   */
   #danglingReferences(steps: SkillStep[]): string[] {
     const missing: string[] = [];
     for (const capabilityId of new Set(steps.map((step) => step.capability_id))) {
       const record = this.#capabilities.get(capabilityId);
-      if (record === null || record.record.status !== "enabled") {
+      if (record === null || record.record.status !== "enabled" || record.record.verified !== true) {
         missing.push(capabilityId);
       }
     }
