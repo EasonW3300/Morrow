@@ -1,10 +1,12 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { createPiAdapter, type AgentRuntime, type MorrowTool } from "@morrow/pi-adapter";
 import packageJson from "../package.json" with { type: "json" };
 import piAdapterPackageJson from "../../../packages/pi-adapter/package.json" with { type: "json" };
 import { ensureBuiltinCapabilities, MEMORY_WRITE_CAPABILITY_MANIFEST } from "./capabilities/builtin.ts";
-import { PermissionEngine } from "./capabilities/engine.ts";
+import { CAPABILITY_EVENT_TYPES, PermissionEngine, type CapabilityLifecycleEvent } from "./capabilities/engine.ts";
+import type { CapabilityRecord } from "@morrow/protocol";
 import { capabilityRoutes } from "./capabilities/routes.ts";
 import { skillRoutes } from "./capabilities/skills/routes.ts";
 import { SkillService } from "./capabilities/skills/service.ts";
@@ -32,10 +34,11 @@ import { buildEventEnvelope } from "./envelope.ts";
 import { computeIntegrityHash, type EventEnvelope } from "@morrow/protocol";
 import { UUID_RE } from "./uuid-v7.ts";
 import { parsePaging, readJsonBody, sendError, sendJson } from "./http-util.ts";
+import { sendInvocationError } from "./invocation-errors.ts";
 import { LockTable } from "./locks.ts";
 import { WorktreeManager } from "./worktree.ts";
 import { DockerRunner } from "./sandbox/docker-runner.ts";
-import { ToolInvoker } from "./sandbox/invoker.ts";
+import { ToolInvoker, type InvocationResult } from "./sandbox/invoker.ts";
 import { createRegistryPermissionAdapter, type SandboxPermissionEngine } from "./sandbox/permission.ts";
 import type { SandboxRunner } from "./sandbox/runner.ts";
 
@@ -55,7 +58,9 @@ import type { SandboxRunner } from "./sandbox/runner.ts";
  * （POST /v1/memory/import 受控导入、DELETE /v1/memory/facts/:id 删除标记、
  * POST /v1/memory/project 投影再生成）、M2-T1 能力族
  * （POST/GET /v1/capabilities、GET/PUT /v1/capabilities/grants、
- * GET /v1/capabilities/:id、POST /v1/capabilities/:id/{enable,disable,rollback}）、
+ * GET /v1/capabilities/:id、POST /v1/capabilities/:id/{enable,disable,rollback}、
+ * POST /v1/capabilities/:id/invoke ——能力调用端点，#22 修复批 / FR-CAP-5：经
+ * ToolInvoker 统一执行链，错误码按 invocation-errors.ts 映射表落 HTTP 状态）、
  * M2-T5 Skill 族（GET /v1/capabilities/skills[?match=]、GET/POST
  * /v1/capabilities/skills/cases、POST /v1/capabilities/skills[...]、
  * POST .../skills/:id/{approve,reject}、POST .../skills/:id/invoke +
@@ -63,9 +68,11 @@ import type { SandboxRunner } from "./sandbox/runner.ts";
  * 未匹配路径 404，路径命中但方法不符 405（账本 append-only：对事件的任何变更
  * 方法在请求层即被拒绝）。
  * 生命周期：start 先监听后记账 runtime.started（携带实际端口），随后 builtin 工具
- * ensure-registered（memory.write，幂等）；close 先停收请求，再中止会话运行与在跑
- * 任务节点并释放 AgentRuntime，然后记账 runtime.stopped（causation 指向 started），
- * 最后关闭能力注册表、任务投影库与账本落盘。
+ * ensure-registered（memory.write，幂等），并把注册表全部 enabled 能力登记进
+ * ToolInvoker 调用接缝（enable/disable/rollback 生命周期事件经 onLifecycle 驱动
+ * 注册表的增删改——disable 后 invoke 报 unknown_tool）；close 先停收请求，再中止会话
+ * 运行与在跑任务节点并释放 AgentRuntime，然后记账 runtime.stopped（causation 指向
+ * started），最后关闭能力注册表、任务投影库与账本落盘。
  */
 
 /** 版本号唯一来源：本包 package.json（main.ts 的 ready 行也从这里取——不再双真相源） */
@@ -90,6 +97,8 @@ interface RequestContext {
   projector: MemoryProjector;
   /** 能力注册表（票 M2-T1：PermissionEngine 单一入口——注册校验/生命周期/运行时复核） */
   capabilities: PermissionEngine;
+  /** 沙箱工具调用接缝（M2-T2：invoke 端点与 Skill steps 共用的统一执行链） */
+  sandbox: ToolInvoker;
   /** 能力工厂（票 M2-T3：生成闭环编排——检索/规划/构建/验证/确认门） */
   factory: CapabilityFactory;
   /** Skill 服务（票 M2-T5：案例收集/晋升提案/Owner 决策/重用调用/检索） */
@@ -163,8 +172,9 @@ export interface RuntimeOptions {
   capabilityGenerator?: CapabilityGenerator;
   /**
    * Skill 能力调用接缝注入（M2-T5 / Issue #26）：Skill invoke 逐步调用 steps 引用的
-   * capability。缺省 = runtime 的 ToolInvoker（T2 统一调用接缝，执行前运行时复核——
-   * Skill 不绕过安全边界）；测试注入 FakeInvoker（零网络零 docker）。
+   * capability。缺省 = runtime 的 ToolInvoker（T2 统一调用接缝；#22 修复批起缺省接线
+   * 为真——enabled 能力经生命周期同步登记进注册表，执行前运行时复核）。测试仍可注入
+   * FakeInvoker（零网络零 docker）。
    */
   skillInvoker?: {
     invoke(name: string, input: unknown, context?: { actorId?: string }): Promise<{ ok: boolean; result?: unknown; error_code?: string; error?: string; via?: string }>;
@@ -245,6 +255,10 @@ const routes: Route[] = [
   // 的 `[^/]+` 会吞掉 /v1/capabilities/skills（grants 路由同款先具体后通配）
   ...skillRoutes,
   ...memoryRoutes,
+  // 能力调用端点（#22 修复批 / FR-CAP-5）：POST /v1/capabilities/:id/invoke（body = 工具
+  // input）——经 ToolInvoker 统一执行链（权限复核在链上），builtin 进程内直呼、sandboxed
+  // 走容器；capability.used 审计先落账本后返回。与既有生命周期路由无路径/方法冲突。
+  { method: "POST", re: /^\/v1\/capabilities\/([^/]+)\/invoke$/, handler: handleInvokeCapability },
   ...capabilityRoutes,
   // M2-T3 工厂端点（POST /v1/capabilities/request、GET /v1/capabilities/requests/:id、
   // POST /v1/capabilities/:id/confirm）——ctx.factory 桥接到 factory 自有路由签名
@@ -265,7 +279,16 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
   // 能力注册表（票 M2-T1 / Issue #22）：会话工具注入改查注册表（disable 即不再注入）；
   // builtin 工具的 ensure-registered 在 runtime.started 之后执行（审计顺序：进程启动 →
   // builtin 注册；幂等，同 dataDir 重启不产生新事件）。
-  const capabilities = new PermissionEngine({ dataDir: config.dataDir, ledger, replicaId: config.replicaId });
+  // 生命周期事件驱动调用面同步（#22 修复批 / FR-CAP-5）：onLifecycle 在注册/启停/回滚
+  // 审计事件落账本后回调——把 ToolInvoker 注册表与能力注册表保持同相（disable 即从
+  // 调用接缝摘除、enable/rollback 重新登记）。syncInvoker 晚绑定（sandbox 在其后构建）。
+  let syncInvoker: ((event: CapabilityLifecycleEvent) => void) | undefined;
+  const capabilities = new PermissionEngine({
+    dataDir: config.dataDir,
+    ledger,
+    replicaId: config.replicaId,
+    onLifecycle: (event) => syncInvoker?.(event),
+  });
   const providers = new ProviderRegistry({
     dataDir: config.dataDir,
     secretStore: options.secretStore ?? detectSecretStore().store,
@@ -309,6 +332,80 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     permissionEngine: options.permissionEngine ?? createRegistryPermissionAdapter({ registry: capabilities, workspaceRoot }),
     workspaceRoot,
   });
+  // 内置工具实现表（票 M2-T1）：注册表只管 manifest 与启停，实现工厂留在接线层。
+  // 新 builtin 工具在此追加工厂并加入 capabilities/builtin.ts 的 manifest 全集。
+  const builtinToolFactories: Record<string, (sessionId: string) => MorrowTool> = {
+    [MEMORY_WRITE_CAPABILITY_MANIFEST.name]: (sessionId) => createMemoryWriteTool({ service: memory, sessionId }),
+  };
+  // 能力 → 调用接缝登记（#22 修复批 / FR-CAP-5「能力调用路径做真」）：
+  //   builtin 实现存在（memory.write 等 human vetted 内置件）→ sandbox.type=process 进程内执行；
+  //   manifest.sandbox.type=container（工厂产物）→ 以最近确认请求的工厂包入口登记容器执行条目；
+  //   其余（无实现的 human 注册、无构建产物追踪的 go 注册）→ 跳过并告警（invoke 404，不静默假装可调）。
+  const registerCapabilityIntoInvoker = (record: CapabilityRecord): void => {
+    if (record.status !== "enabled") {
+      sandbox.unregister(record.name);
+      return;
+    }
+    const manifest = record.manifest;
+    const builtinFactory = builtinToolFactories[record.name];
+    if (builtinFactory !== undefined) {
+      sandbox.register({
+        manifest: {
+          name: manifest.name,
+          version: manifest.version,
+          author: manifest.author,
+          runtime: manifest.runtime,
+          permissions: manifest.permissions,
+          sandbox: { type: "process", network: "none", filesystem: "none" },
+        },
+        package: { name: manifest.name, kind: "typescript" },
+        inProcess: async (input, context) => {
+          // 归属会话：显式携带 sessionId 时用之；否则占位（memory.write 的来源回链要求
+          // 会话里有 user message，缺归属的实现自身报错——不伪造归属）
+          const tool = builtinFactory(context?.sessionId ?? "capability-invoke");
+          const outcome = await tool.execute(`invoke-${Date.now()}`, input ?? {});
+          return outcome.isError
+            ? { ok: false, error: outcome.text }
+            : { ok: true, result: { text: outcome.text } };
+        },
+      });
+      return;
+    }
+    if (manifest.sandbox.type === "container" && manifest.runtime === "typescript") {
+      const requestId = factory.latestConfirmedRequestIdByCapability(record.name);
+      const entry = requestId === null ? null : join(config.dataDir, "capability-factory", requestId, "package", "src", "entry.ts");
+      if (entry !== null && existsSync(entry)) {
+        sandbox.register({
+          manifest: {
+            name: manifest.name,
+            version: manifest.version,
+            author: manifest.author,
+            runtime: manifest.runtime,
+            permissions: manifest.permissions,
+            sandbox: { type: "container", network: "none", filesystem: "workspace-only" },
+          },
+          package: { name: manifest.name, kind: "typescript", entry },
+        });
+        return;
+      }
+      console.warn(
+        `[morrow] capability "${record.name}" has no factory package entry on disk; invoke will report unknown_tool until it is re-confirmed via the factory`,
+      );
+      sandbox.unregister(record.name);
+      return;
+    }
+    console.warn(
+      `[morrow] capability "${record.name}" (${manifest.runtime}/${manifest.sandbox.type}) has no executable implementation wired; invoke reports unknown_tool`,
+    );
+    sandbox.unregister(record.name);
+  };
+  syncInvoker = (event: CapabilityLifecycleEvent) => {
+    if (event.eventType === CAPABILITY_EVENT_TYPES.disabled) {
+      sandbox.unregister(event.record.name);
+      return;
+    }
+    registerCapabilityIntoInvoker(event.record);
+  };
   // Skill 服务（M2-T5 / Issue #26）：案例收集（tool.finished 观测 + 上报端点）→ 晋升
   // 提案 → Owner 批准 → invoke 重用。invoker 缺省 = ToolInvoker（T2 统一调用接缝，
   // 执行前 assertRuntimeUse 复核——Skill 只调用已验证 Tool，不绕过安全边界）。
@@ -320,11 +417,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     invoker: options.skillInvoker ?? sandbox,
     ...(options.skillPromotionThreshold === undefined ? {} : { promotionThreshold: options.skillPromotionThreshold }),
   });
-  // 内置工具实现表（票 M2-T1）：注册表只管 manifest 与启停，实现工厂留在接线层。
-  // 新 builtin 工具在此追加工厂并加入 capabilities/builtin.ts 的 manifest 全集。
-  const builtinToolFactories: Record<string, (sessionId: string) => MorrowTool> = {
-    [MEMORY_WRITE_CAPABILITY_MANIFEST.name]: (sessionId) => createMemoryWriteTool({ service: memory, sessionId }),
-  };
+  // 会话工具注入改查注册表（票 M2-T1）：enabled 且有内置实现的 typescript 能力才实例化
   const sessions = new SessionManager({
     ledger,
     replicaId: config.replicaId,
@@ -437,7 +530,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     memorySearch: (query) => memory.search(query).map((hit) => ({ content: hit.content, entry_kind: hit.stage })),
     workspaceRoot,
   });
-  const ctx: RequestContext = { ledger, replicaId: config.replicaId, sessions, providers, devices, tasks, scheduler, checkpoints, memory, projector, capabilities, factory, skills };
+  const ctx: RequestContext = { ledger, replicaId: config.replicaId, sessions, providers, devices, tasks, scheduler, checkpoints, memory, projector, capabilities, sandbox, factory, skills };
   const server = createServer((req, res) => {
     routeRequest(req, res, ctx);
   });
@@ -467,6 +560,12 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
   // builtin 工具 ensure-registered（票 M2-T1）：首见注册落 capability.registered（actor
   // agent:runtime），已注册同版本同内容 → no-op；builtin 常量与历史账本冲突时抛错（fail-fast）。
   ensureBuiltinCapabilities(capabilities);
+  // 调用接缝初始登记（#22 修复批 / FR-CAP-5）：把注册表里全部 enabled 能力登记进
+  // ToolInvoker（本进程新建的经 onLifecycle 已登记；这里覆盖重启场景——历史行不重放
+  // registered 事件）。登记失败的条目跳过并告警（invoke 404，不静默假装可调）。
+  for (const record of capabilities.list({ status: "enabled" })) {
+    registerCapabilityIntoInvoker(record);
+  }
   // Skill 案例回填（票 M2-T5）：重启后扫描历史 tool.finished 补齐案例表
   // （source_event 唯一约束幂等；streak 由此跨重启延续）。
   try {
@@ -971,6 +1070,91 @@ async function handleTestProvider(_req: IncomingMessage, res: ServerResponse, _u
   }
   const result = await testProviderConnectivity(resolved);
   sendJson(res, 200, result);
+}
+
+// --- M2 修复批：能力调用端点（#22 / FR-CAP-5）---------------------------------
+// POST /v1/capabilities/:id/invoke：body 即工具 input（JSON 对象）。执行链与 Skill steps
+// 完全同链——ToolInvoker（unknown_tool 404 → assertRuntimeUse 运行时复核 → builtin 进程
+// 内直呼 / sandboxed 容器执行）。审计：capability.used 先落账本后返回（成功/失败/耗时/
+// via 全留痕，威胁模型域 2 的调用可追踪口径）；HTTP 状态码按 invocation-errors.ts 的
+// 统一映射表执行（工具自身失败 502、sandbox_unavailable 503+install-hint、tool_timeout
+// 504 等）。
+
+/** capability.used 审计（invoke 端点直呼路径；path=direct 与 Skill 步级 path=skill 区分） */
+function appendCapabilityUsed(
+  ctx: RequestContext,
+  capabilityId: string,
+  outcome: { ok: boolean; error_code?: string; error?: string; via?: string },
+  durationMs: number,
+  sessionId?: string,
+): void {
+  try {
+    ctx.ledger.append(
+      buildEventEnvelope({
+        replicaId: ctx.replicaId,
+        actorId: "owner",
+        eventType: CAPABILITY_EVENT_TYPES.used,
+        ...(sessionId !== undefined ? { sessionId } : {}),
+        payload: {
+          capability: capabilityId,
+          ok: outcome.ok,
+          ...(outcome.error_code !== undefined ? { error_code: outcome.error_code } : {}),
+          ...(outcome.error !== undefined ? { error: outcome.error } : {}),
+          ...(outcome.via !== undefined ? { via: outcome.via } : {}),
+          duration_ms: durationMs,
+          path: "direct",
+        },
+      }),
+    );
+  } catch (err) {
+    console.error("[morrow] capability.used audit failed:", err);
+  }
+}
+
+/** InvocationResult → HTTP 投影（执行证据字段全保留；ok=false 走 502） */
+function invocationResponseBody(result: InvocationResult): Record<string, unknown> {
+  return {
+    ok: result.ok,
+    ...(result.result !== undefined ? { result: result.result } : {}),
+    ...(result.error_code !== undefined ? { error_code: result.error_code } : {}),
+    ...(result.error !== undefined ? { error: result.error } : {}),
+    ...(result.via !== undefined ? { via: result.via } : {}),
+    exit_code: result.exit_code,
+    duration_ms: result.duration_ms,
+  };
+}
+
+async function handleInvokeCapability(
+  req: IncomingMessage,
+  res: ServerResponse,
+  url: URL,
+  ctx: RequestContext,
+  params: string[],
+): Promise<void> {
+  const capabilityId = params[0];
+  // 归属上下文走查询串（body 恒为工具 input）：session_id 供需要会话归属的工具
+  // （memory.write 的来源回链）使用；缺省 = 无会话上下文，由工具自身语义裁决。
+  const sessionRaw = url.searchParams.get("session_id");
+  if (sessionRaw !== null && sessionRaw.trim().length === 0) {
+    sendError(res, 400, "invalid_query", "session_id must be a non-empty session id when present");
+    return;
+  }
+  const sessionId = sessionRaw?.trim();
+  const body = await readJsonBody(req, res);
+  if (body === null) return; // 响应已在 readJsonBody 里写出（415/413/400）
+  const startedAt = Date.now();
+  try {
+    const result = await ctx.sandbox.invoke(capabilityId, body, { actorId: "owner", ...(sessionId !== undefined ? { sessionId } : {}) });
+    // 先落审计后返回（账本可追踪优先于响应时延；审计失败不改变执行结果口径）
+    appendCapabilityUsed(ctx, capabilityId, result, result.duration_ms, sessionId);
+    sendJson(res, result.ok ? 200 : 502, invocationResponseBody(result));
+  } catch (err) {
+    const durationMs = Date.now() - startedAt;
+    const errorCode = err instanceof Error && "code" in err && typeof (err as { code?: unknown }).code === "string" ? (err as { code: string }).code : undefined;
+    appendCapabilityUsed(ctx, capabilityId, { ok: false, ...(errorCode !== undefined ? { error_code: errorCode } : {}), error: err instanceof Error ? err.message : String(err) }, durationMs, sessionId);
+    if (sendInvocationError(res, err)) return;
+    throw err;
+  }
 }
 
 // --- M1-T4 任务族 handlers（票 #16，PRD §6.2 任务端点）------------------------

@@ -23,12 +23,16 @@ export interface SandboxResources {
 /** v1 仅 none（fail-closed）；未来按 PRD 演进 allowlist 等形态时在此放开。 */
 export type SandboxNetwork = "none";
 
-/** v1 仅 workspace-only：工具可见的宿主文件系统 = workspace 挂载 + 工具包目录（只读）。 */
-export type SandboxFilesystem = "workspace-only";
+/** v1 容器契约仅 workspace-only：工具可见的宿主文件系统 = workspace 挂载 + 工具包目录（只读）。
+ *  "none" 仅为进程内契约（sandbox.type=process 的内置件不触碰宿主文件系统）保留。 */
+export type SandboxFilesystem = "workspace-only" | "none";
 
 export interface SandboxContract {
-  /** container = 生成代码进容器；builtin = human vetted（Go Worker 等），不经容器 */
-  type: "container" | "builtin";
+  /**
+   * container = 生成代码进容器；builtin = human vetted 的 Go Worker 直跑（不经容器）；
+   * process = human vetted 的进程内实现（TS 内置工具经注册函数直呼，不经容器/子进程）。
+   */
+  type: "container" | "builtin" | "process";
   network: SandboxNetwork;
   filesystem: SandboxFilesystem;
   resources: SandboxResources;
@@ -36,7 +40,7 @@ export interface SandboxContract {
 
 /** manifest.sandbox 的原始输入形态（规范化前的宽松形状） */
 export interface SandboxContractInput {
-  type: "container" | "builtin";
+  type: "container" | "builtin" | "process";
   network?: string;
   filesystem?: string;
   resources?: {
@@ -94,8 +98,8 @@ export function normalizeSandboxContract(input: unknown): SandboxContract {
     throw new SandboxContractError("sandbox contract must be an object");
   }
   const raw = input as SandboxContractInput;
-  if (raw.type !== "container" && raw.type !== "builtin") {
-    throw new SandboxContractError(`sandbox.type must be "container" or "builtin", got: ${String(raw.type)}`);
+  if (raw.type !== "container" && raw.type !== "builtin" && raw.type !== "process") {
+    throw new SandboxContractError(`sandbox.type must be "container", "builtin" or "process", got: ${String(raw.type)}`);
   }
   const network = raw.network ?? "none";
   if (network !== "none") {
@@ -103,11 +107,14 @@ export function normalizeSandboxContract(input: unknown): SandboxContract {
       `sandbox.network only supports "none" in v1 (fail-closed), got: ${String(network)}`,
     );
   }
-  const filesystem = raw.filesystem ?? "workspace-only";
+  const filesystem = raw.filesystem ?? (raw.type === "process" ? "none" : "workspace-only");
   if (filesystem !== "workspace-only") {
-    throw new SandboxContractError(
-      `sandbox.filesystem only supports "workspace-only" in v1, got: ${String(filesystem)}`,
-    );
+    // process 类（进程内实现）不触碰宿主文件系统，允许显式 none；container 仍仅 workspace-only
+    if (!(raw.type === "process" && filesystem === "none")) {
+      throw new SandboxContractError(
+        `sandbox.filesystem only supports "workspace-only"${raw.type === "process" ? ' (or "none" for in-process tools)' : ""} in v1 (fail-closed), got: ${String(filesystem)}`,
+      );
+    }
   }
   const resources = raw.resources ?? {};
   return {

@@ -1,5 +1,6 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { readJsonBody, sendError, sendJson } from "../../http-util.ts";
+import { sendInvocationError } from "../../invocation-errors.ts";
 import { SkillError, type SkillInvokeResult, type SkillRecord, type SkillService } from "./service.ts";
 
 /**
@@ -249,13 +250,16 @@ async function handleDecide(
 
 interface InvokeBody {
   params?: unknown;
+  /** 归属会话（可选）：透传给步级调用（需要会话归属的工具，如 memory.write） */
+  session_id?: unknown;
 }
 
 async function handleInvoke(req: IncomingMessage, res: ServerResponse, _url: URL, ctx: SkillRouteContext, params: string[]): Promise<void> {
   const body = await readJsonBody(req, res);
   if (body === null) return;
+  const sessionId = typeof (body as InvokeBody).session_id === "string" ? (body as InvokeBody).session_id as string : undefined;
   try {
-    const result: SkillInvokeResult = await ctx.skills.invoke(params[0], (body as InvokeBody).params ?? {});
+    const result: SkillInvokeResult = await ctx.skills.invoke(params[0], (body as InvokeBody).params ?? {}, sessionId === undefined ? {} : { sessionId });
     sendJson(res, 200, result);
   } catch (err) {
     handleSkillError(res, err);
@@ -265,7 +269,10 @@ async function handleInvoke(req: IncomingMessage, res: ServerResponse, _url: URL
 /**
  * SkillError → HTTP：not_found 404；invalid_input / missing_params 400；conflict /
  * invalid_state / not_approved / dangling_reference 409（悬空引用 message 携带具体
- * 缺失能力清单）；其余上抛 500。
+ * 缺失能力清单）。SkillError 之外的调用链库层错误（UnknownToolError / SandboxError /
+ * PermissionDeniedError / CapabilityError——Skill 经 ToolInvoker 执行 steps 时抛出）
+ * 交由 invocation-errors.ts 的统一映射落状态码（#22 修复批：不再裸抛成 500）；
+ * 未识别错误仍上抛 500。
  */
 export function handleSkillError(res: ServerResponse, err: unknown): void {
   if (err instanceof SkillError) {
@@ -278,5 +285,6 @@ export function handleSkillError(res: ServerResponse, err: unknown): void {
     sendError(res, status, `skill_${err.code}`, err.message);
     return;
   }
+  if (sendInvocationError(res, err)) return;
   throw err;
 }

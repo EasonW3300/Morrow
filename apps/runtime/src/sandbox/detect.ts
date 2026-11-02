@@ -35,6 +35,11 @@ export interface SandboxAvailability {
   runtime: ContainerRuntimeInfo | null;
   /** available=false 时的安装/修复指引（对应 OS） */
   installHint: string | null;
+  /**
+   * 探测命令超时标记（options.timeoutMs 开启时）：CLI 挂起（而非快速失败）的诚实
+   * 区分——容器测试套件据此 skip 并注明「探测超时」理由（#23 修复批）。
+   */
+  probeTimedOut?: boolean;
 }
 
 export interface DetectContainerRuntimeOptions {
@@ -42,6 +47,12 @@ export interface DetectContainerRuntimeOptions {
   exec?: ExecFn;
   /** 平台桩（默认 process.platform） */
   platform?: NodeJS.Platform;
+  /**
+   * 单条探测命令的超时界（ms；缺省 = 不加界，沿用 exec 自身语义）。开启后每条探测
+   * 命令与超时哨兵 race，超时按「探测失败（exit 124）」归类并置 probeTimedOut——
+   * 测试套件用它把「docker CLI 挂起」与「确实无运行时」诚实区分开。
+   */
+  timeoutMs?: number;
 }
 
 /** 各 OS 安装指引（拒绝路径的 install-hint 文本；保持单源供测试断言） */
@@ -89,17 +100,25 @@ function probeSpecs(platform: NodeJS.Platform): EngineProbeSpec[] {
   ];
 }
 
+/** 超时哨兵退出码（有界探测把 CLI 挂起归类为此——timeout(1) 同款约定） */
+export const PROBE_TIMED_OUT_EXIT_CODE = 124;
+
 async function probeEngine(
   spec: EngineProbeSpec,
   exec: ExecFn,
   platform: NodeJS.Platform,
-): Promise<{ available: boolean; daemonDown: boolean; runtime: ContainerRuntimeInfo | null }> {
+): Promise<{ available: boolean; daemonDown: boolean; timedOut: boolean; runtime: ContainerRuntimeInfo | null }> {
   // daemon 探测：`info` 成功 = daemon 可达 + 可用
   const info = await safeExec(exec, spec.command, platform === "win32" ? ["info"] : ["info"]);
   if (info.exitCode !== 0) {
     // CLI 是否存在（--version 纯 CLI 操作，不连 daemon）→ 存在即 daemon-down 态
     const cli = await safeExec(exec, spec.command, ["--version"]);
-    return { available: false, daemonDown: cli.exitCode === 0, runtime: null };
+    return {
+      available: false,
+      daemonDown: cli.exitCode === 0,
+      timedOut: info.exitCode === PROBE_TIMED_OUT_EXIT_CODE,
+      runtime: null,
+    };
   }
   const versionOut = await safeExec(exec, spec.command, ["version", "--format", "{{.Server.Version}}"]);
   const version = versionOut.exitCode === 0 ? versionOut.stdout.trim().split("\n")[0] : "unknown";
@@ -109,6 +128,7 @@ async function probeEngine(
   return {
     available: true,
     daemonDown: false,
+    timedOut: false,
     runtime: {
       engine,
       version: version || "unknown",
@@ -139,25 +159,58 @@ function wsl2Available(exec: ExecFn): Promise<boolean> {
 /**
  * 检测本机容器运行时。顺序：docker → podman；Windows 上两者都不可用再探 WSL2
  * （子系统在但无引擎 → WSL2 专项指引）。探测顺序固定，第一个可用者胜出。
+ * options.timeoutMs 开启有界探测：CLI 挂起按超时归类（probeTimedOut=true），探测总
+ * 耗时有上界（每条命令一界），测试套件据此诚实 skip。
  */
 export async function detectContainerRuntime(
   options: DetectContainerRuntimeOptions = {},
 ): Promise<SandboxAvailability> {
-  const exec = options.exec ?? defaultExec;
+  const rawExec = options.exec ?? defaultExec;
   const platform = options.platform ?? process.platform;
+  const timeoutMs = options.timeoutMs;
+  const exec: ExecFn =
+    timeoutMs === undefined
+      ? rawExec
+      : (file, args) =>
+          Promise.race([
+            // exec 自身以 reject 表达「被杀」（defaultExec 的 SIGTERM 超时同款）→ 按超时哨兵
+            // 归类：探测有界的语义是「界内无结论」，reject 与哨兵同为无结论（不区分成因）
+            rawExec(file, args).catch(
+              () =>
+                ({
+                  stdout: "",
+                  stderr: `${file} ${args.join(" ")} did not complete within ${timeoutMs}ms probe bound`,
+                  exitCode: PROBE_TIMED_OUT_EXIT_CODE,
+                }) as ExecResult,
+            ),
+            new Promise<ExecResult>((resolve) => {
+              const timer = setTimeout(
+                () => resolve({ stdout: "", stderr: `${file} ${args.join(" ")} timed out after ${timeoutMs}ms`, exitCode: PROBE_TIMED_OUT_EXIT_CODE }),
+                timeoutMs,
+              );
+              if (typeof timer.unref === "function") timer.unref();
+            }),
+          ]);
 
   let daemonDown = false;
+  let probeTimedOut = false;
   for (const spec of probeSpecs(platform)) {
     const probed = await probeEngine(spec, exec, platform);
     if (probed.available) {
       return { available: true, runtime: probed.runtime, installHint: null };
     }
     daemonDown = daemonDown || probed.daemonDown;
+    probeTimedOut = probeTimedOut || probed.timedOut;
   }
 
   if (platform === "win32" && (await wsl2Available(exec))) {
-    return { available: false, runtime: null, installHint: WSL2_HINT };
+    return { available: false, runtime: null, installHint: WSL2_HINT, ...(probeTimedOut ? { probeTimedOut: true } : {}) };
   }
   const base = INSTALL_HINT[platform] ?? DEFAULT_INSTALL_HINT;
-  return { available: false, runtime: null, installHint: daemonDown ? DAEMON_DOWN_HINT_SUFFIX : base };
+  return {
+    available: false,
+    runtime: null,
+    installHint: daemonDown ? DAEMON_DOWN_HINT_SUFFIX : base,
+    ...(probeTimedOut ? { probeTimedOut: true } : {}),
+  };
 }

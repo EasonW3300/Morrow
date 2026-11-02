@@ -10,13 +10,20 @@ import { detectContainerRuntime } from "../src/sandbox/detect.ts";
 import { DockerRunner } from "../src/sandbox/docker-runner.ts";
 import { evaluateHarness, FACTORY_SAMPLES, runFactoryHarness } from "./capability-factory.samples.ts";
 
-const availability = await detectContainerRuntime();
-const SKIP_REASON = availability.available
+// 探测有界（#23 修复批）：docker CLI 挂起（而非快速失败）时探测 10s 内归类为超时，
+// harness 诚实 skip 并注明理由——绝不无限等待探测。
+const availability = await detectContainerRuntime({ timeoutMs: 10_000 });
+const SKIP_REASON: string | false = availability.available
   ? false
-  : "本 runner 无可用容器运行时——真实容器 harness 跳过（CI 仅 ubuntu 腿跑；" +
-    `install-hint: ${availability.installHint ?? "n/a"}）`;
+  : availability.probeTimedOut === true
+    ? "容器运行时探测超时（docker CLI 挂起，10s 无响应）——真实容器 harness 诚实跳过而非挂死 " +
+      "（CI 仅 ubuntu 腿跑真实容器；本机 docker 恢复后重跑）"
+    : "本 runner 无可用容器运行时——真实容器 harness 跳过（CI 仅 ubuntu 腿跑；" +
+      `install-hint: ${availability.installHint ?? "n/a"}）`;
 
-test("20 组样例（真实容器路径）：≥18 组走通 + 越权 100% 阻断", { timeout: 600_000 }, async () => {
+// skip 守卫（#23 修复批）：无运行时/探测超时 → 诚实 skip 并注明理由。修复前本测试
+// 只计算了 SKIP_REASON 却从未挂到 test 上——无 docker 的 runner 上会跑真容器并失败。
+test("20 组样例（真实容器路径）：≥18 组走通 + 越权 100% 阻断", { skip: SKIP_REASON, timeout: 600_000 }, async () => {
   assert.equal(FACTORY_SAMPLES.length, 20);
   const results = await runFactoryHarness(new DockerRunner());
   const verdict = evaluateHarness(results);

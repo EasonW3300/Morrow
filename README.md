@@ -34,4 +34,21 @@ docs/gates          门禁报告归档（docs/security 威胁模型）
 docs/history        归档文档
 ```
 
+## Runtime HTTP API（能力域摘要）
+
+完整端点清单见 PRD §6.2；能力域（M2）端点：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET/POST | /v1/capabilities | 能力清单 / 注册（permissions ⊆ grants 五维判定） |
+| GET/PUT | /v1/capabilities/grants | Owner 五维预授权 |
+| GET | /v1/capabilities/:id | 详情（当前记录 + verified 已验证标记 + 版本历史） |
+| POST | /v1/capabilities/:id/{enable,disable,rollback} | 生命周期（事件驱动同步调用注册表） |
+| POST | /v1/capabilities/:id/invoke | **能力调用**（body = 工具 input；`?session_id=` 供归属）。经 ToolInvoker 统一执行链：builtin 进程内直呼、sandboxed 容器执行，权限复核在链上 |
+| POST | /v1/capabilities/request | 发起能力生成（工厂闭环） |
+| POST | /v1/capabilities/:id/confirm | Owner 确认门（沙箱验证 → 注册，verified=1） |
+| GET/POST | /v1/capabilities/skills[...]、/v1/skills[...] | Skill 提案/决策/重用（T6 合约别名） |
+
+**调用错误码**：`POST .../invoke`（能力与 Skill 重用共用）的 HTTP 状态按统一契约表映射（单源 `apps/runtime/src/invocation-errors.ts`）：`unknown_tool`→404、`permission_denied`→403、`invalid_sandbox_contract`/`tool_package_unsupported`/`capability_escalation`→400、`sandbox_unavailable`/`image_pull_failed`→503（附 install-hint）、`tool_timeout`→504、`tool_build_failed`→500、工具自身失败（`tool_error`/`tool_exit_nonzero`/`tool_protocol_error`/`tool_output_too_large`）→502。每次调用先落 `capability.used` 审计后返回（Skill 重用另落 `skill.invoked`）。
+
 里程碑与验收标准见 PRD §8/§9。

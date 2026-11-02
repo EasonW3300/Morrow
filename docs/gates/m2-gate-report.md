@@ -82,7 +82,7 @@ T6 的接缝清单（capability-fixture.ts 内「T3/T5 合入后整段删除」�
 
 ## 5. 未达项与边界（如实标注）
 
-1. **Skill invoke 的 runtime 缺省接线缺口（T7 发现，待修复票）**：SkillService 缺省 invoker = ToolInvoker，但 runtime 产品代码**从未向 ToolInvoker 注册任何工具**（builtin 实现留在会话层工厂、sandboxed 能力注册也只进能力注册表）——缺省 `POST /v1/capabilities/skills/:id/invoke` 必然 `unknown_tool`；T5 的演示链路测试经 `skillInvoker` 注入 FakeInvoker 通过，真实 Runtime 上不成立。本夹具经同一公开 seam 注入 memory.write 的**真实 builtin 实现**（与 Agent Loop 同一条 createMemoryWriteTool 路径，写真实记忆服务）完成演示，不伪造结果。**保持开放**：缺省接线应把能力注册表落 ToolInvoker（或 invoke 走注册表分派），并补 assertRuntimeUse 复核路径。
+1. **Skill invoke 的 runtime 缺省接线缺口（T7 发现 → 已由 #22 修复批闭合）**：SkillService 缺省 invoker = ToolInvoker，但修复前 runtime 产品代码**从未向 ToolInvoker 注册任何工具**（builtin 实现留在会话层工厂、sandboxed 能力注册也只进能力注册表）——缺省 `POST /v1/capabilities/skills/:id/invoke` 必然 `unknown_tool`；T5 的演示链路测试经 `skillInvoker` 注入 FakeInvoker 通过，真实 Runtime 上不成立。**修复批（分支 `fix/ci-build-legs`）已闭合**：启动时把注册表全部 enabled 能力登记进 ToolInvoker（builtin → `sandbox.type=process` 进程内执行条目、工厂产物 → 最近确认请求的容器执行条目），enable/disable/rollback 生命周期事件经 `PermissionEngine.onLifecycle` 驱动注册表增删改（disable 后 invoke 404 unknown_tool，测试断言）；新增 `POST /v1/capabilities/:id/invoke` 与 Skill invoke 共用同一执行链（权限复核在链上），错误码按 `invocation-errors.ts` 契约表统一映射 HTTP 状态（503+install-hint / 403 / 400 / 504 / 502 / 404），`capability.used` / `skill.invoked` 审计先落账本后返回；能力注册表增 verified 标记（GLOSSARY「已验证」），Skill 引用校验升级为 enabled AND verified。证据：`apps/runtime/test/capabilities.invoke.test.ts`（缺省链路 e2e + 逐错误码断言）。
 2. **声明网络的合法工具 v1 无法过验证（fail-closed by design）**：沙箱契约 v1 只支持 `network: none`（`contract.ts:101` fail-closed 拒绝其它取值）——manifest 声明 `network: restricted` 的合法工具（如演示能力 web.fetch）无法经工厂验证/容器执行；网络放行面（restricted 的 egress 白名单实现）v1 未建。**保持开放**。
 3. **Skill 多步组合的提案边界**：自动晋升仅覆盖单能力组合（同能力连续成功 streak）；多步声明式组合（steps 多能力 + arg_mapping）只能经手动提案端点 `POST /v1/capabilities/skills` 成立（悬空引用 409、invoke 逐步执行已实现并有测试），但无 UI 入口、也无从经验自动组合多步的路径。**保持开放**（组合生成属后续票）。
 4. **真实 LLM 生成冒烟未跑**：工厂生成器默认经 PiAdapter 一次 prompt（生产路径已实现），全部证据用脚本化生成器（FakePi 同款口径，零网络）——与 M0/M1 同一边界：真实模型行为待 Owner 密钥（ac-baseline §4）。`smoke-real-provider.ts` 同样未执行。**保持开放**。
@@ -92,4 +92,25 @@ T6 的接缝清单（capability-fixture.ts 内「T3/T5 合入后整段删除」�
 
 ## 6. 结论
 
-**M2 门禁：通过**（PRD §9 主线门槛「缺能力→造工具→安全验证→重用」以可重复脚本达成并归档；AC-06/08 前置证据齐档，测试规模 714 node:test 全绿）。保持开放的外部依赖待办：Skill invoke 缺省接线修复（§5-1，建议开修复票）、声明网络工具的沙箱网络放行（§5-2）、Skill 多步组合（§5-3）、真实 LLM 生成冒烟（待密钥）、桌面 UI 人工走查（M6）。
+**M2 门禁：通过**（PRD §9 主线门槛「缺能力→造工具→安全验证→重用」以可重复脚本达成并归档；AC-06/08 前置证据齐档，测试规模 714 node:test 全绿）。保持开放的外部依赖待办：声明网络工具的沙箱网络放行（§5-2）、Skill 多步组合（§5-3）、真实 LLM 生成冒烟（待密钥）、桌面 UI 人工走查（M6）。修复批（`fix/ci-build-legs`）已闭合 §5-1 调用路径缺口与 #23 测试套件守卫（docker 探测/辅助调用全部有界 + 容器套件「探测超时 → 诚实 skip」），见 §7 修复批记录。
+
+## 7. M2 code-review 修复批（分支 `fix/ci-build-legs`，2026-11-02）
+
+双轴修复（调用路径缺口 A + 套件健壮性 B + 文档 C）在独立分支交付，基线 fa98f9a、已合并 integration/m0（e47ed74，up to date）。逐项与提交：
+
+| 项 | 内容 | 提交 |
+|---|---|---|
+| A1 (#22) | FR-CAP-5 调用路径做真：启动时把注册表全部 enabled 能力登记进 ToolInvoker（builtin → `sandbox.type=process` 进程内执行条目、工厂产物 → 最近确认请求的容器条目、无实现跳过并告警）；enable/disable/rollback 生命周期事件经 `PermissionEngine.onLifecycle` 驱动注册表增删改（disable 后 invoke 404 unknown_tool，e2e 断言） | 65ec302 |
+| A2 (#22) | `POST /v1/capabilities/:id/invoke`（body=input、`?session_id=` 归属）——经 ToolInvoker 统一执行链（权限复核在链上），与 Skill steps 同链；工具自报失败 502 结构化返回 | 65ec302 |
+| A3 (#22) | 错误码表落地：`invocation-errors.ts` 单源映射（sandbox/runner.ts 头部契约表的 HTTP 半边）——sandbox_unavailable/image_pull_failed→503+install-hint、permission_denied→403、invalid_sandbox_contract/tool_package_unsupported/capability_escalation→400、tool_timeout→504、tool_build_failed→500、工具自身失败→502、unknown_tool→404；`handleSkillError` 裸 throw 替换 | 65ec302 |
+| A4 (#22/#26) | 审计贯通：`capability.used`（invoke 直呼 path=direct + Skill 步级 path=skill）与 `skill.invoked`（ok/steps/executed/failed_step/duration_ms）先落账本后返回 | 65ec302 + 9a359c7 |
+| A5 (#22/#26) | verified 语义（GLOSSARY「已验证」）：capabilities/capability_versions 增 verified 列（pragma 补列迁移）；工厂确认/builtin=true、human 按 tests 非空、直注 ai=false；Skill 引用校验升级 enabled AND verified（提案与批准双道） | 65ec302 + 9a359c7 |
+| B6 (#23) | 默认测试链 docker 挂起防线：`detectContainerRuntime` 增 timeoutMs 有界探测 + probeTimedOut 标记；DockerRunner 辅助调用（inspect/pull/kill/rm）全经超时 race（aux 10s / pull 300s）；容器套件「探测超时 → skip(理由)」守卫（本机 wedged-docker 实测两套件 ~10s 诚实 skip）；修复存量缺陷——harness 测试曾只计算 SKIP_REASON 未挂载。守卫逻辑全部以注入桩证明 | ecf3076 |
+| B7 (#22) | CapabilityStore manifest 字段串（Data Clumps）收敛为 CapabilityManifestFields + identity/content/currentUpdate 绑定 helper（并修复 updateCurrent 绑定序错位） | 65ec302 |
+| C8 (#22) | 越权消息构造单源：escalationMessage（engine 注册预检与工厂 plan 预检共用） | 65ec302 |
+| C9 (#23) | classifyRun/classify 同构分类器收敛为 classify.ts 的 classifyToolRun（协议差异参数化，两 Runner 薄包装，文案逐字不变） | ecf3076 |
+| C10 (#21) | 本报告 §5-1 闭合标注 + §7 修复批记录；README 增能力域端点表与调用错误码表（单源指向 invocation-errors.ts） | 本提交 |
+
+**测试规模**：runtime 531/531（本机，排除两个真实容器套件；较合并态同口径 +21——新增 capabilities.invoke e2e ×8、invocation-errors 映射表 ×3、invoker 进程内 ×5、detect 有界探测 ×2、DockerRunner 有界辅助 ×2、verified 标记 ×1；真实容器套件本机探测超时诚实 skip，由 CI ubuntu 腿验证）；protocol 40/40、pi-adapter 31/31、desktop 67/67 + sidecar Rust 9/9、packaging 56/56 全绿。node 24.22.1。
+
+**判定**：§5-1 调用路径缺口**已闭合**（缺省接线为真 + 端点 + 错误码 + 审计 + verified，测试锁定）；§5-2/5-3/5-4/5-5 保持开放不变。

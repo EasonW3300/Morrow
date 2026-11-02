@@ -8,7 +8,7 @@
  */
 
 import { spawn } from "node:child_process";
-import { parseToolEnvelope } from "./protocol.ts";
+import { classifyToolRun } from "./classify.ts";
 import type { SandboxErrorCode } from "./runner.ts";
 
 export interface GoWorkerResult {
@@ -82,22 +82,9 @@ function runProcess(binPath: string, input: string, timeoutMs: number): Promise<
   });
 }
 
+/** 分类薄包装：口径单源在 classify.ts 的 classifyToolRun（C9），本模块只定协议差异参数 */
 function classify(raw: RawResult, timeoutMs: number): Omit<GoWorkerResult, "via" | "bin" | "duration_ms"> {
-  const base = { ok: false, exit_code: raw.exitCode, timed_out: raw.timedOut, stdout: raw.stdout, stderr: raw.stderr };
-  if (raw.timedOut) {
-    return { ...base, error_code: "tool_timeout", error: `go worker exceeded ${timeoutMs}ms and was killed` };
-  }
-  const envelope = parseToolEnvelope(raw.stdout);
-  if (envelope.kind === "result" && raw.exitCode === 0) {
-    return { ...base, ok: true, result: envelope.result };
-  }
-  if (envelope.kind === "tool_error") {
-    return { ...base, error_code: "tool_error", error: `tool reported failure: ${envelope.error}` };
-  }
-  if (raw.exitCode !== 0) {
-    return { ...base, error_code: "tool_exit_nonzero", error: `go worker exited with code ${raw.exitCode}` };
-  }
-  return { ...base, error_code: "tool_protocol_error", error: "exit 0 but stdout has no result envelope" };
+  return classifyToolRun(raw, { timeoutMs, subject: "go worker" });
 }
 
 export async function runGoWorker(options: RunGoWorkerOptions): Promise<GoWorkerResult> {

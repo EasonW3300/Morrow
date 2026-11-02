@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS capabilities (
   author      TEXT NOT NULL CHECK (author IN ('human', 'ai')),
   runtime     TEXT NOT NULL CHECK (runtime IN ('typescript', 'go')),
   status      TEXT NOT NULL CHECK (status IN ('enabled', 'disabled')),
+  verified    INTEGER NOT NULL DEFAULT 0,
   source_hash TEXT NOT NULL,
   manifest    TEXT NOT NULL,
   created_at  TEXT NOT NULL,
@@ -31,6 +32,7 @@ CREATE TABLE IF NOT EXISTS capability_versions (
   name        TEXT NOT NULL,
   version     TEXT NOT NULL,
   author      TEXT NOT NULL CHECK (author IN ('human', 'ai')),
+  verified    INTEGER NOT NULL DEFAULT 0,
   source_hash TEXT NOT NULL,
   manifest    TEXT NOT NULL,
   created_at  TEXT NOT NULL,
@@ -44,7 +46,22 @@ CREATE TABLE IF NOT EXISTS capability_grants (
 );
 `;
 
-/** 打开能力域表（幂等；新库建表、既有库补齐）。迁移入口——后续表结构演进在此扩展。 */
+/**
+ * 既有库补列（#22 修复批：verified 已验证标记）：CREATE TABLE IF NOT EXISTS 不改已有
+ * 表，按 pragma 逐列检查补齐——新库建表后此校验为 no-op。
+ */
+const CAPABILITY_COLUMN_MIGRATIONS: Array<{ table: string; column: string; ddl: string }> = [
+  { table: "capabilities", column: "verified", ddl: "ALTER TABLE capabilities ADD COLUMN verified INTEGER NOT NULL DEFAULT 0" },
+  { table: "capability_versions", column: "verified", ddl: "ALTER TABLE capability_versions ADD COLUMN verified INTEGER NOT NULL DEFAULT 0" },
+];
+
+/** 打开能力域表（幂等；新库建表、既有库补列）。迁移入口——后续表结构演进在此扩展。 */
 export function ensureCapabilityTables(db: SqliteDatabase): void {
   db.exec(CAPABILITY_TABLES_SQL);
+  for (const migration of CAPABILITY_COLUMN_MIGRATIONS) {
+    const columns = db.prepare(`PRAGMA table_info(${migration.table})`).all() as Array<{ name: string }>;
+    if (!columns.some((column) => column.name === migration.column)) {
+      db.exec(migration.ddl);
+    }
+  }
 }

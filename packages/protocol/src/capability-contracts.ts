@@ -114,6 +114,13 @@ export interface CapabilityRecord {
   author: CapabilityAuthor;
   runtime: CapabilityRuntimeKind;
   status: CapabilityStatus;
+  /**
+   * 已验证标记（GLOSSARY「已验证」；FR-CAP-5 调用路径）：能力是否经测试/沙箱验证——
+   * 工厂确认（沙箱逐用例验证）= true；builtin（Owner 交付的 vetted 内置件）= true；
+   * human 注册且 manifest.tests 非空 = true；其余（无测试的 human 注册、未经工厂
+   * 验证直注的 ai 注册）= false。Skill 引用校验要求 enabled AND verified。
+   */
+  verified: boolean;
   source_hash: string;
   manifest: CapabilityManifest;
   created_at: string;

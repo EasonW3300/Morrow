@@ -14,6 +14,11 @@
  * 本机只实测 docker——OrbStack 亦为 docker CLI）。Windows WSL2/podman/OrbStack
  * 的归类在 detect.ts；本模块对引擎不可知，只要有兼容 docker run 的 CLI。
  *
+ * 有界纪律（#23 修复批）：辅助 docker 调用（image inspect / pull / kill / rm）全部经
+ * safeExec 的超时 race——daemon 卡死时 inspect 超时按 sandbox_unavailable 拒绝、pull
+ * 超时按 image_pull_failed 失败，绝不让挂起的 CLI 拖垮调用方；容器 run 自身由
+ * contract.resources.timeoutMs + kill 宽限兜底（原有语义不变）。
+ *
  * go 工具包不经本 Runner（builtin 直跑，见 go-worker.ts）：kind=go → 显式拒绝
  * （tool_package_unsupported），防止「以为进了沙箱实际直跑」的静默降级。
  */
@@ -24,9 +29,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { ExecFn, ExecResult } from "../keyring.ts";
+import { classifyToolRun, stderrTail } from "./classify.ts";
 import { detectContainerRuntime, DEFAULT_INSTALL_HINT, type ContainerRuntimeInfo } from "./detect.ts";
 import { buildDockerRunArgs } from "./docker-args.ts";
-import { parseToolEnvelope } from "./protocol.ts";
 import { SandboxError, SandboxUnavailableError, type SandboxResult, type SandboxRunner, type SandboxToolPackage } from "./runner.ts";
 import type { SandboxContract } from "./contract.ts";
 
@@ -38,7 +43,15 @@ export const DEFAULT_SANDBOX_IMAGE = "node:22-alpine";
 const KILL_GRACE_MS = 5_000;
 const DOCKER_MAX_BUFFER_BYTES = 32 * 1024 * 1024;
 
-/** docker CLI 执行（不设自身超时——超时由 Runner 按 contract.resources.timeoutMs 管理并强杀） */
+/** 辅助 docker 调用（image inspect / kill / rm）的有界默认值：daemon 卡死不拖垮调用方 */
+export const DEFAULT_AUX_TIMEOUT_MS = 10_000;
+/** 基础镜像 pull 的有界默认值（首拉走网络，放宽但仍有界） */
+export const DEFAULT_PULL_TIMEOUT_MS = 300_000;
+
+/**
+ * docker CLI 执行（容器 run 不设自身超时——超时由 Runner 按 contract.resources.timeoutMs
+ * 管理并强杀；inspect/pull/kill/rm 等辅助调用经 safeExec 的有界 race 兜底）。
+ */
 export function defaultDockerExec(file: string, args: string[], options?: { input?: string }): Promise<ExecResult> {
   return new Promise((resolve, reject) => {
     const child = execFile(
@@ -73,11 +86,10 @@ export interface DockerRunnerOptions {
   image?: string;
   /** esbuild 产物临时目录根（默认 os.tmpdir()） */
   bundleDirRoot?: string;
-}
-
-function stderrTail(stderr: string): string {
-  const tail = stderr.trim().split("\n").slice(-3).join(" | ");
-  return tail.length > 0 ? tail.slice(0, 400) : "(no stderr)";
+  /** 辅助 docker 调用（inspect/kill/rm）超时（默认 10s；daemon 卡死的有界防线，#23） */
+  auxTimeoutMs?: number;
+  /** 基础镜像 pull 超时（默认 300s；首拉走网络故独立放宽，仍不无界） */
+  pullTimeoutMs?: number;
 }
 
 /** esbuild 预打包（动态 import：esbuild 为 devDependency，单二进制打包路线 M2-T3 决策点） */
@@ -108,12 +120,16 @@ export class DockerRunner implements SandboxRunner {
   private readonly detect: typeof detectContainerRuntime;
   private readonly image: string;
   private readonly bundleDirRoot: string;
+  private readonly auxTimeoutMs: number;
+  private readonly pullTimeoutMs: number;
 
   constructor(options: DockerRunnerOptions = {}) {
     this.exec = options.exec ?? defaultDockerExec;
     this.detect = options.detect ?? detectContainerRuntime;
     this.image = options.image ?? DEFAULT_SANDBOX_IMAGE;
     this.bundleDirRoot = options.bundleDirRoot ?? tmpdir();
+    this.auxTimeoutMs = options.auxTimeoutMs ?? DEFAULT_AUX_TIMEOUT_MS;
+    this.pullTimeoutMs = options.pullTimeoutMs ?? DEFAULT_PULL_TIMEOUT_MS;
   }
 
   private async requireRuntime(): Promise<ContainerRuntimeInfo> {
@@ -141,13 +157,22 @@ export class DockerRunner implements SandboxRunner {
       packageDir = mkdtempSync(join(this.bundleDirRoot, "morrow-sandbox-"));
       await bundleTool(toolPackage.entry, packageDir);
 
-      // 镜像拉取策略：inspect 缺失才 pull（记录 pulled=true）
+      // 镜像拉取策略：inspect 缺失才 pull（记录 pulled=true）。inspect/pull 均有界：
+      // daemon 卡死时 inspect 超时按「沙箱不可用」拒绝、pull 超时按 image_pull_failed
+      // 失败——绝不无限等待（#23：本机 docker CLI 挂起的教训）。
+      const inspect = await this.safeExec(["image", "inspect", this.image], this.auxTimeoutMs);
+      if (inspect.timedOut) {
+        throw new SandboxUnavailableError(
+          `\`docker image inspect\` did not respond within ${this.auxTimeoutMs}ms — the container daemon appears wedged; ` +
+            "restart Docker Desktop / OrbStack (or the docker service) and verify with `docker info`.",
+        );
+      }
       let pulled: boolean | undefined;
-      const inspect = await this.safeExec(["image", "inspect", this.image]);
       if (inspect.exitCode !== 0) {
-        const pull = await this.safeExec(["pull", this.image]);
-        if (pull.exitCode !== 0) {
-          throw new SandboxError("image_pull_failed", `failed to pull ${this.image}: ${stderrTail(pull.stderr)}`);
+        const pull = await this.safeExec(["pull", this.image], this.pullTimeoutMs);
+        if (pull.timedOut || pull.exitCode !== 0) {
+          const reason = pull.timedOut ? `pull did not respond within ${this.pullTimeoutMs}ms` : stderrTail(pull.stderr);
+          throw new SandboxError("image_pull_failed", `failed to pull ${this.image}: ${reason}`);
         }
         pulled = true;
       }
@@ -164,7 +189,15 @@ export class DockerRunner implements SandboxRunner {
       });
 
       const result = await this.runContainer(runtime.command, args, containerName, JSON.stringify(input ?? {}), contract.resources.timeoutMs);
-      const classified = classifyRun(result, contract.resources.timeoutMs);      return {
+      const classified = classifyToolRun(result, {
+        timeoutMs: contract.resources.timeoutMs,
+        subject: "tool",
+        stderrTailDetail: true,
+        protocolTailDetail: true,
+        maxBufferExitCode: -2,
+        timeoutExitCodeZeroAs: 137,
+      });
+      return {
         ...classified,
         duration_ms: Date.now() - started,
         engine: runtime.engine,
@@ -178,8 +211,25 @@ export class DockerRunner implements SandboxRunner {
     }
   }
 
-  private safeExec(args: string[]): Promise<ExecResult> {
-    return this.exec("docker", args).catch(() => ({ stdout: "", stderr: "exec failed", exitCode: 127 }));
+  /**
+   * 有界 docker 辅助调用（inspect/pull/kill/rm）：exec 结果与超时哨兵 race——
+   * CLI 挂起不再拖垮调用方（超时结果 exitCode 124 + timedOut 标记，调用方按语义归类）。
+   */
+  private safeExec(args: string[], timeoutMs: number): Promise<ExecResult & { timedOut: boolean }> {
+    const timeout = new Promise<ExecResult & { timedOut: boolean }>((resolve) => {
+      const timer = setTimeout(
+        () => resolve({ stdout: "", stderr: `docker call timed out after ${timeoutMs}ms: ${args.join(" ")}`, exitCode: 124, timedOut: true }),
+        timeoutMs,
+      );
+      if (typeof timer.unref === "function") timer.unref();
+    });
+    return Promise.race([
+      this.exec("docker", args).then(
+        (res) => ({ ...res, timedOut: false }),
+        () => ({ stdout: "", stderr: "exec failed", exitCode: 127, timedOut: false }),
+      ),
+      timeout,
+    ]);
   }
 
   private async runContainer(
@@ -191,10 +241,10 @@ export class DockerRunner implements SandboxRunner {
   ): Promise<ExecResult & { timedOut: boolean }> {
     let timedOut = false;
     // 超时强杀：按容器名 docker kill（杀 CLI 客户端不杀容器）；杀完 --rm 自动清理，
-    // 再补一刀 rm 防竞态残留。
+    // 再补一刀 rm 防竞态残留。kill/rm 为 fire-and-forget，但同样有界（防 daemon 卡死泄漏）。
     const killTimer = setTimeout(() => {
       timedOut = true;
-      void this.safeExec(["kill", containerName]);
+      void this.safeExec(["kill", containerName], this.auxTimeoutMs);
     }, timeoutMs);
     if (typeof killTimer.unref === "function") killTimer.unref();
     // 兜底硬停：kill 失败（容器已退出等）也不让调用方无限等——以超时分类收尾
@@ -220,49 +270,8 @@ export class DockerRunner implements SandboxRunner {
       clearTimeout(killTimer);
       if (hardTimer !== undefined) clearTimeout(hardTimer);
       if (timedOut) {
-        void this.safeExec(["rm", "-f", containerName]);
+        void this.safeExec(["rm", "-f", containerName], this.auxTimeoutMs);
       }
     }
   }
-}
-
-function classifyRun(
-  res: ExecResult & { timedOut: boolean },
-  timeoutMs: number,
-): Omit<SandboxResult, "duration_ms" | "engine" | "image"> {
-  const base = { exit_code: res.exitCode, timed_out: res.timedOut, stdout: res.stdout, stderr: res.stderr };
-  if (res.exitCode === -2) {
-    // maxBuffer：输出超限
-    return { ...base, ok: false, error_code: "tool_output_too_large", error: "tool stdout exceeded 32MB" };
-  }
-  if (res.timedOut) {
-    return {
-      ...base,
-      ok: false,
-      exit_code: res.exitCode === 0 ? 137 : res.exitCode,
-      error_code: "tool_timeout",
-      error: `tool exceeded ${timeoutMs}ms and was killed (stderr: ${stderrTail(res.stderr)})`,
-    };
-  }
-  const envelope = parseToolEnvelope(res.stdout);
-  if (envelope.kind === "result" && res.exitCode === 0) {
-    return { ...base, ok: true, result: envelope.result };
-  }
-  if (envelope.kind === "tool_error") {
-    return { ...base, ok: false, error_code: "tool_error", error: `tool reported failure: ${envelope.error}` };
-  }
-  if (res.exitCode !== 0) {
-    return {
-      ...base,
-      ok: false,
-      error_code: "tool_exit_nonzero",
-      error: `tool exited with code ${res.exitCode} (stderr: ${stderrTail(res.stderr)})`,
-    };
-  }
-  return {
-    ...base,
-    ok: false,
-    error_code: "tool_protocol_error",
-    error: `exit 0 but stdout has no result envelope (last line: ${res.stdout.trim().slice(0, 120) || "(empty)"})`,
-  };
 }

@@ -25,7 +25,7 @@ import { uuidv7 } from "../../uuid-v7.ts";
 import { buildEventEnvelope } from "../../envelope.ts";
 import type { EventLedger } from "../../ledger.ts";
 import type { CapabilityRecord } from "@morrow/protocol";
-import { CapabilityError, checkPermissionsWithinGrants, type PermissionEngine } from "../engine.ts";
+import { CapabilityError, checkPermissionsWithinGrants, escalationMessage, type PermissionEngine } from "../engine.ts";
 import {
   DefaultCapabilityRetriever,
   type CapabilityRetriever,
@@ -171,12 +171,19 @@ export class CapabilityFactory {
       throw new CapabilityError("invalid_state", `factory request "${requestId}" has no validated plan (data corruption)`);
     }
     try {
-      const registered = this.#capabilities.register(plan.manifest, { actorId: options.actorId ?? "owner", now: options.now });
+      // 先落行后注册（行先于事件口径；且 onLifecycle 的调用面同步——见下——要按
+      // status=confirmed 定位工厂包目录，行未落会 miss）：注册器拒绝时由 catch 把请求
+      // 转 failed，不会留下 confirmed 而无能力的中间态。
       this.#store.update(requestId, {
         status: "confirmed",
-        capability_name: registered.record.name,
+        capability_name: plan.manifest.name,
         updated_at: (options.now ?? new Date()).toISOString(),
       });
+      // verified=true（GLOSSARY「已验证」）：管线第 4 步已在本 Runner 沙箱逐用例验证，
+      // Owner confirm 注册的产物带已验证标记（Skill 引用校验 enabled AND verified 的依据）
+      const registered = this.#capabilities.register(plan.manifest, { actorId: options.actorId ?? "owner", now: options.now, verified: true });
+      // 注册成功 → onLifecycle 同步把能力登记进 ToolInvoker（此时行已 confirmed，
+      // 容器条目按 capability_name 定位最近确认请求的包目录成功）
       const eventId = this.#append(CAPABILITY_FACTORY_EVENT_TYPES.confirmed, options.actorId ?? "owner", {
         request_id: requestId,
         name: registered.record.name,
@@ -208,6 +215,16 @@ export class CapabilityFactory {
   describeCapabilities(): Array<{ name: string; description: string | null }> {
     if (this.#closed) return [];
     return this.#store.listConfirmedDescriptions();
+  }
+
+  /**
+   * 能力名 → 最近一次 Owner 确认的工厂请求 id（#22 修复批：invoke 接线用它定位
+   * 沙箱工具包目录——注册表只存 manifest，执行入口在工厂包目录里）。未确认/不存在
+   * 返回 null。
+   */
+  latestConfirmedRequestIdByCapability(capabilityName: string): string | null {
+    if (this.#closed) return null;
+    return this.#store.latestConfirmedRequestIdByCapability(capabilityName);
   }
 
   close(): void {
@@ -280,14 +297,7 @@ export class CapabilityFactory {
       const plan = validated.plan;
       const violations = checkPermissionsWithinGrants(plan.manifest.permissions, grants);
       if (violations.length > 0) {
-        return this.#fail(
-          requestId,
-          "plan",
-          "escalation",
-          `manifest permissions exceed the PermissionGrant (${violations.length} violation(s)): ` +
-            violations.map((v) => `${v.dimension}: ${v.reason}`).join("; "),
-          { violations },
-        );
+        return this.#fail(requestId, "plan", "escalation", escalationMessage(violations), { violations });
       }
       this.#store.update(requestId, {
         stage: "planned",
