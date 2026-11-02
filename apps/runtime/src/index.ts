@@ -189,3 +189,40 @@ export {
   detectSecretStore,
 } from "./keyring.ts";
 export type { DetectedSecretStore, ExecFn, ExecResult, SecretStore } from "./keyring.ts";
+// 能力工厂（M2-T3 / Issue #24）：生成闭环——检索/规划/构建/验证/确认门 + 事件留痕
+export { CapabilityFactory, CAPABILITY_FACTORY_EVENT_TYPES } from "./capabilities/factory/service.ts";
+export type { CapabilityFactoryOptions } from "./capabilities/factory/service.ts";
+export { CapabilityFactoryStore } from "./capabilities/factory/store.ts";
+export type { FactoryRequestRow } from "./capabilities/factory/store.ts";
+export { factoryRoutes } from "./capabilities/factory/routes.ts";
+export {
+  CAPABILITY_FACTORY_SYSTEM_PROMPT,
+  PiCapabilityGenerator,
+  buildUserPrompt,
+  extractJsonObject,
+} from "./capabilities/factory/generator.ts";
+export type { CapabilityGenerator, CapabilityGeneratorContext, PiCapabilityGeneratorOptions } from "./capabilities/factory/generator.ts";
+export { DefaultCapabilityRetriever, capabilityTokens } from "./capabilities/factory/retriever.ts";
+export type { CapabilityRetriever, RetrievalMatch, RetrievalResult, MemoryMatch, DefaultCapabilityRetrieverOptions } from "./capabilities/factory/retriever.ts";
+export { CapabilityBuilder } from "./capabilities/factory/builder.ts";
+export type { BuildResult, CapabilityBuilderOptions } from "./capabilities/factory/builder.ts";
+export { CapabilityVerifier } from "./capabilities/factory/verifier.ts";
+export type { VerifyInput, CapabilityVerifierOptions } from "./capabilities/factory/verifier.ts";
+export { validateGeneratorOutput } from "./capabilities/factory/plan-schema.ts";
+export type { PlanValidationResult } from "./capabilities/factory/plan-schema.ts";
+export type {
+  FactoryTestCaseKind,
+  FactoryTestCaseSpec,
+  GeneratorOutput,
+  GeneratorFailureCode,
+  GeneratorResult,
+  ValidatedPlan,
+  FactoryRequestStatus,
+  FactoryRequestStage,
+  FactoryRequestError,
+  VerifyReport,
+  FactoryRequestView,
+  TestCaseVerdict,
+} from "./capabilities/factory/types.ts";
+export { FACTORY_TEST_CASE_KINDS } from "./capabilities/factory/types.ts";
+export { ENTRY_TEMPLATE, VERIFY_TEMPLATE } from "./capabilities/factory/harness-templates.ts";

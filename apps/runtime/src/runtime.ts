@@ -6,6 +6,9 @@ import piAdapterPackageJson from "../../../packages/pi-adapter/package.json" wit
 import { ensureBuiltinCapabilities, MEMORY_WRITE_CAPABILITY_MANIFEST } from "./capabilities/builtin.ts";
 import { PermissionEngine } from "./capabilities/engine.ts";
 import { capabilityRoutes } from "./capabilities/routes.ts";
+import { factoryRoutes } from "./capabilities/factory/routes.ts";
+import { CapabilityFactory } from "./capabilities/factory/service.ts";
+import { CAPABILITY_FACTORY_SYSTEM_PROMPT, PiCapabilityGenerator, type CapabilityGenerator } from "./capabilities/factory/generator.ts";
 import type { RuntimeConfig } from "./config.ts";
 import { testProviderConnectivity } from "./connectivity.ts";
 import { DeviceRegistry, type DeviceRecord } from "./devices.ts";
@@ -81,6 +84,8 @@ interface RequestContext {
   projector: MemoryProjector;
   /** 能力注册表（票 M2-T1：PermissionEngine 单一入口——注册校验/生命周期/运行时复核） */
   capabilities: PermissionEngine;
+  /** 能力工厂（票 M2-T3：生成闭环编排——检索/规划/构建/验证/确认门） */
+  factory: CapabilityFactory;
 }
 
 type Handler = (
@@ -141,6 +146,13 @@ export interface RuntimeOptions {
    * 越界的 fail-closed 基线）。
    */
   permissionEngine?: SandboxPermissionEngine;
+  /**
+   * 能力工厂生成器注入 seam（M2-T3 / Issue #24）：缺省 = 默认 Provider + 工厂系统提示词
+   * （经 PiAdapter 一次 prompt 产出计划 JSON）；测试注入脚本化生成器（零网络）。注入时
+   * POST /v1/capabilities/request 不做 Provider 预检（fire-and-forget：失败落
+   * factory_failed 事件，不以状态码转述）。
+   */
+  capabilityGenerator?: CapabilityGenerator;
 }
 
 export interface RuntimeHandle {
@@ -165,6 +177,8 @@ export interface RuntimeHandle {
   checkpoints: CheckpointService;
   /** 沙箱工具调用接缝（M2-T2 / Issue #23：sandboxed 与 builtin Go Worker 的统一注册/调用） */
   sandbox: ToolInvoker;
+  /** 能力工厂（M2-T3 / Issue #24：submitRequest / getRequest / confirm，库形态可直用） */
+  factory: CapabilityFactory;
   /**
    * 优雅停止：停止接收请求 → 中止并释放会话运行时与在跑任务节点 → 记账 runtime.stopped
    * → 关闭任务投影库与账本（WAL checkpoint）。signal 传入收到的 POSIX 信号名，
@@ -208,6 +222,14 @@ const routes: Route[] = [
   { method: "POST", re: /^\/v1\/tasks\/([^/]+)\/nodes\/([^/]+)\/release$/, handler: handleReleaseNode },
   ...memoryRoutes,
   ...capabilityRoutes,
+  // M2-T3 工厂端点（POST /v1/capabilities/request、GET /v1/capabilities/requests/:id、
+  // POST /v1/capabilities/:id/confirm）——ctx.factory 桥接到 factory 自有路由签名
+  ...factoryRoutes.map((route) => ({
+    method: route.method,
+    re: route.re,
+    handler: (req: IncomingMessage, res: ServerResponse, url: URL, ctx: RequestContext, params: string[]) =>
+      route.handler(req, res, url, ctx.factory, params),
+  })),
 ];
 
 export async function startRuntime(config: RuntimeConfig, options: RuntimeOptions = {}): Promise<RuntimeHandle> {
@@ -340,12 +362,29 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
   // 本地基线 + capabilities.assertRuntimeUse 双道）；注入 seam（RuntimeOptions.permissionEngine）
   // 保留给测试/宿主。Runner 仅服务 sandboxed 类；builtin（Go Worker）不经容器直跑。
   const workspaceRoot = join(config.dataDir, "workspace");
+  const sandboxRunnerInstance = options.sandboxRunner ?? new DockerRunner();
   const sandbox = new ToolInvoker({
-    runner: options.sandboxRunner ?? new DockerRunner(),
+    runner: sandboxRunnerInstance,
     permissionEngine: options.permissionEngine ?? createRegistryPermissionAdapter({ registry: capabilities, workspaceRoot }),
     workspaceRoot,
   });
-  const ctx: RequestContext = { ledger, replicaId: config.replicaId, sessions, providers, devices, tasks, scheduler, checkpoints, memory, projector, capabilities };
+  // 能力工厂（M2-T3 / Issue #24）：生成闭环编排。生成器缺省 = 默认 Provider + 工厂系统
+  // 提示词（经 PiAdapter 一次 prompt）；注入 seam（RuntimeOptions.capabilityGenerator）供
+  // 测试脚本化（FakePi 零网络）。检索注入 MemoryService.search（FR-CAP-1 FTS 记忆半边）。
+  // Runner 与 ToolInvoker 共用同一实例（验证即同一条沙箱执行路径）。
+  const factory = new CapabilityFactory({
+    dataDir: config.dataDir,
+    ledger,
+    replicaId: config.replicaId,
+    capabilities,
+    generator:
+      options.capabilityGenerator ??
+      new PiCapabilityGenerator({ runtimeFactory: defaultFactoryRuntimeFactory(providers) }),
+    runner: sandboxRunnerInstance,
+    memorySearch: (query) => memory.search(query).map((hit) => ({ content: hit.content, entry_kind: hit.stage })),
+    workspaceRoot,
+  });
+  const ctx: RequestContext = { ledger, replicaId: config.replicaId, sessions, providers, devices, tasks, scheduler, checkpoints, memory, projector, capabilities, factory };
   const server = createServer((req, res) => {
     routeRequest(req, res, ctx);
   });
@@ -354,6 +393,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
   try {
     port = await listen(server, config.host, config.port);
   } catch (err) {
+    factory.close();
     tasks.close();
     locks.close();
     capabilities.close();
@@ -388,6 +428,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     projector,
     capabilities,
     sandbox,
+    factory,
     async close(signal?: string): Promise<void> {
       if (closing) return;
       closing = true;
@@ -400,6 +441,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
       tasks.close();
       locks.close();
       checkpoints.close();
+      factory.close();
       capabilities.close();
       try {
         ledger.append(
@@ -465,6 +507,27 @@ function defaultTaskRuntimeFactory(providers: ProviderRegistry, systemPrompt?: s
       model: { id: provider.modelId, contextWindow: provider.contextWindow, maxTokens: provider.maxTokens },
       ...(provider.compat !== undefined ? { compat: provider.compat } : {}),
       ...(systemPrompt === undefined ? {} : { systemPrompt }),
+    });
+  };
+}
+
+/**
+ * 能力工厂默认生成器运行时（M2-T3）：默认 Provider → createPiAdapter + 工厂系统提示词
+ * （一次 prompt 产出计划 JSON）。Provider 解析失败抛错——管线折叠为
+ * factory_failed(stage=plan, runtime_error)，不静默。
+ */
+function defaultFactoryRuntimeFactory(providers: ProviderRegistry): (prompt: string) => Promise<AgentRuntime> {
+  return async () => {
+    const provider = await providers.resolve();
+    if (provider === null) {
+      throw new Error("no model provider configured");
+    }
+    return createPiAdapter({
+      baseUrl: provider.baseUrl,
+      apiKey: provider.apiKey.length > 0 ? provider.apiKey : "unused",
+      model: { id: provider.modelId, contextWindow: provider.contextWindow, maxTokens: provider.maxTokens },
+      ...(provider.compat !== undefined ? { compat: provider.compat } : {}),
+      systemPrompt: CAPABILITY_FACTORY_SYSTEM_PROMPT,
     });
   };
 }
