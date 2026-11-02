@@ -1,8 +1,11 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { join } from "node:path";
-import { createPiAdapter, type AgentRuntime } from "@morrow/pi-adapter";
+import { createPiAdapter, type AgentRuntime, type MorrowTool } from "@morrow/pi-adapter";
 import packageJson from "../package.json" with { type: "json" };
 import piAdapterPackageJson from "../../../packages/pi-adapter/package.json" with { type: "json" };
+import { ensureBuiltinCapabilities, MEMORY_WRITE_CAPABILITY_MANIFEST } from "./capabilities/builtin.ts";
+import { PermissionEngine } from "./capabilities/engine.ts";
+import { capabilityRoutes } from "./capabilities/routes.ts";
 import type { RuntimeConfig } from "./config.ts";
 import { testProviderConnectivity } from "./connectivity.ts";
 import { DeviceRegistry, type DeviceRecord } from "./devices.ts";
@@ -26,11 +29,11 @@ import { UUID_RE } from "./uuid-v7.ts";
 import { parsePaging, readJsonBody, sendError, sendJson } from "./http-util.ts";
 import { DockerRunner } from "./sandbox/docker-runner.ts";
 import { ToolInvoker } from "./sandbox/invoker.ts";
-import { createLocalPermissionEngine, type PermissionEngine } from "./sandbox/permission.ts";
+import { createRegistryPermissionAdapter, type SandboxPermissionEngine } from "./sandbox/permission.ts";
 import type { SandboxRunner } from "./sandbox/runner.ts";
 
 /**
- * Runtime HTTP 服务（PRD §6.2 的 M0 子集 + M1-T4 任务族）。
+ * Runtime HTTP 服务（PRD §6.2 的 M0 子集 + M1 任务族 + M2-T1 能力族）。
  *
  * node:http + 极简路由，不引框架——为 T8 bun compile 单二进制留路（ADR-0003）。
  * 路由面：GET /v1/health、GET /v1/events、GET /v1/devices（M0 只读登记，票 #3）、
@@ -43,12 +46,15 @@ import type { SandboxRunner } from "./sandbox/runner.ts";
  * POST /v1/memory/candidates/:id/decide、GET /v1/memory/conflicts、
  * POST /v1/memory/conflicts/:id/resolve）+ M1-T3 记忆投影族
  * （POST /v1/memory/import 受控导入、DELETE /v1/memory/facts/:id 删除标记、
- * POST /v1/memory/project 投影再生成）。
+ * POST /v1/memory/project 投影再生成）、M2-T1 能力族
+ * （POST/GET /v1/capabilities、GET/PUT /v1/capabilities/grants、
+ * GET /v1/capabilities/:id、POST /v1/capabilities/:id/{enable,disable,rollback}）。
  * 未匹配路径 404，路径命中但方法不符 405（账本 append-only：对事件的任何变更
  * 方法在请求层即被拒绝）。
- * 生命周期：start 先监听后记账 runtime.started（携带实际端口）；close 先停收请求，
- * 再中止会话运行与在跑任务节点并释放 AgentRuntime，然后记账 runtime.stopped
- * （causation 指向 started），最后关闭任务投影库与账本落盘。
+ * 生命周期：start 先监听后记账 runtime.started（携带实际端口），随后 builtin 工具
+ * ensure-registered（memory.write，幂等）；close 先停收请求，再中止会话运行与在跑
+ * 任务节点并释放 AgentRuntime，然后记账 runtime.stopped（causation 指向 started），
+ * 最后关闭能力注册表、任务投影库与账本落盘。
  */
 
 /** 版本号唯一来源：本包 package.json（main.ts 的 ready 行也从这里取——不再双真相源） */
@@ -71,6 +77,8 @@ interface RequestContext {
   memory: MemoryService;
   /** 记忆投影器（票 M1-T3：/v1/memory/project 命令执行体） */
   projector: MemoryProjector;
+  /** 能力注册表（票 M2-T1：PermissionEngine 单一入口——注册校验/生命周期/运行时复核） */
+  capabilities: PermissionEngine;
 }
 
 type Handler = (
@@ -130,7 +138,7 @@ export interface RuntimeOptions {
    * 运行时复核 assertRuntimeUse。缺省 = 确定性本地判定桩（network 矛盾 / workspace
    * 越界的 fail-closed 基线）。
    */
-  permissionEngine?: PermissionEngine;
+  permissionEngine?: SandboxPermissionEngine;
 }
 
 export interface RuntimeHandle {
@@ -145,6 +153,8 @@ export interface RuntimeHandle {
   memory: MemoryService;
   /** 记忆投影器（票 M1-T3 / Issue #15：dataDir/memory/*.md，幂等再生成，库形态可直用） */
   projector: MemoryProjector;
+  /** 能力注册表（票 M2-T1 / Issue #22：注册表治理 + 五维权限判定，库形态可直用） */
+  capabilities: PermissionEngine;
   /** Provider 注册表（库形态可直用：CRUD / 默认 / env 回退解析） */
   providers: ProviderRegistry;
   /** 任务服务（库形态可直用：createTask / 详情 / 状态机迁移；调度经 HTTP 自动触发） */
@@ -195,6 +205,7 @@ const routes: Route[] = [
   { method: "POST", re: /^\/v1\/tasks\/([^/]+)\/nodes\/([^/]+)\/complete$/, handler: handleCompleteNode },
   { method: "POST", re: /^\/v1\/tasks\/([^/]+)\/nodes\/([^/]+)\/release$/, handler: handleReleaseNode },
   ...memoryRoutes,
+  ...capabilityRoutes,
 ];
 
 export async function startRuntime(config: RuntimeConfig, options: RuntimeOptions = {}): Promise<RuntimeHandle> {
@@ -203,6 +214,10 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
   // 不做配对/撤销（M3 范围）
   const devices = DeviceRegistry.open(config.dataDir);
   devices.touch(config.replicaId);
+  // 能力注册表（票 M2-T1 / Issue #22）：会话工具注入改查注册表（disable 即不再注入）；
+  // builtin 工具的 ensure-registered 在 runtime.started 之后执行（审计顺序：进程启动 →
+  // builtin 注册；幂等，同 dataDir 重启不产生新事件）。
+  const capabilities = new PermissionEngine({ dataDir: config.dataDir, ledger, replicaId: config.replicaId });
   const providers = new ProviderRegistry({
     dataDir: config.dataDir,
     secretStore: options.secretStore ?? detectSecretStore().store,
@@ -233,6 +248,11 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
           }
         : {}),
   });
+  // 内置工具实现表（票 M2-T1）：注册表只管 manifest 与启停，实现工厂留在接线层。
+  // 新 builtin 工具在此追加工厂并加入 capabilities/builtin.ts 的 manifest 全集。
+  const builtinToolFactories: Record<string, (sessionId: string) => MorrowTool> = {
+    [MEMORY_WRITE_CAPABILITY_MANIFEST.name]: (sessionId) => createMemoryWriteTool({ service: memory, sessionId }),
+  };
   const sessions = new SessionManager({
     ledger,
     replicaId: config.replicaId,
@@ -242,7 +262,12 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     providerRequired: options.agentAdapterFactory === undefined,
     // 记忆（M1-T1）：高价值规则即时写候选；memory.write 工具按会话注入 Agent Loop
     memory,
-    agentTools: (sessionId) => [createMemoryWriteTool({ service: memory, sessionId })],
+    // 工具注入改查注册表（票 M2-T1）：enabled 且有内置实现的 typescript 能力才实例化
+    agentTools: (sessionId) =>
+      capabilities
+        .list({ status: "enabled", runtime: "typescript" })
+        .filter((capability) => builtinToolFactories[capability.name] !== undefined)
+        .map((capability) => builtinToolFactories[capability.name](sessionId)),
   });
   // 任务域（M1-T4）：规划器/节点工厂注入语义对齐会话——注入时不做 Provider 预检，
   // 默认工厂路径要求存在可解析的默认 Provider（POST /v1/tasks 预检 503 依据）。
@@ -296,15 +321,16 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
   });
   // 沙箱执行 Worker（M2-T2 / Issue #23）：ToolInvoker 统一接缝。runner 缺省 DockerRunner
   // （每次执行前探测容器运行时；无运行时 → sandboxed 调用拒绝 sandbox_unavailable +
-  // install-hint）；权限引擎缺省本地判定桩（M2-T1 合并后由 PermissionEngine 单一入口
-  // 接管，merger 对齐）。Runner 仅服务 sandboxed 类；builtin（Go Worker）不经容器直跑。
+  // install-hint）。权限引擎缺省 = M2-T1 注册表复核适配器（createRegistryPermissionAdapter，
+  // 本地基线 + capabilities.assertRuntimeUse 双道）；注入 seam（RuntimeOptions.permissionEngine）
+  // 保留给测试/宿主。Runner 仅服务 sandboxed 类；builtin（Go Worker）不经容器直跑。
   const workspaceRoot = join(config.dataDir, "workspace");
   const sandbox = new ToolInvoker({
     runner: options.sandboxRunner ?? new DockerRunner(),
-    permissionEngine: options.permissionEngine ?? createLocalPermissionEngine({ workspaceRoot }),
+    permissionEngine: options.permissionEngine ?? createRegistryPermissionAdapter({ registry: capabilities, workspaceRoot }),
     workspaceRoot,
   });
-  const ctx: RequestContext = { ledger, replicaId: config.replicaId, sessions, providers, devices, tasks, scheduler, checkpoints, memory, projector };
+  const ctx: RequestContext = { ledger, replicaId: config.replicaId, sessions, providers, devices, tasks, scheduler, checkpoints, memory, projector, capabilities };
   const server = createServer((req, res) => {
     routeRequest(req, res, ctx);
   });
@@ -314,6 +340,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     port = await listen(server, config.host, config.port);
   } catch (err) {
     tasks.close();
+    capabilities.close();
     memoryStore.close();
     devices.close();
     ledger.close();
@@ -327,6 +354,9 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     payload: { pid: process.pid, host: config.host, port, version: VERSION },
   });
   ledger.append(startedEnvelope);
+  // builtin 工具 ensure-registered（票 M2-T1）：首见注册落 capability.registered（actor
+  // agent:runtime），已注册同版本同内容 → no-op；builtin 常量与历史账本冲突时抛错（fail-fast）。
+  ensureBuiltinCapabilities(capabilities);
 
   let closing = false;
   return {
@@ -340,6 +370,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     checkpoints,
     memory,
     projector,
+    capabilities,
     sandbox,
     async close(signal?: string): Promise<void> {
       if (closing) return;
@@ -352,6 +383,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
       await scheduler.dispose();
       tasks.close();
       checkpoints.close();
+      capabilities.close();
       try {
         ledger.append(
           buildEventEnvelope({
@@ -483,12 +515,12 @@ function handleAsyncError(res: ServerResponse, err: unknown): void {
   }
 }
 
-function handleHealth(_req: IncomingMessage, res: ServerResponse, _url: URL, ctx: RequestContext): void {
+async function handleHealth(_req: IncomingMessage, res: ServerResponse, _url: URL, ctx: RequestContext): Promise<void> {
   sendJson(res, 200, {
     status: "ok",
     version: VERSION,
     replica_id: ctx.replicaId,
-    sandbox: probeSandbox(),
+    sandbox: await probeSandbox(),
     ledger: { events: ctx.ledger.count() },
   });
 }

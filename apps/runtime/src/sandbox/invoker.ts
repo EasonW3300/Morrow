@@ -18,7 +18,7 @@
 import type { SandboxContract } from "./contract.ts";
 import { normalizeSandboxContract } from "./contract.ts";
 import { runGoWorker, type GoWorkerResult } from "./go-worker.ts";
-import type { PermissionEngine, ToolManifestLite } from "./permission.ts";
+import type { SandboxPermissionEngine, ToolManifestLite } from "./permission.ts";
 import type { SandboxResult, SandboxRunner, SandboxToolPackage } from "./runner.ts";
 
 export class UnknownToolError extends Error {
@@ -56,7 +56,7 @@ export interface InvokeContext {
 
 export interface ToolInvokerOptions {
   runner: SandboxRunner;
-  permissionEngine: PermissionEngine;
+  permissionEngine: SandboxPermissionEngine;
   /** workspace 根（sandboxed 工具按 manifest 接线挂载） */
   workspaceRoot: string;
 }
@@ -64,7 +64,7 @@ export interface ToolInvokerOptions {
 export class ToolInvoker {
   private readonly tools = new Map<string, ToolRegistration & { contract: SandboxContract }>();
   private readonly runner: SandboxRunner;
-  private readonly permissionEngine: PermissionEngine;
+  private readonly permissionEngine: SandboxPermissionEngine;
   private readonly workspaceRoot: string;
 
   constructor(options: ToolInvokerOptions) {

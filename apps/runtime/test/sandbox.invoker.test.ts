@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { ToolInvoker, UnknownToolError } from "../src/sandbox/invoker.ts";
-import { PermissionDeniedError, type PermissionEngine, type RuntimeUseRequest } from "../src/sandbox/permission.ts";
+import { PermissionDeniedError, type SandboxPermissionEngine, type RuntimeUseRequest } from "../src/sandbox/permission.ts";
 import { SandboxError, type SandboxResult, type SandboxRunner, type SandboxToolPackage } from "../src/sandbox/runner.ts";
 import { SandboxContractError, type SandboxContract } from "../src/sandbox/contract.ts";
 
@@ -35,7 +35,7 @@ function fakeRunner(reply: Partial<SandboxResult> = { ok: true, result: { echo: 
   };
 }
 
-function fakeEngine(intercept?: (req: RuntimeUseRequest) => void): PermissionEngine & { seen: RuntimeUseRequest[] } {
+function fakeEngine(intercept?: (req: RuntimeUseRequest) => void): SandboxPermissionEngine & { seen: RuntimeUseRequest[] } {
   const seen: RuntimeUseRequest[] = [];
   return {
     seen,

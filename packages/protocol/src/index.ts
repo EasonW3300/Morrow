@@ -24,6 +24,25 @@ export type {
   TaskStatus,
   TaskSummary,
 } from "./task-contracts.ts";
+export type {
+  CapabilityAuthor,
+  CapabilityChannel,
+  CapabilityManifest,
+  CapabilityPermissions,
+  CapabilityRecord,
+  CapabilityRuntimeKind,
+  CapabilitySandboxSpec,
+  CapabilityStatus,
+  CapabilityUseRequest,
+  CapabilityVersionRecord,
+  PermissionGrant,
+  PermissionViolation,
+  ShellCommandCategory,
+} from "./capability-contracts.ts";
+export {
+  CAPABILITY_CHANNELS,
+  SHELL_COMMAND_CATEGORIES,
+} from "./capability-contracts.ts";
 export {
   canonicalJson,
   computeIntegrityHash,

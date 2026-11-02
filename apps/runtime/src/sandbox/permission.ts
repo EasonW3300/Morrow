@@ -8,6 +8,9 @@
  * 确定性本地判定桩：不依赖 LLM、不依赖数据库，测试与无注册表环境可独立工作。
  */
 
+import type { CapabilityUseRequest } from "@morrow/protocol";
+import { join } from "node:path";
+import { CapabilityError } from "../capabilities/engine.ts";
 import type { SandboxContract } from "./contract.ts";
 
 /** manifest 权限五维（PRD §6.3；M2-T1 的 manifest v1 字段集，这里取必需子集） */
@@ -55,7 +58,7 @@ export interface RuntimeUseRequest {
  * 权限引擎单一入口（M2-T1 接缝）。实现方约定：拒绝时抛 PermissionDeniedError；
  * 通过即返回（void）。执行前复核必须发生在任何执行机制（容器/直跑）之前。
  */
-export interface PermissionEngine {
+export interface SandboxPermissionEngine {
   assertRuntimeUse(req: RuntimeUseRequest): Promise<void>;
 }
 
@@ -96,7 +99,7 @@ function collectStrings(value: unknown, out: string[]): void {
  *    诊断留在权限层而非让工具运行时撞 ENOENT）。
  * M2-T1 合并后由其 Grant 五维语义接管，本实现仅作基线守卫。
  */
-export function createLocalPermissionEngine(options: { workspaceRoot: string }): PermissionEngine {
+export function createLocalPermissionEngine(options: { workspaceRoot: string }): SandboxPermissionEngine {
   const workspaceRoot = options.workspaceRoot;
   return {
     async assertRuntimeUse(req: RuntimeUseRequest): Promise<void> {
@@ -125,4 +128,64 @@ export function createLocalPermissionEngine(options: { workspaceRoot: string }):
       }
     },
   };
+}
+
+/** M2-T1 PermissionEngine 的运行时复核面（结构最小化——只依赖 assertRuntimeUse 形状） */
+export interface RegistryRuntimeChecker {
+  /** m2t1 口径：能力必须存在且 enabled，请求五维 ⊆ manifest ∩ grant；拒绝抛 CapabilityError */
+  assertRuntimeUse(name: string, request?: CapabilityUseRequest): unknown;
+}
+
+/**
+ * 注册表运行时复核适配器（merger 对齐件，票 #23 ↔ #22）：
+ * 第一道 = 本地确定性基线（契约一致性 + workspace 越界——注册表不知道 sandbox 契约与输入）；
+ * 第二道 = M2-T1 注册表 assertRuntimeUse（存在/enabled/五维 ⊆ manifest ∩ grant），
+ * 从输入派生**具体路径**（workspace:// 解析为 workspace 下具体路径；绝对路径原样——
+ * 越界的已被第一道拒绝）。network 维不派生：v1 沙箱契约恒 network:none（容器层强制），
+ * 输入里的 URL 串是待处理数据而非本次出网目标，派生会把正常输入误判为越权；
+ * 将来放开 network 契约时在此加显式声明通道。
+ * CapabilityError（not_found/invalid_state/escalation）→ PermissionDeniedError（本接缝统一口径）。
+ */
+export function createRegistryPermissionAdapter(options: {
+  registry: RegistryRuntimeChecker;
+  workspaceRoot: string;
+}): SandboxPermissionEngine {
+  const local = createLocalPermissionEngine({ workspaceRoot: options.workspaceRoot });
+  return {
+    async assertRuntimeUse(req: RuntimeUseRequest): Promise<void> {
+      await local.assertRuntimeUse(req);
+      const request: CapabilityUseRequest = {};
+      const fsPaths = deriveConcretePaths(req.input, options.workspaceRoot);
+      if (fsPaths.length > 0) {
+        request.filesystem = fsPaths;
+      }
+      try {
+        options.registry.assertRuntimeUse(req.manifest.name, request);
+      } catch (err) {
+        if (err instanceof CapabilityError) {
+          throw new PermissionDeniedError(`registry ${err.code}: ${err.message}`);
+        }
+        throw err;
+      }
+    },
+  };
+}
+
+function deriveConcretePaths(input: unknown, workspaceRoot: string): string[] {
+  const strings: string[] = [];
+  collectStrings(input, strings);
+  const paths = new Set<string>();
+  for (const s of strings) {
+    if (s.startsWith(WORKSPACE_PROTOCOL)) {
+      const rel = s.slice(WORKSPACE_PROTOCOL.length).replace(/^\/+/, "");
+      if (rel.length > 0) {
+        paths.add(join(workspaceRoot, rel));
+      }
+      continue;
+    }
+    if (ABSOLUTE_PATH_RE.test(s)) {
+      paths.add(s);
+    }
+  }
+  return [...paths];
 }

@@ -5,7 +5,8 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
-import { createLocalPermissionEngine, PermissionDeniedError } from "../src/sandbox/permission.ts";
+import { createLocalPermissionEngine, createRegistryPermissionAdapter, PermissionDeniedError, type RuntimeUseRequest } from "../src/sandbox/permission.ts";
+import { CapabilityError } from "../src/capabilities/engine.ts";
 import { normalizeSandboxContract } from "../src/sandbox/contract.ts";
 
 const WS = mkdtempSync(join(tmpdir(), "morrow-perm-ws-"));
@@ -77,3 +78,67 @@ describe("LocalPermissionEngine：确定性本地判定（fail-closed 基线）"
     await engine.assertRuntimeUse({ manifest: baseManifest, contract: CONTAINER, input: { file: "a.docx" } });
   });
 });
+
+// merger 对齐件（#23 接缝 ↔ #22 注册表单一入口）：注册表 stub 按 m2t1
+// assertRuntimeUse(name, CapabilityUseRequest) 口径回放。
+function stubRegistry(reply: "ok" | "not_found" | "disabled" | "throw_raw", seen: Array<{ name: string; request: unknown }> = []) {
+  return {
+    assertRuntimeUse(name: string, request?: unknown): unknown {
+      seen.push({ name, request });
+      if (reply === "ok") return { allowed: true, name, version: "1.0.0" };
+      if (reply === "not_found") throw new CapabilityError("not_found", `capability "${name}" is not registered`);
+      if (reply === "disabled") throw new CapabilityError("invalid_state", `capability "${name}" is disabled (runtime use denied)`);
+      throw new Error("raw non-capability error");
+    },
+  };
+}
+
+describe("createRegistryPermissionAdapter：merger 对齐（#23 接缝 ↔ #22 注册表单一入口）", () => {
+  const goManifest = {
+    name: "morrow.go.textstats",
+    version: "1.0.0",
+    author: "human" as const,
+    runtime: "go" as const,
+    sandbox: { type: "builtin" as const },
+  };
+
+  it("注册表放行 → void；workspace:// 输入派生为 workspace 下具体路径传给注册表", async () => {
+    const seen: Array<{ name: string; request: unknown }> = [];
+    const adapter = createRegistryPermissionAdapter({ registry: stubRegistry("ok", seen), workspaceRoot: WS });
+    await adapter.assertRuntimeUse({ manifest: goManifest, contract: BUILTIN, input: { file: "workspace://input/a.docx" } });
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].name, "morrow.go.textstats");
+    const request = seen[0].request as { filesystem?: string[] };
+    assert.deepEqual(request.filesystem, [join(WS, "input/a.docx")]);
+  });
+
+  it("注册表 not_found / disabled（CapabilityError）→ PermissionDeniedError（本接缝统一口径）", async () => {
+    const nf = createRegistryPermissionAdapter({ registry: stubRegistry("not_found"), workspaceRoot: WS });
+    await assert.rejects(nf.assertRuntimeUse({ manifest: goManifest, contract: BUILTIN, input: {} }), PermissionDeniedError);
+    const dis = createRegistryPermissionAdapter({ registry: stubRegistry("disabled"), workspaceRoot: WS });
+    await assert.rejects(dis.assertRuntimeUse({ manifest: goManifest, contract: BUILTIN, input: {} }), (err: unknown) => {
+      assert.ok(err instanceof PermissionDeniedError);
+      assert.match(err.message, /invalid_state/);
+      return true;
+    });
+  });
+
+  it("本地基线先于注册表：workspace 越界输入在第一道即拒绝（注册表未被调用）", async () => {
+    const seen: Array<{ name: string; request: unknown }> = [];
+    const adapter = createRegistryPermissionAdapter({ registry: stubRegistry("ok", seen), workspaceRoot: WS });
+    await assert.rejects(
+      adapter.assertRuntimeUse({ manifest: goManifest, contract: BUILTIN, input: { path: "/etc/passwd" } }),
+      PermissionDeniedError,
+    );
+    assert.equal(seen.length, 0);
+  });
+
+  it("非 CapabilityError 的注册表异常原样上抛（不吞内部错误）", async () => {
+    const adapter = createRegistryPermissionAdapter({ registry: stubRegistry("throw_raw"), workspaceRoot: WS });
+    await assert.rejects(
+      adapter.assertRuntimeUse({ manifest: goManifest, contract: BUILTIN, input: {} }),
+      (err: unknown) => err instanceof Error && err.message === "raw non-capability error",
+    );
+  });
+});
+

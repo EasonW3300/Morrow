@@ -65,7 +65,7 @@ provider 参数）；凭据库可经 `startRuntime(config, { secretStore })` 注
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/v1/health` | `{ status: "ok", version, replica_id, sandbox, ledger: { events } }`；沙箱探针为桩，恒返回 `not-configured`（明确第四态；真实化是 M2-T1 / Issue #22 交付，检测逻辑见 `src/sandbox/detect.ts`） |
+| GET | `/v1/health` | `{ status: "ok", version, replica_id, sandbox, ledger: { events } }`；沙箱探针（M2-T1 / Issue #22 真实化）：`not_configured`（MORROW_SANDBOX_PROBE=off）/ `missing` / `daemon_down` / `ready`（带 engine/version，missing/daemon_down 带 install_hint） |
 | GET | `/v1/events` | `{ events: EventEnvelope[], total, limit, offset }`；query：`limit`（1–200，默认 50）、`offset`、`replica_id`（uuid 过滤）；非法入参 400 |
 | POST | `/v1/sessions` | 建会话，body `{ title?, provider_id? }`（provider_id 需已注册，或为 env 回退）→ 201 `{ session_id, event_id, sequence, occurred_at, provider_id?, title? }`；未知 provider_id → 400 `unknown_provider` |
 | GET | `/v1/sessions` | 会话列表（`session.created` 投影，含显式 `provider_id`）→ `{ sessions: [...] }` |
@@ -504,7 +504,9 @@ src/
                    routes.ts     facts/candidates/conflicts 控制面端点
   config.ts      环境变量解析（含 Provider 三元组 env 回退种子）+ 副本身份持久化
   sandbox/       沙箱执行 Worker（M2-T2 / Issue #23，详见下节）
-  health.ts      沙箱可用性探针（M0 桩；真实化是 M2-T1 / Issue #22 的交付，检测逻辑见 sandbox/detect.ts）
+  health.ts      沙箱可用性探针（M2-T1 / Issue #22 真实化：which+daemon 探测四级状态；
+                   M2-T2 的 sandbox/detect.ts 服务 Runner 执行路径，两处口径独立维护）
+  capabilities/  能力注册表与权限模型（M2-T1 / Issue #22）：PermissionEngine 单一入口
   uuid-v7.ts     UUID v7 生成 + 小写 uuid 形态正则 UUID_RE（config / runtime 共用）
   index.ts       公共出口（库形态供桌面宿主内嵌）
 scripts/
@@ -576,12 +578,16 @@ OperatingSystem 字段归类 orbstack；Windows 探 docker.exe，缺失再探 WS
   `tool_timeout` → 504；`tool_error` / `tool_exit_nonzero` / `tool_protocol_error` /
   `tool_output_too_large` → 502（工具自身失败）；`image_pull_failed` / `tool_build_failed` → 503/500。
 
-### 运行时权限复核（M2-T1 接缝）
+### 运行时权限复核（M2-T1 单一入口，已对齐）
 
-执行前固定调用 `PermissionEngine.assertRuntimeUse({manifest, contract, input, context})`
-（`src/sandbox/permission.ts`）。本票交付接口桩 + 确定性本地判定基线（fail-closed）：
-manifest 声明 network 权限但契约为 none → 拒绝；输入含 workspace 外绝对路径 → 执行前
-拒绝（builtin 同样过复核）。M2-T1（Issue #22）合并后由其 Grant 五维语义接管该接缝。
+执行前固定调用 `SandboxPermissionEngine.assertRuntimeUse({manifest, contract, input,
+context})`（`src/sandbox/permission.ts`，执行链接缝）。生产默认 = `createRegistryPermissionAdapter`
+双道复核（merger 对齐件）：第一道本地确定性基线（fail-closed：manifest 声明 network 权限
+但契约为 none → 拒绝；输入含 workspace 外绝对路径 → 执行前拒绝；builtin 同样过复核），
+第二道 M2-T1 `PermissionEngine.assertRuntimeUse(name, CapabilityUseRequest)`（存在/enabled/
+五维 ⊆ manifest ∩ grant；workspace:// 输入派生为 workspace 下具体路径传入；
+CapabilityError → PermissionDeniedError）。测试/宿主可经 `RuntimeOptions.permissionEngine`
+注入桩。
 
 ### Go Worker 示范（workers/go）
 
