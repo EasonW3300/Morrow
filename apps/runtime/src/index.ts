@@ -50,7 +50,33 @@ export type {
   TaskErrorCode,
 } from "./tasks.ts";
 export { TaskScheduler, DEFAULT_TASK_CONCURRENCY } from "./scheduler.ts";
-export type { NodeAgentFactory, TaskNodeExecInput, TaskSchedulerOptions } from "./scheduler.ts";
+export type {
+  NodeAgentFactory,
+  TaskNodeExecInput,
+  TaskSchedulerOptions,
+  PauseResult,
+  ResumeResult,
+} from "./scheduler.ts";
+export {
+  CheckpointService,
+  CheckpointStore,
+  CheckpointError,
+  CHECKPOINT_SNAPSHOT_SCHEMA,
+  TASK_CHECKPOINT_EVENT_TYPES,
+  planReconcile,
+} from "./checkpoint.ts";
+export type {
+  CheckpointNodeSnapshot,
+  CheckpointPendingSideEffect,
+  CheckpointRecord,
+  CheckpointSnapshot,
+  CheckpointTaskView,
+  CheckpointErrorCode,
+  ReconcileAction,
+  ReconcileActionKind,
+  ReconcileReport,
+  RestoreOutcome,
+} from "./checkpoint.ts";
 export { ensureTaskTables, TASK_TABLES_SQL } from "./task-migrations.ts";
 export { MemoryStore, normalizeForFts, buildFtsQuery } from "./memory/store.ts";
 export type {

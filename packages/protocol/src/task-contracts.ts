@@ -19,8 +19,13 @@ export type TaskStatus =
   | "completed"
   | "cancelled";
 
-/** 节点执行状态（DAG 投影；pending = 依赖未满足，调度器就绪判定见 runtime scheduler） */
-export type TaskNodeStatus = "pending" | "running" | "completed" | "failed";
+/**
+ * 节点执行状态（DAG 投影；pending = 依赖未满足，调度器就绪判定见 runtime scheduler）。
+ * pending_review（M1-T5 / Issue #17）：副作用不可自动重发的节点恢复后的人工核对态——
+ * 不可逆/未知分类的节点被回卷（或中断于半写状态）时不自动重执行，等 Owner 核对；
+ * 调度器不派发该状态，含此类节点的任务在无可跑节点时转 waiting_input。
+ */
+export type TaskNodeStatus = "pending" | "running" | "completed" | "failed" | "pending_review";
 
 /**
  * 副作用分类（GLOSSARY: SideEffect；FR-TASK-6）。

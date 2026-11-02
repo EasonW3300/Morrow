@@ -1,12 +1,19 @@
 import type { AgentRuntime, MorrowAgentEvent } from "@morrow/pi-adapter";
 import { buildEventEnvelope } from "./envelope.ts";
 import type { EventLedger } from "./ledger.ts";
-import type { TaskNodeRecord } from "@morrow/protocol";
+import type { TaskNodeRecord, TaskSummary } from "@morrow/protocol";
 import { TASK_EVENT_TYPES, TaskError, type TaskService } from "./tasks.ts";
+import {
+  CheckpointService,
+  planReconcile,
+  type CheckpointRecord,
+  type ReconcileReport,
+} from "./checkpoint.ts";
 import { SESSION_EVENT_TYPES } from "./sessions.ts";
 
 /**
- * 单机任务调度器（票 M1-T4 / Issue #16，FR-TASK-1 的调度半边）。
+ * 单机任务调度器（票 M1-T4 / Issue #16，FR-TASK-1 的调度半边；M1-T5 / Issue #17 扩展
+ * pause/resume/restore 的编排）。
  *
  * 调度模型（M1 单机、单副本）：
  * - 就绪判定：节点 pending 且其全部依赖（task_edges 入边）completed——顺序由依赖
@@ -14,16 +21,24 @@ import { SESSION_EVENT_TYPES } from "./sessions.ts";
  *   FR-TASK-8（P1）的事；
  * - 并行：同批就绪节点并发执行，在跑数受 concurrency 上限约束（可配置，默认 2，
  *   最小 1）；同批按 node_seq（规划序）优先派发，行为确定；
- * - 多任务：schedule() 入队 FIFO 逐任务驱动（同一时刻至多一个任务在派发）——
- *   concurrency 是调度器级上限，串行化让它跨任务成立，任务内节点并行不受影响；
+ * - 多任务：schedule()/resume()/restore() 共用一条 FIFO 队列逐任务驱动（同一时刻
+ *   至多一个任务在 #drive）——concurrency 是调度器级上限，串行化让它跨任务成立，
+ *   任务内节点并行不受影响；
  * - 节点执行 = 一次 Agent Loop（复用 sessions.ts 的驱动模式：subscribe 窄事件 →
  *   账本事件 + causation 链）。工具事件复用既有 tool.started/tool.finished 类型
  *   （只加演进：信封带 task_id），causation 链到 task.node_started；
  * - 失败：节点失败（error 事件 / stop_reason error|aborted / prompt 拒绝 / 工厂抛错）
- *   时 retriable 节点自动重试一次（attempts=2）；最终失败标记节点 failed，等在跑
- *   兄弟节点收尾后整任务迁 failed（task.failed payload 带 node_id 与原因）；
- * - 暂停：每次派发前检查任务状态，非 running（paused/cancelled）即停止派发新节点，
- *   在跑节点自然收尾；恢复调度是 FR-TASK-3 的接续工作。
+ *   时 retriable 节点自动重试一次（每次调度运行内最多 2 次；跨恢复的 attempts 在
+ *   节点行上累计递增）；最终失败标记节点 failed，等在跑兄弟节点收尾后整任务迁
+ *   failed（task.failed payload 带 node_id 与原因）；
+ * - 暂停（M1-T5）：pause = 停止派发（#pausing 标志即时生效）+ 等在跑节点到边界
+ *   （自然收尾，不中止）→ task.paused 迁移 → checkpoint 落库。安全点语义：在跑
+ *   节点的工作不浪费、事件流保持真实（不产生 aborted 节点簿记）；pause 一旦受理
+ *   即粘滞（drive 主循环让位，不会并发地把任务迁到 completed）；
+ * - 恢复（M1-T5）：resume = 从最新 checkpoint（可为空）reconcile（副作用分类 gate，
+ *   见 checkpoint.ts planReconcile）→ task.restored → 迁回 running（或 stale-running
+ *   恢复标记）→ 重新入队驱动；restore = 指定 checkpoint 的同一管线。reconcile 后
+ *   只剩 pending_review 节点时任务转 waiting_input（reconciliation_required）。
  *
  * 事件 actor 一律 agent:runtime；全部事件 task_id 关联，可经
  * GET /v1/tasks/:id/events（账本 task_id 专列）查询。
@@ -31,6 +46,10 @@ import { SESSION_EVENT_TYPES } from "./sessions.ts";
 
 export const DEFAULT_TASK_CONCURRENCY = 2;
 const MAX_ATTEMPTS_RETRIABLE = 2;
+const PAUSE_SETTLE_TIMEOUT_MS = 10_000;
+const PAUSE_POLL_MS = 20;
+
+const TERMINAL_TASK_STATUSES = new Set(["failed", "completed", "cancelled"]);
 
 /** 节点执行输入（工厂 seam：生产按 Provider 构建 PiAdapter；测试注入 FakePi 脚本） */
 export interface TaskNodeExecInput {
@@ -42,7 +61,7 @@ export interface TaskNodeExecInput {
   goal: string;
   agentRole?: string;
   model?: string;
-  /** 第几次尝试（1 起；retriable 节点失败重试时为 2） */
+  /** 第几次尝试（1 起；跨恢复累计：stale 半写的那次也计入） */
   attempt: number;
 }
 
@@ -54,6 +73,8 @@ export interface TaskSchedulerOptions {
   replicaId: string;
   /** null 时每个节点尝试即失败（error = 说明），任务以 failed 收尾——诚实留痕而非静默 */
   nodeAgentFactory: NodeAgentFactory | null;
+  /** Checkpoint 服务（M1-T5：pause 落 checkpoint；resume/restore 经它 reconcile） */
+  checkpoints: CheckpointService;
   /** 同时在跑节点上限；默认 2，最小 1 */
   concurrency?: number;
 }
@@ -65,15 +86,33 @@ interface NodeOutcome {
   stopReason?: string;
 }
 
+export interface PauseResult {
+  task: TaskSummary;
+  checkpoint: CheckpointRecord;
+}
+
+export interface ResumeResult {
+  task: TaskSummary;
+  report: ReconcileReport;
+  checkpoint_id: string | null;
+  /** 后台驱动 promise（HTTP 层 202 后 fire-and-forget） */
+  drive: Promise<void>;
+}
+
 export class TaskScheduler {
   readonly #tasks: TaskService;
   readonly #ledger: EventLedger;
   readonly #replicaId: string;
   readonly #factory: NodeAgentFactory | null;
+  readonly #checkpoints: CheckpointService;
   readonly #concurrency: number;
   readonly #active = new Set<AgentRuntime>();
-  /** 待调度的任务 FIFO（schedule 串行化：并发上限按调度器全局记账，不按单任务） */
-  readonly #queue: Array<{ taskId: string; resolve: () => void; reject: (err: unknown) => void }> = [];
+  /** 待调度的任务 FIFO（schedule/resume/restore 共用；并发上限按调度器全局记账） */
+  readonly #queue: Array<{ run: () => Promise<void>; resolve: () => void; reject: (err: unknown) => void }> = [];
+  /** pause 已受理、正在等边界的任务（drive 主循环见之让位） */
+  readonly #pausing = new Set<string>();
+  /** 本进程内正在 #drive 的任务（stale-running 判定：running 且不在本集合 = 中断残留） */
+  readonly #driving = new Set<string>();
   #draining = false;
   #disposed = false;
 
@@ -82,6 +121,7 @@ export class TaskScheduler {
     this.#ledger = options.ledger;
     this.#replicaId = options.replicaId;
     this.#factory = options.nodeAgentFactory;
+    this.#checkpoints = options.checkpoints;
     this.#concurrency = Math.max(1, Math.floor(options.concurrency ?? DEFAULT_TASK_CONCURRENCY));
   }
 
@@ -97,10 +137,66 @@ export class TaskScheduler {
     if (task === null) {
       return Promise.reject(new TaskError("not_found", `task ${taskId} does not exist`));
     }
-    return new Promise((resolve, reject) => {
-      this.#queue.push({ taskId, resolve, reject });
-      void this.#drain();
-    });
+    return this.#enqueue(taskId, () => this.#scheduleOne(taskId));
+  }
+
+  /**
+   * 暂停（M1-T5 / FR-TASK-3 暂停半边）：安全点暂停。
+   * 流程：受理（#pausing 即刻停派发）→ 等在跑节点到边界（不中止，PAUSE_SETTLE_TIMEOUT_MS
+   * 内未收尾则 timeout）→ task.paused 迁移 → checkpoint（FR-TASK-5 快照）落库。
+   * 任务在等待期间被并发终结（completed/failed）时抛 invalid_transition（任务状态为准）。
+   */
+  async pause(taskId: string): Promise<PauseResult> {
+    const task = this.#tasks.getTask(taskId);
+    if (task === null) {
+      throw new TaskError("not_found", `task ${taskId} does not exist`);
+    }
+    if (task.status !== "running") {
+      throw new TaskError(
+        "invalid_transition",
+        `task ${taskId} is ${task.status}, expected running to pause`,
+        { from: task.status, to: "paused" },
+      );
+    }
+    this.#pausing.add(taskId);
+    try {
+      await this.#waitForSettled(taskId);
+      const fresh = this.#tasks.getTask(taskId);
+      if (fresh === null) {
+        throw new TaskError("not_found", `task ${taskId} does not exist`);
+      }
+      if (fresh.status !== "running") {
+        throw new TaskError(
+          "invalid_transition",
+          `task ${taskId} is ${fresh.status}; it left running while pausing`,
+          { from: task.status, to: "paused" },
+        );
+      }
+      const transitioned = this.#tasks.transition(taskId, "paused", {
+        payload: { reason: "owner_request" },
+      });
+      const checkpoint = await this.#checkpoints.createCheckpoint(taskId, "pause");
+      return { task: transitioned.task, checkpoint };
+    } finally {
+      this.#pausing.delete(taskId);
+    }
+  }
+
+  /**
+   * 恢复（M1-T5）：从最新 checkpoint（无 checkpoint 时按活状态）reconcile 后续跑。
+   * 接受 paused / waiting_input / planned（崩溃前未调度）/ running（中断残留：本进程
+   * 未在驱动）；活跃 running 与终端态拒绝（invalid_transition）。
+   */
+  async resume(taskId: string): Promise<ResumeResult> {
+    const task = this.#assertResumable(taskId);
+    const latest = this.#checkpoints.latestCheckpoint(taskId);
+    return this.#resumeFrom(task, latest?.checkpoint_id ?? null);
+  }
+
+  /** 指定 checkpoint 恢复（M1-T5）：与 resume 同一 reconcile 管线；校验归属与版本。 */
+  async restore(taskId: string, checkpointId: string): Promise<ResumeResult> {
+    const task = this.#assertResumable(taskId);
+    return this.#resumeFrom(task, checkpointId);
   }
 
   /** 优雅退出：拒绝未开跑的排队任务、中止在跑节点运行时并等待收尾（上限 2s） */
@@ -119,6 +215,111 @@ export class TaskScheduler {
     }
   }
 
+  // --- 入口辅助 ----------------------------------------------------------------
+
+  #enqueue(taskId: string, run: () => Promise<void>): Promise<void> {
+    return new Promise((resolve, reject) => {
+      this.#queue.push({ run, resolve, reject });
+      void this.#drain();
+    });
+  }
+
+  #enqueueDrive(taskId: string, rootEventId: string): Promise<void> {
+    return this.#enqueue(taskId, () => this.#driveTracked(taskId, rootEventId));
+  }
+
+  #assertResumable(taskId: string): NonNullable<ReturnType<TaskService["getTask"]>> {
+    const task = this.#tasks.getTask(taskId);
+    if (task === null) {
+      throw new TaskError("not_found", `task ${taskId} does not exist`);
+    }
+    if (TERMINAL_TASK_STATUSES.has(task.status)) {
+      throw new TaskError(
+        "invalid_transition",
+        `task ${taskId} is terminal (${task.status}) and cannot resume`,
+        { from: task.status, to: "running" },
+      );
+    }
+    if (task.status === "created") {
+      throw new TaskError(
+        "invalid_transition",
+        `task ${taskId} has no plan (still created); recreate the task instead of resuming`,
+        { from: task.status, to: "running" },
+      );
+    }
+    if (task.status === "running" && this.#driving.has(taskId)) {
+      throw new TaskError(
+        "invalid_transition",
+        `task ${taskId} is already running in this process`,
+        { from: task.status, to: "running" },
+      );
+    }
+    return task;
+  }
+
+  /**
+   * reconcile（checkpoint 可空）→ task.restored → 迁回 running / 恢复标记 → 入队驱动。
+   * #driving 在同步段即登记（并发双 resume 的第二个在入队前就被 409），驱动收尾时注销。
+   */
+  #resumeFrom(
+    task: NonNullable<ReturnType<TaskService["getTask"]>>,
+    checkpointId: string | null,
+  ): ResumeResult {
+    const taskId = task.task_id;
+    this.#driving.add(taskId);
+    try {
+      const outcome = this.#checkpoints.restoreCheckpoint(taskId, checkpointId);
+      let rootEventId = outcome.eventId;
+      if (task.status === "planned" || task.status === "paused" || task.status === "waiting_input") {
+        // planned→running 记 task.started；paused/waiting_input→running 记 task.resumed
+        rootEventId = this.#tasks.transition(taskId, "running").eventId;
+      } else if (task.status === "running") {
+        // 中断残留（stale-running）：无状态迁移，补恢复标记（cause 上挂 checkpoint）
+        rootEventId = this.#tasks.markResumedForRecovery(taskId, {
+          reason: "recovered_after_interruption",
+          checkpoint_id: outcome.checkpoint_id,
+        }).eventId;
+      }
+      const drive = this.#enqueue(taskId, async () => {
+        try {
+          await this.#drive(taskId, rootEventId);
+        } finally {
+          this.#driving.delete(taskId);
+        }
+      });
+      const fresh = this.#tasks.getTask(taskId);
+      return {
+        task: (fresh ?? task) as TaskSummary,
+        report: outcome.report,
+        checkpoint_id: outcome.checkpoint_id,
+        drive,
+      };
+    } catch (err) {
+      this.#driving.delete(taskId);
+      throw err;
+    }
+  }
+
+  /** 等待任务无 running 节点（安全点）；任务先于边界离开 running 时立即返回 */
+  async #waitForSettled(taskId: string): Promise<void> {
+    const deadline = Date.now() + PAUSE_SETTLE_TIMEOUT_MS;
+    for (;;) {
+      const task = this.#tasks.getTask(taskId);
+      if (task === null) {
+        throw new TaskError("not_found", `task ${taskId} does not exist`);
+      }
+      if (task.status !== "running") return;
+      if (!task.nodes.some((node) => node.status === "running")) return;
+      if (Date.now() > deadline) {
+        throw new TaskError(
+          "timeout",
+          `pause timed out waiting for in-flight nodes of task ${taskId} to settle`,
+        );
+      }
+      await sleep(PAUSE_POLL_MS);
+    }
+  }
+
   // --- 调度主循环 --------------------------------------------------------------
 
   async #drain(): Promise<void> {
@@ -126,9 +327,9 @@ export class TaskScheduler {
     this.#draining = true;
     try {
       while (this.#queue.length > 0 && !this.#disposed) {
-        const next = this.#queue.shift() as { taskId: string; resolve: () => void; reject: (err: unknown) => void };
+        const next = this.#queue.shift() as { run: () => Promise<void>; resolve: () => void; reject: (err: unknown) => void };
         try {
-          await this.#scheduleOne(next.taskId);
+          await next.run();
           next.resolve();
         } catch (err) {
           next.reject(err);
@@ -139,26 +340,42 @@ export class TaskScheduler {
     }
   }
 
+  /** #drive 的本进程记账包装（#driving 供 stale-running 判定与活跃 resume 拒绝） */
+  async #driveTracked(taskId: string, rootEventId: string): Promise<void> {
+    this.#driving.add(taskId);
+    try {
+      await this.#drive(taskId, rootEventId);
+    } finally {
+      this.#driving.delete(taskId);
+    }
+  }
+
   async #scheduleOne(taskId: string): Promise<void> {
-    const task = this.#tasks.getTask(taskId);
-    if (task === null) {
-      throw new TaskError("not_found", `task ${taskId} does not exist`);
+    // 驱动记账从迁移前开始：迁移到 #drive 之间 resume 不得把任务误判为中断残留
+    this.#driving.add(taskId);
+    try {
+      const task = this.#tasks.getTask(taskId);
+      if (task === null) {
+        throw new TaskError("not_found", `task ${taskId} does not exist`);
+      }
+      if (task.status !== "planned") {
+        throw new TaskError(
+          "invalid_transition",
+          `task ${taskId} is ${task.status}, expected planned before scheduling`,
+          { from: task.status, to: "running" },
+        );
+      }
+      // causation 链：task.started 由规划完成触发 → 指向 task.planned 事件
+      const plannedEvent = this.#ledger
+        .scan({ taskId, eventType: TASK_EVENT_TYPES.taskPlanned })
+        .at(-1);
+      const started = this.#tasks.transition(taskId, "running", {
+        causeEventId: plannedEvent?.envelope.event_id ?? null,
+      });
+      await this.#drive(taskId, started.eventId);
+    } finally {
+      this.#driving.delete(taskId);
     }
-    if (task.status !== "planned") {
-      throw new TaskError(
-        "invalid_transition",
-        `task ${taskId} is ${task.status}, expected planned before scheduling`,
-        { from: task.status, to: "running" },
-      );
-    }
-    // causation 链：task.started 由规划完成触发 → 指向 task.planned 事件
-    const plannedEvent = this.#ledger
-      .scan({ taskId, eventType: TASK_EVENT_TYPES.taskPlanned })
-      .at(-1);
-    const started = this.#tasks.transition(taskId, "running", {
-      causeEventId: plannedEvent?.envelope.event_id ?? null,
-    });
-    await this.#drive(taskId, started.eventId);
   }
 
   // --- 调度主循环 --------------------------------------------------------------
@@ -166,6 +383,7 @@ export class TaskScheduler {
   async #drive(taskId: string, startedEventId: string): Promise<void> {
     const inflight = new Map<string, { promise: Promise<void>; entry: { done: boolean } }>();
     while (!this.#disposed) {
+      if (this.#pausing.has(taskId)) return; // pause 已受理：让位（不再派发/不再终结任务）
       const task = this.#tasks.getTask(taskId);
       if (task === null || task.status !== "running") return; // 被外部 paused/cancelled/failed
 
@@ -189,6 +407,7 @@ export class TaskScheduler {
       }
 
       if (inflight.size === 0) {
+        if (this.#pausing.has(taskId)) return;
         const fresh = this.#tasks.getTask(taskId);
         if (fresh === null || fresh.status !== "running") return;
         const nodesNow = fresh.nodes;
@@ -216,6 +435,20 @@ export class TaskScheduler {
           });
           return;
         }
+        // 人工核对项挂起（M1-T5）：pending_review 节点不可派发也不算失败，
+        // 任务转 waiting_input 等 Owner 核对（waiting_input→running 之后仍可恢复）
+        const reviewNodes = nodesNow.filter((n) => n.status === "pending_review");
+        if (reviewNodes.length > 0) {
+          this.#tasks.transition(taskId, "waiting_input", {
+            causeEventId: startedEventId,
+            payload: {
+              reason: "reconciliation_required",
+              node_ids: reviewNodes.map((n) => n.node_id),
+              keys: reviewNodes.map((n) => n.key),
+            },
+          });
+          return;
+        }
         // 无就绪、无在跑、未完成：合法 DAG（规划期已拒环）不会到达；防御性收尾
         this.#tasks.transition(taskId, "failed", {
           causeEventId: startedEventId,
@@ -235,9 +468,13 @@ export class TaskScheduler {
   // --- 节点执行（一次 Agent Loop；失败按 retriable 重试一次）--------------------
 
   async #runNode(taskId: string, node: TaskNodeRecord, startedEventId: string): Promise<void> {
+    // attempts 跨恢复累计（M1-T5）：半写/回卷重放的节点在原 attempts 上递增，
+    // node_started 的 attempt 编号与账本史一致；本调度运行内 retriable 最多 2 次
+    const baseAttempts = this.#tasks.getNodeState(node.node_id)?.attempts ?? 0;
     const totalAttempts = node.retriable ? MAX_ATTEMPTS_RETRIABLE : 1;
     let outcome: NodeOutcome = { ok: false, text: "", error: "node did not run" };
-    for (let attempt = 1; attempt <= totalAttempts; attempt++) {
+    for (let i = 1; i <= totalAttempts; i++) {
+      const attempt = baseAttempts + i;
       this.#tasks.setNodeRunning(node.node_id, attempt);
       const nodeStarted = this.#appendTaskEvent(taskId, TASK_EVENT_TYPES.taskNodeStarted, {
         node_id: node.node_id,
@@ -413,4 +650,8 @@ export class TaskScheduler {
 
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }

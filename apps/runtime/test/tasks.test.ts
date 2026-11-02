@@ -7,6 +7,7 @@ import { createFakePi, type FakeStep, type MorrowTool } from "@morrow/pi-adapter
 import type { EventEnvelope, TaskStatus } from "@morrow/protocol";
 import { EventLedger } from "../src/ledger.ts";
 import { TaskScheduler, type NodeAgentFactory } from "../src/scheduler.ts";
+import { CheckpointService } from "../src/checkpoint.ts";
 import { TaskError, TaskService } from "../src/tasks.ts";
 import { removeDir, tmpDir } from "./helpers.ts";
 
@@ -32,6 +33,7 @@ const MIXED_PLAN = planJson([
 
 interface Harness {
   svc: TaskService;
+  checkpoints: CheckpointService;
   dir: string;
   close(): void;
 }
@@ -45,14 +47,16 @@ function openService(plannerOutput: string): Harness {
     replicaId: REPLICA,
     factory: async () => createFakePi({ script: planScript(plannerOutput) }),
   });
-  return { svc, dir, close: () => { svc.close(); ledger.close(); removeDir(dir); } };
+  const checkpoints = new CheckpointService({ tasks: svc, dataDir: dir, ledger, replicaId: REPLICA });
+  return { svc, checkpoints, dir, close: () => { svc.close(); checkpoints.close(); ledger.close(); removeDir(dir); } };
 }
 
 function openIdleService(): Harness {
   const dir = tmpDir("morrow-tasks-idle-");
   const ledger = EventLedger.open(dir);
   const svc = new TaskService({ dataDir: dir, ledger, replicaId: REPLICA, factory: null });
-  return { svc, dir, close: () => { svc.close(); ledger.close(); removeDir(dir); } };
+  const checkpoints = new CheckpointService({ tasks: svc, dataDir: dir, ledger, replicaId: REPLICA });
+  return { svc, checkpoints, dir, close: () => { svc.close(); checkpoints.close(); ledger.close(); removeDir(dir); } };
 }
 
 function nodeFactory(scripts: Record<string, FakeStep[]>, tools: MorrowTool[] = []): NodeAgentFactory {
@@ -65,6 +69,7 @@ function makeScheduler(h: Harness, factory: NodeAgentFactory | null, concurrency
     ledger: h.svc.ledger,
     replicaId: REPLICA,
     nodeAgentFactory: factory,
+    checkpoints: h.checkpoints,
     ...(concurrency === undefined ? {} : { concurrency }),
   });
 }
