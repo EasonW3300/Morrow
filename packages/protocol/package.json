@@ -6,6 +6,7 @@
   "description": "事件信封 schema、API 合约与共享类型（TS + JSON Schema）",
   "exports": {
     ".": "./src/index.ts",
+    "./browser": "./src/browser.ts",
     "./schema/event-envelope.schema.json": "./schema/event-envelope.schema.json"
   },
   "scripts": {

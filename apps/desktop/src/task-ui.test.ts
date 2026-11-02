@@ -4,7 +4,7 @@
 // node:test + 零网络；React 只做装配（与 health-ui / connectivity-ui 同一分工）。
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import type { TaskNodeRecord, TaskStatus } from "@morrow/protocol";
+import type { TaskNodeRecord, TaskStatus } from "@morrow/protocol/browser";
 import type { TaskEventEnvelope } from "./api.ts";
 import {
   dagLayers,
