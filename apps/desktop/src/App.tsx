@@ -5,17 +5,21 @@ import { ChatView } from "./ChatView.tsx";
 import { SessionList } from "./SessionList.tsx";
 import { SettingsView } from "./SettingsView.tsx";
 import { HealthView } from "./HealthView.tsx";
+import { TaskView } from "./TaskView.tsx";
 
 /**
- * 桌面壳根组件：解析控制面地址（sidecar ready）→ 顶栏导航（会话 / 设置 / 健康）。
+ * 桌面壳根组件：解析控制面地址（sidecar ready）→ 顶栏导航（会话 / 任务 / 设置 / 健康）。
  * 会话数据都来自控制面 HTTP/SSE（api.ts / EventSource），壳不做私有通道；
  * 设置与健康页（票 T7 / Issue #8）同样只走控制面 API。
  * 导航整合是 M0 简化：PRD §5.1 的「设置 → Provider 与模型」扁平为一级页签。
+ * 任务页签（票 M1-T6 / Issue #18）：PRD §5.1 Task 视图简版；Chat 任务卡片经
+ * openTaskId 跳转（路由从简：壳内 state 传递，不引路由库）。
  */
-type View = "chat" | "settings" | "health";
+type View = "chat" | "tasks" | "settings" | "health";
 
 const NAV_ITEMS: { key: View; label: string }[] = [
   { key: "chat", label: "会话" },
+  { key: "tasks", label: "任务" },
   { key: "settings", label: "设置" },
   { key: "health", label: "健康" },
 ];
@@ -24,6 +28,7 @@ export default function App() {
   const [base, setBase] = useState<string | null>(null);
   const [bootError, setBootError] = useState<string | null>(null);
   const [view, setView] = useState<View>("chat");
+  const [openTaskId, setOpenTaskId] = useState<string | null>(null);
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [listError, setListError] = useState<string | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -63,6 +68,12 @@ export default function App() {
       setCreating(false);
     }
   }, [base, refreshSessions]);
+
+  /** Chat 任务卡片 → Task 视图（路由从简：切页签 + 预选任务） */
+  const openTask = useCallback((taskId: string) => {
+    setOpenTaskId(taskId);
+    setView("tasks");
+  }, []);
 
   if (bootError !== null) {
     return (
@@ -117,10 +128,15 @@ export default function App() {
                 <p>选择左侧会话，或新建一个开始对话。</p>
               </div>
             ) : (
-              <ChatView key={selectedId} base={base} sessionId={selectedId} />
+              <ChatView key={selectedId} base={base} sessionId={selectedId} onOpenTask={openTask} />
             )}
           </main>
         </div>
+      )}
+      {view === "tasks" && (
+        <main className="main page-host">
+          <TaskView base={base} initialTaskId={openTaskId} />
+        </main>
       )}
       {view === "settings" && (
         <main className="main page-host">

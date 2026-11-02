@@ -17,12 +17,15 @@ import { openSqlite, type SqliteDatabase, type SqliteStatement } from "./db.ts";
 import { uuidv7 } from "./uuid-v7.ts";
 
 /**
- * 任务域（票 M1-T4 / Issue #16，PRD §4.3 FR-TASK-1/2/6、决策稿 §6 状态机）。
+ * 任务域（票 M1-T4 / Issue #16，PRD §4.3 FR-TASK-1/2/6、决策稿 §6 状态机；
+ * M1-T6 / Issue #18 扩展人工介入：revise / takeover / complete / release）。
  *
  * 职责分界：
  * - TaskStore：tasks/task_nodes/task_edges 可变投影表（迁移见 task-migrations.ts）；
  * - TaskService：任务生命周期——建任务 + 规划（经 PiAdapter 接口，FR-TASK-1）、
- *   DAG 存取投影、任务级状态机与 task.* 事件族（FR-TASK-2）；
+ *   DAG 存取投影、任务级状态机与 task.* 事件族（FR-TASK-2）、人工介入操作
+ *   （FR-TASK-3：修改未完成节点 / 接管子任务 / 提交结果 / 交还，全部以 owner
+ *   actor 留审计事件）；
  * - 节点执行与调度在 scheduler.ts（节点行更新经 TaskService 的窄接缝写入）。
  *
  * 规划（FR-TASK-1）：目标描述 → Agent Loop（系统提示词要求只输出 JSON 计划）→
@@ -38,8 +41,11 @@ import { uuidv7 } from "./uuid-v7.ts";
  *   paused | waiting_input → running | failed | cancelled
  *   failed | completed | cancelled → （终端态，拒绝一切迁移）
  * paused→running / waiting_input→running 的恢复事件是 task.resumed（不是再次 started）。
- * 暂停/补充输入的人工介入端点是 FR-TASK-3 的范围；本票状态机先行，服务层
- * transition 即可驱动（测试与后续票共用）。
+ * 人工介入（M1-T6）：revise 是终端态回卷的正道——failed 任务经 reviseTask 回卷为
+ * planned（不走 transition 表，terminal 直接迁移依旧全部拒绝）；running 任务 revise
+ * 被拒（PRD §5.2 流程 2：先暂停再修改）；completed/cancelled 不可逆拒绝。
+ * takeover：节点 actor=owner，调度器跳过派发；Owner 经 complete 提交结果或 release
+ * 交还调度，全部操作留 owner actor 审计事件（AC-12 前置）。
  */
 
 /** 任务事件族（event_type 清单只增不减；点分风格同 PRD §6.3） */
@@ -56,6 +62,11 @@ export const TASK_EVENT_TYPES = {
   taskFailed: "task.failed",
   taskCancelled: "task.cancelled",
   taskPlanningFailed: "task.planning_failed",
+  // M1-T6 人工介入族（actor 一律 owner——AC-12 审计前置）
+  taskRevised: "task.revised",
+  taskNodeTakenOver: "task.node_taken_over",
+  taskNodeReleased: "task.node_released",
+  taskNodeCompletedByOwner: "task.node_completed_by_owner",
 } as const;
 
 /**
@@ -93,6 +104,8 @@ export type TaskErrorCode =
   | "not_found"
   | "planner_unavailable"
   | "invalid_plan"
+  | "invalid_revision"
+  | "immutable_node"
   | "timeout";
 
 export class TaskError extends Error {
@@ -136,6 +149,194 @@ export interface PlannedNode {
 
 export interface PlannedDag {
   nodes: PlannedNode[];
+}
+
+// --- 人工介入：修订修改集（M1-T6 / FR-TASK-3）------------------------------------
+
+/** 节点 key 模式（与规划 schema 一致：小写字母数字开头，短标识） */
+export const NODE_KEY_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+
+/**
+ * 节点修改（update 项）：仅声明的字段被改；depends_on 全量替换；goal/model/
+ * agent_role 显式传 null 清除（goal 清除后执行时回退 title）。
+ */
+export interface TaskRevisionChange {
+  key: string;
+  title?: string;
+  goal?: string | null;
+  model?: string | null;
+  agent_role?: string | null;
+  depends_on?: string[];
+  retriable?: boolean;
+  side_effect?: SideEffectClass;
+}
+
+/** 新增节点（add 项；retriable/side_effect 缺省与规划一致：true / delivery_unknown） */
+export interface TaskRevisionAdd {
+  key: string;
+  title: string;
+  goal?: string;
+  model?: string;
+  agent_role?: string;
+  depends_on?: string[];
+  retriable?: boolean;
+  side_effect?: SideEffectClass;
+}
+
+/** POST /v1/tasks/:id/revise 修改集（update/add/remove 至少一项） */
+export interface TaskRevision {
+  update?: TaskRevisionChange[];
+  add?: TaskRevisionAdd[];
+  remove?: string[];
+}
+
+export interface ReviseTaskResult {
+  task: TaskDetail;
+  revision: {
+    task_version: number;
+    updated_keys: string[];
+    added_keys: string[];
+    removed_keys: string[];
+    /** failed 任务修订回卷 planned 时为 true */
+    status_rolled_back: boolean;
+    event_id: string;
+    sequence: number;
+  };
+}
+
+interface ValidatedRevision {
+  update: Array<Required<Pick<TaskRevisionChange, "key">> & TaskRevisionChange>;
+  add: TaskRevisionAdd[];
+  removedKeys: string[];
+  /** 现存节点 key → 记录（update/remove 目标解析） */
+  existing: Map<string, TaskNodeRecord>;
+  /** key → node_id（update/add 的 depends_on 落边解析；add 项在插入时回填） */
+  keyId: Map<string, string>;
+}
+
+/**
+ * 修订修改集校验（纯函数）：空修改集 / 未知与重复 key / key 模式 / 空 title、goal /
+ * 依赖可解析（对照修改后的 key 集）/ 自依赖 / 成环（Kahn，复用规划期口径）逐一拒绝；
+ * 已完成节点出现在 update/remove → immutable_node。产出归一化修改集供应用层执行。
+ */
+export function validateRevision(detail: TaskDetail, revision: TaskRevision): ValidatedRevision {
+  const update = [...(revision.update ?? [])];
+  const add = [...(revision.add ?? [])];
+  const remove = [...(revision.remove ?? [])];
+  if (update.length === 0 && add.length === 0 && remove.length === 0) {
+    throw new TaskError("invalid_revision", "revision must contain at least one of update/add/remove");
+  }
+  const existing = new Map(detail.nodes.map((n) => [n.key, n]));
+  const keyId = new Map(detail.nodes.map((n) => [n.key, n.node_id]));
+  const seen = new Set<string>();
+  const claim = (key: string, source: string): void => {
+    if (seen.has(key)) {
+      throw new TaskError("invalid_revision", `node "${key}" appears in more than one change (${source})`);
+    }
+    seen.add(key);
+  };
+  for (const change of update) {
+    claim(change.key, "update");
+    const target = existing.get(change.key);
+    if (target === undefined) {
+      throw new TaskError("invalid_revision", `update references unknown node "${change.key}"`);
+    }
+    if (target.status === "completed") {
+      throw new TaskError("immutable_node", `node "${change.key}" is completed and cannot be revised`);
+    }
+    if (change.title !== undefined && change.title.trim().length === 0) {
+      throw new TaskError("invalid_revision", `update "${change.key}": title must be non-empty`);
+    }
+    if (change.goal !== undefined && change.goal !== null && change.goal.trim().length === 0) {
+      throw new TaskError("invalid_revision", `update "${change.key}": goal must be non-empty when present`);
+    }
+  }
+  for (const key of remove) {
+    claim(key, "remove");
+    const target = existing.get(key);
+    if (target === undefined) {
+      throw new TaskError("invalid_revision", `remove references unknown node "${key}"`);
+    }
+    if (target.status === "completed") {
+      throw new TaskError("immutable_node", `node "${key}" is completed and cannot be removed`);
+    }
+  }
+  for (const node of add) {
+    claim(node.key, "add");
+    if (!NODE_KEY_RE.test(node.key)) {
+      throw new TaskError("invalid_revision", `add "${node.key}": key must match ${NODE_KEY_RE.source}`);
+    }
+    if (existing.has(node.key)) {
+      throw new TaskError("invalid_revision", `add "${node.key}": key already exists`);
+    }
+    if (node.title === undefined || node.title.trim().length === 0) {
+      throw new TaskError("invalid_revision", `add "${node.key}": title must be non-empty`);
+    }
+    if (node.goal !== undefined && node.goal.trim().length === 0) {
+      throw new TaskError("invalid_revision", `add "${node.key}": goal must be non-empty when present`);
+    }
+  }
+  // 依赖解析对照「修改后」的 key 集：现存 - 移除 + 新增
+  const keysAfter = new Set([...existing.keys()].filter((k) => !remove.includes(k)).concat(add.map((a) => a.key)));
+  const depsOfUpdate = new Map<string, string[]>();
+  for (const change of update) {
+    if (change.depends_on === undefined) continue;
+    assertDeps(change.key, change.depends_on, keysAfter);
+    depsOfUpdate.set(change.key, change.depends_on);
+  }
+  for (const node of add) {
+    assertDeps(node.key, node.depends_on ?? [], keysAfter);
+  }
+  // 成环检查（Kahn）：update 携带 depends_on 时替换原依赖，其余沿用现图
+  const graph = new Map<string, string[]>();
+  for (const node of detail.nodes) {
+    if (remove.includes(node.key)) continue;
+    graph.set(node.key, depsOfUpdate.get(node.key) ?? node.depends_on.filter((d) => !remove.includes(d)));
+  }
+  for (const node of add) graph.set(node.key, node.depends_on ?? []);
+  assertAcyclic(graph);
+  return { update, add, removedKeys: remove, existing, keyId };
+}
+
+function assertDeps(key: string, deps: string[], keysAfter: Set<string>): void {
+  for (const dep of deps) {
+    if (dep === key) {
+      throw new TaskError("invalid_revision", `node "${key}" depends on itself`);
+    }
+    if (!keysAfter.has(dep)) {
+      throw new TaskError("invalid_revision", `node "${key}" depends on unknown node "${dep}"`);
+    }
+  }
+}
+
+function assertAcyclic(graph: Map<string, string[]>): void {
+  const indegree = new Map<string, number>();
+  const dependents = new Map<string, string[]>();
+  for (const [key, deps] of graph) {
+    indegree.set(key, deps.length);
+    for (const dep of deps) {
+      dependents.set(dep, [...(dependents.get(dep) ?? []), key]);
+    }
+  }
+  let frontier = [...indegree.entries()].filter(([, d]) => d === 0).map(([k]) => k);
+  let visited = frontier.length;
+  while (frontier.length > 0) {
+    const next: string[] = [];
+    for (const key of frontier) {
+      for (const dependent of dependents.get(key) ?? []) {
+        const d = (indegree.get(dependent) ?? 0) - 1;
+        indegree.set(dependent, d);
+        if (d === 0) {
+          next.push(dependent);
+          visited += 1;
+        }
+      }
+    }
+    frontier = next;
+  }
+  if (visited !== graph.size) {
+    throw new TaskError("invalid_revision", "revision would introduce a dependency cycle");
+  }
 }
 
 /**
@@ -310,6 +511,7 @@ interface TaskRow {
   goal: string;
   status: string;
   task_version: number;
+  session_id: string | null;
   error: string | null;
   created_at: string;
   updated_at: string;
@@ -326,6 +528,7 @@ interface NodeRow {
   retriable: number;
   side_effect: string;
   status: string;
+  actor: string | null;
   attempts: number;
   result: string | null;
   error: string | null;
@@ -348,11 +551,19 @@ export class TaskStore {
   #insertTaskStmt;
   #getTaskStmt;
   #listTasksStmt;
+  #listTasksBySessionStmt;
   #updateTaskStmt;
+  #bumpVersionStmt;
   #insertNodeStmt;
   #nodesOfStmt;
   #getNodeStmt;
   #updateNodeStmt;
+  #updateNodePlanStmt;
+  #setNodeActorStmt;
+  #deleteNodeStmt;
+  #deleteEdgesTouchingStmt;
+  #deleteEdgesToStmt;
+  #maxNodeSeqStmt;
   #insertEdgeStmt;
   #edgesOfStmt;
 
@@ -360,11 +571,17 @@ export class TaskStore {
     this.#db = db;
     ensureTaskTables(db);
     this.#insertTaskStmt = db.prepare(
-      "INSERT INTO tasks (task_id, goal, status, task_version, error, created_at, updated_at) VALUES (?, ?, ?, ?, NULL, ?, ?)",
+      "INSERT INTO tasks (task_id, goal, status, task_version, session_id, error, created_at, updated_at) VALUES (?, ?, ?, 1, ?, NULL, ?, ?)",
     );
     this.#getTaskStmt = db.prepare("SELECT * FROM tasks WHERE task_id = ?");
     this.#listTasksStmt = db.prepare("SELECT * FROM tasks ORDER BY created_at, task_id");
+    this.#listTasksBySessionStmt = db.prepare(
+      "SELECT * FROM tasks WHERE session_id = ? ORDER BY created_at, task_id",
+    );
     this.#updateTaskStmt = db.prepare("UPDATE tasks SET status = ?, error = ?, updated_at = ? WHERE task_id = ?");
+    this.#bumpVersionStmt = db.prepare(
+      "UPDATE tasks SET task_version = task_version + 1, updated_at = ? WHERE task_id = ?",
+    );
     this.#insertNodeStmt = db.prepare(
       `INSERT INTO task_nodes
         (node_id, task_id, node_key, title, goal, agent_role, model, retriable, side_effect, status, attempts, result, error, node_seq, created_at, updated_at)
@@ -375,27 +592,52 @@ export class TaskStore {
     this.#updateNodeStmt = db.prepare(
       "UPDATE task_nodes SET status = ?, attempts = ?, result = ?, error = ?, updated_at = ? WHERE node_id = ?",
     );
+    // 修订（M1-T6）：计划字段补丁 + 状态/结果/错误整体重置（修改集应用时逐字段给定）
+    this.#updateNodePlanStmt = db.prepare(
+      `UPDATE task_nodes SET title = ?, goal = ?, agent_role = ?, model = ?, retriable = ?,
+        side_effect = ?, status = ?, result = ?, error = ?, updated_at = ? WHERE node_id = ?`,
+    );
+    this.#setNodeActorStmt = db.prepare(
+      "UPDATE task_nodes SET actor = ?, updated_at = ? WHERE node_id = ?",
+    );
+    this.#deleteNodeStmt = db.prepare("DELETE FROM task_nodes WHERE node_id = ?");
+    this.#deleteEdgesTouchingStmt = db.prepare(
+      "DELETE FROM task_edges WHERE task_id = ? AND (from_node = ? OR to_node = ?)",
+    );
+    this.#deleteEdgesToStmt = db.prepare(
+      "DELETE FROM task_edges WHERE task_id = ? AND to_node = ?",
+    );
+    this.#maxNodeSeqStmt = db.prepare("SELECT MAX(node_seq) AS max_seq FROM task_nodes WHERE task_id = ?");
     this.#insertEdgeStmt = db.prepare(
       "INSERT INTO task_edges (edge_id, task_id, from_node, to_node) VALUES (?, ?, ?, ?)",
     );
     this.#edgesOfStmt = db.prepare("SELECT * FROM task_edges WHERE task_id = ? ORDER BY rowid");
   }
 
-  insertTask(row: { taskId: string; goal: string; now: string }): void {
-    this.#insertTaskStmt.run(row.taskId, row.goal, "created", 1, row.now, row.now);
+  insertTask(row: { taskId: string; goal: string; sessionId?: string; now: string }): void {
+    this.#insertTaskStmt.run(row.taskId, row.goal, "created", row.sessionId ?? null, row.now, row.now);
   }
 
   getTask(taskId: string): TaskRow | null {
     return (this.#getTaskStmt.get(taskId) as TaskRow | undefined) ?? null;
   }
 
-  listTasks(): TaskRow[] {
-    return this.#listTasksStmt.all() as unknown as TaskRow[];
+  listTasks(sessionId?: string): TaskRow[] {
+    const rows =
+      sessionId === undefined
+        ? (this.#listTasksStmt.all() as unknown as TaskRow[])
+        : (this.#listTasksBySessionStmt.all(sessionId) as unknown as TaskRow[]);
+    return rows;
   }
 
   /** 状态推进 + 失败原因（error 仅 failed 时有值；恢复/完成清空） */
   updateTaskStatus(taskId: string, status: TaskStatus, error: string | null, now: string): void {
     this.#updateTaskStmt.run(status, status === "failed" ? error : null, now, taskId);
+  }
+
+  /** 规划修订（FR-TASK-3）：版本 +1 */
+  bumpTaskVersion(taskId: string, now: string): void {
+    this.#bumpVersionStmt.run(now, taskId);
   }
 
   insertNode(row: {
@@ -429,6 +671,63 @@ export class TaskStore {
 
   insertEdge(row: { taskId: string; fromNode: string; toNode: string }): void {
     this.#insertEdgeStmt.run(uuidv7(), row.taskId, row.fromNode, row.toNode);
+  }
+
+  // --- 修订/接管的存储接缝（M1-T6）----------------------------------------------
+
+  /** 修订应用：计划字段补丁 + 状态整体重置（修改集验证后逐字段给定） */
+  updateNodePlan(
+    nodeId: string,
+    patch: {
+      title: string;
+      goal: string | null;
+      agent_role: string | null;
+      model: string | null;
+      retriable: boolean;
+      side_effect: string;
+      status: string;
+      result: string | null;
+      error: string | null;
+    },
+    now: string,
+  ): void {
+    this.#updateNodePlanStmt.run(
+      patch.title,
+      patch.goal,
+      patch.agent_role,
+      patch.model,
+      patch.retriable ? 1 : 0,
+      patch.side_effect,
+      patch.status,
+      patch.result,
+      patch.error,
+      now,
+      nodeId,
+    );
+  }
+
+  /** 接管/交还：节点责任方标记（NULL = 调度器，'owner' = Owner） */
+  setNodeActor(nodeId: string, actor: string | null, now: string): void {
+    this.#setNodeActorStmt.run(actor, now, nodeId);
+  }
+
+  /** 移除节点及其全部关联边（修订移除；仅未完成节点走到这里） */
+  deleteNodeWithEdges(taskId: string, nodeId: string): void {
+    this.#deleteEdgesTouchingStmt.run(taskId, nodeId, nodeId);
+    this.#deleteNodeStmt.run(nodeId);
+  }
+
+  /** 重算某节点的入边（修订的 depends_on 全量替换；from 为 node_id 形态） */
+  replaceEdgesTo(taskId: string, toNodeId: string, fromNodeIds: string[]): void {
+    this.#deleteEdgesToStmt.run(taskId, toNodeId);
+    for (const fromNodeId of fromNodeIds) {
+      this.#insertEdgeStmt.run(uuidv7(), taskId, fromNodeId, toNodeId);
+    }
+  }
+
+  maxNodeSeq(taskId: string): number {
+    const row = this.#maxNodeSeqStmt.get(taskId) as unknown as { max_seq: number | null };
+    return row.max_seq ?? -1;
   }
 
   nodesOf(taskId: string): NodeRow[] {
@@ -538,19 +837,26 @@ export class TaskService {
    * task.planned（DAG 全量投影入 payload）。规划失败（工厂抛错 / 输出非法）不抛给
    * 调用方：task.planning_failed + task.failed 留痕后返回 failed 态任务。
    * 存储类错误原样抛出（HTTP 500）。
+   * opts.sessionId（M1-T6）：创建来源会话，随 task.created 留痕并落 tasks.session_id
+   * （Chat 任务卡片按会话关联任务）。
    */
-  async createTask(goal: string): Promise<TaskDetail> {
+  async createTask(goal: string, opts: { sessionId?: string } = {}): Promise<TaskDetail> {
     if (this.#factory === null) {
       throw new TaskError("planner_unavailable", this.#unavailableReason);
     }
     const taskId = uuidv7();
     const now = new Date().toISOString();
-    this.#store.insertTask({ taskId, goal, now });
+    this.#store.insertTask({
+      taskId,
+      goal,
+      ...(opts.sessionId !== undefined ? { sessionId: opts.sessionId } : {}),
+      now,
+    });
     const created = this.#appendTaskEvent(
       taskId,
       TASK_EVENT_TYPES.taskCreated,
       "owner",
-      { goal },
+      opts.sessionId === undefined ? { goal } : { goal, session_id: opts.sessionId },
       null,
     );
 
@@ -631,8 +937,8 @@ export class TaskService {
     };
   }
 
-  listTasks(): TaskSummary[] {
-    return this.#store.listTasks().map((row) => this.#summaryOf(row));
+  listTasks(sessionId?: string): TaskSummary[] {
+    return this.#store.listTasks(sessionId).map((row) => this.#summaryOf(row));
   }
 
   /**
@@ -662,6 +968,238 @@ export class TaskService {
   taskEvents(taskId: string, options: { limit?: number; offset?: number } = {}): LedgerPage | null {
     if (this.#store.getTask(taskId) === null) return null;
     return this.ledger.list({ taskId, ...options });
+  }
+
+  // --- 人工介入（M1-T6 / FR-TASK-3；全部操作以 owner actor 留审计事件）-----------
+
+  /**
+   * 修订（FR-TASK-3「修改未完成节点」）：修改集只作用于未完成节点——
+   * update 按节点 key 部分更新（title/goal/model/agent_role/retriable/side_effect/
+   * depends_on 全量替换），未完成但曾失败/待核对的节点重置为 pending 重跑；
+   * add 新增节点；remove 移除节点并重算下游（被移除 key 从依赖者剥离）。
+   * 已完成节点不可改/不可移（immutable_node），版本 +1，task.revised（actor owner，
+   * 携带修改摘要）留痕。failed 任务修订后回卷 planned（终端态回卷的正道；不走
+   * transition 表——终端态直接迁移依旧全部拒绝）；其余状态保持不变。
+   * Checkpoint 不在此创建（HTTP 编排层在事件后补 reason=revise 的快照）。
+   */
+  reviseTask(taskId: string, revision: TaskRevision): ReviseTaskResult {
+    const row = this.#store.getTask(taskId);
+    if (row === null) {
+      throw new TaskError("not_found", `task ${taskId} does not exist`);
+    }
+    const status = row.status as TaskStatus;
+    if (status === "running") {
+      throw new TaskError(
+        "invalid_transition",
+        `task ${taskId} is running; pause it before revising (PRD §5.2: pause → revise → resume)`,
+        { from: status },
+      );
+    }
+    if (status === "completed" || status === "cancelled") {
+      throw new TaskError(
+        "invalid_transition",
+        `task ${taskId} is terminal (${status}); revision cannot roll it back`,
+        { from: status },
+      );
+    }
+    if (status === "created") {
+      throw new TaskError(
+        "invalid_transition",
+        `task ${taskId} has no plan (still created); recreate the task instead of revising`,
+        { from: status },
+      );
+    }
+    const plan = validateRevision(this.getTask(taskId) as TaskDetail, revision);
+    const now = new Date().toISOString();
+
+    // 行变更先行，事件后写（账本是审计层；修订不做副作用投递，无需补偿序）。
+    // 被修改的未完成节点统一重置 pending（failed/pending_review 的旧结果随之清空重跑）
+    for (const change of plan.update) {
+      const target = plan.existing.get(change.key) as TaskNodeRecord;
+      this.#store.updateNodePlan(
+        target.node_id,
+        {
+          title: change.title ?? target.title,
+          goal: change.goal !== undefined ? change.goal : target.goal ?? null,
+          agent_role: change.agent_role !== undefined ? change.agent_role : target.agent_role ?? null,
+          model: change.model !== undefined ? change.model : target.model ?? null,
+          retriable: change.retriable ?? target.retriable,
+          side_effect: change.side_effect ?? target.side_effect,
+          status: "pending",
+          result: null,
+          error: null,
+        },
+        now,
+      );
+      if (change.depends_on !== undefined) {
+        const keyToId = (key: string) => plan.keyId.get(key) as string;
+        this.#store.replaceEdgesTo(taskId, target.node_id, change.depends_on.map(keyToId));
+      }
+    }
+    for (const key of plan.removedKeys) {
+      this.#store.deleteNodeWithEdges(taskId, (plan.existing.get(key) as TaskNodeRecord).node_id);
+    }
+    const seqBase = this.#store.maxNodeSeq(taskId);
+    for (const [index, add] of plan.add.entries()) {
+      const nodeId = uuidv7();
+      plan.keyId.set(add.key, nodeId);
+      this.#store.insertNode({
+        nodeId,
+        taskId,
+        key: add.key,
+        title: add.title,
+        goal: add.goal ?? null,
+        agentRole: add.agent_role ?? null,
+        model: add.model ?? null,
+        retriable: add.retriable ?? true,
+        sideEffect: add.side_effect ?? "delivery_unknown",
+        seq: seqBase + 1 + index,
+        now,
+      });
+      for (const dep of add.depends_on ?? []) {
+        this.#store.insertEdge({ taskId, fromNode: plan.keyId.get(dep) as string, toNode: nodeId });
+      }
+    }
+    this.#store.bumpTaskVersion(taskId, now);
+
+    const taskVersion = row.task_version + 1;
+    const summary = {
+      updated_keys: plan.update.map((c) => c.key),
+      added_keys: plan.add.map((a) => a.key),
+      removed_keys: plan.removedKeys,
+    };
+    const revised = this.#appendTaskEvent(taskId, TASK_EVENT_TYPES.taskRevised, "owner", {
+      task_version: taskVersion,
+      summary,
+      changes: { update: plan.update, add: plan.add, remove: plan.removedKeys },
+    }, null);
+
+    let rolledBack = false;
+    if (status === "failed") {
+      // 终端态回卷的正道：revise 专属路径（transition 表的 failed 依旧不可直接迁出）
+      this.#store.updateTaskStatus(taskId, "planned", null, new Date().toISOString());
+      this.#appendTaskEvent(taskId, TASK_EVENT_TYPES.taskPlanned, "agent:runtime", {
+        reason: "revised_after_failure",
+        task_version: taskVersion,
+      }, revised.eventId);
+      rolledBack = true;
+    }
+    return {
+      task: this.getTask(taskId) as TaskDetail,
+      revision: {
+        task_version: taskVersion,
+        ...summary,
+        status_rolled_back: rolledBack,
+        event_id: revised.eventId,
+        sequence: revised.sequence,
+      },
+    };
+  }
+
+  /**
+   * 接管（FR-TASK-3「接管子任务」）：pending 节点标记 actor=owner（调度器从此跳过
+   * 派发），task.node_taken_over（actor owner）留痕。仅 pending 可接管：running 节点
+   * 在执行中（先暂停），completed 不可改（immutable_node），已接管的重复接管拒绝。
+   */
+  takeoverNode(taskId: string, nodeId: string): TaskDetail {
+    const context = this.#nodeForIntervention(taskId, nodeId, "takeover");
+    if (context.node.status === "completed") {
+      throw new TaskError("immutable_node", `node "${context.node.key}" is completed and cannot be taken over`);
+    }
+    if (context.node.status !== "pending") {
+      throw new TaskError(
+        "invalid_transition",
+        `node "${context.node.key}" is ${context.node.status}; only pending nodes can be taken over`,
+      );
+    }
+    if (context.node.actor === "owner") {
+      throw new TaskError("invalid_transition", `node "${context.node.key}" is already taken over by owner`);
+    }
+    this.#store.setNodeActor(nodeId, "owner", new Date().toISOString());
+    this.#appendTaskEvent(taskId, TASK_EVENT_TYPES.taskNodeTakenOver, "owner", {
+      node_id: nodeId,
+      key: context.node.key,
+      title: context.node.title,
+    }, null);
+    return this.getTask(taskId) as TaskDetail;
+  }
+
+  /**
+   * Owner 提交接管节点的结果：节点 → completed（result 落行，actor 保持 owner 留痕），
+   * task.node_completed_by_owner（actor owner）。未接管的节点不可经此完成。
+   */
+  completeNode(taskId: string, nodeId: string, result: string): TaskDetail {
+    const context = this.#nodeForIntervention(taskId, nodeId, "complete");
+    if (context.node.actor !== "owner") {
+      throw new TaskError(
+        "invalid_transition",
+        `node "${context.node.key}" is not taken over by owner; take it over first`,
+      );
+    }
+    if (context.node.status !== "pending") {
+      throw new TaskError(
+        "invalid_transition",
+        `node "${context.node.key}" is ${context.node.status}; only pending nodes can be completed by owner`,
+      );
+    }
+    this.#store.updateNode(nodeId, { status: "completed", attempts: context.node.attempts, result, error: null }, new Date().toISOString());
+    this.#appendTaskEvent(taskId, TASK_EVENT_TYPES.taskNodeCompletedByOwner, "owner", {
+      node_id: nodeId,
+      key: context.node.key,
+      status: "completed",
+      result,
+    }, null);
+    return this.getTask(taskId) as TaskDetail;
+  }
+
+  /**
+   * 交还（FR-TASK-3「交还」）：接管的节点清掉 actor 标记回到调度器队列，
+   * task.node_released（actor owner）留痕。
+   */
+  releaseNode(taskId: string, nodeId: string): TaskDetail {
+    const context = this.#nodeForIntervention(taskId, nodeId, "release");
+    if (context.node.actor !== "owner") {
+      throw new TaskError(
+        "invalid_transition",
+        `node "${context.node.key}" is not taken over by owner; nothing to release`,
+      );
+    }
+    if (context.node.status !== "pending") {
+      throw new TaskError(
+        "invalid_transition",
+        `node "${context.node.key}" is ${context.node.status}; only pending nodes can be released`,
+      );
+    }
+    this.#store.setNodeActor(nodeId, null, new Date().toISOString());
+    this.#appendTaskEvent(taskId, TASK_EVENT_TYPES.taskNodeReleased, "owner", {
+      node_id: nodeId,
+      key: context.node.key,
+    }, null);
+    return this.getTask(taskId) as TaskDetail;
+  }
+
+  /** 介入操作的公共前置：任务存在且非终端（终端态一律拒绝——409 语义） */
+  #nodeForIntervention(
+    taskId: string,
+    nodeId: string,
+    op: "takeover" | "complete" | "release",
+  ): { node: TaskNodeRecord } {
+    const detail = this.getTask(taskId);
+    if (detail === null) {
+      throw new TaskError("not_found", `task ${taskId} does not exist`);
+    }
+    if (detail.status === "failed" || detail.status === "completed" || detail.status === "cancelled") {
+      throw new TaskError(
+        "invalid_transition",
+        `task ${taskId} is terminal (${detail.status}); ${op} is not possible`,
+        { from: detail.status },
+      );
+    }
+    const node = detail.nodes.find((n) => n.node_id === nodeId);
+    if (node === undefined) {
+      throw new TaskError("not_found", `node ${nodeId} does not exist in task ${taskId}`);
+    }
+    return { node };
   }
 
   // --- 调度器窄接缝（节点行更新；M1 单机单调度器，无并发争用）---------------------
@@ -778,6 +1316,7 @@ export class TaskService {
       goal: row.goal,
       status: row.status as TaskStatus,
       task_version: row.task_version,
+      ...(row.session_id === null ? {} : { session_id: row.session_id }),
       created_at: row.created_at,
       updated_at: row.updated_at,
     };
@@ -799,6 +1338,7 @@ export class TaskService {
       retriable: row.retriable === 1,
       side_effect: row.side_effect as SideEffectClass,
       status: row.status as TaskNodeRecord["status"],
+      ...(row.actor === null ? {} : { actor: row.actor as TaskNodeRecord["actor"] }),
       attempts: row.attempts,
       ...(row.result === null ? {} : { result: row.result }),
       ...(row.error === null ? {} : { error: row.error }),

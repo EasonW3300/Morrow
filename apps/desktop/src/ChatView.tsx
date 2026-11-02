@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { api, ApiError } from "./api.ts";
+import { api, ApiError, type TaskSummary } from "./api.ts";
 import {
   applyFrame,
   emptyChatState,
@@ -9,6 +9,7 @@ import {
   type Envelope,
   type Frame,
 } from "./sse.ts";
+import { taskStatusLabel, taskStatusTone } from "./task-ui.ts";
 
 /**
  * Chat 视图（票 T6 验收核心）：
@@ -17,6 +18,9 @@ import {
  *   text_delta 易失累积，message.assistant 权威全文覆盖；
  * - 工具事件（tool.started/finished）与 agent.error 直接可见；
  * - 发送失败（如 503 provider_not_configured）以可读横幅呈现。
+ * - 任务关联卡片（票 M1-T6 / Issue #18）：本会话产生的任务（POST /v1/tasks 携带
+ *   session_id 关联）以状态摘要卡呈现，点击跳 Task 视图。任务事件不在会话 SSE 上
+ *   （task.* 走账本 task_id 专列），卡片用 3s 轮询（轻量 GET，无推送通道可订阅）。
  * 所有通信仅经控制面 HTTP/SSE（fetch + EventSource）。
  */
 
@@ -32,12 +36,23 @@ const DURABLE_EVENTS = [
 
 const ALL_FRAME_EVENTS: readonly string[] = [...DURABLE_EVENTS, "text_delta", "done"];
 
-export function ChatView({ base, sessionId }: { base: string; sessionId: string }) {
+const TASK_POLL_MS = 3000;
+
+export function ChatView({
+  base,
+  sessionId,
+  onOpenTask,
+}: {
+  base: string;
+  sessionId: string;
+  onOpenTask?: (taskId: string) => void;
+}) {
   const [state, setState] = useState<ChatState>(emptyChatState());
   const [streamError, setStreamError] = useState<string | null>(null);
   const [connected, setConnected] = useState(false);
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
+  const [sessionTasks, setSessionTasks] = useState<TaskSummary[]>([]);
   const bottomRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -86,6 +101,25 @@ export function ChatView({ base, sessionId }: { base: string; sessionId: string 
     bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [state]);
 
+  // 任务关联卡片：本会话任务轻量轮询（无 task.* 推送通道；失败静默——卡片是辅助视图）
+  useEffect(() => {
+    let cancelled = false;
+    const poll = async (): Promise<void> => {
+      try {
+        const tasks = await api.listTasks(base, sessionId);
+        if (!cancelled) setSessionTasks(tasks);
+      } catch {
+        // 卡片轮询失败不打扰会话主链路
+      }
+    };
+    void poll();
+    const timer = setInterval(() => void poll(), TASK_POLL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [base, sessionId]);
+
   const send = async () => {
     const text = draft.trim();
     if (text.length === 0 || sending) return;
@@ -111,6 +145,23 @@ export function ChatView({ base, sessionId }: { base: string; sessionId: string 
       {streamError !== null && (
         <div className="banner-error" role="alert">
           {streamError}
+        </div>
+      )}
+      {sessionTasks.length > 0 && (
+        <div className="task-cards" role="list">
+          {sessionTasks.map((task) => (
+            <button
+              key={task.task_id}
+              role="listitem"
+              className="task-card"
+              onClick={() => onOpenTask?.(task.task_id)}
+              title="在 Task 视图中查看详情"
+            >
+              <span className={`badge tone-${taskStatusTone(task.status)}`}>{taskStatusLabel(task.status)}</span>
+              <span className="task-card-goal">{task.goal}</span>
+              <span className="task-card-meta mono">v{task.task_version}</span>
+            </button>
+          ))}
         </div>
       )}
       <div className="messages">
