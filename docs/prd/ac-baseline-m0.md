@@ -92,3 +92,15 @@ CI 侧：node 22（runner 托管）、bun 1.4.4（oven-sh setup-bun pin）、Rus
 - **AC-03 测试数据集（登记入 §5）**：`apps/runtime/scripts/memory-ac03.ts`（`pnpm --filter @morrow/runtime memory:ac03`），100 条设计记录 写入→抽取→巩固→投影→检索→回链→hash 全断言，确定性可重复，合并态复跑 100/100 通过（0.66s）。
 - **AC-12 现状**：介入操作端到端覆盖盘点见 `docs/gates/m1-gate-report.md` §3——暂停/接管/恢复达标；修改正向 4 次、切模型独立场景 3 个、交还正向 4 次，尚不足 5（缺口如实登记，M6 全量验收前补齐）。AC-12 正式验收形态（含桌面 UI 人工走查）在 M6。
 - **仍未校准**：AC-03/05/07/12 的正式阈值校准（成功率分类统计等）待多轮实测数据，本节只登记 M1 实测现状与新增环境约束；真实 LLM 抽取冒烟仍待 Owner 密钥（§4）。
+
+## 8. M2 校准注记（2026-11-02，M2-T7 / Issue #28 合并态实测）
+
+基线补记（PRD §8「M2 校准」的 M2 部分，环境仍以 §1/§2 为准，Docker 29.6.1 本机可用）：
+
+- **AC-06 分母/阈值定版**：20 组限定需求样例 = `apps/runtime/test/capability-factory.samples.ts`（S01–S18 走通组含 1 组代码越权被沙箱阻断；S19/S20 manifest 越权规划期阻断）——**分母 20、走通线 ≥18、越权样例 3 组 100% 阻断**就此固定，禁止剔除失败样本（PRD §8）。执行口径双路径：`pnpm --filter @morrow/runtime factory:ac06`（LocalNodeRunner 桩，合并态 20/20、5.2s）与 `factory:harness:container`（DockerRunner 真容器，合并态 1/1、34.7s，node:22-alpine）；CI ubuntu 容器腿独立判定（`sandbox tests (ubuntu, real containers)` job）。登记入 §5 测试数据集。
+- **沙箱容器测试环境登记（§5 测试数据）**：T2 套件 `apps/runtime/test/sandbox.*.test.ts`（11 套件 69 用例）为本机 docker 实跑（M2 合并态 69/69、10.1s）；CI 侧由 ubuntu runner 真容器 job 承载。沙箱契约 v1 只支持 `network: none`（fail-closed）——声明网络工具的放行面未建（见 m2-gate-report §5-2）。
+- **AC-08 前置测试数据（登记入 §5）**：`apps/runtime/test/tasks.parallel.test.ts`，6 用例（worktree 隔离并行/资源锁串行化/冲突 pending_review/verify 失败回滚/节点内沙箱指向 worktree/残留清扫），真实 git worktree 夹具，合并态 6/6（2.2s）。
+- **测试规模（M2 合并态 b461a8d + T7 接缝收尾实测）**：runtime 520（M1 收官 298 → 520）、desktop 67（39 → 67）+ sidecar Rust 9、protocol 40、pi-adapter 31、packaging 56；全 workspace node:test 合计 **714**（M1 收官 464 → 714），全部绿（exit 0）。
+- **M2 门槛演示数据（登记入 §5）**：`scripts/real-machine/m2-demo.sh`（可重复执行，PASS=10 FAIL=0 × 2 次）+ 归档输出 `docs/gates/m2-demo-output.md`；生成口径为夹具注入的脚本化生成器（FakePi 同款，零 LLM）——AC-06 的「生成成功率」在真实 LLM 接入前以该口径为分母，真实模型行为待 Owner 密钥（§4）。
+- **新登记的 runtime 缺口（待修复票）**：Skill invoke 缺省接线（ToolInvoker 未注册任何工具 → 缺省 unknown_tool）——AC-06/PRD §4.2 重用调用在真实 Runtime 缺省配置下不成立，见 `docs/gates/m2-gate-report.md` §5-1。
+- **仍未校准**：AC-06 的三类成功率分类统计（正式口径）、AC-08 的并行度量化指标待多轮实测；本节只登记 M2 实测现状与分母定版。
