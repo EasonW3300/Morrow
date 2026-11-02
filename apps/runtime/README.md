@@ -10,6 +10,15 @@ Runtime 骨架 + 事件账本 v1（票 T2 / Issue #3）+ 对话贯通（票 T4 /
 T5 交付 Provider CRUD + OS 凭据库 + 连通性测试端点 + 会话级 Provider 切换与失败隔离。
 M1-T1（Issue #13）交付记忆垂直切片：memory.write 工具 + 高价值规则即时写入候选 +
 `GET /v1/memory/facts` FTS5 检索（表结构一次到位，fact 巩固写路径留 T2）。
+M1-T2（Issue #14）交付后台抽取与巩固管线：轮次收尾异步抽取（可注入 Extractor，默认确定性
+启发式）→ 巩固（可注入 Consolidator，默认确定性决策矩阵）产出 MemoryFact + MemoryRevision
+版本链；常规偏好冲突自动更新留历史，重大事实 / locked / 敏感等级冲突进待确认队列；
+候选/冲突控制面端点与 `memory.extracted` / `memory.consolidated` 等运行事件。
+M1-T3（Issue #15）交付 Markdown 投影、受控导入与删除标记：长期记忆投影为 §6.4 格式的
+`dataDir/memory/*.md`（再生成幂等），`POST /v1/memory/import` 把人工编辑转版本化修订
+（不绕过冲突检测，frontmatter 版本对账防覆盖），`DELETE /v1/memory/facts/:id` 软删 +
+`memory.fact_deleted` tombstone + 投影移除（重投影不复活），AC-03 前置脚本 100 条记录
+回链断言（`memory:ac03`）。
 
 ## 运行与测试
 
@@ -80,6 +89,13 @@ provider 参数）；凭据库可经 `startRuntime(config, { secretStore })` 注
 | POST | `/v1/tasks/:id/restore` | 指定 checkpoint 恢复，body `{ checkpoint_id }`（必填）→ 202 `{ task, checkpoint_id, reconcile }`；未知/他任务 checkpoint 404 `checkpoint_not_found`、版本不匹配 409 `checkpoint_version_mismatch` |
 | GET | `/v1/tasks/:id/checkpoints` | checkpoint 列表（新→旧，快照全量）→ `{ checkpoints: [{ checkpoint_id, task_id, task_version, reason, created_at, snapshot }] }`；未知任务 404 |
 | GET | `/v1/memory/facts` | 记忆检索（M1-T1）：`q`（必填非空关键词，FTS5 短语查询，中英文均可）→ `{ q, facts: [{ id, stage, type, content, sensitivity, confidence?, version, sources, created_at }] }`；`sources` 为来源账本事件 id 数组（回链），缺 q/空 q → 400 `invalid_query` |
+| GET | `/v1/memory/candidates` | 候选列表（M1-T2）：`status` 可选（`pending`/`consolidated`/`dismissed`/`conflicted`）+ 分页（`limit` 1–200 默认 200、`offset`）→ `{ candidates: [{ candidate_id, content, kind, sensitivity, confidence, source_event_id, observed_at, occurred_at, version, status, created_at }] }`；非法 status → 400 `invalid_query` |
+| POST | `/v1/memory/candidates/:id/decide` | Owner 决定（M1-T2）：body `{ decision: "accept" \| "dismiss" }`；accept → 立即巩固该候选（绕过置信度准入线）→ 200 `{ candidate_id, decision, outcome: { kind: "fact_created" \| "fact_updated" \| "corroborated" \| "conflict", fact_id?/conflict_id? }, run }`；dismiss → 状态置 dismissed；未知 id 404 `memory_not_found`、非 pending 409 `memory_invalid_state`（conflicted 候选走冲突裁决端点）、decision 非法 400 |
+| GET | `/v1/memory/conflicts` | 冲突列表（M1-T2）：`status` 可选（`open` 待确认队列 / `resolved`）+ 分页 → `{ conflicts: [{ conflict_id, candidate_id, fact_id, reason, existing_content, incoming_content, existing_sensitivity, incoming_sensitivity, status, resolution?, resolved_content?, created_at, resolved_at? }] }` |
+| POST | `/v1/memory/conflicts/:id/resolve` | 冲突裁决（M1-T2，FR-MEM-5 的出口）：body `{ resolution: "keep_new" \| "keep_old" \| "merge", content? }`；keep_new → 采纳候选值（版本+1 + 修订 `conflict_resolved` + `memory.fact_updated`）；keep_old → 事实不动、候选 dismissed（只留 `memory.conflict_resolved`）；merge → 必须携带非空 `content`（Owner 合并文本）进版本链（修订 `conflict_merged`，敏感性维持既有分级）→ 200 `{ conflict_id, fact_id, resolution, version, revision_id, factUpdatedEventId, conflictResolvedEventId }`；未知 404、已裁决 409、merge 缺 content / resolution 非法 400 |
+| POST | `/v1/memory/import` | 受控导入（M1-T3 / Issue #15，FR-MEM-6）：body `{ markdown }` = 编辑后的 §6.4 投影文件全文 → 200 `{ status: "updated" \| "conflict" \| "unchanged", fact_id, version, import_event_id, ... }`；合法编辑转版本化修订（版本+1 + MemoryRevision `manual_import` + `memory.fact_updated`，投影文件同步刷新）；locked / 敏感分级变更进待确认队列不直写（status=`conflict` + `conflict_id`/`reason`，裁决走 resolve 端点）；frontmatter `version` 落后库内 → 409 `memory_stale_version`（防覆盖）；未知/已删事实 404、缺 frontmatter / 缺 `markdown` 400 |
+| DELETE | `/v1/memory/facts/:id` | 删除标记（M1-T3，FR-MEM-8 单机前置）：tombstone 事件 `memory.fact_deleted` 入账本 + facts 行软删（`deleted_at` 标记；修订/来源多对多保留作回链审计）+ FTS 索引移除 + 投影文件移除 → 200 `{ deleted: true, fact_id, version, deleted_at, event_id }`；重投影不复活已删记忆；locked 记忆默认拒绝 409 `memory_locked_confirm`，`?confirm=true` 显式确认后删除；未知/已删 404 |
+| POST | `/v1/memory/project` | 投影再生成命令（M1-T3，幂等）：现存有效事实 → `<dataDir>/memory/{fact_id}.md`（§6.4 frontmatter），只写差异文件（同状态产出同字节）+ 清理孤儿投影文件（外来文件不动）→ 200 `{ directory, written, unchanged, removed }` |
 
 错误统一 `{ error: { code, message } }`；未匹配路径 404，路径命中但方法不符 405，
 body 非法 400 `invalid_body`，body 的 content-type 非 application/json 一律 415
@@ -186,7 +202,13 @@ M0 不设队列上限（单用户本地场景）。
 | `tool.finished` | `agent:runtime` | 对应 tool.started | `{ tool_call_id, tool_name, text, is_error, duration_ms? }` |
 | `agent.error` | `agent:runtime` | message.user | `{ message }` |
 | `message.assistant` | `agent:runtime` | message.user | `{ message_id, text, stop_reason }` |
-| `memory.candidate_created` | `agent:runtime` | 来源 message.user | `{ candidate_id, content, kind, sensitivity, confidence, source_id, source_event_id, rule }`（M1-T1；rule = 命中的启发式规则或 `memory.write`） |
+| `memory.candidate_created` | `agent:runtime` | 来源 message.user | `{ candidate_id, content, kind, sensitivity, confidence, source_id, source_event_id, rule }`（M1-T1；rule = 命中的启发式规则 / `memory.write` / 抽取器规则名） |
+| `memory.extracted` | `agent:runtime` | 本轮 message.assistant | `{ user_event_id, assistant_event_id?, extracted_count, skipped_duplicates, candidate_ids }`（M1-T2：抽取运行收尾，0 条也留痕——管线跑过且可审计） |
+| `memory.consolidated` | `agent:runtime` | 自动路径 = 同轮 memory.extracted；decide 路径 = 候选来源事件 | `{ candidate_count, created_fact_ids, updated_fact_ids, corroborated_fact_ids, conflict_ids, candidate_ids }`（M1-T2：巩固运行收尾；无待巩固候选时不产生空运行事件） |
+| `memory.fact_created` | `agent:runtime` | 证据 message.user | `{ fact_id, content, kind, sensitivity, version, candidate_id, source_event_id }`（M1-T2：巩固新建事实） |
+| `memory.fact_updated` | `agent:runtime` | 证据 message.user | `{ fact_id, version, content, sensitivity, revision_id, reason, candidate_id?, conflict_id?, source_event_id }`（M1-T2：版本链推进——reason = `preference_update` / `conflict_resolved` / `conflict_merged`） |
+| `memory.conflict_detected` | `agent:runtime` | 证据 message.user | `{ conflict_id, fact_id, candidate_id, reason, existing_content, incoming_content }`（M1-T2：reason = `fact_conflict` / `locked` / `sensitivity_change`；上报即不静默覆盖） |
+| `memory.conflict_resolved` | `agent:runtime` | 证据 message.user | `{ conflict_id, resolution, fact_id, version, revision_id?, resolved_content? }`（M1-T2：裁决落定；keep_old 也留此事件——"不改"亦是裁决） |
 
 信封 `session_id` 关联会话；全部过 protocol JSON Schema + integrity_hash 复算后入账本
 （append-only 三层防线见下）。`text_delta` 不入账本（易失，见 SSE 一节）。
@@ -297,18 +319,19 @@ restore。套件可重复执行（临时目录 + 显式脚本）。
 - 会话可用工具经工厂 extras 注入（M1-T1：`agentTools(sessionId)` → `AgentRuntimeExtras.tools`，
   生产默认工厂透传给 `createPiAdapter` 的 tools 通道；注入测试工厂可忽略该参数）。
 
-## 记忆管线（M1-T1，Issue #13）
+## 记忆管线（M1-T1 候选 + M1-T2 抽取/巩固，Issue #13 / #14）
 
 **表结构**（与事件账本同库 `events.sqlite`，表可变、不影响 events 的 append-only；
-迁移全 `CREATE TABLE IF NOT EXISTS`，可重复执行；表结构一次到位）：
+迁移全 `CREATE TABLE IF NOT EXISTS` + 候选表 CHECK 重建（T1 旧库自动加 `conflicted` 状态），可重复执行）：
 
-| 表 | 用途 | 本票 |
+| 表 | 用途 | 状态 |
 | --- | --- | --- |
 | `memory_sources` | 记忆来源（回链账本 event_id；GLOSSARY: MemorySource「事实必须可回链到来源」） | ✅ 写入 |
-| `memory_candidates` | 候选记忆（来源/观察时间/发生时间/置信度/敏感等级/版本/status，GLOSSARY: MemoryCandidate） | ✅ 写入 |
-| `memory_facts` | 长期记忆（版本与有效期，GLOSSARY: MemoryFact） | 只建表（巩固写路径留 T2） |
-| `memory_fact_sources` | 事实↔来源多对多（巩固聚合多条来源） | 只建表 |
-| `memory_revisions` | 事实版本历史（FR-MEM-5） | 只建表 |
+| `memory_candidates` | 候选记忆（来源/观察时间/发生时间/置信度/敏感等级/版本/status，GLOSSARY: MemoryCandidate）；status：`pending` → `consolidated` \| `dismissed` \| `conflicted` | ✅ 写入 |
+| `memory_facts` | 长期记忆（版本与有效期，GLOSSARY: MemoryFact） | ✅ 写入（M1-T2 巩固） |
+| `memory_fact_sources` | 事实↔来源多对多（巩固聚合多条来源） | ✅ 写入（M1-T2） |
+| `memory_revisions` | 事实版本历史（FR-MEM-5） | ✅ 写入（M1-T2） |
+| `memory_conflicts` | 冲突待确认队列（重大事实 / locked / 敏感等级冲突，FR-MEM-5） | ✅ 写入（M1-T2） |
 | `memory_fts` | FTS5 索引（content + entry_id/entry_kind UNINDEXED），候选与事实统一索引 | ✅ 写入 |
 
 **两条写入路径，一个出口**（`MemoryService.#persist`：先落行（来源+候选+FTS 同一事务），后记账本事件）：
@@ -321,21 +344,83 @@ restore。套件可重复执行（临时目录 + 显式脚本）。
    `MemoryWriteInput`），模型显式调用；来源 = 会话最新一条 `message.user`；非法入参以
    `isError` 文本返回给模型而非抛异常。缺省 `kind=fact`、`confidence=0.9`、`sensitivity=private`。
 
-**事件族**（event_type 清单只增不减）：`memory.candidate_created`（上表）；
-`memory.fact_created` 本票只登记类型名，T2 巩固产出事实时启用。事件过统一信封
-（protocol JSON Schema + integrity_hash 复算），`causation_id` 指向来源 `message.user` 事件——
-「记忆可回链」在账本侧由 causation 承载，在检索侧由 `sources` 数组承载。顺序约定：
-行先于事件（行是可重建投影，事件缺失即本次写入未生效，不静默吞掉）。
+**事件族**（event_type 清单只增不减）：见「M0 会话事件族」表中的 memory.* 行。
+事件过统一信封（protocol JSON Schema + integrity_hash 复算），候选/事实证据的
+`causation_id` 指向来源 `message.user` 事件——「记忆可回链」在账本侧由 causation 承载，
+在检索侧由 `sources` 数组承载。顺序约定：行先于事件（行是可重建投影，事件缺失即本次
+写入未生效，不静默吞掉）。
+
+**后台抽取与巩固（M1-T2 / Issue #14，FR-MEM-3/4/5）**——两个可注入接缝 + 服务层写路径：
+
+1. **抽取（`extraction.ts`，seam `MemoryExtractor`）**：SessionManager 在 `message.assistant`
+   落账后调用 `MemoryObserver.observeTurnEnd`（可选方法，T2 新增）→ `MemoryService.extractTurn`
+   fire-and-forget 异步执行（失败只记日志，不影响会话主链路；`RuntimeOptions.memoryExtractor`
+   可注入，默认 `HeuristicExtractor` = 同一套确定性启发式的多句全量扫描）。输出候选带
+   内容/kind/置信度/sensitivity/rule；**同来源事件 + 同内容去重**（T1 即时写入先写走的候选
+   不重复），运行落 `memory.extracted`（0 条也留痕）。
+2. **巩固（`consolidator.ts`，seam `MemoryConsolidator`）**：抽取收尾把**全部 pending 候选中
+   confidence ≥ 0.8（`AUTO_CONSOLIDATE_MIN_CONFIDENCE`）**的交给巩固器（跨写路径补齐——T1
+   即时写入与 memory.write 工具产生的候选同样在下一轮收尾被巩固）；低置信弱命中（0.7 的
+   fact-statement）留 pending 等 Owner `decide`。巩固器是纯判定（输入候选批次 + 现存事实
+   视图，逐条决策、事实视图即时刷新杜绝批内重复建事实），服务执行写路径：
+   - `create_fact`：事实 v1 + 来源多对多 + FTS + `memory.fact_created`；
+   - `update_fact`：版本+1 + MemoryRevision（reason=`preference_update`）+ `memory.fact_updated`；
+   - `corroborate`：归一化内容相同 → 只补来源、不推进版本（locked 事实也允许印证）；
+   - `escalate`：冲突行 + 候选转 `conflicted` + `memory.conflict_detected`——绝不静默覆盖。
+   运行收尾落 `memory.consolidated`。
+3. **冲突规则（FR-MEM-5 口径，按序判定）**：同主题 = kind 相同 且 显著词元交集非空
+   （ASCII 词 ≥2 字符 + CJK 单字去停用字）；①既有事实 **locked** 且内容不同 → 上报
+   （GLOSSARY：禁止一切自动改写，连偏好也不豁免）；②候选与事实**敏感等级不同** → 上报
+   （可见性分级不静默变更，升级与放宽都算）；③同主题 **preference** → 自动更新留历史
+   （版本链）；④其余 kind 内容不同 → 上报（重大事实冲突）。裁决三选一：keep_new /
+   keep_old / merge（Owner 提供合并文本），见端点表——keep_new/merge 推进版本链，
+   keep_old 事实不动只留裁决事件。
+
+**候选/冲突控制面**：端点见上表；候选 decisions（accept/dismiss）与冲突裁决（resolve）
+的行变更均为单事务（候选/事实/修订/冲突行同进退），事件在行落定后记账。
 
 **检索**：`GET /v1/memory/facts?q=` → FTS5 短语查询（用户输入经 CJK 逐字插空格归一化 +
 引号转义：unicode61 下连续中文成词，短语查询即子串匹配，零 native 分词依赖），按 rank 排序
 上限 50，候选/事实统一索引，命中带 `sources` 回链。**默认敏感级**：新记忆一律
 `sensitivity=private`（GLOSSARY: Sensitivity Level，仅 Owner 会话可读），工具入参可显式覆盖。
 
-**边界（如实）**：本票只写候选——后台抽取（FR-MEM-3）、巩固（FR-MEM-4）、冲突处理（FR-MEM-5）、
-Markdown 投影（FR-MEM-6）是 T2+ 的票；启发式按句匹配、不懂语义（反讽/引用有误报漏报），
-由 T2 巩固的置信度整合与冲突审核兜底；`memory.*` 事件经账本入 SSE 重放（session_id 关联），
-不入会话易失帧；FTS5 为硬依赖（Node 22.16+/24，见文首）。
+**Markdown 投影 / 受控导入 / 删除标记（M1-T3 / Issue #15，FR-MEM-6/8）**：
+
+1. **投影**：现存有效事实 → `<dataDir>/memory/{fact_id}.md`（文件名 = fact_id），frontmatter
+   严格按 PRD §6.4 十字段（id/type/sensitivity/confidence/valid_from/valid_until/sources/
+   created_at/updated_at/version），正文 = 事实内容原文。值格式两处刻意偏差取无损/一致性：
+   `id` 用 fact_id 原文（与检索 API、文件名同一真相源，不带示例中的 `mem_` 前缀）、时间戳
+   用完整 ISO 8601 UTC；`confidence` 对事实恒为 `null`（置信度是候选属性，字段按 §6.4
+   字段集保留）。**幂等**：渲染是 store 状态的纯函数——同状态产出同字节（统一 LF + 尾随
+   换行，无需换行归一层），projectAll 只写差异文件并清理孤儿 `{uuid}.md`（外来文件不动）；
+   再生成命令 `POST /v1/memory/project`。已删/已过期事实不投影。
+2. **受控导入**：`POST /v1/memory/import`，body = `{ markdown }`（编辑后的投影文件全文——
+   一次携带全部 frontmatter，与投影互为往返；结构化 `{fact_id, content}` 形态会绕过 §6.4
+   解析与版本对账，不做）。流程：id 定位事实（不存在/已删 404）→ version 对账（落后即 409
+   `memory_stale_version` 防覆盖）→ `memory.import_received` 证据事件 → 内容与分级均未变
+   → `unchanged`；否则候选（confidence 1，人工编辑即 Owner 授权）+ 与 T2 巩固同一冲突口径：
+   locked 任何变更 → 冲突队列（`locked`），分级变更 → 冲突队列（`sensitivity_change`，纯
+   分级变更也算，比巩固器更严），其余 → 版本+1 + MemoryRevision（`manual_import`）+
+   `memory.fact_updated` + 投影单事实刷新。frontmatter 其余字段是投影只读面（type 不可变、
+   sources/时间戳以库内为准），不因导入改写。
+3. **删除标记**：`DELETE /v1/memory/facts/:id` → facts 行软删（`deleted_at`；修订/来源保留
+   作回链审计）+ FTS 索引移除（检索面立即退出）+ `memory.fact_deleted` tombstone 事件
+   （payload 带事实终态，M3 同步传播的证据）+ 投影文件移除；重投影只认现存事实，不复活
+   已删记忆。**locked 删除需确认**：默认 409 `memory_locked_confirm`，`?confirm=true`
+   显式放行（locked = 变更须经 Owner 确认，删除是不可逆变更，宁可多问）。
+
+**AC-03 前置脚本**：`pnpm --filter @morrow/runtime memory:ac03`
+（`scripts/memory-ac03.ts`）——100 条设计记录端到端（词元两两不相交的确定性内容）：
+写入→抽取→巩固→投影（幂等断言）→检索→逐条回链断言（全部 100 条投影 frontmatter 的
+sources 非空且指向存在的账本事件）→账本完整性校验→受控导入/删除抽查。确定性、零网络、
+可重复执行（临时数据目录即建即清）。
+
+**边界（如实）**：抽取/巩固默认实现是确定性启发式——按句匹配、不懂语义（反讽/引用有
+误报漏报），同主题判定靠词元交集（过宽多问、过窄多建事实，均可经控制面纠偏）；LLM 抽取/
+巩固后续经同接口替换（`MemoryExtractor` / `MemoryConsolidator`），无需动写路径；投影为
+单向导出（`POST /v1/memory/project` 再生成），尚无编辑器文件监听/自动重投影；删除的跨
+副本传播是 M3（本票只落单机 tombstone）；`memory.*` 事件经账本入 SSE 重放
+（session_id 关联），不进会话实时帧；FTS5 为硬依赖（Node 22.16+/24，见文首）。
 
 ## 真实 Provider 冒烟（手动，不进测试套件）
 
@@ -409,12 +494,14 @@ src/
   envelope.ts    事件信封工厂（T2 生命周期事件与 T4 会话事件共用）
   db.ts          SQLite 薄 facade（node:sqlite 绑定收敛点）
   devices.ts     DeviceRegistry：devices 表（replica_id 主键）+ 启动种子（M0 最小实现，票 #3）
-  memory/        记忆垂直切片（M1-T1 / Issue #13）：
-                   heuristics.ts 高价值规则（确定性纯函数，explicit-remember/preference/fact）
-                   store.ts      MemoryStore：记忆五表 + FTS5 迁移与检索（同库 events.sqlite）
-                   service.ts    MemoryService：两条写入路径统一出口 + memory.* 事件记账
+  memory/        记忆管线（M1-T1 候选 / Issue #13 + M1-T2 抽取巩固 / Issue #14）：
+                   store.ts      MemoryStore：记忆表 + FTS5 检索 + 巩固/冲突事务写路径
+                   service.ts    MemoryService：三条候选写入路径 + 抽取/巩固管线 + 控制面
+                   extraction.ts MemoryExtractor 接缝 + 默认确定性抽取器（T2）
+                   consolidator.ts MemoryConsolidator 接缝 + 默认决策矩阵/冲突规则（T2）
+                   heuristics.ts 确定性高价值规则（即时写入取首命中 / 抽取取全部）
                    tool.ts       memory.write 工具（PiAdapter tools 通道注册）
-                   routes.ts     GET /v1/memory/facts（FTS5 检索 + 来源回链）
+                   routes.ts     facts/candidates/conflicts 控制面端点
   config.ts      环境变量解析（含 Provider 三元组 env 回退种子）+ 副本身份持久化
   health.ts      沙箱可用性探针（M0 桩）
   uuid-v7.ts     UUID v7 生成 + 小写 uuid 形态正则 UUID_RE（config / runtime 共用）
@@ -425,5 +512,7 @@ test/         node:test：ledger / server / config / lifecycle / sessions / keyr
               providers.api / connectivity / provider-switch / cors / devices / tasks（服务层）/
               tasks.api（HTTP 任务族）/ checkpoint（快照字段集与恢复决策）/ checkpoint.scheduler
               （pause/resume/restore 编排）/ checkpoint.api（HTTP 介入端点）/
-              checkpoint.faults（故障注入套件，AC-07）/ memory.* 等 seam
+              checkpoint.faults（故障注入套件，AC-07）/ memory（heuristics / store / store2 巩固
+              写路径 / consolidator 决策矩阵 / pipeline 管线 / api 检索 / pipeline.api 抽取巩固
+              端到端）等 seam
 ```

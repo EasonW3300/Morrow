@@ -10,7 +10,9 @@ import { EventLedger } from "./ledger.ts";
 import { MemoryService } from "./memory/service.ts";
 import { MemoryStore } from "./memory/store.ts";
 import { createMemoryWriteTool } from "./memory/tool.ts";
-import { memoryFactsRoute } from "./memory/routes.ts";
+import { memoryRoutes } from "./memory/routes.ts";
+import { MemoryProjector } from "./memory/projection.ts";
+import type { MemoryExtractor } from "./memory/extraction.ts";
 import { ProviderRegistry, ProviderRegistryError, ENV_PROVIDER_ID, type ProviderResolver, type ResolvedProvider } from "./providers.ts";
 import { SessionManager, type AgentRuntimeExtras, type SessionFrame } from "./sessions.ts";
 import { TaskScheduler, type NodeAgentFactory, type TaskNodeExecInput } from "./scheduler.ts";
@@ -29,7 +31,12 @@ import { UUID_RE } from "./uuid-v7.ts";
  * POST/GET /v1/sessions/:id/messages、GET /v1/sessions/:id/stream SSE）、
  * T5 Provider 族（GET/POST /v1/providers、GET/PUT/DELETE /v1/providers/:id、
  * POST /v1/providers/:id/default、POST /v1/providers/:id/test）、
- * M1-T4 任务族（POST/GET /v1/tasks、GET /v1/tasks/:id、GET /v1/tasks/:id/events）。
+ * M1-T4 任务族（POST/GET /v1/tasks、GET /v1/tasks/:id、GET /v1/tasks/:id/events）、
+ * M1-T2 记忆族（GET /v1/memory/facts、GET /v1/memory/candidates、
+ * POST /v1/memory/candidates/:id/decide、GET /v1/memory/conflicts、
+ * POST /v1/memory/conflicts/:id/resolve）+ M1-T3 记忆投影族
+ * （POST /v1/memory/import 受控导入、DELETE /v1/memory/facts/:id 删除标记、
+ * POST /v1/memory/project 投影再生成）。
  * 未匹配路径 404，路径命中但方法不符 405（账本 append-only：对事件的任何变更
  * 方法在请求层即被拒绝）。
  * 生命周期：start 先监听后记账 runtime.started（携带实际端口）；close 先停收请求，
@@ -52,6 +59,8 @@ interface RequestContext {
   /** Checkpoint 服务（M1-T5：pause/resume/restore/checkpoints 端点背后的快照与恢复） */
   checkpoints: CheckpointService;
   memory: MemoryService;
+  /** 记忆投影器（票 M1-T3：/v1/memory/project 命令执行体） */
+  projector: MemoryProjector;
 }
 
 type Handler = (
@@ -94,6 +103,12 @@ export interface RuntimeOptions {
   taskNodeAgentFactory?: NodeAgentFactory;
   /** 调度器同时在跑节点上限（默认 2，最小 1；调度器级上限，跨任务成立） */
   taskConcurrency?: number;
+  /**
+   * 后台抽取器注入 seam（M1-T2 / Issue #14）：缺省 = 确定性启发式（HeuristicExtractor）；
+   * 测试注入可控抽取（含失败注入——验证 fire-and-forget 不影响会话主链路），后续可接
+   * LLM 抽取（经 PiAdapter）。
+   */
+  memoryExtractor?: MemoryExtractor;
 }
 
 export interface RuntimeHandle {
@@ -106,6 +121,8 @@ export interface RuntimeHandle {
   sessions: SessionManager;
   /** 记忆服务（票 M1-T1 / Issue #13：候选写入 + FTS 检索，库形态可直用） */
   memory: MemoryService;
+  /** 记忆投影器（票 M1-T3 / Issue #15：dataDir/memory/*.md，幂等再生成，库形态可直用） */
+  projector: MemoryProjector;
   /** Provider 注册表（库形态可直用：CRUD / 默认 / env 回退解析） */
   providers: ProviderRegistry;
   /** 任务服务（库形态可直用：createTask / 详情 / 状态机迁移；调度经 HTTP 自动触发） */
@@ -145,7 +162,7 @@ const routes: Route[] = [
   { method: "POST", re: /^\/v1\/tasks\/([^/]+)\/resume$/, handler: handleResumeTask },
   { method: "POST", re: /^\/v1\/tasks\/([^/]+)\/restore$/, handler: handleRestoreTask },
   { method: "GET", re: /^\/v1\/tasks\/([^/]+)\/checkpoints$/, handler: handleListCheckpoints },
-  memoryFactsRoute,
+  ...memoryRoutes,
 ];
 
 export async function startRuntime(config: RuntimeConfig, options: RuntimeOptions = {}): Promise<RuntimeHandle> {
@@ -154,9 +171,20 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
   // 不做配对/撤销（M3 范围）
   const devices = DeviceRegistry.open(config.dataDir);
   devices.touch(config.replicaId);
-  // 记忆存储（票 M1-T1 / Issue #13）：与账本同库；候选即时写入 + FTS5 检索
+  // 记忆存储（票 M1-T1 / Issue #13）：与账本同库；候选即时写入 + FTS5 检索。
+  // 抽取/巩固管线（M1-T2 / Issue #14）：MemoryService 内含可注入 Extractor/Consolidator
+  // （默认确定性实现），轮次收尾（message.assistant 落账）由 SessionManager 触发后台抽取。
   const memoryStore = MemoryStore.open(config.dataDir);
-  const memory = new MemoryService({ store: memoryStore, ledger, replicaId: config.replicaId });
+  // 记忆投影器（票 M1-T3 / Issue #15，FR-MEM-6）：facts → dataDir/memory/*.md；
+  // 注入 MemoryService（导入修订后单事实刷新 / 删除后投影文件移除），投影命令走路由。
+  const projector = new MemoryProjector({ store: memoryStore, dataDir: config.dataDir });
+  const memory = new MemoryService({
+    store: memoryStore,
+    ledger,
+    replicaId: config.replicaId,
+    projector,
+    ...(options.memoryExtractor !== undefined ? { extractor: options.memoryExtractor } : {}),
+  });
   const providers = new ProviderRegistry({
     dataDir: config.dataDir,
     secretStore: options.secretStore ?? detectSecretStore().store,
@@ -216,7 +244,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     checkpoints,
     ...(options.taskConcurrency === undefined ? {} : { concurrency: options.taskConcurrency }),
   });
-  const ctx: RequestContext = { ledger, replicaId: config.replicaId, sessions, providers, devices, tasks, scheduler, checkpoints, memory };
+  const ctx: RequestContext = { ledger, replicaId: config.replicaId, sessions, providers, devices, tasks, scheduler, checkpoints, memory, projector };
   const server = createServer((req, res) => {
     routeRequest(req, res, ctx);
   });
@@ -251,6 +279,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     tasks,
     checkpoints,
     memory,
+    projector,
     async close(signal?: string): Promise<void> {
       if (closing) return;
       closing = true;

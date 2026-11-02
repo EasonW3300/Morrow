@@ -3,7 +3,8 @@
 // 无命中（闲聊）返回 null。T2 后台抽取复用本模块。
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { detectHighValue } from "../src/memory/heuristics.ts";
+import { detectAllHighValue, detectHighValue } from "../src/memory/heuristics.ts";
+import { HeuristicExtractor } from "../src/memory/extraction.ts";
 
 test("显式『记住 X』：提取关键词之后的内容（中文，剥离前导标点）", () => {
   const hit = detectHighValue("记住我家猫叫小白");
@@ -88,4 +89,52 @@ test("闲聊不命中：问候/请求/提问返回 null", () => {
 test("『记住』后无内容：不产生空候选", () => {
   assert.equal(detectHighValue("记住"), null);
   assert.equal(detectHighValue("记住。"), null);
+});
+
+// --- 票 M1-T2 / Issue #14：后台抽取（detectAllHighValue 多句全量 + HeuristicExtractor）---
+
+test("detectAllHighValue：多句全量扫描——每句至多一条、全部命中返回", () => {
+  const matches = detectAllHighValue("今天有点累。我偏好早上跑步。我住在杭州。明天再聊。");
+  assert.deepEqual(
+    matches.map((m) => [m.rule, m.content]),
+    [
+      ["preference-statement", "我偏好早上跑步"],
+      ["fact-statement", "我住在杭州"],
+    ],
+  );
+  assert.deepEqual(matches.map((m) => m.confidence), [0.8, 0.7], "各规则固有的确定性置信度");
+});
+
+test("detectAllHighValue：单句命中与 T1 detectHighValue 一致（首条 = 即时写入路径）", () => {
+  const all = detectAllHighValue("请记住：明早 9 点开站会");
+  assert.equal(all.length, 1);
+  assert.equal(all[0].rule, "explicit-remember");
+  assert.equal(all[0].content, "明早 9 点开站会");
+  assert.equal(all[0].kind, "fact");
+});
+
+test("detectAllHighValue：闲聊与空文本返回空数组（不产生候选）", () => {
+  assert.deepEqual(detectAllHighValue("今天天气怎么样？"), []);
+  assert.deepEqual(detectAllHighValue(""), []);
+  assert.deepEqual(detectAllHighValue("   \n  "), []);
+});
+
+test("HeuristicExtractor（默认抽取器）：输出即候选形态，sensitivity 恒 private，rule 透传", () => {
+  const extractor = new HeuristicExtractor();
+  const candidates = extractor.extract({
+    sessionId: "sess-x",
+    userEventId: "evt-x",
+    occurredAt: "2026-11-01T08:00:00.000Z",
+    userText: "我喜欢用 Rust 写脚本。我住在上海。",
+    recentUserTexts: ["我喜欢用 Rust 写脚本。我住在上海。"],
+  });
+  assert.equal(candidates.length, 2);
+  assert.deepEqual(
+    candidates.map((c) => [c.kind, c.rule, c.sensitivity]),
+    [
+      ["preference", "preference-statement", "private"],
+      ["profile", "fact-statement", "private"],
+    ],
+  );
+  assert.ok(candidates.every((c) => c.confidence > 0 && c.confidence <= 1));
 });
