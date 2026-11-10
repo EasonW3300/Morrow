@@ -142,4 +142,10 @@ export interface ChannelHealth {
   healthy: boolean;
   detail: string | null;
   checked_at: string;
+  /** 事件连接状态（长连接适配器自报；M4-T3 起为可选附加字段） */
+  connection?: "connected" | "connecting" | "disconnected" | "degraded";
+  /** 平台 access token 到期时间（RFC 3339；无 token 概念时 null） */
+  token_expires_at?: string | null;
+  /** 最近一次错误（成功路径清空；诊断用，不含密钥） */
+  last_error?: string | null;
 }

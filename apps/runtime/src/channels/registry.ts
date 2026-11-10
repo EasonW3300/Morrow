@@ -4,6 +4,7 @@ import type {
   ChannelHealth,
   ChannelSummary,
   InboundMessage,
+  OutboundMessage,
 } from "@morrow/protocol";
 import type { EventLedger } from "../ledger.ts";
 import type { SessionManager } from "../sessions.ts";
@@ -36,12 +37,23 @@ export interface ChannelRegistryOptions {
   enableEcho?: boolean;
   /** 任务存在性校验（入站关联 task_id 时）；缺省不校验 */
   taskExists?: (taskId: string) => boolean;
+  /**
+   * 外发出口（M4-T3）：助手回复入 Outbox；缺省 = 直接 adapter.send（T1/测试兼容）。
+   */
+  outboundSink?: { enqueue(outbound: OutboundMessage): unknown };
   now?: () => Date;
 }
 
 /** 账号登记可同时绑定 Owner 的平台身份（owner_native_ids → principal=owner） */
 export interface ChannelAccountRegistration extends ChannelAccountInput {
   owner_native_ids?: string[];
+}
+
+/** 生产适配器注册项（M4-T3）：适配器 + 绑定的渠道账号（runtime 启动时注入） */
+export interface ChannelAdapterRegistration {
+  adapter: ChannelAdapter;
+  account: ChannelAccountRegistration;
+  experimental?: boolean;
 }
 
 interface AdapterEntry {
@@ -73,6 +85,7 @@ export class ChannelRegistry {
       sessions: options.sessions,
       store: this.#store,
       adapterFor: (channelId) => this.getAdapter(channelId),
+      ...(options.outboundSink === undefined ? {} : { outboundSink: options.outboundSink }),
       ...(options.taskExists === undefined ? {} : { taskExists: options.taskExists }),
       now: this.#now,
     });
@@ -172,6 +185,9 @@ export class ChannelRegistry {
       healthy: entry.state === "running" && reported.healthy,
       detail: entry.detail ?? reported.detail ?? null,
       checked_at: this.#now().toISOString(),
+      ...(reported.connection === undefined ? {} : { connection: reported.connection }),
+      ...(reported.token_expires_at === undefined ? {} : { token_expires_at: reported.token_expires_at }),
+      ...(reported.last_error === undefined ? {} : { last_error: reported.last_error }),
     };
   }
 
@@ -195,6 +211,14 @@ export class ChannelRegistry {
           accountId: account.account_id,
           onInbound: (raw) => {
             this.ingest(channelId, raw);
+          },
+          onInboundRejected: (rejection) => {
+            this.#router.reject({
+              channel: channelId,
+              reason: "event_rejected",
+              error_code: rejection.code,
+              detail: rejection.message,
+            });
           },
         });
         entry.state = "running";
