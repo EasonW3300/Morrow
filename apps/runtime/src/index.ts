@@ -219,6 +219,25 @@ export type {
   FeishuVerifyResult,
   LoadFeishuConfigOptions,
 } from "./channels/adapters/feishu/index.ts";
+// 通知规则与路由（M4-T7 / Issue #44，FR-NOT-1/2）
+export {
+  NotificationService,
+  NotificationError,
+  NOTIFICATION_EVENT_TYPES,
+} from "./notifications/service.ts";
+export type {
+  NotificationErrorCode,
+  NotificationRouteOutcome,
+  NotificationServiceOptions,
+  NotificationTaskView,
+} from "./notifications/service.ts";
+export { NotificationStore } from "./notifications/store.ts";
+export type { DeliveryInsert, DeliveryPatch } from "./notifications/store.ts";
+export { NOTIFICATION_TABLES_SQL, ensureNotificationTables } from "./notifications/migrations.ts";
+export { notificationRoutes } from "./notifications/routes.ts";
+export type { NotificationRoute, NotificationRouteContext } from "./notifications/routes.ts";
+export { sanitizeForExternalRecipient, REDACTED } from "./notifications/sanitizer.ts";
+export { createChannelOutboxAdapter } from "./channels/outbox-adapter.ts";
 export {
   CheckpointService,
   CheckpointStore,

@@ -157,6 +157,11 @@ export class ChannelRegistry {
     return this.#adapters.get(channelId)?.adapter ?? null;
   }
 
+  /** 渠道当前绑定的账号 id（通知/Outbox 外发的 account_id 来源）；未绑定 null */
+  accountIdForChannel(channelId: string): string | null {
+    return this.#store.findAccountByChannel(channelId)?.account_id ?? null;
+  }
+
   /** GET /v1/channels：适配器清单 + 绑定账号 + capabilities + state */
   list(): ChannelSummary[] {
     const out: ChannelSummary[] = [];
