@@ -219,6 +219,55 @@ export type {
   FeishuVerifyResult,
   LoadFeishuConfigOptions,
 } from "./channels/adapters/feishu/index.ts";
+// 渠道事件传输接缝（M4-T3/T4 共用；飞书/QQ 只改 streamPath）
+export { HttpLongPollEventTransport as ChannelHttpLongPollEventTransport } from "./channels/event-transport.ts";
+export type {
+  EventTransport as ChannelEventTransport,
+  HttpLongPollEventTransportOptions as ChannelHttpLongPollEventTransportOptions,
+} from "./channels/event-transport.ts";
+// QQ 官方 Bot 适配器（M4-T4 / Issue #41）
+export {
+  QqChannelAdapter,
+  QqConfigError,
+  QqError,
+  QQ_PERMISSION_ERROR_CODES,
+  QQ_PROACTIVE_REJECT_CODES,
+  QQ_RATE_LIMIT_CODES,
+  QQ_SECRET_FIELDS,
+  QQ_SECRET_SERVICE,
+  QQ_TOKEN_ERROR_CODES,
+  answerQqValidation,
+  classifyQqEvent,
+  isQqRateLimitCode,
+  loadQqConfig,
+  parseQqInbound,
+  qqPublicKeyHex,
+  qqSecretAccount,
+  qqSigningSeed,
+  signEd25519,
+  verifyEd25519,
+  verifyQqEvent,
+} from "./channels/adapters/qq/index.ts";
+export type {
+  LoadQqConfigOptions,
+  ParseQqInboundOptions,
+  QqChannelAdapterOptions,
+  QqConfig,
+  QqErrorCategory,
+  QqEventConfig,
+  QqEventKind,
+  QqSecretField,
+  QqVerifyOptions,
+  QqVerifyResult,
+} from "./channels/adapters/qq/index.ts";
+// QQ 协议桩（T4/T5 复用；与 ChannelTestServer 组合使用）
+export { registerQqTestStub } from "./channels/testing/qq-stub.ts";
+export type {
+  QqTestMessageRecord,
+  QqTestStub,
+  QqTestStubOptions,
+  QqTestStubRequestKind,
+} from "./channels/testing/qq-stub.ts";
 // 微信个人号实验适配器（M4-T5 / Issue #42；出厂 disabled，LocalBridge 可注入）
 export {
   LocalBridgeError,

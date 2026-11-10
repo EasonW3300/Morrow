@@ -116,7 +116,9 @@ export class ChannelOutboxAdapter implements OutboxChannelAdapter {
     } catch (err) {
       if (err instanceof ChannelSendError) {
         if (err.kind === "explicit") {
-          return { kind: "failed", error: err.message };
+          // retryable=false（如 QQ 主动消息被平台策略拒绝）原样传给 Outbox，
+          // 由状态机立即转 needs_review（不自动重发）而非退避重试。
+          return { kind: "failed", error: err.message, ...(err.retryable ? {} : { retryable: false }) };
         }
         throw new OutboxChannelError(err.kind, err.message);
       }

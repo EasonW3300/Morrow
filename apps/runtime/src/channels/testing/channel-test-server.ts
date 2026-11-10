@@ -283,7 +283,14 @@ export class ChannelTestServer {
 
   /** 事件入队（长轮询取走）；返回本次投递的帧数（duplicateEvents 时为 2） */
   pushEvent(event: Record<string, unknown>): number {
-    const frame = this.buildEventFrame(event);
+    return this.pushFrame(this.buildEventFrame(event));
+  }
+
+  /**
+   * 预构造帧入队（M4-T4 起）：供非飞书签名形态的平台使用（QQ Ed25519 等）。
+   * 与 pushEvent 共享同一游标/去重/唤醒语义；帧由调用方签名。
+   */
+  pushFrame(frame: ChannelTestEventFrame): number {
     this.#events.push(frame);
     if (this.duplicateEvents) this.#events.push(frame);
     this.#wakeWaiters();
