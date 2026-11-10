@@ -30,3 +30,14 @@ export type {
   QqVerifyOptions,
   QqVerifyResult,
 } from "./events.ts";
+export {
+  QQ_INTENT_GROUP_AND_C2C,
+  QqWebSocketTransport,
+  isQqWebSocketTransport,
+} from "./websocket-transport.ts";
+export type {
+  QqAccessTokenProvider,
+  QqWebSocketEventLike,
+  QqWebSocketLike,
+  QqWebSocketTransportOptions,
+} from "./websocket-transport.ts";
