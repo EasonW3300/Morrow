@@ -96,6 +96,8 @@ export class DeviceRegistry {
   #getWithTokenStmt;
   #setIdentityStmt;
   #markPairedStmt;
+  #markJoinedPeerStmt;
+  #markSyncedStmt;
   #revokeStmt;
   #touchStmt;
 
@@ -146,6 +148,21 @@ export class DeviceRegistry {
          revoked_at = NULL,
          token_hash = excluded.token_hash`,
     );
+    this.#markJoinedPeerStmt = db.prepare(
+      `INSERT INTO devices
+         (replica_id, label, created_at, last_seen_at, public_key, fingerprint, trusted, revoked, paired_at, revoked_at, token_hash)
+       VALUES (?, ?, ?, ?, ?, ?, 1, 0, ?, NULL, NULL)
+       ON CONFLICT(replica_id) DO UPDATE SET
+         label = excluded.label,
+         last_seen_at = excluded.last_seen_at,
+         public_key = excluded.public_key,
+         fingerprint = excluded.fingerprint,
+         trusted = 1,
+         revoked = 0,
+         paired_at = excluded.paired_at,
+         revoked_at = NULL`,
+    );
+    this.#markSyncedStmt = db.prepare("UPDATE devices SET last_sync_at = ? WHERE replica_id = ?");
     this.#revokeStmt = db.prepare(
       "UPDATE devices SET revoked = 1, revoked_at = ? WHERE replica_id = ?",
     );
@@ -195,6 +212,25 @@ export class DeviceRegistry {
       iso,
       input.tokenHash,
     );
+  }
+
+  /**
+   * 本机作为新设备加入对端 Runtime 后（M3 修复批 / Issue #35，POST /v1/pairing/join）：
+   * 把对端（服务端）记为本机 devices 中的可信远端设备。token 不落本表——只存本机
+   * OS 凭据库（见 PairingService.join），本表只保存公开身份。
+   */
+  markJoinedPeer(input: { replicaId: string; label: string | null; publicKey: string; fingerprint: string; now: Date }): void {
+    const iso = input.now.toISOString();
+    this.#markJoinedPeerStmt.run(input.replicaId, input.label, iso, iso, input.publicKey, input.fingerprint, iso);
+  }
+
+  /**
+   * 同步成功：写 last_sync_at（M3 修复批 / Issue #35）。只更新已存在的设备行——
+   * 不认识的 peer 不因一次同步而凭空出现在设备列表。返回是否命中一行。
+   */
+  markSynced(replicaId: string, now: Date = new Date()): boolean {
+    const result = this.#markSyncedStmt.run(now.toISOString(), replicaId);
+    return Number(result.changes) > 0;
   }
 
   /**

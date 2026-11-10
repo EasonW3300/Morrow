@@ -10,6 +10,9 @@ import { PairingError, type PairingService } from "./service.ts";
  *
  *   POST   /v1/pairing/codes     已信任设备生成一次性配对码（body 可空）
  *   POST   /v1/pairing/claim     新设备凭码换取设备凭据（唯一免除 bearer 的非回环路径）
+ *   POST   /v1/pairing/join      **本机作为新设备**加入对端 Runtime（M3 修复批 / Issue #35）：
+ *                                宿主侧 claim + 本地指纹校验 + token 写 OS 凭据库 +
+ *                                对端公钥写设备表；响应绝不含 token 明文
  *   DELETE /v1/devices/:id       撤销设备（revoked=1 + 清 token_hash + 审计）
  *
  * GET /v1/devices 仍由 runtime.ts 的极简路由承载（M0 起就在那里；本票只扩展了
@@ -38,6 +41,7 @@ export interface PairingRouteContext {
 export const pairingRoutes: PairingRoute[] = [
   { method: "POST", re: /^\/v1\/pairing\/codes$/, handler: handleCreatePairingCode },
   { method: "POST", re: /^\/v1\/pairing\/claim$/, handler: handleClaimPairing },
+  { method: "POST", re: /^\/v1\/pairing\/join$/, handler: handleJoinPairing },
   { method: "DELETE", re: /^\/v1\/devices\/([^/]+)$/, handler: handleRevokeDevice },
 ];
 
@@ -104,8 +108,47 @@ async function handleClaimPairing(
   }
 }
 
-function handleRevokeDevice(
-  _req: IncomingMessage,
+async function handleJoinPairing(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _url: URL,
+  ctx: PairingRouteContext,
+): Promise<void> {
+  const body = await readJsonBody(req, res);
+  if (body === null) return;
+  const baseUrl = body.base_url;
+  const code = body.code;
+  if (typeof baseUrl !== "string" || baseUrl.trim().length === 0) {
+    sendError(res, 400, "invalid_body", "base_url must be a non-empty string");
+    return;
+  }
+  if (typeof code !== "string") {
+    sendError(res, 400, "invalid_body", "code must be a string");
+    return;
+  }
+  if (body.device_label !== undefined && typeof body.device_label !== "string") {
+    sendError(res, 400, "invalid_body", "device_label must be a string when present");
+    return;
+  }
+  if (body.expect_server_fingerprint !== undefined && typeof body.expect_server_fingerprint !== "string") {
+    sendError(res, 400, "invalid_body", "expect_server_fingerprint must be a string when present");
+    return;
+  }
+  try {
+    const result = await ctx.pairing.join({
+      baseUrl: baseUrl.trim(),
+      code,
+      deviceLabel: body.device_label,
+      expectedServerFingerprint: body.expect_server_fingerprint,
+    });
+    // 响应类型 PairingJoinResponse 不含 token；join() 已把它写入本机凭据库。
+    sendJson(res, 200, result);
+  } catch (err) {
+    sendPairingError(res, err);
+  }
+}
+
+function handleRevokeDevice(  _req: IncomingMessage,
   res: ServerResponse,
   _url: URL,
   ctx: PairingRouteContext,

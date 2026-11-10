@@ -17,6 +17,7 @@ CREATE TABLE IF NOT EXISTS sync_cursors (
   peer_replica_id      TEXT PRIMARY KEY,
   last_pulled_sequence INTEGER NOT NULL DEFAULT 0,
   last_acked_sequence  INTEGER NOT NULL DEFAULT 0,
+  last_synced_at       TEXT,
   updated_at           TEXT NOT NULL
 );
 
@@ -63,6 +64,12 @@ const SYNC_CURSOR_COLUMNS: Array<{ column: string; ddl: string }> = [
   {
     column: "updated_at",
     ddl: "ALTER TABLE sync_cursors ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''",
+  },
+  {
+    // M3 修复批（Issue #35）：最近一次成功同步时间。旧库补列即可，既有行为 null
+    // （「从未成功同步」——与真实情况一致，不伪造时间）。
+    column: "last_synced_at",
+    ddl: "ALTER TABLE sync_cursors ADD COLUMN last_synced_at TEXT",
   },
 ];
 

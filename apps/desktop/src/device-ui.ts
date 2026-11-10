@@ -12,7 +12,7 @@
  *
  * 类型一律从 `@morrow/protocol/browser` 引（主入口有浏览器守卫测试）。
  */
-import type { DeviceInfo, PairingClaimResponse, SyncStatus } from "@morrow/protocol/browser";
+import type { DeviceInfo, PairingClaimResponse, PairingJoinResponse, SyncStatus } from "@morrow/protocol/browser";
 
 // --- 指纹 -------------------------------------------------------------------------
 
@@ -103,11 +103,17 @@ export interface PeerCursorView {
   pulled: number;
   acked: number;
   updatedAt: string | null;
+  /** 最近一次成功同步时间（Runtime 的 peers[].last_synced_at；旧状态无此字段时回退 null） */
+  lastSyncedAt: string | null;
   /**
-   * 待上传估算 = 本地 seq 上界 − 已确认（钳到 0）。只在有游标且本地非空账本时有值；
-   * 已确认游标的方向命名空间以 Protocol 注释为准（发送方为本副本时即本地命名空间）。
+   * 待上传 = 本地 seq 上界 − 已确认（钳到 0）。优先用 Runtime 的 peers[].pending_upload
+   * （M3 修复批起真实提供）；旧版状态回退到前端同口径估算。
    */
   pendingUpload: number | null;
+  /** 待下载（Runtime 实时探测对端账本上界；对端不可达为 null） */
+  pendingDownload: number | null;
+  /** 该 peer 本次查询是否不可达 */
+  unreachable: boolean;
 }
 
 export interface SyncPanelView {
@@ -116,12 +122,12 @@ export interface SyncPanelView {
   seqRangeLabel: string;
   count: number;
   cursors: PeerCursorView[];
-  /** 最近一次同步时间（游标 updated_at 与设备 last_sync_at 取最大；无则 null） */
+  /** 最近一次同步时间（游标 last_synced_at / updated_at 与设备 last_sync_at 取最大） */
   lastSyncedAt: string | null;
   lastSyncedLabel: string;
-  /** 待上传合计估算；无游标/无本地事件时为 null（未知） */
+  /** 待上传合计；无 peer 时为 null（未知） */
   pendingUpload: number | null;
-  /** 待下载：GET /v1/sync/status 不提供对端账本上界 → 恒 null（面板如实标注原因） */
+  /** 待下载合计；任一 peer 不可达/未提供时为 null（不臆造数字） */
   pendingDownload: number | null;
   pendingDownloadReason: string;
   empty: boolean;
@@ -144,30 +150,54 @@ export function formatRelativeTime(iso: string, nowMs: number): string {
 
 /**
  * `GET /v1/sync/status` → 面板视图。
- * `devices` 是可选增强：设备的 last_sync_at 由同步引擎写入，可能比游标更新时间更可信；
- * 两者取最大，任何一侧为 null 都自然跳过。
+ * Runtime（M3 修复批 / Issue #35）在 `peers[]` 里直接给出 pending_upload /
+ * pending_download / last_synced_at；旧版状态没有 peers 时回退到前端估算（待下载未知）。
+ * `devices` 是可选增强：设备的 last_sync_at 由同步引擎写入，可能比游标更新时间更可信。
  */
 export function mapSyncStatus(status: SyncStatus, nowMs: number, devices: DeviceInfo[] = []): SyncPanelView {
   const localMax = status.sequence.max;
-  const cursors: PeerCursorView[] = status.cursors.map((cursor) => ({
-    peer: cursor.peer_replica_id,
-    peerShort: cursor.peer_replica_id.slice(0, 8),
-    pulled: cursor.last_pulled_sequence,
-    acked: cursor.last_acked_sequence,
-    updatedAt: cursor.updated_at,
-    pendingUpload:
-      localMax === null
-        ? null
-        : Math.max(0, localMax - cursor.last_acked_sequence),
-  }));
+  const peers = status.peers ?? [];
+  const peerById = new Map(peers.map((peer) => [peer.peer_replica_id, peer]));
+  const cursors: PeerCursorView[] = status.cursors.map((cursor) => {
+    const peer = peerById.get(cursor.peer_replica_id);
+    return {
+      peer: cursor.peer_replica_id,
+      peerShort: cursor.peer_replica_id.slice(0, 8),
+      pulled: cursor.last_pulled_sequence,
+      acked: cursor.last_acked_sequence,
+      updatedAt: cursor.updated_at,
+      lastSyncedAt: peer?.last_synced_at ?? cursor.last_synced_at ?? null,
+      pendingUpload:
+        peer?.pending_upload ??
+        (localMax === null ? null : Math.max(0, localMax - cursor.last_acked_sequence)),
+      pendingDownload: peer === undefined ? null : peer.pending_download,
+      unreachable: peer?.unreachable === true,
+    };
+  });
   const pendingValues = cursors.map((c) => c.pendingUpload);
   const pendingUpload =
     pendingValues.length === 0 || pendingValues.some((v) => v === null)
       ? null
       : pendingValues.reduce<number>((sum, v) => sum + (v ?? 0), 0);
+  const downloadValues = cursors.map((c) => c.pendingDownload);
+  const pendingDownload =
+    downloadValues.length === 0 || downloadValues.some((v) => v === null)
+      ? null
+      : downloadValues.reduce<number>((sum, v) => sum + (v ?? 0), 0);
+  const unreachable = cursors.some((cursor) => cursor.unreachable);
+  const pendingDownloadReason =
+    pendingDownload !== null
+      ? "各 peer 待下载合计（Runtime 实时查询对端账本上界）"
+      : unreachable
+        ? "对端不可达，待下载未知（Runtime 如实返回 null，不臆造 0）"
+        : cursors.length === 0
+          ? "还没有已配对 peer"
+          : "Runtime 未提供对端账本上界";
 
   const timestamps = [
     ...status.cursors.map((c) => c.updated_at),
+    ...status.cursors.map((c) => c.last_synced_at),
+    ...peers.map((p) => p.last_synced_at),
     ...devices.map((d) => d.last_sync_at),
   ].filter((v): v is string => v !== null && v !== undefined);
   const lastSyncedAt = timestamps.length === 0 ? null : timestamps.reduce((a, b) => (a >= b ? a : b));
@@ -181,10 +211,9 @@ export function mapSyncStatus(status: SyncStatus, nowMs: number, devices: Device
     lastSyncedAt,
     lastSyncedLabel: lastSyncedAt === null ? "从未同步" : formatRelativeTime(lastSyncedAt, nowMs),
     pendingUpload,
-    pendingDownload: null,
-    pendingDownloadReason:
-      "Runtime 的 GET /v1/sync/status 不含对端账本上界，待下载条数需对端状态才能算出",
-    empty: status.cursors.length === 0,
+    pendingDownload,
+    pendingDownloadReason,
+    empty: status.cursors.length === 0 && peers.length === 0,
   };
 }
 
@@ -388,6 +417,21 @@ export interface ClaimReview {
   matchesExpected: boolean | null;
   /** 不一致时给 Owner 的唯一补救指引（撤销刚建立的信任） */
   rejectAdvice: string | null;
+}
+
+/** 宿主侧 join 响应 → 双端指纹核对视图（token 由 Runtime 写凭据库，UI 从不接触） */
+export function joinReview(response: PairingJoinResponse, expectedFingerprint: string): ClaimReview {
+  const check = fingerprintCheck(expectedFingerprint, response.server_fingerprint);
+  return {
+    deviceShort: response.server_fingerprint_short,
+    deviceLabel: response.device.label ?? "对端 Runtime",
+    serverShort: response.server_fingerprint_short,
+    matchesExpected: check.ok,
+    rejectAdvice:
+      check.ok === false
+        ? "指纹不一致（Runtime 应已回滚对端信任）：请刷新设备列表确认；若仍存在，手动撤销该设备并核对地址。"
+        : null,
+  };
 }
 
 /** claim 响应 → 双端指纹核对视图（token 不进入任何展示字段） */

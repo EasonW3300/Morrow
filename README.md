@@ -62,6 +62,27 @@ Runtime 默认不监听公网；非回环访问必须持配对下发的 bearer t
 | POST | /v1/capabilities/:id/confirm | Owner 确认门（沙箱验证 → 注册，verified=1） |
 | GET/POST | /v1/capabilities/skills[...]、/v1/skills[...] | Skill 提案/决策/重用（T6 合约别名） |
 
+设备、配对与同步（M3）端点：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | /v1/devices | 设备列表（`last_sync_at` 由同步引擎在每次成功同步后按 peer 写入） |
+| POST | /v1/pairing/codes | 已信任设备生成一次性 6 位配对码（5 分钟 TTL）+ 本机指纹 |
+| POST | /v1/pairing/claim | 新设备凭码换取 bearer token（服务端只存哈希） |
+| POST | /v1/pairing/join | **本机作为新设备**加入对端：宿主侧 claim + 本地指纹校验 + token 写本机 OS 凭据库 + 对端公钥写设备表；指纹不符则撤销对端信任（rollback）。响应 `{device, server_fingerprint}`，**绝不回传 token** |
+| DELETE | /v1/devices/:id | 撤销设备（revoked + 审计墓碑） |
+| GET | /v1/sync/status | 本副本 sequence + `peers[]`：`last_pulled_sequence` / `last_acked_sequence` / `last_synced_at` / `pending_upload` / `pending_download` / `unreachable`；顶层 `last_sync_at`。缺省实时探测对端账本上界；`?probe=local` 只回本地快照（传输层防递归） |
+| POST | /v1/sync/run | **立即同步一轮**：body 可选 `{peer_replica_id?}`（缺省全部已配对 peer）。对每个 peer 执行 pull→push→push→pull，返回 `{peers[], totals}`（`pulled/pushed/duplicates/gaps/errors`）；单 peer 失败不中断其他 peer，落 `sync.run_completed` 审计 |
+| GET | /v1/sync/pull?since=&limit= | 按来源账本 sequence 增量导出事件信封（不复制 DB 文件） |
+| POST | /v1/sync/push | 幂等导入（event_id 去重 + integrity 复算 + 缺口拒绝） |
+| GET | /v1/sync/conflicts?status= | 跨设备冲突汇总（复用 M1 冲突队列） |
+
+**待同步量口径**：`pending_upload = max(0, 本副本账本最大 seq − 该 peer 的 last_acked_sequence)`；
+`pending_download = max(0, 对端账本最大 seq − last_pulled_sequence)`。对端不可达时
+`pending_download = null` 且 `unreachable = true`（不伪造 0）。一次 `sync/run` 结束后
+`pending_upload` 可能残留少量 `sync.*` 审计事件（本轮 pull 带入的对端审计 + 本条
+`sync.run_completed` 尚未推送），下次同步会继续推进。
+
 **调用错误码**：`POST .../invoke`（能力与 Skill 重用共用）的 HTTP 状态按统一契约表映射（单源 `apps/runtime/src/invocation-errors.ts`）：`unknown_tool`→404、`permission_denied`→403、`invalid_sandbox_contract`/`tool_package_unsupported`/`capability_escalation`→400、`sandbox_unavailable`/`image_pull_failed`→503（附 install-hint）、`tool_timeout`→504、`tool_build_failed`→500、工具自身失败（`tool_error`/`tool_exit_nonzero`/`tool_protocol_error`/`tool_output_too_large`）→502。每次调用先落 `capability.used` 审计后返回（Skill 重用另落 `skill.invoked`）。
 
 里程碑与验收标准见 PRD §8/§9。

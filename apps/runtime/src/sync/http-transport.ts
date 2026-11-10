@@ -1,6 +1,6 @@
-import type { SyncEnvelope, SyncPullBatch, SyncPushRequest } from "@morrow/protocol";
+import type { SyncEnvelope, SyncPullBatch, SyncPushRequest, SyncStatus } from "@morrow/protocol";
 import { SyncError } from "./errors.ts";
-import type { SyncPushReceipt, SyncTransport, SyncTransportPullResult } from "./transport.ts";
+import type { SyncPeerProbe, SyncPushReceipt, SyncTransport, SyncTransportPullResult } from "./transport.ts";
 
 /**
  * HTTP 传输实现（M3-T1 / Issue #30）：与内存实现共用 SyncTransport 契约，
@@ -58,8 +58,21 @@ export class HttpSyncTransport implements SyncTransport {
     };
   }
 
-  async #request(peerId: string, path: string, init: RequestInit): Promise<Response> {
-    const base = this.#baseUrlForPeer(peerId).replace(/\/+$/, "");
+  /**
+   * 探测对端账本上界（M3 修复批 / Issue #35）：`?probe=local` 让对端只回本地 sequence，
+   * 不再向它的 peer 探测——否则 A 查 B、B 又查 A 会互相递归。
+   */
+  async status(peerId: string): Promise<SyncPeerProbe> {
+    const response = await this.#request(peerId, "/v1/sync/status?probe=local", { method: "GET" });
+    const payload = (await this.#payload(response, peerId)) as Partial<SyncStatus>;
+    const max = payload.sequence?.max;
+    return {
+      replica_id: typeof payload.replica_id === "string" ? payload.replica_id : null,
+      max_sequence: typeof max === "number" ? max : null,
+    };
+  }
+
+  async #request(peerId: string, path: string, init: RequestInit): Promise<Response> {    const base = this.#baseUrlForPeer(peerId).replace(/\/+$/, "");
     try {
       return await this.#fetch(`${base}${path}`, init);
     } catch (err) {

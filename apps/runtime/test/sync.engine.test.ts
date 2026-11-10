@@ -332,7 +332,8 @@ test("sync_cursors 迁移幂等：旧表缺列经 ensureSyncTables 补齐，重�
   const dir = tmpDir("morrow-sync-migration-");
   const db = openSqlite(join(dir, DB_FILE_NAME));
   try {
-    // 模拟最早版本的表形态（只有 peer 主键），迁移应补齐两个游标列与 updated_at
+    // 模拟最早版本的表形态（只有 peer 主键），迁移应补齐游标列、updated_at 与
+    // M3 修复批新增的 last_synced_at
     db.exec("CREATE TABLE sync_cursors (peer_replica_id TEXT PRIMARY KEY)");
     ensureSyncTables(db);
     ensureSyncTables(db);
@@ -342,6 +343,7 @@ test("sync_cursors 迁移幂等：旧表缺列经 ensureSyncTables 补齐，重�
     assert.deepEqual(columns.sort(), [
       "last_acked_sequence",
       "last_pulled_sequence",
+      "last_synced_at",
       "peer_replica_id",
       "updated_at",
     ]);
