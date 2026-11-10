@@ -163,6 +163,7 @@ test("invite code binds a channel identity once, is rejected after use, and defa
 
   const invite = await createInvite(h, { display_name: "Alice" });
   assert.match(invite.code, /^MC-[0-9A-F]{10}$/);
+  assert.equal(contactEvents(h, "contact.invited"), 1);
 
   // 绑定前：联系人只有默认 query 授权
   const listed = await getJson<ContactList>(h.runtime.port, "/v1/contacts");
@@ -228,6 +229,13 @@ test("all five unauthorized contact actions are blocked and audited through Perm
   });
   assert.equal(grants.status, 200);
   assert.deepEqual(grants.body.grants.map((grant) => grant.category).sort(), ["memory_reference", "task_execute"]);
+  const fetched = await getJson<GrantList>(h.runtime.port, `/v1/contacts/${contactId}/grants`);
+  assert.equal(fetched.status, 200);
+  assert.deepEqual(
+    fetched.body.grants.map((grant) => [grant.category, grant.scope]).sort(),
+    [["memory_reference", []], ["task_execute", ["allowed.capability"]]].sort(),
+  );
+  assert.equal(contactEvents(h, "contact.grants_updated"), 1);
 
   const ownerSession = h.runtime.sessions.createSession("owner private session").sessionId;
 
