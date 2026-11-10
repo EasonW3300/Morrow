@@ -123,6 +123,33 @@ export interface ChannelSendReceipt {
 /** 适配器生命周期状态（GET /v1/channels 的 state） */
 export type ChannelAdapterState = "registered" | "starting" | "running" | "stopped" | "error";
 
+/**
+ * 实验适配器的运行环境声明（M4-T5 / Issue #42）。
+ *
+ * 微信个人号只承诺 Windows + 最新版微信客户端：环境是实验结果可复现的前提，
+ * 必须随清单/health 一起暴露给 UI，不能藏在文档里。
+ */
+export interface ChannelEnvironment {
+  /** 目标操作系统（微信个人号 = "Windows"） */
+  os: string;
+  /** 目标客户端（微信个人号 = 最新版微信桌面客户端） */
+  client: string;
+  /** 本地自动化桥方案（M4 仅 StubLocalBridge；真实桥未实现） */
+  bridge: string;
+  /** 真实平台联调是否完成（M4-T5 = not_done，外部依赖阻塞） */
+  real_integration: "not_done" | "done";
+  /** 补充说明（跨 OS 稳定性、账号安全不作承诺等） */
+  notes?: string;
+}
+
+/** 实验适配器本地桥健康（M4-T5：进程 / 登录态 / 窗口句柄 / 最近错误） */
+export interface ChannelLocalBridgeHealth {
+  process: "running" | "stopped" | "error" | "unknown";
+  login: "logged_in" | "logged_out" | "unknown";
+  window: "available" | "unavailable" | "unknown";
+  last_error: string | null;
+}
+
 /** GET /v1/channels 的清单元素（适配器 + 绑定账号 + 能力 + 状态） */
 export interface ChannelSummary {
   channel_id: string;
@@ -133,6 +160,10 @@ export interface ChannelSummary {
   enabled: boolean;
   /** 实验适配器（出厂默认关闭、需显式启用并自担风险；GLOSSARY Experimental Adapter） */
   experimental: boolean;
+  /** 实验适配器环境声明（仅实验适配器提供；UI 呈现「Windows + 最新版微信」） */
+  environment?: ChannelEnvironment;
+  /** 实验适配器风险声明（仅实验适配器提供；UI 呈现风险自担/默认关闭文案） */
+  risk_notice?: string;
 }
 
 /** GET /v1/channels/:id/health 的响应（适配器自报健康 + 状态投影） */
@@ -142,6 +173,14 @@ export interface ChannelHealth {
   healthy: boolean;
   detail: string | null;
   checked_at: string;
+  /** 实验适配器标记（与清单一致；UI 不需要再查清单即可渲染警示） */
+  experimental?: boolean;
+  /** 实验适配器环境声明 */
+  environment?: ChannelEnvironment;
+  /** 实验适配器风险声明 */
+  risk_notice?: string;
+  /** 实验适配器本地桥状态（进程/登录/窗口句柄/最近错误） */
+  bridge?: ChannelLocalBridgeHealth;
   /** 事件连接状态（长连接适配器自报；M4-T3 起为可选附加字段） */
   connection?: "connected" | "connecting" | "disconnected" | "degraded";
   /** 平台 access token 到期时间（RFC 3339；无 token 概念时 null） */
