@@ -12,6 +12,7 @@ import type {
 import { ChannelSendError, isParseError } from "../../types.ts";
 import type { ChannelTestEventFrame } from "../../testing/channel-test-server.ts";
 import { HttpLongPollEventTransport, type EventTransport } from "../../event-transport.ts";
+import { isQqWebSocketTransport } from "./websocket-transport.ts";
 import {
   QqError,
   QQ_PERMISSION_ERROR_CODES,
@@ -43,8 +44,10 @@ import type { QqConfig } from "./config.ts";
  *   不带 = 主动消息（平台有场景/额度限制，`capabilities().group_proactive = limited`）；
  * - 主动消息被拒 → `proactive_rejected`（explicit + 不可重试）→ Outbox 直接
  *   needs_review，不自动重发；
- * - 事件签名：配置 `bot_secret` 后强制 Ed25519 校验（真实 Webhook 语义）；未配置时
- *   走内网桥接/测试传输（与 T3 的 HTTP 长轮询共用）。
+ * - 事件签名：配置 `bot_secret` 后 Webhook 模式强制 Ed25519 校验（真实公网回调语义）；
+ *   真实平台推荐用 `QqWebSocketTransport`（官方网关、无需公网回调，见
+ *   `websocket-transport.ts`）：WS Dispatch 由 access token 鉴权，走
+ *   `handleTrustedEvent`；未配置 bot_secret 时的 HTTP 长轮询/内网桥接仍走 `handleFrame`。
  */
 
 const CAPABILITIES: ChannelCapabilities = {
@@ -77,7 +80,10 @@ export interface QqChannelAdapterOptions {
   tokenRefreshSkewMs?: number;
   /** 事件时间偏差容忍（秒，默认 300；0 = 不校验） */
   signatureToleranceSeconds?: number;
-  /** 事件传输（缺省 = apiBaseUrl 上的 HTTP 长轮询，与 ChannelTestServer 对齐） */
+  /**
+   * 事件传输。生产传 `QqWebSocketTransport`（QQ 官方 WebSocket 网关；无需公网回调）；
+   * 缺省 = apiBaseUrl 上的 HTTP 长轮询，与 ChannelTestServer 对齐。
+   */
   eventTransport?: EventTransport;
   /** 长轮询路径（默认 /open-apis/event/v1/stream，与共享协议桩对齐） */
   eventStreamPath?: string;
@@ -205,6 +211,15 @@ export class QqChannelAdapter implements ChannelAdapter {
         streamPath: this.#eventStreamPath,
       });
     this.#transport = transport;
+    if (isQqWebSocketTransport(transport)) {
+      // WS 传输与适配器共用同一份 access token 缓存/刷新逻辑；Dispatch 走可信入口
+      // （见 handleTrustedEvent 的信任边界说明），不走 Ed25519 的 handleFrame。
+      transport.attachTokenProvider({
+        getAccessToken: () => this.#ensureToken(),
+        refreshAccessToken: () => this.#ensureToken(true),
+      });
+      transport.attachTrustedEventSink((event) => this.handleTrustedEvent(event));
+    }
     transport.start(
       (frame) => this.handleFrame(frame),
       (error) => {
@@ -251,6 +266,44 @@ export class QqChannelAdapter implements ChannelAdapter {
       this.#lastError = null;
       this.#onInbound?.(verified.event);
       return { ok: true };
+    }
+    return { ok: true };
+  }
+
+  /**
+   * 已鉴权 WS 事件入口（QQ 官方 WebSocket 网关专用）。
+   *
+   * 信任边界：只允许 `QqWebSocketTransport` 调用。该传输在 Identify 时用
+   * `QQBot <access_token>` 完成网关鉴权，之后的 Dispatch 都由平台在**已认证连接**
+   * 上推送；网关协议没有 Webhook 的 `X-Signature-Ed25519` 帧签名（那是公网回调
+   * 防伪用的），因此这里跳过 `verifyQqEvent` 的签名校验，保留 classify 的结构校验
+   * 与拒绝留痕。Webhook 模式（带 bot_secret）继续走 `handleFrame`。
+   *
+   * 其它来源（HTTP 请求体、UI、本地文件）**不得**调用本方法——否则等于绕过签名。
+   */
+  handleTrustedEvent(event: unknown): QqVerifyResult | { ok: true } {
+    if (typeof event !== "object" || event === null || Array.isArray(event)) {
+      const result = {
+        ok: false as const,
+        code: "invalid_body",
+        message: "qq websocket event must be a JSON object",
+      };
+      this.#lastError = `${result.code}: ${result.message}`;
+      this.#onInboundRejected?.({
+        code: result.code,
+        message: result.message,
+        raw: {},
+      });
+      return result;
+    }
+
+    const record = event as Record<string, unknown>;
+    const classified = classifyQqEvent(record);
+    if (classified.kind === "message") {
+      this.#connected = true;
+      this.#degraded = false;
+      this.#lastError = null;
+      this.#onInbound?.(record);
     }
     return { ok: true };
   }

@@ -39,6 +39,19 @@ node --experimental-sqlite --experimental-strip-types scripts/real-machine/ac05-
 - 删除不复活双向证据（A 删/B 离线改、B 删/A 离线改）；
 - 输出 `m3-ac05-conflicts.json` + `.md`；重放缺陷见门禁报告 §6-5。
 
+## qq-live-smoke.ts（QQ 官方 Bot WebSocket 真机联调，Issue #41）
+
+```bash
+export PATH="/opt/homebrew/bin:$PATH"
+node --experimental-strip-types scripts/real-machine/qq-live-smoke.ts [--reply "文本"] [--seconds 60]
+```
+
+- 从 macOS Keychain（`channel:qq` / `app_id`、`app_secret`）读凭据，走官方 WebSocket
+  网关（Hello → Identify → Dispatch），打印 READY 与每个群 @ / 单聊事件的摘要（不打印 token）；
+- `--reply`：收到**群 @ 消息**时用回复 API 回一条，验证完整回环；缺省只观察；
+- `--seconds N`：超时退出（默认 60），退出打印事件/拒绝计数与 `health()`；
+- 需机器人已入群，且有人在 QQ 里 **@ 机器人**（未 @ 的群消息平台不投递）。
+
 ## m2-demo.sh（M2 门槛演示：「缺能力 → 造工具 → 安全验证 → 重用」，Issue #28）
 
 ```bash

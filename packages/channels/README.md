@@ -179,7 +179,63 @@ await startRuntime(startConfig, {
   `{ plain_token, signature }`（签名内容 `event_ts + plain_token`），供宿主 Webhook
   层应答。
 - 默认事件传输仍是与 ChannelTestServer 对齐的 HTTP 长轮询桥接（`EventTransport` 接缝，
-  QQ 复用 T3 实现）；真实平台由官方长连接/SDK 或本地 sidecar 适配后注入。
+  QQ 复用 T3 实现）；真实平台走下面的 **WebSocket 网关传输**（无需公网回调）。
+
+### 真实 WebSocket 网关传输（生产路径）
+
+代码：`apps/runtime/src/channels/adapters/qq/websocket-transport.ts`。QQ 官方 Webhook
+要求平台回调到公网 HTTPS 地址，与 ADR-0004「私有网络、Runtime 不监听公网」冲突；
+官方 WebSocket 网关由 Runtime 主动外连，是唯一符合约束的真实接入方式（与飞书长连接同
+一决策）。零新增依赖：使用 Node 22+ 全局 `WebSocket`，运行环境缺失时**明确报错**而不静默降级。
+
+协议实现（`QqWebSocketTransport implements EventTransport`）：
+
+1. 复用适配器的 access token 缓存/刷新（`attachTokenProvider`，与 HTTP 发消息同一份
+   token，不会出现两条独立刷新链）；
+2. `GET https://api.sgroup.qq.com/gateway`（`Authorization: QQBot <access_token>`）→ `{url}`；
+3. 连接 `wss://` 后等待 **op 10 Hello**（`heartbeat_interval`），随后发送
+   **op 2 Identify**：`{op:2, d:{token:"QQBot <access_token>", intents:33554432, shard:[0,1]}}`；
+4. 按 Hello 间隔发送 **op 1 心跳**（`d` = 最近 Dispatch 的 `s`，无则 `null`），
+   **op 11** 心跳 ACK 忽略；
+5. **op 0 Dispatch**：消息事件（`GROUP_AT_MESSAGE_CREATE` / `C2C_MESSAGE_CREATE`）
+   交给适配器 `handleTrustedEvent`；
+6. **op 7**（平台要求重连）与 **op 9**（会话失效）→ 关闭旧连接、用当前 token 重新
+   Identify；
+7. 断线重连：指数退避 `1s → 2s → 4s …`，上限 30s；成功 Hello 后重置计数；
+8. `stop()`：关闭连接、清理心跳/刷新/重连定时器，幂等。
+
+**intents = `1 << 25`（33,554,432）= `GROUP_AND_C2C_EVENT`**，即群聊 @ 与单聊消息。
+注意：**群消息只有 @ 机器人时平台才会投递**（`GROUP_AT_MESSAGE_CREATE`）；普通群消息
+不会到达，适配器也不会声称能收到。`AT_MESSAGE_CREATE`（频道/guild 消息）不属于该 intent，
+事件形状也不同（`guild_id`/`channel_id`），首版不接入。
+
+**token 刷新**：access token TTL 7200s；传输默认在到期前 300s（`tokenRefreshIntervalMs`
+= 6_900_000）调用 provider **强制刷新**，然后关闭连接、**重连并重新 Identify**。不做
+Resume（需要 session_id + seq 的额外状态机，出错面更大）；刷新失败按
+`tokenRefreshRetryMs`（默认 30s）重试，错误上报 `health().last_error`。
+
+**信任边界（`handleTrustedEvent`）**：WS 在 Identify 时用 access token 完成网关鉴权，
+之后的 Dispatch 都来自已认证连接；网关协议**没有** Webhook 的 Ed25519 帧签名（那只用于
+公网回调防伪）。因此 WS 传输直接调用 `QqAdapter.handleTrustedEvent(event)`：跳过
+`verifyQqEvent` 的签名校验，但保留 `classifyQqEvent` 的结构校验与
+`channel.inbound_rejected` 留痕。Webhook 模式继续走 `handleFrame`（带签名校验）。
+**其它来源（HTTP 请求体、UI、本地文件）不得调用 `handleTrustedEvent`**，否则等于绕过签名。
+
+生产接线：
+
+```ts
+const config = await loadQqConfig(secretStore); // channel:qq:app_id / app_secret
+const transport = new QqWebSocketTransport({ apiBaseUrl: "https://api.sgroup.qq.com" });
+const adapter = new QqChannelAdapter({
+  accountId: "qq-default",
+  config,
+  eventTransport: transport, // 缺省仍是 HTTP 长轮询（测试/内网桥接）
+});
+```
+
+测试：`test/channels.qq.websocket.test.ts`（fake WebSocket + fake fetch，零真实网络）覆盖
+Hello→Identify→心跳、Dispatch→可信入口、op 7/op 9 重连、指数退避与 Hello 重置、stop
+清理幂等、token 刷新后重新 Identify。
 
 ### 发送与错误分类
 
@@ -234,7 +290,7 @@ stub.groupMessages; stub.c2cMessages; stub.rejectedProactive; stub.count("group"
 共享服务器新增的通用能力（M4-T4 最小扩展）：`ChannelTestServer.pushFrame(frame)`——
 允许非飞书签名形态（QQ Ed25519）把预构造帧投入同一事件队列；`pushEvent` 行为不变。
 
-T4 测试文件：`test/channels.qq.test.ts`、`test/channels.qq.e2e.test.ts`。
+T4 测试文件：`test/channels.qq.test.ts`、`test/channels.qq.e2e.test.ts`、`test/channels.qq.websocket.test.ts`。
 
 ## 微信个人号实验适配器（M4-T5 / Issue #42）
 
@@ -444,7 +500,7 @@ server.route("POST", /^\/custom\/token$/, (ctx) => {
 主动消息受限、token 过期/刷新失败。飞书测试文件：
 `test/channels.test-server.test.ts`、`test/channels.feishu.test.ts`、
 `test/channels.feishu.e2e.test.ts`、`test/channels.feishu.runtime.test.ts`；
-QQ 测试文件：`test/channels.qq.test.ts`、`test/channels.qq.e2e.test.ts`。
+QQ 测试文件：`test/channels.qq.test.ts`、`test/channels.qq.e2e.test.ts`、`test/channels.qq.websocket.test.ts`。
 
 ## 真实飞书联调（未做，外部依赖阻塞）
 
@@ -465,11 +521,29 @@ QQ 测试文件：`test/channels.qq.test.ts`、`test/channels.qq.e2e.test.ts`。
    `GET /v1/outbox` 与事件账本核对 `outbound.queued/sent` 与平台回执。
 7. 记录 20 次真实收发证据到门禁报告；主动消息限制、附件限制如实登记。
 
-## 真实 QQ 联调（未做，外部依赖阻塞）
+## 真实 QQ 联调（WS 传输已实现，真实收发证据待执行）
 
-**状态：未执行。** 原因：QQ 机器人开发者资质/机器人账号尚未注册（ADR-0005 前置清单）。
-协议层已由 `ChannelTestServer` + `registerQqTestStub` 全链路覆盖；以下步骤在资质就绪后
-执行，**不得以桩测试冒充平台验收**。
+**状态：真实 WebSocket 网关传输与联调脚本已实现；真实收发证据尚未执行**（需要机器人账号
++ 人在 QQ 里 @ 机器人）。协议层已由 `ChannelTestServer` + `registerQqTestStub` 全链路覆盖，
+WS 传输由 `channels.qq.websocket.test.ts` 零网络覆盖；**不得以桩测试冒充平台验收**。
+
+联调脚本：`scripts/real-machine/qq-live-smoke.ts`（只读 Keychain，不打印 token）：
+
+```bash
+export PATH="/opt/homebrew/bin:$PATH"
+# 只观察（默认 60s）
+node --experimental-strip-types scripts/real-machine/qq-live-smoke.ts
+# 收到群 @ 消息时用回复 API 回一条（验证完整回环）
+node --experimental-strip-types scripts/real-machine/qq-live-smoke.ts --reply "收到，我在" --seconds 120
+```
+
+- 从 macOS Keychain（`channel:qq` / `app_id`、`app_secret`）读凭据 → `GET /gateway` →
+  WebSocket Hello/Identify → 打印 READY 与每个事件的类型/会话/发送者/文本摘要（不打印 token）；
+- `--reply` 仅对**群 @ 消息**生效（`reply_to_native_message_id` 走被动回复 API）；
+- `--seconds N` 超时退出（默认 60），退出打印事件/拒绝计数与 `health()`；
+- 前置：机器人已加入群，且有人 **@ 机器人**（未 @ 的群消息平台不投递）。
+
+以下步骤在资质就绪后执行：
 
 1. 在 QQ 开放平台注册机器人开发者并创建机器人，记录 AppID 与 AppSecret。
 2. 配置沙箱/正式环境的事件订阅：填写回调 HTTPS 地址（只允许 80/443/8080/8443），
