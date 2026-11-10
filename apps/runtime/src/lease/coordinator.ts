@@ -1,7 +1,7 @@
 import type { ExecutionReconcileEvidence } from "@morrow/protocol";
 import type { EventLedger } from "../ledger.ts";
 import type { SyncEngine } from "../sync/engine.ts";
-import { detectDualLeaseHold, findRemoteActiveLease, replayLeases, type ReplayedLease } from "./view.ts";
+import { detectDualLeaseHold, findRemoteActiveLease, replayLeaseView, type ReplayedLease } from "./view.ts";
 
 /**
  * 执行权协调器（M3 同步接线修复 / Issue #34，FR-DEP-4 的事前半边）。
@@ -48,6 +48,12 @@ export interface LeaseGateDecision {
   /** afterAcquire 双持有时的 needs_reconcile 证据（协议类型） */
   evidence: ExecutionReconcileEvidence | null;
   pull: LeasePullSummary;
+  /**
+   * 本次重放观察到的跨副本最大 token（M3 修复批 / #33）。调用方应在 acquire 前
+   * 交给 LeaseStore.observeGrantedToken / observeReservedToken——取号越过它、
+   * validate 拒绝低于它的旧 token。
+   */
+  observed: { granted: number; reserved: number };
 }
 
 export interface LeaseCoordinatorOptions {
@@ -88,23 +94,28 @@ export class LeaseCoordinator {
 
   async beforeAcquire(taskId: string): Promise<LeaseGateDecision> {
     const pull = await this.#pullFromPeers(taskId, false);
-    const remote = findRemoteActiveLease(replayLeases(this.#ledger, taskId), this.#replicaId, this.#now());
-    return { ok: remote === null, holder: remote, dual_hold: false, evidence: null, pull };
+    const view = replayLeaseView(this.#ledger, taskId);
+    const remote = findRemoteActiveLease(view.leases, this.#replicaId, this.#now());
+    return {
+      ok: remote === null,
+      holder: remote,
+      dual_hold: false,
+      evidence: null,
+      pull,
+      observed: observedOf(view),
+    };
   }
 
   async afterAcquire(taskId: string): Promise<LeaseGateDecision> {
     const pull = await this.#pullFromPeers(taskId, true);
     const evidence = detectDualLeaseHold(this.#ledger, taskId, this.#now());
+    const view = replayLeaseView(this.#ledger, taskId);
+    const observed = observedOf(view);
     if (evidence === null) {
-      return { ok: true, holder: null, dual_hold: false, evidence: null, pull };
+      return { ok: true, holder: null, dual_hold: false, evidence: null, pull, observed };
     }
-    const other = findRemoteActiveLease(replayLeases(this.#ledger, taskId), this.#replicaId, this.#now());
-    return { ok: false, holder: other, dual_hold: true, evidence, pull };
-  }
-
-  /** 清空节流缓存（测试/运维；设备增删后可调用） */
-  reset(): void {
-    this.#pulls.clear();
+    const other = findRemoteActiveLease(view.leases, this.#replicaId, this.#now());
+    return { ok: false, holder: other, dual_hold: true, evidence, pull, observed };
   }
 
   async #pullFromPeers(taskId: string, force: boolean): Promise<LeasePullSummary> {
@@ -141,4 +152,11 @@ export class LeaseCoordinator {
     }
     return { peers, pulled, errors };
   }
+}
+
+function observedOf(view: { max_granted_token: number; max_reserved_token: number }): {
+  granted: number;
+  reserved: number;
+} {
+  return { granted: view.max_granted_token, reserved: view.max_reserved_token };
 }
