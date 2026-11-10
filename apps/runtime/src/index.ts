@@ -120,6 +120,30 @@ export type {
 } from "./lease/coordinator.ts";
 export { activeLeases, detectDualLeaseHold, findRemoteActiveLease, replayLeases } from "./lease/view.ts";
 export type { ReplayedLease } from "./lease/view.ts";
+// 外发副作用发件箱（M4-T2 / Issue #39，FR-TASK-7 / FR-CH-7）
+export {
+  OutboxService,
+  OutboxError,
+  OutboxChannelError,
+  OUTBOX_EVENT_TYPES,
+} from "./outbox/service.ts";
+export type {
+  OutboxChannelAdapter,
+  OutboxDispatchSummary,
+  OutboxErrorCode,
+  OutboxEventType,
+  OutboxSendOutcome,
+  OutboxSendRequest,
+  OutboxServiceOptions,
+  DispatchOptions,
+  EnqueueOutboundInput,
+  RecoverySummary,
+} from "./outbox/service.ts";
+export { OutboxStore } from "./outbox/store.ts";
+export type { OutboxStoreOptions, OutboxListOptions, OutboxListResult } from "./outbox/store.ts";
+export { OUTBOX_TABLES_SQL, ensureOutboxTables } from "./outbox/migrations.ts";
+export { outboxRoutes } from "./outbox/routes.ts";
+export type { OutboxRoute, OutboxRouteContext } from "./outbox/routes.ts";
 export {
   CheckpointService,
   CheckpointStore,

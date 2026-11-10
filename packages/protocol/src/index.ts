@@ -55,6 +55,14 @@ export type {
   PermissionViolation,
   ShellCommandCategory,
 } from "./capability-contracts.ts";
+export type {
+  OutboxListPage,
+  OutboxMessageRecord,
+  OutboxReceipt,
+  OutboxStatus,
+  OutboxTarget,
+  OutboxTargetKind,
+} from "./outbox-contracts.ts";
 export {
   CAPABILITY_CHANNELS,
   SHELL_COMMAND_CATEGORIES,

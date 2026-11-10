@@ -10,7 +10,10 @@ import type { LeaseStore } from "./store.ts";
  * 当前落点（见 scheduler.ts 与 sandbox/invoker.ts）：
  * 1. 调度器节点完成提交（setNodeFinished completed / task.node_finished）前；
  * 2. worktree 变更合回主区（真实文件副作用）前；
- * 3. capability / Skill 调用携带 {taskId, fencingToken} 上下文时，执行体运行前。
+ * 3. capability / Skill 调用携带 {taskId, fencingToken} 上下文时，执行体运行前；
+ * 4. Outbox 外发投递前（M4-T2 / Issue #39，outbox/service.ts #dispatchRow）：行带 task_id
+ *    且该任务存在活跃租约时，用行上的 fencing_token 走 LeaseStore.validate（与
+ *    assertCanCommit 同一校验语义）；失败不发请求、保留待投递并退避。
  * 边界：不带任务上下文的直接 Owner 调用（/v1/capabilities/:id/invoke 无 taskId）不在
  * 任一 Run 的租约下，按设计不受 fencing 约束；工具通道当前未默认注入节点执行，
  * 因此第 3 点是给宿主/后续票接线用的前置 hook。

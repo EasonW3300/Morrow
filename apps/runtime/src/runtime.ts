@@ -55,6 +55,8 @@ import { LeaseStore } from "./lease/store.ts";
 import { FencingGuard } from "./lease/fencing.ts";
 import { detectDualExecution } from "./lease/reconcile.ts";
 import { LeaseCoordinator } from "./lease/coordinator.ts";
+import { OutboxService, type OutboxChannelAdapter } from "./outbox/service.ts";
+import { outboxRoutes } from "./outbox/routes.ts";
 import { WorktreeManager } from "./worktree.ts";
 import { DockerRunner } from "./sandbox/docker-runner.ts";
 import { ToolInvoker, type InvocationResult } from "./sandbox/invoker.ts";
@@ -130,6 +132,8 @@ interface RequestContext {
   syncConflicts: SyncConflictStore;
   /** 执行租约（M3-T4 / Issue #33：单点执行 + fencing token） */
   leases: LeaseStore;
+  /** 外发副作用发件箱（M4-T2 / Issue #39：先落库再投递 + outbound.* 审计） */
+  outbox: OutboxService;
 }
 
 type Handler = (
@@ -237,6 +241,24 @@ export interface RuntimeOptions {
   leaseCoordination?: boolean;
   /** 同任务租约前拉取结果复用窗口（毫秒，默认 500；0 = 不节流） */
   leasePullThrottleMs?: number;
+  /**
+   * Outbox 渠道适配器注入 seam（M4-T2 / Issue #39）：channel 域（M4-T1）启动后经
+   * `runtime.outbox.setAdapter` 接线；测试注入计数桩。缺省 null = 未接线，
+   * dispatchOnce 明确报 adapter_unavailable（不静默丢消息——消息仍留在 outbox 待发）。
+   */
+  outboxAdapter?: OutboxChannelAdapter;
+  /** Outbox 时钟注入（退避/回执时间测试零 sleep）；缺省系统时间 */
+  outboxNow?: () => Date;
+  /** Outbox 明确失败的最大自动尝试次数（默认 5；耗尽转 needs_review） */
+  outboxMaxAttempts?: number;
+  /** Outbox 指数退避基数（毫秒，默认 1000） */
+  outboxBackoffBaseMs?: number;
+  /** Outbox 退避上限（毫秒，默认 60000） */
+  outboxBackoffMaxMs?: number;
+  /** Outbox 单次投递超时（毫秒，默认 10000；超时按 delivery_unknown 处理） */
+  outboxSendTimeoutMs?: number;
+  /** Outbox dispatchOnce 并发上限（默认 4） */
+  outboxConcurrency?: number;
 }
 
 export interface RuntimeHandle {
@@ -287,6 +309,8 @@ export interface RuntimeHandle {
   leases: LeaseStore;
   /** 跨设备执行权协调器（Issue #34：pre-acquire 拉取/远端租约重放；测试与运维可直用） */
   leaseCoordinator: LeaseCoordinator;
+  /** 外发副作用发件箱（M4-T2 / Issue #39：enqueue/dispatchOnce/retry/markSent，库形态可直用） */
+  outbox: OutboxService;
   /**
    * 优雅停止：停止接收请求 → 中止并释放会话运行时与在跑任务节点 → 记账 runtime.stopped
    * → 关闭任务投影库与账本（WAL checkpoint）。signal 传入收到的 POSIX 信号名，
@@ -341,6 +365,7 @@ const routes: Route[] = [
   // 的 `[^/]+` 会吞掉 /v1/capabilities/skills（grants 路由同款先具体后通配）
   ...skillRoutes,
   ...syncRoutes,
+  ...outboxRoutes,
   ...memoryRoutes,
   // 能力调用端点（#22 修复批 / FR-CAP-5）：POST /v1/capabilities/:id/invoke（body = 工具
   // input）——经 ToolInvoker 统一执行链（权限复核在链上），builtin 进程内直呼、sandboxed
@@ -418,6 +443,22 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     sync,
     now: options.leaseNow ?? (() => new Date()),
     ...(options.leasePullThrottleMs === undefined ? {} : { pullThrottleMs: options.leasePullThrottleMs }),
+  });
+  // 外发副作用发件箱（M4-T2 / Issue #39）：与账本/任务投影同库。接线适配器由 channel 域
+  // 在启动后注入（options.outboxAdapter 供测试/宿主直连）。恢复在 runtime.started 落账后
+  // 执行——先把上次进程「可能已发出」的 pending 行转 needs_review，绝不重发。
+  const outbox = new OutboxService({
+    dataDir: config.dataDir,
+    ledger,
+    replicaId: config.replicaId,
+    leases,
+    adapter: options.outboxAdapter ?? null,
+    ...(options.outboxNow === undefined ? {} : { now: options.outboxNow }),
+    ...(options.outboxMaxAttempts === undefined ? {} : { maxAttempts: options.outboxMaxAttempts }),
+    ...(options.outboxBackoffBaseMs === undefined ? {} : { backoffBaseMs: options.outboxBackoffBaseMs }),
+    ...(options.outboxBackoffMaxMs === undefined ? {} : { backoffMaxMs: options.outboxBackoffMaxMs }),
+    ...(options.outboxSendTimeoutMs === undefined ? {} : { sendTimeoutMs: options.outboxSendTimeoutMs }),
+    ...(options.outboxConcurrency === undefined ? {} : { concurrency: options.outboxConcurrency }),
   });
   // 本机对外基地址在 listen 后才确定；PairingService 通过闭包读取（join 时随 claim
   // 告知对端，对端据此反向出站同步）。
@@ -777,6 +818,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     sync,
     syncConflicts,
     leases,
+    outbox,
   };
   const server = createServer((req, res) => {
     routeRequest(req, res, ctx);
@@ -792,6 +834,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     skills.close();
     factory.close();
     tasks.close();
+    outbox.close();
     locks.close();
     capabilities.close();
     memoryStore.close();
@@ -812,6 +855,9 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     payload: { pid: process.pid, host: config.host, port, version: VERSION },
   });
   ledger.append(startedEnvelope);
+  // 外发崩溃恢复（M4-T2）：上次进程在 dispatch 途中被杀 → 行仍 pending 且 last_attempt_at
+  // 非空 = 请求可能已发出但无回执。转 delivery_unknown → needs_review，绝不自动重发。
+  outbox.recoverStartup();
   // builtin 工具 ensure-registered（票 M2-T1）：首见注册落 capability.registered（actor
   // agent:runtime），已注册同版本同内容 → no-op；builtin 常量与历史账本冲突时抛错（fail-fast）。
   ensureBuiltinCapabilities(capabilities);
@@ -856,6 +902,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     taskRebuilder,
     leases,
     leaseCoordinator,
+    outbox,
     async close(signal?: string): Promise<void> {
       if (closing) return;
       closing = true;
@@ -890,6 +937,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
       syncCursors.close();
       syncConflicts.close();
       tombstones.close();
+      outbox.close();
       if (ownsLeases) leases.close();
       ledger.close();
     },
