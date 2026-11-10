@@ -2,7 +2,7 @@
 
 单主人、长期记忆、可自主生成能力的个人 Agent。
 
-**当前状态**：M2 收官（「缺能力→造工具→安全验证→重用」演示达成，见 [M2 门禁报告](docs/gates/m2-gate-report.md)；M1 两项主线门槛达成，见 [M1 门禁报告](docs/gates/m1-gate-report.md)；M0 冒烟门全绿，见 [M0 门禁报告](docs/gates/m0-gate-report.md)）。
+**当前状态**：M3 收官（三种部署形态、同步引擎、设备配对、离线回放、执行租约交付，门禁报告见 [M3 门禁报告](docs/gates/m3-gate-report.md)；M2「缺能力→造工具→安全验证→重用」演示达成，见 [M2 门禁报告](docs/gates/m2-gate-report.md)；M1 两项主线门槛达成，见 [M1 门禁报告](docs/gates/m1-gate-report.md)；M0 冒烟门全绿，见 [M0 门禁报告](docs/gates/m0-gate-report.md)）。
 
 ## 文档导航
 
@@ -13,8 +13,9 @@
 - [M0 门禁报告](docs/gates/m0-gate-report.md) —— CI 三平台 + 真机门禁证据、PRD §9 门槛核对
 - [M1 门禁报告](docs/gates/m1-gate-report.md) —— 记忆回链 / 故障注入 / 人工介入覆盖盘点、PRD §9 M1 门槛核对
 - [M2 门禁报告](docs/gates/m2-gate-report.md) —— 能力工厂 harness 双路径 / 并行隔离 / 完整演示脚本（[归档输出](docs/gates/m2-demo-output.md)）、PRD §9 M2 门槛核对
+- [M3 门禁报告](docs/gates/m3-gate-report.md) —— AC-04 双向同步 50×2 + p95 / AC-05 20 竞争事实 + 删除不复活 / 三部署与 needs_reconcile 证据、PRD §9 M3 门槛核对（[演示输出](docs/gates/m3-demo-output.md)、[AC-04](docs/gates/m3-ac04-sync.md)、[AC-05](docs/gates/m3-ac05-conflicts.md)）
 - [威胁模型](docs/security/threat-model.md) —— 四域威胁、对策与残余风险（PRD §7）
-- [M0 验收基线](docs/prd/ac-baseline-m0.md) —— 参考硬件/网络/模型/测试数据（PRD §8 校准基准；§7/§8 为 M1/M2 校准注记）
+- [M0 验收基线](docs/prd/ac-baseline-m0.md) —— 参考硬件/网络/模型/测试数据（PRD §8 校准基准；§7/§8/§9 为 M1/M2/M3 校准注记）
 - [决策稿 V0.6](docs/history/decision-baseline-v0.6.md) —— 归档的 PRD 输入基线
 
 ## 仓库结构

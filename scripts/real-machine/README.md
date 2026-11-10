@@ -2,6 +2,43 @@
 
 CI runner 无音频设备与 GUI 会话，冒烟门清单 #4 的真机项在本机执行；本目录放可重复执行的探针。
 
+## m3-demo.sh（M3 门槛演示：两轮 × 10 项断言，Issue #36）
+
+```bash
+bash scripts/real-machine/m3-demo.sh [--out docs/gates/m3-demo-output.md] [--keep]
+```
+
+- 每轮起两个独立 Runtime（独立 dataDir/SQLite + 随机端口），走真实 HTTP 接缝：
+  `POST /v1/pairing/join` 配对 → `POST /v1/sync/run` 双向同步 → 删除传播（A 删/B 不复活）
+  → 冲突分类（preference 自动合并 / locked 待审核）→ 任务执行权转移 → needs_reconcile
+  检测与 Owner 裁决；
+- 两轮独立执行，每轮 10 项断言；退出码 0 = 20/20；
+- 归档输出：`docs/gates/m3-demo-output.md`；口径与边界见 `docs/gates/m3-gate-report.md`。
+
+## ac04-sync.ts（AC-04 合并态复跑 + p95，Issue #36）
+
+```bash
+export PATH="/opt/homebrew/bin:$PATH"
+node --experimental-sqlite --experimental-strip-types scripts/real-machine/ac04-sync.ts --out docs/gates
+```
+
+- 两实例经 join 配对 → A/B 各离线 50 条 `session.created` → 双向 `sync/run` → 逐项对账
+  （无丢失/无重复/顺序一致）；
+- 100 个样本：每轮 1 条 ≤1KB 小事件 → 一次 `sync/run` 的墙钟 p95（**回环基线**，真实网络待校准）；
+- 输出 `m3-ac04-sync.json` + `m3-ac04-sync.md`。
+
+## ac05-conflicts.ts（AC-05 合并态复跑，Issue #36）
+
+```bash
+export PATH="/opt/homebrew/bin:$PATH"
+node --experimental-sqlite --experimental-strip-types scripts/real-machine/ac05-conflicts.ts --out docs/gates
+```
+
+- 20 个竞争事实（6 preference 自动合并 + 14 待审核：locked 3 / sensitivity_change 5 /
+  fact_conflict 6）分类，与 M1 巩固器同口径；
+- 删除不复活双向证据（A 删/B 离线改、B 删/A 离线改）；
+- 输出 `m3-ac05-conflicts.json` + `.md`；重放缺陷见门禁报告 §6-5。
+
 ## m2-demo.sh（M2 门槛演示：「缺能力 → 造工具 → 安全验证 → 重用」，Issue #28）
 
 ```bash
