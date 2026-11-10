@@ -14,7 +14,7 @@ T7 归档时的产品缺口在 §6 如实登记；其中 §6-4（任务投影不
 
 | 项 | 值 |
 |---|---|
-| 当前 tip | 79c8fa8（merge: fix(#35) M3 同步缺口——status 字段/join 端点/sync run 做真），与 `origin/integration/m0` 一致 |
+| 当前 tip | 6c3e47b（merge: integration/m0 合并态——AC-04/AC-05 复跑与门禁报告刷新），与 `integration/m0` 一致 |
 | 最新 run | [42767124433](https://github.com/EasonW3300/Morrow/actions/runs/42767124433)（push integration/m0，2026-11-10T06:14:02Z，约 4m13s）—— **success**（8 job 全绿：build ×3、gate ×3、gate report、`sandbox tests (ubuntu, real containers)`） |
 | Ubuntu 部署冒烟 job | `gate (linux)` 第 8 步 **Deployment smoke (server form, systemd-equivalent)** success（`scripts/deploy/smoke-server.sh --binary artifacts/runtime/morrow-runtime-linux-x64`，服务器单二进制前台等价形态） |
 | 前一条成功 run | [42762135949](https://github.com/EasonW3300/Morrow/actions/runs/42762135949)（a5d7eba，2026-11-10T05:26Z）—— 同为 8 job 全绿，含同一部署冒烟步骤 |
@@ -22,7 +22,7 @@ T7 归档时的产品缺口在 §6 如实登记；其中 §6-4（任务投影不
 
 M3 专属门禁项（AC-04/AC-05 复跑、p95 测量、needs_reconcile 场景、两轮演示）不在 CI 判定内，由本报告 §2–§4 在合并态本机补齐——与 M0/M1/M2 报告「CI 边界」同一处置。
 
-## 2. 合并态复跑（本机，79c8fa8 工作树；node v24.22.1 homebrew）
+## 2. 合并态复跑（本机，6c3e47b 工作树；node v24.22.1 homebrew）
 
 复跑脚本（可重复执行，全部走真实 HTTP 接缝；设备私钥只在进程内存）：
 
@@ -149,8 +149,9 @@ HTTP 传输已按设备凭据携带 bearer token，真实非回环路径具备�
 **M3 门禁判定：条件性通过（产品侧阻断项已修复）**——三种部署与 AC-04/AC-05 达成；
 「跨设备不重复执行同一任务」补上了跨设备租约事件同步与 acquire 前检查（#34，d716b99），
 按 PRD §4.6 FR-DEP-4 的口径达成回环基线。仍未闭合：无共识协议下「拉取 → acquire」之间的
-竞态窗口（已文档化，靠 fencing token + needs_reconcile 兜底）、任务投影不随同步重建（§6-4）、
-真实 systemd/Tailscale/UI 人工走查等外部边界。其余开放边界见 §6。
+竞态窗口（已文档化，靠 fencing token + needs_reconcile 兜底）、
+真实 systemd/Tailscale/UI 人工走查等外部边界。任务投影已随同步重建（§6-4，`51ecc64` 修复）。
+其余开放边界见 §6。
 
 ## 6. 未达项与边界（如实登记）
 
@@ -183,7 +184,7 @@ HTTP 传输已按设备凭据携带 bearer token，真实非回环路径具备�
    ——按账本 sequence 重放 `task.*` 重建 `tasks`/`task_nodes`/`task_edges`（状态、`task_version`、
    节点结果、attempts、resources、actor、依赖边）；`task.revised` 携带修订后 DAG 全量投影、
    `task.failed` 携带 `error`，重建可精确复原。挂点与记忆投影一致：同步导入批次末尾（批次含
-   `task.*` 时）重建；启动时「任务表为空但账本有 `task.created`」补建一次。对端 `GET /v1/tasks`
+   投影相关的 `task.*` 时；纯租约心跳 `task.lease_*` 不触发全量重建）重建；启动时「任务表为空但账本有 `task.created`」补建一次。对端 `GET /v1/tasks`
    可列出、`GET /v1/tasks/:id` 返回真实状态；**重建只写投影不触发调度器**，未完成任务只读可见，
    执行仍须显式 resume/kick 并经租约。证据：`sync.tasks.test.ts`、`task-rebuild.test.ts`。
 5. ~~**AC-05 重放缺陷（待审核期间本地可见值回落）**~~ **已修复（`51ecc64`）**：重放按**事件作者归属**
@@ -239,7 +240,7 @@ desktop 测试前先 `pnpm --filter @morrow/runtime build`）：
 
 **M3 门禁：条件性通过（主线门槛已达成，外部边界待 Owner/后续票）**。
 达成项：三种部署形态（本机 local/server/hybrid + CI ubuntu 服务器形态）、AC-04 回环基线（50×2 对账
-无丢失/无重复/顺序一致，p95 2.54 ms）、AC-05 分类/删除/待审核可见值（20/20 预期合并或待审核；
+无丢失/无重复/顺序一致，p95 2.43 ms）、AC-05 分类/删除/待审核可见值（20/20 预期合并或待审核；
 本地 v2 可见 14/14 两侧；双向删除不复活）、两轮端到端演示 20/20、needs_reconcile 检测与 Owner 裁决。
 **跨设备不重复执行同一任务**由 #34（`d716b99`）补齐「租约事件同步 + acquire 前远端检查 + 双持有冻结」
 （回环基线达成）；任务投影随同步重建与 AC-05 可见值由 #32/#36（`51ecc64`）补齐。
