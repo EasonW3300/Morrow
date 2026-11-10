@@ -1,10 +1,10 @@
 {
   "ticket": "M3-T7 / Issue #36 AC-05",
-  "generated_at": "2026-11-10T06:29:48.237Z",
+  "generated_at": "2026-11-10T06:50:57.872Z",
   "environment": {
     "node": "v24.22.1",
     "platform": "darwin-arm64",
-    "cwd": "/Users/wys3300/Desktop/project/Morrow-wt/m3t7"
+    "cwd": "/Users/wys3300/Desktop/project/Morrow-wt/m3fix3"
   },
   "samples": 20,
   "counts": {
@@ -15,7 +15,9 @@
     "locked": 3,
     "sensitivity_change": 5,
     "fact_conflict": 6,
-    "review_local_view_retained": 0
+    "review_local_view_retained": 14,
+    "review_local_view_retained_b": 14,
+    "conflict_records_with_local_ref": 14
   },
   "rows": [
     {
@@ -31,6 +33,7 @@
       "b_content": "Owner 偏好使用 vim 编辑器。",
       "converged": true,
       "local_view_kept": null,
+      "b_local_view_kept": null,
       "pass": true
     },
     {
@@ -46,6 +49,7 @@
       "b_content": "I prefer the light theme for the editor.",
       "converged": true,
       "local_view_kept": null,
+      "b_local_view_kept": null,
       "pass": true
     },
     {
@@ -57,10 +61,11 @@
       "b_conflict_reason": null,
       "a_version": 3,
       "b_version": 3,
-      "a_content": "Owner 喜欢浅色主题。",
-      "b_content": "Owner 喜欢浅色主题。",
+      "a_content": "Owner 喜欢深色主题。",
+      "b_content": "Owner 喜欢深色主题。",
       "converged": true,
       "local_view_kept": null,
+      "b_local_view_kept": null,
       "pass": true
     },
     {
@@ -72,10 +77,11 @@
       "b_conflict_reason": null,
       "a_version": 3,
       "b_version": 3,
-      "a_content": "Owner 默认使用 pnpm 安装依赖。",
-      "b_content": "Owner 默认使用 pnpm 安装依赖。",
+      "a_content": "Owner 默认使用 npm 安装依赖。",
+      "b_content": "Owner 默认使用 npm 安装依赖。",
       "converged": true,
       "local_view_kept": null,
+      "b_local_view_kept": null,
       "pass": true
     },
     {
@@ -91,6 +97,7 @@
       "b_content": "Owner prefers tabs in TypeScript files.",
       "converged": true,
       "local_view_kept": null,
+      "b_local_view_kept": null,
       "pass": true
     },
     {
@@ -106,6 +113,7 @@
       "b_content": "Owner 的编辑器字体是 JetBrains Mono。",
       "converged": true,
       "local_view_kept": null,
+      "b_local_view_kept": null,
       "pass": true
     },
     {
@@ -115,12 +123,13 @@
       "m1_consolidator": "review:fact_conflict",
       "a_conflict_reason": "fact_conflict",
       "b_conflict_reason": "fact_conflict",
-      "a_version": 1,
-      "b_version": 1,
+      "a_version": 2,
+      "b_version": 2,
       "a_content": "项目使用 PostgreSQL 作为主数据库。",
-      "b_content": "项目使用 PostgreSQL 作为主数据库。",
-      "converged": true,
-      "local_view_kept": false,
+      "b_content": "项目使用 MySQL 作为主数据库。",
+      "converged": false,
+      "local_view_kept": true,
+      "b_local_view_kept": true,
       "pass": true
     },
     {
@@ -130,12 +139,13 @@
       "m1_consolidator": "review:fact_conflict",
       "a_conflict_reason": "fact_conflict",
       "b_conflict_reason": "fact_conflict",
-      "a_version": 1,
-      "b_version": 1,
+      "a_version": 2,
+      "b_version": 2,
       "a_content": "部署目标是 Ubuntu 24.04。",
-      "b_content": "部署目标是 Ubuntu 24.04。",
-      "converged": true,
-      "local_view_kept": false,
+      "b_content": "部署目标是 Debian 12。",
+      "converged": false,
+      "local_view_kept": true,
+      "b_local_view_kept": true,
       "pass": true
     },
     {
@@ -145,12 +155,13 @@
       "m1_consolidator": "review:fact_conflict",
       "a_conflict_reason": "fact_conflict",
       "b_conflict_reason": "fact_conflict",
-      "a_version": 1,
-      "b_version": 1,
+      "a_version": 2,
+      "b_version": 2,
       "a_content": "服务监听端口 8787。",
-      "b_content": "服务监听端口 8787。",
-      "converged": true,
-      "local_view_kept": false,
+      "b_content": "服务监听端口 9000。",
+      "converged": false,
+      "local_view_kept": true,
+      "b_local_view_kept": true,
       "pass": true
     },
     {
@@ -160,12 +171,13 @@
       "m1_consolidator": "review:fact_conflict",
       "a_conflict_reason": "fact_conflict",
       "b_conflict_reason": "fact_conflict",
-      "a_version": 1,
-      "b_version": 1,
+      "a_version": 2,
+      "b_version": 2,
       "a_content": "Morrow runtime 使用 node:sqlite。",
-      "b_content": "Morrow runtime 使用 node:sqlite。",
-      "converged": true,
-      "local_view_kept": false,
+      "b_content": "Morrow runtime 使用 better-sqlite3。",
+      "converged": false,
+      "local_view_kept": true,
+      "b_local_view_kept": true,
       "pass": true
     },
     {
@@ -175,12 +187,13 @@
       "m1_consolidator": "review:fact_conflict",
       "a_conflict_reason": "fact_conflict",
       "b_conflict_reason": "fact_conflict",
-      "a_version": 1,
-      "b_version": 1,
+      "a_version": 2,
+      "b_version": 2,
       "a_content": "Owner 住在杭州。",
-      "b_content": "Owner 住在杭州。",
-      "converged": true,
-      "local_view_kept": false,
+      "b_content": "Owner 住在上海。",
+      "converged": false,
+      "local_view_kept": true,
+      "b_local_view_kept": true,
       "pass": true
     },
     {
@@ -190,12 +203,13 @@
       "m1_consolidator": "review:fact_conflict",
       "a_conflict_reason": "fact_conflict",
       "b_conflict_reason": "fact_conflict",
-      "a_version": 1,
-      "b_version": 1,
+      "a_version": 2,
+      "b_version": 2,
       "a_content": "发布分支是 integration/m0。",
-      "b_content": "发布分支是 integration/m0。",
-      "converged": true,
-      "local_view_kept": false,
+      "b_content": "发布分支是 main。",
+      "converged": false,
+      "local_view_kept": true,
+      "b_local_view_kept": true,
       "pass": true
     },
     {
@@ -205,12 +219,13 @@
       "m1_consolidator": "review:locked",
       "a_conflict_reason": "locked",
       "b_conflict_reason": "locked",
-      "a_version": 1,
-      "b_version": 1,
+      "a_version": 2,
+      "b_version": 2,
       "a_content": "Owner 的护照号是 E12345678。",
-      "b_content": "Owner 的护照号是 E12345678。",
-      "converged": true,
-      "local_view_kept": false,
+      "b_content": "Owner 的护照号是 E87654321。",
+      "converged": false,
+      "local_view_kept": true,
+      "b_local_view_kept": true,
       "pass": true
     },
     {
@@ -220,12 +235,13 @@
       "m1_consolidator": "review:locked",
       "a_conflict_reason": "locked",
       "b_conflict_reason": "locked",
-      "a_version": 1,
-      "b_version": 1,
+      "a_version": 2,
+      "b_version": 2,
       "a_content": "Owner 的生日是 1990-01-01。",
-      "b_content": "Owner 的生日是 1990-01-01。",
-      "converged": true,
-      "local_view_kept": false,
+      "b_content": "Owner 的生日是 1991-01-01。",
+      "converged": false,
+      "local_view_kept": true,
+      "b_local_view_kept": true,
       "pass": true
     },
     {
@@ -235,12 +251,13 @@
       "m1_consolidator": "review:locked",
       "a_conflict_reason": "locked",
       "b_conflict_reason": "locked",
-      "a_version": 1,
-      "b_version": 1,
+      "a_version": 2,
+      "b_version": 2,
       "a_content": "服务器根密码已托管在 1Password。",
-      "b_content": "服务器根密码已托管在 1Password。",
-      "converged": true,
-      "local_view_kept": false,
+      "b_content": "服务器根密码已托管在 Bitwarden。",
+      "converged": false,
+      "local_view_kept": true,
+      "b_local_view_kept": true,
       "pass": true
     },
     {
@@ -250,12 +267,13 @@
       "m1_consolidator": "review:sensitivity_change",
       "a_conflict_reason": "sensitivity_change",
       "b_conflict_reason": "sensitivity_change",
-      "a_version": 1,
-      "b_version": 1,
+      "a_version": 2,
+      "b_version": 2,
       "a_content": "Owner 的家庭地址是杭州西湖区。",
-      "b_content": "Owner 的家庭地址是杭州西湖区。",
-      "converged": true,
-      "local_view_kept": false,
+      "b_content": "Owner 的家庭地址是杭州滨江区。",
+      "converged": false,
+      "local_view_kept": true,
+      "b_local_view_kept": true,
       "pass": true
     },
     {
@@ -265,12 +283,13 @@
       "m1_consolidator": "review:sensitivity_change",
       "a_conflict_reason": "sensitivity_change",
       "b_conflict_reason": "sensitivity_change",
-      "a_version": 1,
-      "b_version": 1,
+      "a_version": 2,
+      "b_version": 2,
       "a_content": "Owner 的手机号是 13800000000。",
-      "b_content": "Owner 的手机号是 13800000000。",
-      "converged": true,
-      "local_view_kept": false,
+      "b_content": "Owner 的手机号是 13900000000。",
+      "converged": false,
+      "local_view_kept": true,
+      "b_local_view_kept": true,
       "pass": true
     },
     {
@@ -280,12 +299,13 @@
       "m1_consolidator": "review:sensitivity_change",
       "a_conflict_reason": "sensitivity_change",
       "b_conflict_reason": "sensitivity_change",
-      "a_version": 1,
-      "b_version": 1,
+      "a_version": 2,
+      "b_version": 2,
       "a_content": "Owner 的医疗记录保存在家庭医生处。",
-      "b_content": "Owner 的医疗记录保存在家庭医生处。",
-      "converged": true,
-      "local_view_kept": false,
+      "b_content": "Owner 的医疗记录保存在私人诊所。",
+      "converged": false,
+      "local_view_kept": true,
+      "b_local_view_kept": true,
       "pass": true
     },
     {
@@ -295,12 +315,13 @@
       "m1_consolidator": "review:sensitivity_change",
       "a_conflict_reason": "sensitivity_change",
       "b_conflict_reason": "sensitivity_change",
-      "a_version": 1,
-      "b_version": 1,
+      "a_version": 2,
+      "b_version": 2,
       "a_content": "客户的 API key 存放在 vault。",
-      "b_content": "客户的 API key 存放在 vault。",
-      "converged": true,
-      "local_view_kept": false,
+      "b_content": "客户的 API key 存放在环境变量。",
+      "converged": false,
+      "local_view_kept": true,
+      "b_local_view_kept": true,
       "pass": true
     },
     {
@@ -310,12 +331,13 @@
       "m1_consolidator": "review:sensitivity_change",
       "a_conflict_reason": "sensitivity_change",
       "b_conflict_reason": "sensitivity_change",
-      "a_version": 1,
-      "b_version": 1,
+      "a_version": 2,
+      "b_version": 2,
       "a_content": "Owner 的银行账户尾号 1234。",
-      "b_content": "Owner 的银行账户尾号 1234。",
-      "converged": true,
-      "local_view_kept": false,
+      "b_content": "Owner 的银行账户尾号 5678。",
+      "converged": false,
+      "local_view_kept": true,
+      "b_local_view_kept": true,
       "pass": true
     }
   ],
@@ -323,7 +345,7 @@
     "evidence": [
       {
         "direction": "A 删 / B 离线改 / B 上线",
-        "fact_id": "01a1c426-041d-75c8-bd93-02a7316ebe9d",
+        "fact_id": "01a1c439-639e-714b-b16a-94274d823094",
         "deleted_a": true,
         "deleted_b": true,
         "stale_event_imported_by_deleter": false,
@@ -332,7 +354,7 @@
       },
       {
         "direction": "B 删 / A 离线改 / A 上线",
-        "fact_id": "01a1c426-041d-7ef1-b91b-b265a725f499",
+        "fact_id": "01a1c439-639e-7454-9665-59c175da979f",
         "deleted_a": true,
         "deleted_b": true,
         "stale_event_imported_by_deleter": false,

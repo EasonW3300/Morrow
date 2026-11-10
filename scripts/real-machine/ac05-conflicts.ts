@@ -8,7 +8,9 @@
  *   3. A/B 各自离线写同一事实的 v2 竞争修订（内容/敏感等级按 20 个样本），重连同步；
  *   4. 逐项分类：6 个 preference 应自动合并（两端收敛到同一 v3）；14 个应进待审核
  *      （locked 3 / sensitivity_change 5 / fact_conflict 6），分类口径复用 M1 巩固器
- *      （DefaultConsolidator，展示在同一行）；
+ *      （DefaultConsolidator，展示在同一行）；同时断言待审核期间两端各自的本地 v2
+ *      仍可见（修复批 #32 #36：修复前 0/14 → 修复后 14/14）且冲突记录同时携带本地
+ *      版本引用与远端事件引用；
  *   5. 删除不复活双向：A 删 / B 离线改 → 同步；B 删 / A 离线改 → 同步；
  *      断言双方事实保持 deleted_at 非空、旧修订未导入、sync.tombstone_skipped 审计。
  *
