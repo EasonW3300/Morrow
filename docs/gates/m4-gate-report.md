@@ -111,6 +111,19 @@ node --experimental-sqlite --experimental-strip-types scripts/real-machine/ac15-
 
 归档：`docs/gates/m4-ac15-wechat.{md,json}`。
 
+### 2.5 生产接线缺口修复（A1–A4 / Issue #37，#47 同批审查发现）—— **PASS（本机回归）**
+
+T9 报告此前只测到「协议层功能在测试/脚本里成立」，未覆盖生产入口接线。本批修复四项并补测试（`apps/runtime/test/`）：
+
+| 项 | 修复前 | 修复后 | 证据 |
+|---|---|---|---|
+| **A1 生产入口注入渠道适配器** | `startRuntime` 不注入任何适配器；飞书/QQ/微信只在测试与 `scripts/real-machine/*` 被 `new`。真实桌面/服务器 `/v1/channels` 为空，UI 配好凭据也无效 | `channels/bootstrap.ts` 按 SecretStore 已配置凭据（`channel:feishu:app_id`、`channel:qq:app_id`、`channel:wechat:*`）自动构造并注册；缺省 disabled（`channel_settings` 持久化，读既有状态），缺字段/启动失败降级为 health 可见的 error，不阻断 Runtime；稳定渠道可由 `POST /v1/channels/:id/enable` 显式启用，微信仍出厂 disabled + `confirm_risk` | `channels.bootstrap.test.ts`（飞书+QQ 自动列出/缺省 stopped/health/enable/跨重启持久化；未配置渠道不出现；微信 confirm_risk；缺字段 error 不阻断） |
+| **A2 Outbox 自动投递循环** | `dispatchOnce` 只有通知 drain 会调；入站回复 enqueue 后无人投递，人工 retry 也只改状态 | Runtime 启动 `outboxDrainIntervalMs`（默认 1000ms，0 关闭，`unref()`）定时 drain；启动即接 Outbox→Channel 桥，关闭时清理 | `outbox.drain.test.ts`（enqueue 后不手动 dispatch → 一个周期内 sent 且平台桩收到一次；间隔 0 不自投） |
+| **A3 通知的渠道目标解析** | 渠道通知目标硬编码 `{kind:"user", id:"owner"}`，飞书/QQ 适配器无法解析 | 新表 `channel_notify_target`（channel→native_conversation_id）+ `GET/PUT /v1/channels/:id/notify-target`（校验会话已存在/已白名单）；未配置时规则保存 400 `notify_target_required`（不再运行时静默失败）；投递 target 为 `{kind:"conversation", id:<指定会话>}` | `notifications.notify-target.test.ts`（未配置 400、未知会话 400、配置后经 Outbox 发到指定会话） |
+| **A4 联系人授权接进入站路由** | 入站 `permission_context` 生成后不调用 `authorizeContactUse`，类别授权只存不判 | 入站解析出 `contact:<id>` 后按消息意图（query / task_execute / memory_reference）调用 `PermissionEngine.authorizeContactUse`；拒绝 `channel.inbound_rejected(reason=contact_permission_denied)` 且不回复；判定类别与依据随 `channel.inbound_received.permission_decision` 留痕；联系人会话工具经 `contactCapabilitiesForSession` 收窄 | `channels.contact-authorization.test.ts`（仅 query 联系人触发任务执行 → 拒绝留痕；public 记忆放行、private 拒绝；工具收窄 []） |
+
+**通知去重口径差异（如实登记）**：PRD FR-NOT-1 字面写「去重键 `task_id+event_type`」，实现为 `task_id+event_type+target`（不同目标各自投递一次，Outbox 幂等键 = 去重基键 + 窗口起点）。差异原因：桌面与各渠道目标互不替代，若按 PRD 字面去重，多目标配置下只会有第一个目标收到通知。当前实现与 AC-13 的「通知按规则去重送达」一致，但**不满足 PRD 字面**；已在此登记，需产品确认是否修订 PRD 或收窄实现。
+
 ## 3. 真实平台层（逐项登记，不标完成）
 
 | 项 | 状态 | 证据/边界 |
@@ -175,6 +188,7 @@ node --experimental-sqlite --experimental-strip-types scripts/real-machine/ac15-
 11. **语音段属 M5**：AC-11（打断 p95 ≤300ms、字幕、本地/云端切换）无 M4 实现与证据；AC-14 第 10 项只登记该事实。
 12. **群聊 proactive_limited 语义**：`proactive_limited` 白名单模式在路由层允许非 @ 处理，但真实平台的主动消息额度/场景仍以平台为准，不承诺无限推送（PRD FR-NOT-4）。
 13. **合并态 typecheck 基线缺陷（已修复）**：`QqTestStubOptions`（`apps/runtime/src/channels/testing/qq-stub.ts`）曾缺 `rejectProactive` / `rejectAllTokens` / `failTokenEndpoint` / `rateLimit` / `mode` / `signatureMode` 六个字段，导致 56ca2d2 合并态 `tsc --noEmit` 7 处报错。已由 `4e43c03`（fix(#41)）补齐，本 tip（1ca9cce）的 `pnpm --filter @morrow/runtime test` 前置 typecheck 通过。
+14. **生产接线缺口（此前未登记，已修复）**：A1 生产入口不注入适配器、A2 Outbox 无自动投递、A3 通知渠道目标硬编码 owner、A4 联系人授权未接入站路由。四项修复与测试证据见 §2.5；不属于真实平台层，但属于「功能只在测试/脚本成立、生产入口没接」的假完成风险，已按生产入口回归覆盖。
 
 ## 7. 测试规模与最终验证
 
@@ -184,25 +198,25 @@ desktop 测试前先 `pnpm --filter @morrow/runtime build`）：
 
 | 套件 | 结果 |
 |---|---|
-| runtime（node:test，排除容器套件） | **726/726 PASS**（33.6s） |
+| runtime（node:test，排除容器套件） | **733/733 PASS**（新增 A1–A4 生产接线 7 例） |
 | protocol | 40/40 |
 | pi-adapter | 31/31 |
 | desktop（node:test） | **133/133**（Issue #47 新增通知中心 17 例） |
 | desktop sidecar（cargo test） | 9/9 |
 | packaging | 56/56 |
-| **node:test 合计** | **986/986**（M4 收官 969 + Issue #47 通知中心 17） |
+| **node:test 合计** | **993/993**（M4 收官 969 + Issue #47 通知中心 17 + A1–A4 生产接线 7） |
 
 真实容器套件（`sandbox.docker.test.ts` / `capability-factory.harness.container.test.ts`）按票面要求本机不跑（docker 可能挂起），由 CI ubuntu 腿 `sandbox tests (ubuntu, real containers)` 独立判定（最新 run success，§1）。
 
-**typecheck 现状**：`4e43c03` 已补齐 `QqTestStubOptions` 六字段，本 tip（1ca9cce）runtime / protocol / pi-adapter / packaging / desktop 的 `tsc --noEmit` 全部通过（desktop 另通过 Tauri 插件 `cargo test` 编译）。Issue #47 的通知中心改动新增 `notification-center.ts` / `notification-system.ts` / `NotificationCenter.tsx` 与 17 例纯逻辑测试，均并入上表。
+**typecheck 现状**：`4e43c03` 已补齐 `QqTestStubOptions` 六字段，本 tip 的 runtime / protocol / pi-adapter / packaging / desktop 的 `tsc --noEmit` 全部通过（desktop 另通过 Tauri 插件 `cargo test` 编译）。Issue #47 的通知中心改动新增 `notification-center.ts` / `notification-system.ts` / `NotificationCenter.tsx` 与 17 例纯逻辑测试；A1–A4 生产接线新增 7 例 runtime 测试，均并入上表。
 
 ## 8. 结论
 
 **M4 门禁：协议层通过，真实平台层未达成；另有合并态 typecheck 基线缺陷 —— 双层结论 + 一个基线阻断项，不合并宣称完成。**
 
-- **达成的部分（协议层 + 桌面消费端）**：AC-09 飞书五面各 20/20；AC-10 QQ 群 @ 与私聊各 20/20 + 主动消息受限/拒绝分类（真实 `40034105` 已入表）+ token 刷新；AC-13 五类越权 100/100 阻断、通知 160 送达/160 去重，且桌面端完成 pending → 系统通知/应用内中心 → ack 闭环（Issue #47）；AC-15 风险确认/白名单收发/健康/日志/关闭 20/20；AC-14 两轮 20/20；全 workspace 986 node:test + 9 Rust 全绿、typecheck 全绿；CI 8 job success。
+- **达成的部分（协议层 + 桌面消费端 + 生产入口）**：AC-09 飞书五面各 20/20；AC-10 QQ 群 @ 与私聊各 20/20 + 主动消息受限/拒绝分类（真实 `40034105` 已入表）+ token 刷新；AC-13 五类越权 100/100 阻断、通知 160 送达/160 去重，且桌面端完成 pending → 系统通知/应用内中心 → ack 闭环（Issue #47）；AC-15 风险确认/白名单收发/健康/日志/关闭 20/20；AC-14 两轮 20/20；A1–A4 生产入口接线（渠道自动装配 / Outbox 自动投递 / 通知目标解析 / 联系人授权入路由）7 例回归；全 workspace 993 node:test + 9 Rust 全绿、typecheck 全绿；CI 8 job success。
 - **未达成的部分（真实平台层）**：飞书 0 次（资质未注册）；微信 0 次（真实桥未实现 + 需 Owner Windows）；QQ 累计群 @ 15/20（差 5）+ 私聊 1 次。QQ 真实平台还发现并修复了三处缺陷（`unknown_conversation` 适配器缺陷、`40034105` 不可重试码表缺失、测试桩注入选项失效），这本身是真实层证据，但不改变 20 次门线未满的事实。
 
-**基线阻断项**：合并态 56ca2d2 的 `QqTestStubOptions` 缺六个注入选项字段导致 `tsc --noEmit` 失败（§6-13/§7）。node:test 与门禁数字不受影响，但「全 workspace 测试绿」的严格口径需下一提交修复该接口后再宣告。
+**基线阻断项（已解除）**：合并态 56ca2d2 的 `QqTestStubOptions` 缺六个注入选项字段导致 `tsc --noEmit` 失败（§6-13/§7），已由 `4e43c03` 修复；本批 A1–A4 后全 workspace typecheck 仍全绿。
 
 **后续最小闭环建议**：① 完成飞书自建应用注册后，用同一套脚本（仅改 base_url/凭据）跑真实 20 次；② Owner 在 QQ 群补足 5 次群 @ 并做私聊 10+ 次，补齐真实外发审计对账；③ 启动微信真实桥（Windows）或明确降级为实验说明；④ 附件文件传输与 QQ 频道消息按后续票评估；⑤ M5 语音交付后补 AC-11 与 AC-14 语音段。

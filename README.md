@@ -24,12 +24,13 @@
 
 ```
 apps/desktop        Tauri 2 + React 桌面壳（Chat / Task / Voice / 设置）
-apps/runtime        核心 Node 应用：编排、记忆、能力、API（单二进制打包）
+apps/runtime        核心 Node 应用：编排、记忆、能力、渠道、API（单二进制打包）
+apps/runtime/src/channels 渠道网关实现：飞书 / QQ 官方 / 微信实验（适配器、统一入站路由、Outbox 桥、凭据管理）
 packages/protocol   事件 schema、API 合约、共享类型（TS + JSON Schema）
 packages/pi-adapter Pi 内核版本锁定适配层（ADR-0001）
 packages/memory     记忆管线：抽取 / 巩固 / 冲突 / Markdown 投影
 packages/sync       副本同步引擎：增量、租约、配对
-packages/channels   渠道网关：飞书 / QQ 官方 / 微信实验
+packages/channels   渠道域操作/复用手册（代码实现位于 apps/runtime/src/channels）
 packages/capability 能力工厂：生成 / 沙箱验证 / 注册 / 演进
 packages/voice      语音管线：VAD / ASR / TTS / 打断
 workers/go          Go 组件（系统适配、性能敏感服务、CLI）

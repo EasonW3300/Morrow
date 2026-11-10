@@ -277,6 +277,7 @@ async function runRound(round: number, server: ChannelTestServer): Promise<Round
         ],
         outboxBackoffBaseMs: 100,
         notificationDrainIntervalMs: 0,
+        outboxDrainIntervalMs: 0,
       };
     },
   });

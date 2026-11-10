@@ -67,6 +67,8 @@ test("startRuntime: 飞书适配器清单/健康可查；入站回复经 Outbox 
       },
     ],
     outboxBackoffBaseMs: 100,
+    // 本测试手动 dispatchOnce 断言单步状态；关闭自动定时投递（A2 语义另测）
+    outboxDrainIntervalMs: 0,
   });
   t.after(async () => {
     await runtime.close();

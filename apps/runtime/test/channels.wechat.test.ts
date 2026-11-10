@@ -401,6 +401,7 @@ test("API：出厂 disabled、未确认 409、确认后白名单收发；实验�
       },
     ],
     outboxBackoffBaseMs: 100,
+    outboxDrainIntervalMs: 0,
   });
   t.after(async () => {
     await runtime.close();

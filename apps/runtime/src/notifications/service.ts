@@ -45,7 +45,11 @@ export const NOTIFICATION_EVENT_TYPES = {
   acknowledged: "notification.acknowledged",
 } as const;
 
-export type NotificationErrorCode = "invalid_input" | "invalid_status" | "not_found";
+export type NotificationErrorCode =
+  | "invalid_input"
+  | "invalid_status"
+  | "not_found"
+  | "notify_target_required";
 
 export class NotificationError extends Error {
   readonly code: NotificationErrorCode;
@@ -81,6 +85,12 @@ export interface NotificationServiceOptions {
   privateMemoryContents?: () => string[];
   /** 渠道账号解析（Outbox envelope 的 account_id）；缺省 ch-<channel> 占位 */
   channelAccountId?: (channelId: string) => string | null;
+  /**
+   * 渠道默认通知会话解析（A3 修复批 / Issue #37）：channel:<id> 目标必须映射到该
+   * 渠道已存在/已白名单的 native conversation。提供本解析器时，保存渠道规则会校验；
+   * 未配置目标 → 400 notify_target_required（不在运行时静默失败）。
+   */
+  channelNotifyTarget?: (channelId: string) => string | null;
   /** 正文最大长度（默认 1000 字符，超出截断） */
   maxBodyChars?: number;
 }
@@ -101,6 +111,7 @@ export class NotificationService {
   readonly #taskLookup: ((taskId: string) => NotificationTaskView | null) | null;
   readonly #privateMemoryContents: () => string[];
   readonly #channelAccountId: ((channelId: string) => string | null) | null;
+  readonly #channelNotifyTarget: ((channelId: string) => string | null) | null;
   readonly #maxBodyChars: number;
   #closed = false;
 
@@ -114,6 +125,7 @@ export class NotificationService {
     this.#taskLookup = options.taskLookup ?? null;
     this.#privateMemoryContents = options.privateMemoryContents ?? (() => []);
     this.#channelAccountId = options.channelAccountId ?? null;
+    this.#channelNotifyTarget = options.channelNotifyTarget ?? null;
     this.#maxBodyChars = Math.max(1, options.maxBodyChars ?? 1_000);
   }
 
@@ -133,6 +145,20 @@ export class NotificationService {
     this.#assertOpen();
     if (inputs.length === 0) throw new NotificationError("invalid_input", "rules must be a non-empty array");
     const normalized = inputs.map(normalizeRuleInput);
+    // A3 修复批：渠道目标必须已解析到该渠道的默认通知会话；未配置即拒绝保存，
+    // 避免规则落库后在运行时静默失败（通知只出现在 history，永远发不出去）。
+    if (this.#channelNotifyTarget !== null) {
+      for (const rule of normalized) {
+        if (!rule.target.startsWith("channel:")) continue;
+        const channelId = rule.target.slice("channel:".length);
+        if (this.#channelNotifyTarget(channelId) === null) {
+          throw new NotificationError(
+            "notify_target_required",
+            `notification target "${rule.target}" has no default notify conversation; set one with PUT /v1/channels/${channelId}/notify-target first`,
+          );
+        }
+      }
+    }
     const rules = this.#store.upsertRules(normalized, this.#now());
     this.#emit(NOTIFICATION_EVENT_TYPES.ruleUpserted, "owner", null, {
       rules: rules.map((rule) => ({
@@ -390,13 +416,19 @@ export class NotificationService {
       this.#channelFailed(row, `channel_unavailable: no account bound to ${row.channel_id}`);
       return;
     }
+    // A3 修复批：按 Owner 指定的默认通知会话投递（native_conversation_id），而不是
+    // 硬编码的 owner 用户目标——飞书/QQ 适配器无法解析 user:owner。
+    const targetConversation = this.#channelNotifyTarget?.(row.channel_id) ?? null;
+    if (targetConversation === null) {
+      this.#channelFailed(row, `notify_target_required: no default notify conversation for ${row.channel_id}`);
+      return;
+    }
     try {
       const queued = this.#outbox.enqueue({
         idempotencyKey: `notification:${row.dedupe_key}`,
         channelId: row.channel_id,
         accountId,
-        // 规则只声明渠道；接收者是 Owner 本人（渠道适配器把 user 身份解析为平台 DM 会话）
-        target: { kind: "user", id: "owner" },
+        target: { kind: "conversation", id: targetConversation },
         payload: {
           kind: "notification",
           notification_id: row.notification_id,
