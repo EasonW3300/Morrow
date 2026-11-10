@@ -16,11 +16,12 @@ import {
   type ProviderFormValues,
 } from "./provider-form.ts";
 import { CapabilitiesView } from "./CapabilitiesView.tsx";
+import { DevicesView } from "./DevicesView.tsx";
 
 /**
- * 设置页（PRD §5.1 设置区）：子页签「Provider 与模型」（票 T7 / Issue #8）与
- * 「能力管理」（票 M2-T6 / Issue #27）。能力管理页签可由 Task 视图的能力引用卡
- * 跳入（initialCapabilityName 预选详情）。
+ * 设置页（PRD §5.1 设置区）：三个子页签——「Provider 与模型」（票 T7 / Issue #8）、
+ * 「能力管理」（票 M2-T6 / Issue #27）与「设备与同步」（票 M3-T6 / Issue #35）。
+ * 能力管理页签可由 Task 视图的能力引用卡跳入（initialCapabilityName 预选详情）。
  */
 export function SettingsView({
   base,
@@ -29,28 +30,40 @@ export function SettingsView({
   base: string;
   initialCapabilityName?: string | null;
 }) {
-  const [section, setSection] = useState<"providers" | "capabilities">(initialCapabilityName !== null ? "capabilities" : "providers");
+  const [section, setSection] = useState<"providers" | "capabilities" | "devices">(
+    initialCapabilityName !== null ? "capabilities" : "providers",
+  );
 
   // 引用卡跳转在页已挂载后到达时，同样切到能力管理
   useEffect(() => {
     if (initialCapabilityName !== null) setSection("capabilities");
   }, [initialCapabilityName]);
 
-  if (section === "capabilities") {
-    return <CapabilitiesView base={base} initialCapabilityName={initialCapabilityName} />;
-  }
   return (
-    <>
+    <div className="page settings-page">
       <div className="settings-subnav">
-        <button className="subnav-item selected" onClick={() => setSection("providers")}>
-          Provider 与模型
-        </button>
-        <button className="subnav-item" onClick={() => setSection("capabilities")}>
-          能力管理
-        </button>
+        {(
+          [
+            ["providers", "Provider 与模型"],
+            ["capabilities", "能力管理"],
+            ["devices", "设备与同步"],
+          ] as const
+        ).map(([key, label]) => (
+          <button
+            key={key}
+            className={section === key ? "subnav-item selected" : "subnav-item"}
+            onClick={() => setSection(key)}
+          >
+            {label}
+          </button>
+        ))}
       </div>
-      <ProvidersSection base={base} />
-    </>
+      {section === "providers" && <ProvidersSection base={base} />}
+      {section === "capabilities" && (
+        <CapabilitiesView base={base} initialCapabilityName={initialCapabilityName} />
+      )}
+      {section === "devices" && <DevicesView base={base} />}
+    </div>
   );
 }
 
@@ -163,7 +176,7 @@ function ProvidersSection({ base }: { base: string }) {
   };
 
   return (
-    <div className="page">
+    <div className="settings-section">
       <div className="page-head">
         <h2>Provider 与模型</h2>
         <button className="btn primary" onClick={openCreate} disabled={form !== null}>

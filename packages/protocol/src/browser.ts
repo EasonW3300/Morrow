@@ -45,6 +45,17 @@ export type {
   TransferExecutionRequest,
   TransferExecutionResponse,
 } from "./task-contracts.ts";
+// 同步协议（M3-T6 / Issue #35：设置→设备与同步页的同步状态面板）
+// sync-contracts.ts 只依赖 EventEnvelope 类型，无 node 内置模块——浏览器安全。
+export type {
+  SyncCursorRecord,
+  SyncEnvelope,
+  SyncGapDetails,
+  SyncPullBatch,
+  SyncPushOutcome,
+  SyncPushRequest,
+  SyncStatus,
+} from "./sync-contracts.ts";
 export type {
   CapabilityAuthor,
   CapabilityChannel,

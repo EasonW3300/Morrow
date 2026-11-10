@@ -10,9 +10,13 @@ import {
 } from "./api.ts";
 import {
   dagLayers,
+  describeReconcileEvidence,
   eventPageState,
   looksLikeDiff,
+  NEEDS_RECONCILE_MESSAGE,
   projectTaskEvents,
+  reconcileControls,
+  taskNeedsReconcile,
   taskNodeStatusLabel,
   taskNodeStatusTone,
   taskStatusLabel,
@@ -85,23 +89,34 @@ export function TaskView({
         </button>
       </div>
       {listError !== null && <div className="banner-error">{listError}</div>}
+      {tasks.some((task) => taskNeedsReconcile(task.status)) && (
+        <div className="needs-reconcile-strip">
+          有任务处于「待人工裁决」：两设备独立执行过同一任务，需要你在详情页给出结论。
+        </div>
+      )}
       <div className="task-layout">
         <aside className="task-list">
           {tasks.length === 0 && <p className="empty-note">暂无任务。任务由会话或 API 创建（POST /v1/tasks）。</p>}
-          {tasks.map((task) => (
-            <button
-              key={task.task_id}
-              className={task.task_id === selectedId ? "task-row selected" : "task-row"}
-              onClick={() => setSelectedId(task.task_id)}
-            >
-              <span className="task-row-goal">{task.goal}</span>
-              <span className="task-row-meta">
-                <span className={`badge tone-${taskStatusTone(task.status)}`}>{taskStatusLabel(task.status)}</span>
-                <span className="mono">v{task.task_version}</span>
-                <span>{shortTime(task.created_at)}</span>
-              </span>
-            </button>
-          ))}
+          {tasks.map((task) => {
+            const needsReconcile = taskNeedsReconcile(task.status);
+            return (
+              <button
+                key={task.task_id}
+                className={`task-row${task.task_id === selectedId ? " selected" : ""}${needsReconcile ? " task-row-reconcile" : ""}`}
+                onClick={() => setSelectedId(task.task_id)}
+              >
+                <span className="task-row-goal">
+                  {needsReconcile && <span className="task-row-alert" aria-label="需人工裁决">⚠ </span>}
+                  {task.goal}
+                </span>
+                <span className="task-row-meta">
+                  <span className={`badge tone-${taskStatusTone(task.status)}`}>{taskStatusLabel(task.status)}</span>
+                  <span className="mono">v{task.task_version}</span>
+                  <span>{shortTime(task.created_at)}</span>
+                </span>
+              </button>
+            );
+          })}
         </aside>
         <main className="task-detail">
           {selectedId === null ? (
@@ -180,6 +195,22 @@ function TaskDetailPanel({
     })();
   }, [base, taskId]);
 
+  // needs_reconcile 证据（票 M3-T6 / Issue #35）：GET /v1/tasks/:id/execution 的
+  // evidence 说明哪两个副本各自执行过（判定不是凭空冻结）。
+  const [evidenceText, setEvidenceText] = useState<string | null>(null);
+  useEffect(() => {
+    if (task?.status !== "needs_reconcile") {
+      setEvidenceText(null);
+      return;
+    }
+    void api
+      .taskExecution(base, taskId)
+      .then((execution) => setEvidenceText(describeReconcileEvidence(execution.evidence)))
+      .catch(() => setEvidenceText(null));
+  }, [base, taskId, task?.status]);
+
+  const [reconcileNote, setReconcileNote] = useState("");
+
   const run = useCallback(
     async (what: string, action: () => Promise<unknown>): Promise<void> => {
       setBusy(true);
@@ -236,6 +267,47 @@ function TaskDetailPanel({
       </div>
       {opError !== null && <div className="banner-error">{opError}</div>}
       {task.error !== undefined && <div className="banner-error">任务错误：{task.error}</div>}
+      {reconcileControls(task.status, busy).visible && (
+        <div className="needs-reconcile-panel" role="alert">
+          <div className="needs-reconcile-head">
+            <span className="needs-reconcile-badge">⚠ 待人工裁决</span>
+            <strong>{NEEDS_RECONCILE_MESSAGE}</strong>
+          </div>
+          <p className="hint-inline">
+            Runtime 不会自动合并任何一侧结果：请核对下方证据与节点结果后，选择一个结论；裁决会记入任务账本。
+          </p>
+          {evidenceText !== null && <p className="needs-reconcile-evidence">执行证据：{evidenceText}</p>}
+          <label className="field">
+            <span className="field-label">裁决说明（可选，进审计）</span>
+            <input
+              value={reconcileNote}
+              onChange={(e) => setReconcileNote(e.target.value)}
+              placeholder="例如：采纳台式机侧的归档结果"
+              disabled={busy}
+            />
+          </label>
+          <div className="form-actions">
+            {reconcileControls(task.status, busy).options.map((option) => (
+              <button
+                key={option.resolution}
+                className={option.resolution === "completed" ? "btn primary" : "btn danger"}
+                disabled={option.disabled}
+                title={option.hint}
+                onClick={() =>
+                  void run("裁决", () =>
+                    api.reconcileTask(base, task.task_id, {
+                      resolution: option.resolution,
+                      ...(reconcileNote.trim().length > 0 ? { note: reconcileNote.trim() } : {}),
+                    }),
+                  )
+                }
+              >
+                {busy ? "提交中…" : option.label}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
       {!terminal && task.status === "running" && <p className="hint-inline">任务执行中：详情每 2 秒自动刷新。</p>}
       {showRevise && (
         <ReviseForm

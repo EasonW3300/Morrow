@@ -6,9 +6,11 @@
  *   - diff 识别（节点结果/工具输出中的统一 diff 以只读块呈现）；
  *   - 任务事件流归约（tool.started/finished 配对为可展开 I/O 项，口径同 sse.ts）；
  *   - 事件分页窗口（最新页优先 + 向更早翻页）；
- *   - 修订表单校验（与服务端 validateRevision 同口径的前端防线）。
+ *   - 修订表单校验（与服务端 validateRevision 同口径的前端防线）；
+ *   - needs_reconcile 双端独立执行的 Owner 裁决呈现（票 M3-T6 / Issue #35：
+ *     说明文案 + 裁决按钮状态机 + 执行证据复述）。
  */
-import type { TaskNodeRecord, TaskNodeStatus, TaskStatus } from "@morrow/protocol/browser";
+import type { ExecutionReconcileEvidence, TaskNodeRecord, TaskNodeStatus, TaskStatus } from "@morrow/protocol/browser";
 // 任务账本事件信封：单一真相源在 api.ts（GET /v1/tasks/:id/events 的 events 元素；
 // M1 code-review 收敛——原先本文件自持一份同形 TaskEnvelope 拷贝）
 import type { TaskEventEnvelope } from "./api.ts";
@@ -71,6 +73,85 @@ export function taskStatusTone(status: TaskStatus): Tone {
 
 export function taskNodeStatusTone(status: TaskNodeStatus): Tone {
   return TASK_NODE_STATUS_TONES[status] ?? "idle";
+}
+
+// --- needs_reconcile 人工裁决（票 M3-T6 / Issue #35，FR-DEP-4）--------------------
+
+/** 详情页横幅与列表提示的统一文案（Owner 一眼知道为什么需要自己出手） */
+export const NEEDS_RECONCILE_MESSAGE = "两设备独立执行过此任务，需你裁决";
+
+export function taskNeedsReconcile(status: TaskStatus): boolean {
+  return status === "needs_reconcile";
+}
+
+export interface ReconcileOption {
+  resolution: "completed" | "failed";
+  label: string;
+  hint: string;
+  disabled: boolean;
+}
+
+export interface ReconcileControls {
+  visible: boolean;
+  canSubmit: boolean;
+  noteEnabled: boolean;
+  /** 非待裁决状态时的说明（为何没有裁决入口） */
+  hint: string | null;
+  options: ReconcileOption[];
+}
+
+/**
+ * 裁决按钮状态机（组件只做按钮渲染）：
+ *   - 只有 needs_reconcile 才出现入口；提交中两个按钮都禁用（防重复裁决）；
+ *   - 裁决语义是「采纳一侧结论」或「记为失败」——不自动合并，note 进账本审计；
+ *   - 离开 needs_reconcile 只能经 `POST /v1/tasks/:id/reconcile`（服务端拒绝其他
+ *     状态），因此非该状态时入口整体隐藏而非假装可点。
+ */
+export function reconcileControls(status: TaskStatus, busy: boolean): ReconcileControls {
+  const visible = taskNeedsReconcile(status);
+  const disabled = !visible || busy;
+  return {
+    visible,
+    canSubmit: visible && !busy,
+    noteEnabled: visible,
+    hint: visible
+      ? null
+      : `任务当前为「${taskStatusLabel(status)}」，无需裁决（只有 needs_reconcile 状态可裁决）`,
+    options: [
+      {
+        resolution: "completed",
+        label: "标记为已完成",
+        hint: "采纳已完成的一侧结论（不自动合并两侧结果）",
+        disabled,
+      },
+      {
+        resolution: "failed",
+        label: "标记为失败",
+        hint: "两侧都不可信：记为失败并保留证据供复盘",
+        disabled,
+      },
+    ],
+  };
+}
+
+/**
+ * 执行证据复述（GET /v1/tasks/:id/execution 的 evidence）：告诉 Owner 是哪两个副本
+ * 各自执行过、判定原因是什么。无证据返回 null（UI 不渲染证据块）。
+ */
+export function describeReconcileEvidence(evidence: ExecutionReconcileEvidence | null): string | null {
+  if (evidence === null) return null;
+  const replicas = evidence.independent_replicas.length > 0 ? evidence.independent_replicas : evidence.replicas;
+  const shorts = replicas.map((r) => r.slice(0, 8));
+  const reasonLabels: Record<string, string> = {
+    dual_execution: "两个副本各自独立执行了同一任务",
+    task_version_diverged: "两侧任务版本已分叉",
+  };
+  const reasons = evidence.reasons.map((r) => reasonLabels[r] ?? r).join("；");
+  const head =
+    shorts.length > 0
+      ? `涉及副本：${shorts.join("、")}`
+      : "涉及副本：未记录";
+  return reasons.length > 0 ? `${head}——${reasons}` : head;
 }
 
 // --- DAG 层级分组 ----------------------------------------------------------------

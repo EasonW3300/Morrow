@@ -9,13 +9,34 @@ import type {
   CapabilityRecord,
   CapabilityVersionRecord,
   ConnectivityResult,
+  DeviceInfo,
+  PairingClaimRequest,
+  PairingClaimResponse,
+  PairingCodeResponse,
   PermissionGrant,
   ProviderRecord,
+  SyncStatus,
   TaskDetail,
+  TaskExecutionState,
   TaskNodeRecord,
   TaskSummary,
 } from "@morrow/protocol/browser";
-export type { CapabilityRecord, CapabilityVersionRecord, ConnectivityResult, PermissionGrant, ProviderRecord, TaskDetail, TaskNodeRecord, TaskSummary };
+export type {
+  CapabilityRecord,
+  CapabilityVersionRecord,
+  ConnectivityResult,
+  DeviceInfo,
+  PairingClaimRequest,
+  PairingClaimResponse,
+  PairingCodeResponse,
+  PermissionGrant,
+  ProviderRecord,
+  SyncStatus,
+  TaskDetail,
+  TaskExecutionState,
+  TaskNodeRecord,
+  TaskSummary,
+};
 // 能力域 UI 侧类型（SkillSummary/SkillProposal 在 capability-ui 定义；工厂投影在本文件）
 import type { SkillProposal, SkillSummary } from "./capability-ui.ts";
 export type { SkillProposal, SkillSummary };
@@ -24,6 +45,11 @@ export class ApiError extends Error {
     readonly status: number,
     readonly code: string,
     message: string,
+    /**
+     * 错误信封里 code/message 之外平铺的字段（M3-T6 / Issue #35）：
+     * sync_gap 的 peer_replica_id / expected / actual 就在这里，UI 才能说清缺口位置。
+     */
+    readonly details: Record<string, unknown> = {},
   ) {
     super(message);
     this.name = "ApiError";
@@ -45,14 +71,19 @@ async function request<T>(base: string, path: string, init?: RequestInit): Promi
   if (!res.ok) {
     let code = `http_${res.status}`;
     let message = res.statusText || `HTTP ${res.status}`;
+    let details: Record<string, unknown> = {};
     try {
-      const body = (await res.json()) as { error?: { code?: string; message?: string } };
+      const body = (await res.json()) as { error?: { code?: string; message?: string } & Record<string, unknown> };
       if (body.error?.code) code = body.error.code;
       if (body.error?.message) message = body.error.message;
+      if (body.error !== undefined && typeof body.error === "object") {
+        const { code: _code, message: _message, ...rest } = body.error;
+        details = rest;
+      }
     } catch {
       // 非 JSON 错误体，保留 statusText
     }
-    throw new ApiError(res.status, code, message);
+    throw new ApiError(res.status, code, message, details);
   }
   return (await res.json()) as T;
 }
@@ -208,6 +239,57 @@ export interface FactoryRequest {
 }
 
 const JSON_HEADERS = { "content-type": "application/json" };
+
+// --- 设备与同步（票 M3-T6 / Issue #35；设备/配对类型在 @morrow/protocol，冲突视图是 UI 投影）---
+
+/**
+ * GET /v1/sync/conflicts 的元素：memory_conflicts 本体 + 同步元数据
+ * （apps/runtime/src/sync/memory-sync.ts 的 SyncConflictView 投影）。
+ */
+export interface SyncConflictView {
+  conflict_id: string;
+  candidate_id: string;
+  fact_id: string;
+  reason: string;
+  existing_content: string;
+  incoming_content: string;
+  existing_sensitivity: string;
+  incoming_sensitivity: string;
+  source_id: string;
+  status: "open" | "resolved";
+  /** T3 裁决语义：keep_old = 本地既有值，keep_new = 远端入站值 */
+  resolution: "keep_new" | "keep_old" | "merge" | null;
+  resolved_content: string | null;
+  created_at: string;
+  resolved_at: string | null;
+  /** sync = 来自其他副本；local = 本机内产生（同一队列，不另建） */
+  origin: "sync" | "local";
+  local_replica_id: string | null;
+  remote_replica_id: string | null;
+  local_version: number | null;
+  remote_version: number | null;
+  base_version: number | null;
+  remote_event_id: string | null;
+  sync_resolved_at: string | null;
+}
+
+/** POST /v1/sync/conflicts/:id/resolve 200 载荷（memory.resolveConflict 结果 + 同步元数据） */
+export interface SyncConflictResolveResult {
+  conflictId: string;
+  factId: string;
+  resolution: "keep_new" | "keep_old" | "merge";
+  version: number;
+  revisionId: string | null;
+  factUpdatedEventId: string | null;
+  conflictResolvedEventId: string;
+  sync: Record<string, unknown> | null;
+}
+
+/** POST /v1/tasks/:id/reconcile 200 载荷 */
+export interface TaskReconcileResult {
+  task: TaskDetail;
+  reconciliation: { resolution: "completed" | "failed"; event_id: string; sequence: number };
+}
 
 export const api = {
   listSessions(base: string): Promise<SessionSummary[]> {
@@ -435,6 +517,84 @@ export const api = {
   ): Promise<SkillProposal> {
     return request<SkillProposal>(base, `/v1/skills/proposals/${encodeURIComponent(proposalId)}/${decision}`, {
       method: "POST",
+    });
+  },
+
+  // --- 设备与同步（票 M3-T6 / Issue #35；端点由 M3-T1/T2/T3/T4 提供）-------------
+
+  /** GET /v1/devices（本机自注册行在前，按 created_at 排序；投影不含 token 摘要） */
+  listDevices(base: string): Promise<DeviceInfo[]> {
+    return request<{ devices: DeviceInfo[] }>(base, "/v1/devices").then((r) => r.devices);
+  },
+
+  /** POST /v1/pairing/codes（201）：一次性 6 位码 + 过期时间 + 本机指纹 */
+  createPairingCode(base: string): Promise<PairingCodeResponse> {
+    return request<PairingCodeResponse>(base, "/v1/pairing/codes", { method: "POST" });
+  },
+
+  /**
+   * POST /v1/pairing/claim：新设备凭码加入信任网络。
+   * `base` 是**被加入的那个 Runtime**（不是本机控制面）——加入设备向导允许输入地址；
+   * 响应里 token 仅此一次出现，浏览器侧不持久化（桌面壳应存 OS 凭据库）。
+   */
+  claimPairing(base: string, body: PairingClaimRequest): Promise<PairingClaimResponse> {
+    return request<PairingClaimResponse>(base, "/v1/pairing/claim", {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify(body),
+    });
+  },
+
+  /** DELETE /v1/devices/:id：撤销（revoked=1 + 清鉴权能力，保留审计墓碑） */
+  revokeDevice(base: string, deviceId: string): Promise<{ device: DeviceInfo; changed: boolean }> {
+    return request<{ device: DeviceInfo; changed: boolean }>(
+      base,
+      `/v1/devices/${encodeURIComponent(deviceId)}`,
+      { method: "DELETE" },
+    );
+  },
+
+  /** GET /v1/sync/status：本副本 sequence 范围 + 各 peer 游标（无待上传/下载字段） */
+  syncStatus(base: string): Promise<SyncStatus> {
+    return request<SyncStatus>(base, "/v1/sync/status");
+  },
+
+  /** GET /v1/sync/conflicts?status=：跨设备冲突汇总（复用 M1 冲突队列） */
+  syncConflicts(base: string, status?: "open" | "resolved"): Promise<SyncConflictView[]> {
+    const query = status === undefined ? "" : `?status=${status}`;
+    return request<{ conflicts: SyncConflictView[] }>(base, `/v1/sync/conflicts${query}`).then(
+      (r) => r.conflicts,
+    );
+  },
+
+  /** POST /v1/sync/conflicts/:id/resolve：复用 M1 裁决语义（keep_old/keep_new/merge） */
+  resolveSyncConflict(
+    base: string,
+    conflictId: string,
+    body: { resolution: "keep_old" | "keep_new" | "merge"; content?: string },
+  ): Promise<SyncConflictResolveResult> {
+    return request<SyncConflictResolveResult>(
+      base,
+      `/v1/sync/conflicts/${encodeURIComponent(conflictId)}/resolve`,
+      { method: "POST", headers: JSON_HEADERS, body: JSON.stringify(body) },
+    );
+  },
+
+  /** GET /v1/tasks/:id/execution：租约 + 双端独立执行证据（needs_reconcile 的事实依据） */
+  taskExecution(base: string, taskId: string): Promise<TaskExecutionState> {
+    return request<TaskExecutionState>(base, `/v1/tasks/${encodeURIComponent(taskId)}/execution`);
+  },
+
+  /** POST /v1/tasks/:id/reconcile：Owner 显式裁决 needs_reconcile → completed | failed */
+  reconcileTask(
+    base: string,
+    taskId: string,
+    body: { resolution: "completed" | "failed"; note?: string },
+  ): Promise<TaskReconcileResult> {
+    return request<TaskReconcileResult>(base, `/v1/tasks/${encodeURIComponent(taskId)}/reconcile`, {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify(body),
     });
   },
 };
