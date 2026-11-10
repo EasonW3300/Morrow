@@ -42,8 +42,9 @@ import { MemoryProjectionRebuilder } from "./memory/rebuild.ts";
 import { TaskProjectionRebuilder } from "./task-rebuild.ts";
 import { ProviderRegistry, ProviderRegistryError, ENV_PROVIDER_ID, type ProviderResolver, type ResolvedProvider } from "./providers.ts";
 import { SessionManager, type AgentRuntimeExtras, type SessionFrame } from "./sessions.ts";
-import { ChannelRegistry } from "./channels/registry.ts";
+import { ChannelRegistry, type ChannelAdapterRegistration } from "./channels/registry.ts";
 import { channelRoutes } from "./channels/routes.ts";
+import { createChannelOutboundSink } from "./channels/outbox.ts";
 import { ContactService } from "./contacts/service.ts";
 import { contactRoutes } from "./contacts/routes.ts";
 import { createChannelOutboxAdapter } from "./channels/outbox-adapter.ts";
@@ -261,6 +262,12 @@ export interface RuntimeOptions {
   enableEchoChannel?: boolean;
   /** 联系人时钟注入（M4-T6：邀请码过期测试零等待）；缺省系统时间 */
   contactNow?: () => Date;
+  /**
+   * 生产渠道适配器注入（M4-T3 / Issue #40）：飞书/QQ 等适配器与绑定账号。
+   * 注入时助手回复经 Outbox（`outboundSink`）落库，`runtime.outbox` 的投递出口
+   * 自动接到这些适配器（未显式提供 outboxAdapter 时）。
+   */
+  channelAdapters?: ChannelAdapterRegistration[];
   /**
    * Outbox 渠道适配器注入 seam（M4-T2 / Issue #39）：channel 域（M4-T1）启动后经
    * `runtime.outbox.setAdapter` 接线；测试注入计数桩。缺省 null = 未接线，
@@ -796,10 +803,21 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     sessions,
     contacts,
     ...(options.enableEchoChannel === undefined ? {} : { enableEcho: options.enableEchoChannel }),
+    ...(options.channelAdapters === undefined || options.channelAdapters.length === 0
+      ? {}
+      : { outboundSink: createChannelOutboundSink(outbox) }),
     taskExists: (taskId) => tasks.getTask(taskId) !== null,
   });
+  // 生产适配器注册（M4-T3）：适配器只做协议转换；回复经 Outbox 投递（AC-09 协议层闭环）。
+  for (const registration of options.channelAdapters ?? []) {
+    channels.registerAdapter(registration.adapter, {
+      ...(registration.experimental === undefined ? {} : { experimental: registration.experimental }),
+    });
+    channels.registerAccount(registration.account);
+  }
   // Outbox → ChannelAdapter 桥（M4-T7）：渠道外发（通知及后续主动消息）统一经 Outbox。
-  // 宿主注入 outboxAdapter 时以注入为准（T2 契约测试的计数桩）。
+  // 宿主注入 outboxAdapter 时以注入为准（T2 契约测试的计数桩）。桥沿用 M4-T3 的
+  // ChannelOutboxAdapter（保留 reply_to_native_message_id / 附件与 ChannelSendError 分类）。
   if (options.outboxAdapter === undefined) {
     outbox.setAdapter(createChannelOutboxAdapter(channels));
   }

@@ -126,4 +126,28 @@ token），见门禁报告 §6。
 
 **调用错误码**：`POST .../invoke`（能力与 Skill 重用共用）的 HTTP 状态按统一契约表映射（单源 `apps/runtime/src/invocation-errors.ts`）：`unknown_tool`→404、`permission_denied`→403、`invalid_sandbox_contract`/`tool_package_unsupported`/`capability_escalation`→400、`sandbox_unavailable`/`image_pull_failed`→503（附 install-hint）、`tool_timeout`→504、`tool_build_failed`→500、工具自身失败（`tool_error`/`tool_exit_nonzero`/`tool_protocol_error`/`tool_output_too_large`）→502。每次调用先落 `capability.used` 审计后返回（Skill 重用另落 `skill.invoked`）。
 
+## 渠道域（M4）
+
+渠道适配器（`ChannelAdapter`）只做平台协议转换；入站统一归一化为 `InboundMessage` 后经
+账号/本地身份映射/群白名单/@ 判定进入既有会话链路；助手回复先落 **Outbox**（幂等键唯一），
+`dispatchOnce` 经适配器发送，全部外发留 `outbound.*` 审计。管理端点：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | /v1/channels | 适配器清单（账号、状态、capabilities、experimental） |
+| GET | /v1/channels/:id/health | 健康检查（状态、连接、token 到期、最近错误） |
+| GET | /v1/outbox?status=&limit=&offset= | 外发审计列表 |
+| POST | /v1/outbox/:id/retry | 人工重试（needs_review 需 `{"confirmed": true}`） |
+| POST | /v1/outbox/:id/mark-sent | 人工标记已送达 |
+
+**飞书 Bot（M4-T3）**：自建应用配置经 SecretStore（`channel:feishu:app_id|app_secret|
+verification_token|encrypt_key|bot_open_id`）；事件订阅**优先长连接**（ADR-0004 私有网络，
+无需公网回调），签名校验 + Encrypt Key AES 解密，失败事件落
+`channel.inbound_rejected`；回复走 reply API 引用原消息；`tenant_access_token` 缓存并在
+到期前刷新（失效时刷新一次，仍失败则健康降级）；429/权限不足/主动消息受限按
+`explicit` 退避，超时/网络中断归 `delivery_unknown` 不自动重发。`capabilities()` 如实
+声明私聊/群 @ supported、群主动消息 limited、附件 limited、编辑 unsupported。
+**真实飞书平台联调未做**（开放平台资质未注册）——配置项、联调步骤与
+`ChannelTestServer` 复用接口见 [packages/channels/README.md](packages/channels/README.md)。
+
 里程碑与验收标准见 PRD §8/§9。

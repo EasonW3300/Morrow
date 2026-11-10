@@ -23,12 +23,59 @@ export interface ChannelAdapterContext {
   accountId: string;
   /** 平台事件到达时回调；registry 负责 parseInbound 与入站路由 */
   onInbound(raw: unknown): void;
+  /**
+   * 平台事件在适配器层被拒（签名/解密/Verification Token 失败等）——
+   * registry 写 `channel.inbound_rejected` 留痕（reason=event_rejected, error_code）。
+   */
+  onInboundRejected?(event: ChannelInboundRejection): void;
 }
 
-/** 适配器自报健康（GET /v1/channels/:id/health 的核心字段；状态由 registry 补充） */
+/** 适配器层拒绝事件的结构化原因（尚未进入 parseInbound） */
+export interface ChannelInboundRejection {
+  code: string;
+  message: string;
+  /** 诊断用原始帧（不落敏感载荷；由 registry 决定是否写 detail） */
+  raw?: unknown;
+}
+
+/**
+ * 适配器自报健康（GET /v1/channels/:id/health 的核心字段；状态由 registry 补充）。
+ * 生产适配器可给出 token 有效期与最近错误，便于渠道管理 UI 诊断。
+ */
 export interface ChannelAdapterHealth {
   healthy: boolean;
   detail?: string;
+  /** 事件连接状态（长连接/长轮询适配器） */
+  connection?: "connected" | "connecting" | "disconnected" | "degraded";
+  /** 平台 access token 到期时间（RFC 3339；无 token 概念时省略） */
+  token_expires_at?: string | null;
+  /** 最近一次错误（成功路径清空；诊断用，不含密钥） */
+  last_error?: string | null;
+}
+
+/**
+ * 适配器发送失败（统一错误模型）：Outbox 桥据此决定
+ *   explicit → 平台明确拒收（failed，可指数退避重试）
+ *   network / timeout → 请求可能已到达平台（delivery_unknown，不自动重发）
+ */
+export class ChannelSendError extends Error {
+  readonly kind: "explicit" | "network" | "timeout";
+  readonly code?: string;
+  readonly retryable: boolean;
+  readonly retry_after_seconds?: number;
+
+  constructor(
+    kind: "explicit" | "network" | "timeout",
+    message: string,
+    options: { code?: string; retryable?: boolean; retry_after_seconds?: number } = {},
+  ) {
+    super(message);
+    this.name = "ChannelSendError";
+    this.kind = kind;
+    this.code = options.code;
+    this.retryable = options.retryable ?? kind === "explicit";
+    this.retry_after_seconds = options.retry_after_seconds;
+  }
 }
 
 /** 解析失败的结构化错误（parseInbound 的另一半；原因可入 inbound_rejected 留痕） */

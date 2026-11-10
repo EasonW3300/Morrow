@@ -144,6 +144,81 @@ export type { OutboxStoreOptions, OutboxListOptions, OutboxListResult } from "./
 export { OUTBOX_TABLES_SQL, ensureOutboxTables } from "./outbox/migrations.ts";
 export { outboxRoutes } from "./outbox/routes.ts";
 export type { OutboxRoute, OutboxRouteContext } from "./outbox/routes.ts";
+// 渠道域（M4-T1 / Issue #38 + M4-T3 / Issue #40）
+export { ChannelRegistry } from "./channels/registry.ts";
+export type {
+  ChannelAccountRegistration,
+  ChannelAdapterRegistration,
+  ChannelRegistryOptions,
+} from "./channels/registry.ts";
+export { ChannelInboundRouter } from "./channels/inbound.ts";
+export type { InboundRouteOptions, InboundRouteResult, InboundDecision } from "./channels/inbound.ts";
+export { ChannelStore } from "./channels/store.ts";
+export type {
+  ChannelAccountInput,
+  ChannelAccountRecord,
+  ChannelIdentityInput,
+  ChannelIdentityRecord,
+  ChannelMessageRecord,
+  ConversationAllowInput,
+  ConversationRecord,
+} from "./channels/store.ts";
+export { ChannelSendError, isParseError } from "./channels/types.ts";
+export type {
+  ChannelAdapter,
+  ChannelAdapterContext,
+  ChannelAdapterHealth,
+  ChannelInboundRejection,
+  ChannelParseError,
+  ParseInboundResult,
+} from "./channels/types.ts";
+export { EchoChannelAdapter } from "./channels/echo.ts";
+export { CHANNEL_EVENT_TYPES } from "./channels/events.ts";
+export { channelRoutes } from "./channels/routes.ts";
+export { ChannelOutboxAdapter, createChannelOutboundSink, enqueueOutbound } from "./channels/outbox.ts";
+export type { ChannelOutboundSink, ChannelOutboxAdapterOptions, OutboundEnqueueResult } from "./channels/outbox.ts";
+// 渠道协议桩（T4/T5 复用；真实适配器只改 base_url 即可对接）
+export {
+  ChannelTestServer,
+  encryptFeishuPayload,
+  signFeishuEvent,
+} from "./channels/testing/channel-test-server.ts";
+export type {
+  ChannelTestEventFrame,
+  ChannelTestProactiveRecord,
+  ChannelTestReplyRecord,
+  ChannelTestRequestKind,
+  ChannelTestRouteContext,
+  ChannelTestRouteHandler,
+  ChannelTestServerOptions,
+  ChannelTestServerRequest,
+} from "./channels/testing/channel-test-server.ts";
+// 飞书适配器（M4-T3 / Issue #40）
+export {
+  FeishuChannelAdapter,
+  FeishuConfigError,
+  FeishuError,
+  FEISHU_SECRET_FIELDS,
+  FEISHU_SECRET_SERVICE,
+  HttpLongPollEventTransport,
+  classifyFeishuEvent,
+  decryptFeishuPayload,
+  feishuSecretAccount,
+  loadFeishuConfig,
+  parseFeishuInbound,
+  verifyFeishuEvent,
+} from "./channels/adapters/feishu/index.ts";
+export type {
+  FeishuChannelAdapterOptions,
+  FeishuConfig,
+  FeishuErrorCategory,
+  FeishuEventConfig,
+  FeishuEventKind,
+  FeishuEventTransport,
+  FeishuSecretField,
+  FeishuVerifyResult,
+  LoadFeishuConfigOptions,
+} from "./channels/adapters/feishu/index.ts";
 // 通知规则与路由（M4-T7 / Issue #44，FR-NOT-1/2）
 export {
   NotificationService,

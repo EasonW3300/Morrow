@@ -65,6 +65,11 @@ export interface ChannelInboundRouterOptions {
   sessions: SessionManager;
   store: ChannelStore;
   adapterFor(channelId: string): ChannelAdapter | null;
+  /**
+   * 外发出口（M4-T3 起默认由 runtime 接到 Outbox）：存在时助手回复先入 outbox
+   * （先落库再投递、幂等键去重）；缺省仍直接 adapter.send（T1/测试兼容）。
+   */
+  outboundSink?: { enqueue(outbound: OutboundMessage): unknown };
   /** 任务存在性（中间路由关联校验）；缺省不校验 */
   taskExists?: (taskId: string) => boolean;
   /** 联系人接缝（M4-T6）：邀请码绑定/歧义/会话归属/类别解析；缺省退化为 T1 身份映射 */
@@ -78,6 +83,7 @@ export class ChannelInboundRouter {
   readonly #sessions: SessionManager;
   readonly #store: ChannelStore;
   readonly #adapterFor: (channelId: string) => ChannelAdapter | null;
+  readonly #outboundSink: { enqueue(outbound: OutboundMessage): unknown } | null;
   readonly #taskExists: ((taskId: string) => boolean) | null;
   readonly #contacts: ContactBindingResolver | null;
   readonly #now: () => Date;
@@ -88,6 +94,7 @@ export class ChannelInboundRouter {
     this.#sessions = options.sessions;
     this.#store = options.store;
     this.#adapterFor = options.adapterFor;
+    this.#outboundSink = options.outboundSink ?? null;
     this.#taskExists = options.taskExists ?? null;
     this.#contacts = options.contacts ?? null;
     this.#now = options.now ?? (() => new Date());
@@ -476,6 +483,11 @@ export class ChannelInboundRouter {
     );
 
     try {
+      if (this.#outboundSink !== null) {
+        // Outbox 已接线：回复先落库（幂等键唯一），由 dispatchOnce 经适配器投递
+        this.#outboundSink.enqueue(outbound);
+        return;
+      }
       const result = adapter.send(outbound);
       if (result instanceof Promise) {
         result.catch((err: unknown) => {
