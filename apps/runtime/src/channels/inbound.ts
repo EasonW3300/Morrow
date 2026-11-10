@@ -5,6 +5,7 @@ import type {
 } from "@morrow/protocol";
 import type { EventLedger } from "../ledger.ts";
 import type { SessionFrame, SessionManager } from "../sessions.ts";
+import type { ContactBindingResolver } from "../contacts/types.ts";
 import { buildEventEnvelope } from "../envelope.ts";
 import { uuidv7, UUID_RE } from "../uuid-v7.ts";
 import { CHANNEL_EVENT_TYPES } from "./events.ts";
@@ -71,6 +72,8 @@ export interface ChannelInboundRouterOptions {
   outboundSink?: { enqueue(outbound: OutboundMessage): unknown };
   /** 任务存在性（中间路由关联校验）；缺省不校验 */
   taskExists?: (taskId: string) => boolean;
+  /** 联系人接缝（M4-T6）：邀请码绑定/歧义/会话归属/类别解析；缺省退化为 T1 身份映射 */
+  contacts?: ContactBindingResolver;
   now?: () => Date;
 }
 
@@ -82,6 +85,7 @@ export class ChannelInboundRouter {
   readonly #adapterFor: (channelId: string) => ChannelAdapter | null;
   readonly #outboundSink: { enqueue(outbound: OutboundMessage): unknown } | null;
   readonly #taskExists: ((taskId: string) => boolean) | null;
+  readonly #contacts: ContactBindingResolver | null;
   readonly #now: () => Date;
 
   constructor(options: ChannelInboundRouterOptions) {
@@ -92,6 +96,7 @@ export class ChannelInboundRouter {
     this.#adapterFor = options.adapterFor;
     this.#outboundSink = options.outboundSink ?? null;
     this.#taskExists = options.taskExists ?? null;
+    this.#contacts = options.contacts ?? null;
     this.#now = options.now ?? (() => new Date());
   }
 
@@ -129,21 +134,82 @@ export class ChannelInboundRouter {
       });
     }
 
+    // 邀请码绑定（M4-T6）：对方在渠道回复一次性码 → 平台身份绑定为联系人。
+    // 绑定是「本地账本决定身份」的另一条入口，仍然不采信平台自报身份。
+    // Owner 自己的身份不被邀请码覆盖（Owner 永远优先）。
+    let inviteDetail: string | undefined;
+    const existingIdentity = this.#store.findIdentity(inbound.account, inbound.sender.native_id);
+    if (this.#contacts !== null && existingIdentity?.principal !== "owner") {
+      const bind = this.#contacts.bindFromCode({
+        channel: inbound.channel,
+        accountId: inbound.account,
+        nativeSenderId: inbound.sender.native_id,
+        text: inbound.text,
+        displayName: inbound.sender.display_name ?? null,
+      });
+      if (bind.bound && bind.contactId !== undefined) {
+        const principal = `contact:${bind.contactId}` as ChannelPermissionContext["principal"];
+        this.#store.registerIdentity({
+          account_id: inbound.account,
+          native_sender_id: inbound.sender.native_id,
+          principal,
+          display_name: inbound.sender.display_name ?? null,
+          granted_categories: this.#contacts.resolveCategories(principal, bind.contactId, ["query"]),
+        });
+      } else if (bind.reason !== undefined && bind.reason !== "invite_invalid") {
+        inviteDetail = bind.reason;
+      }
+    }
+
     // 身份只来自本地映射：平台自报的 principal/is_owner 不参与判定
     const identity = this.#store.findIdentity(inbound.account, inbound.sender.native_id);
-    if (identity === null) {
-      return this.reject({
-        channel: inbound.channel,
-        reason: "unknown_sender",
-        account: inbound.account,
-        native_message_id: inbound.native_message_id,
-        native_conversation_id: inbound.native_conversation_id,
-        sender_native_id: inbound.sender.native_id,
-      });
+
+    // 联系人解析（Owner 身份优先；同一发送者匹配多个联系人 = 歧义，绝不自动合并）
+    let principal: ChannelPermissionContext["principal"];
+    let contactId: string | null;
+    if (identity !== null && identity.principal === "owner") {
+      principal = "owner";
+      contactId = null;
+    } else {
+      const matches = this.#contacts?.matchContacts(inbound.account, inbound.sender.native_id) ?? [];
+      if (matches.length > 1) {
+        const ambiguityId = this.#contacts!.recordAmbiguity(
+          inbound.account,
+          inbound.sender.native_id,
+          matches,
+        );
+        return this.reject({
+          channel: inbound.channel,
+          reason: "identity_ambiguous",
+          account: inbound.account,
+          native_message_id: inbound.native_message_id,
+          native_conversation_id: inbound.native_conversation_id,
+          sender_native_id: inbound.sender.native_id,
+          detail: ambiguityId,
+        });
+      }
+      if (matches.length === 1) {
+        contactId = matches[0] as string;
+        principal = `contact:${contactId}`;
+      } else if (identity !== null && identity.principal !== "owner") {
+        principal = identity.principal;
+        contactId = identity.principal.slice("contact:".length);
+      } else {
+        return this.reject({
+          channel: inbound.channel,
+          reason: "unknown_sender",
+          account: inbound.account,
+          native_message_id: inbound.native_message_id,
+          native_conversation_id: inbound.native_conversation_id,
+          sender_native_id: inbound.sender.native_id,
+          ...(inviteDetail === undefined ? {} : { detail: inviteDetail }),
+        });
+      }
     }
 
     if (inbound.conversation_kind === "group") {
-      if (!this.#store.isConversationAllowed(inbound.account, inbound.native_conversation_id)) {
+      const mode = this.#store.findAllowMode(inbound.account, inbound.native_conversation_id);
+      if (mode === null) {
         return this.reject({
           channel: inbound.channel,
           reason: "conversation_not_allowed",
@@ -153,7 +219,8 @@ export class ChannelInboundRouter {
           sender_native_id: inbound.sender.native_id,
         });
       }
-      if (!inbound.mention.agent) {
+      // mention_only：未 @ 不插话；proactive_limited：允许白名单群内的有限主动参与
+      if (mode === "mention_only" && !inbound.mention.agent) {
         return this.reject({
           channel: inbound.channel,
           reason: "group_mention_required",
@@ -180,6 +247,13 @@ export class ChannelInboundRouter {
       }
     }
 
+    // 权限类别经 PermissionEngine（联系人 → 类别 → 能力集）；无联系人接缝时回退 T1 快照
+    const fallbackCategories = identity?.granted_categories ?? [];
+    const grantedCategories =
+      this.#contacts === null
+        ? [...fallbackCategories]
+        : this.#contacts.resolveCategories(principal, contactId, [...fallbackCategories]);
+
     const permissionContext: ChannelPermissionContext = {
       channel: inbound.channel,
       account: inbound.account,
@@ -188,11 +262,9 @@ export class ChannelInboundRouter {
         native_conversation_id: inbound.native_conversation_id,
         kind: inbound.conversation_kind,
       },
-      principal: identity.principal,
-      contact_id: identity.principal.startsWith("contact:")
-        ? identity.principal.slice("contact:".length)
-        : null,
-      granted_categories: [...identity.granted_categories],
+      principal,
+      contact_id: contactId,
+      granted_categories: grantedCategories,
     };
 
     const conversation = this.#store.getOrCreateConversation({
@@ -236,9 +308,19 @@ export class ChannelInboundRouter {
 
     const sessionId = this.#sessionFor(conversation, inbound.channel);
 
+    // 联系人会话归属（「读他人会话」判定的本地依据；Owner 不需要）
+    if (contactId !== null && this.#contacts !== null) {
+      this.#contacts.recordContactSession({
+        contactId,
+        sessionId,
+        accountId: inbound.account,
+        nativeConversationId: inbound.native_conversation_id,
+      });
+    }
+
     const received = buildEventEnvelope({
       replicaId: this.#replicaId,
-      actorId: identity.principal,
+      actorId: principal,
       eventType: CHANNEL_EVENT_TYPES.inboundReceived,
       sessionId,
       taskId: options.taskId ?? null,
@@ -257,7 +339,7 @@ export class ChannelInboundRouter {
     });
     this.#ledger.append(received);
 
-    this.#driveSession(inbound, sessionId, identity.principal, conversation, options.taskId);
+    this.#driveSession(inbound, sessionId, principal, conversation, options.taskId);
 
     return {
       decision: "processed",

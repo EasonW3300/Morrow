@@ -8,11 +8,13 @@ import type {
 } from "@morrow/protocol";
 import type { EventLedger } from "../ledger.ts";
 import type { SessionManager } from "../sessions.ts";
+import type { ContactBindingResolver } from "../contacts/types.ts";
+import { CONTACT_EVENT_TYPES } from "../contacts/events.ts";
 import { buildEventEnvelope } from "../envelope.ts";
 import { CHANNEL_EVENT_TYPES } from "./events.ts";
 import { EchoChannelAdapter } from "./echo.ts";
 import { ChannelInboundRouter, type InboundRouteOptions, type InboundRouteResult } from "./inbound.ts";
-import { ChannelStore, type ChannelAccountInput, type ChannelAccountRecord, type ChannelIdentityInput, type ChannelMessageRecord, type ConversationAllowInput, type ConversationRecord } from "./store.ts";
+import { ChannelStore, type ChannelAccountInput, type ChannelAccountRecord, type ChannelIdentityInput, type ChannelMessageRecord, type ConversationAllowInput, type ConversationAllowRow, type ConversationRecord } from "./store.ts";
 import { isParseError, type ChannelAdapter } from "./types.ts";
 
 /**
@@ -41,6 +43,8 @@ export interface ChannelRegistryOptions {
    * 外发出口（M4-T3）：助手回复入 Outbox；缺省 = 直接 adapter.send（T1/测试兼容）。
    */
   outboundSink?: { enqueue(outbound: OutboundMessage): unknown };
+  /** 联系人接缝（M4-T6 / Issue #43）：邀请码绑定、身份歧义、会话归属、类别解析 */
+  contacts?: ContactBindingResolver;
   now?: () => Date;
 }
 
@@ -87,6 +91,7 @@ export class ChannelRegistry {
       adapterFor: (channelId) => this.getAdapter(channelId),
       ...(options.outboundSink === undefined ? {} : { outboundSink: options.outboundSink }),
       ...(options.taskExists === undefined ? {} : { taskExists: options.taskExists }),
+      ...(options.contacts === undefined ? {} : { contacts: options.contacts }),
       now: this.#now,
     });
 
@@ -151,6 +156,40 @@ export class ChannelRegistry {
 
   allowConversation(input: ConversationAllowInput): void {
     this.#store.allowConversation(input, this.#now());
+  }
+
+  /**
+   * GET /v1/channels/:id/allowlist：渠道 ✓ 账号 → 白名单。
+   * 未注册渠道返回 null（404）；已注册但未绑定账号返回空名单（不是错误——可诊断）。
+   */
+  allowlist(channelId: string): { account_id: string | null; entries: ConversationAllowRow[] } | null {
+    if (!this.#adapters.has(channelId)) return null;
+    const account = this.#store.findAccountByChannel(channelId);
+    return {
+      account_id: account?.account_id ?? null,
+      entries: account === null ? [] : this.#store.listAllowlist(account.account_id),
+    };
+  }
+
+  /**
+   * PUT /v1/channels/:id/allowlist：整表替换 + channel.allowlist_updated 审计。
+   * 入参已由路由校验形态（native_conversation_id 非空、mode 枚举）；这里再兜一次。
+   */
+  setAllowlist(
+    channelId: string,
+    entries: Array<{ native_conversation_id: string; mode: ConversationAllowRow["mode"] }>,
+  ): { account_id: string | null; entries: ConversationAllowRow[] } | null {
+    if (!this.#adapters.has(channelId)) return null;
+    const account = this.#store.findAccountByChannel(channelId);
+    if (account === null) return { account_id: null, entries: [] };
+    this.#store.replaceAllowlist(account.account_id, entries, this.#now());
+    const stored = this.#store.listAllowlist(account.account_id);
+    this.#append(CONTACT_EVENT_TYPES.allowlistUpdated, {
+      channel: channelId,
+      account_id: account.account_id,
+      allowlist: stored.map((entry) => ({ native_conversation_id: entry.native_conversation_id, mode: entry.mode })),
+    });
+    return { account_id: account.account_id, entries: stored };
   }
 
   getAdapter(channelId: string): ChannelAdapter | null {

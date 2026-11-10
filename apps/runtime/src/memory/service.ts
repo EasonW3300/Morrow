@@ -268,9 +268,9 @@ export class MemoryService {
     });
   }
 
-  /** FTS5 关键词检索（MemoryStore 透传；命中含来源回链） */
-  search(q: string): MemorySearchHit[] {
-    return this.#store.search(q);
+  /** FTS5 关键词检索（MemoryStore 透传；命中含来源回链）。options 在检索层过滤。 */
+  search(q: string, options: { sensitivity?: SensitivityLevel } = {}): MemorySearchHit[] {
+    return this.#store.search(q, options);
   }
 
   /** 会话最新一条 message.user 账本事件（工具写入的来源回链目标） */
