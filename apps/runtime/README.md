@@ -80,6 +80,9 @@ provider 参数）；凭据库可经 `startRuntime(config, { secretStore })` 注
 | POST | `/v1/providers/:id/default` | 把默认 Provider 切到该 id → 200 `{ default_provider_id }` |
 | POST | `/v1/providers/:id/test` | 连通性测试 → `{ result: "ok" \| "auth_failed" \| "unreachable" \| "error", ... }`（`unreachable` 带 `kind: "timeout" \| "connect_error"` 结构化类别，见下文） |
 | GET | `/v1/devices` | 本副本已知设备记录（只读；M0 最小实现，见下文「Device 记录」）→ `{ devices: [{ replica_id, label, created_at, last_seen_at }] }` |
+| GET | `/v1/sync/status` | 同步状态（M3-T1 / Issue #30）→ `{ replica_id, sequence: { min, max, count }, cursors: [{ peer_replica_id, last_pulled_sequence, last_acked_sequence, updated_at }] }` |
+| GET | `/v1/sync/pull` | 增量导出（逻辑事件，绝不复制 DB 文件）：query `since`（非负整数，缺省 0）、`limit`（1–1000，缺省 100）→ `{ envelopes: [{ source_replica_id, sequence, envelope }], next_seq, has_more }`；按账本 sequence 升序，limit 截断置 `has_more`；非法入参 400 `invalid_query` |
+| POST | `/v1/sync/push` | 增量导入，body `{ peer_replica_id, envelopes[] }` → `{ accepted, duplicates, next_seq }`；`event_id` 幂等（重复计入 duplicates、无副作用）、`integrity_hash` 复算不符 400 `sync_integrity_mismatch`（整批拒绝）、sequence 缺口 409 `sync_gap`（错误体含 `expected`/`actual`，游标不推进） |
 | POST | `/v1/tasks` | 建任务并规划（M1-T4 / Issue #16），body `{ goal }`（非空字符串）→ 201 任务详情（DAG/状态/版本）；规划经 PiAdapter（生产默认 Provider + 规划系统提示词，测试注入 FakePi），规划成功即后台自动调度（见下节）；无 Provider 503 `planner_unavailable`、body 非法 400；坏规划输出不 5xx——任务以 `failed` 状态持久化，响应仍 201 |
 | GET | `/v1/tasks` | 任务列表 → `{ tasks: [{ task_id, goal, status, task_version, created_at, updated_at }] }` |
 | GET | `/v1/tasks/:id` | 任务详情（DAG/状态/版本）→ 200 `{ ...summary, nodes: [{ node_id, key, title, goal?, depends_on, agent_role?, model?, retriable, side_effect, status, attempts, result?, error? }], error? }` / 404 `task_not_found` |
@@ -461,6 +464,42 @@ upsert 种子；`GET /v1/devices` 只读。
 **边界（如实）**：M0 只登记**本副本**一条记录——不做配对、撤销、多设备注册表；那是 M3
 同步里程碑的范围（PRD §5.2 配对协议、AC-04/05）。`actor_id` 的事件级归属已由信封
 （`owner` / `agent:runtime`）承载，本表是设备维度的补充记录。
+
+## 增量同步引擎（M3-T1 / Issue #30，PRD §4.6 FR-DEP-3）
+
+**同步单元**：`SyncEnvelope = { source_replica_id, sequence, envelope }`——事件信封原文 +
+分配该 sequence 的账本副本 + 该副本账本内的写入序号。`source_replica_id` 是 sequence 的
+命名空间；`envelope.replica_id` 仍是事件最初产生的副本（传递同步中两者可不同）。
+**只传逻辑事件，绝不复制活跃 SQLite 文件**。
+
+**接缝 `SyncTransport`**（`src/sync/transport.ts`）：`push(peerId, envelopes) →
+{ accepted, duplicates }`、`pull(peerId, sinceSeq, limit) → { envelopes, nextSeq, hasMore }`。
+内存实现（`InMemorySyncTransport`）服务双副本契约测试；HTTP 实现（`HttpSyncTransport`）
+打对端 `/v1/sync/{push,pull}`，同一契约。引擎出站编排（`pullFromPeer` / `pushToPeer`）
+经 `RuntimeOptions.syncTransport` 注入。
+
+**游标**（`sync_cursors`，与账本同库、迁移幂等）：每对 peer 一行，两个方向独立：
+- `last_pulled_sequence`：从 peer 拉取并导入的最高 **peer 账本** sequence（`since` 缺省值）；
+- `last_acked_sequence`：push 方向已确认的最高 **来源账本** sequence——发送方存自己的本地
+  sequence，接收方存 peer 推送的 sequence（同一序列流的两个视角）。
+游标只前进不后退；缺口/完整性失败不调用 advance。
+
+**导入语义**：整批先做形状 + sequence 连续性/游标衔接校验，再逐条复算 `integrity_hash`；
+两者任一失败整批不落库。通过后逐条经账本 `append`（append-only 通道 + `event_id` 唯一
+约束），已存在的 event_id 计入 `duplicates`。缺口 → `sync_gap`（payload 平铺 expected/actual）。
+批内允许从游标之前开始（重复批幂等），但游标之后的 sequence 必须逐 1 衔接。
+
+**审计事件**（只加演进）：
+
+| event_type | actor_id | payload |
+| --- | --- | --- |
+| `sync.pulled` | `agent:runtime` | `{ peer_replica_id, direction: "inbound", accepted, duplicates, next_seq }` |
+| `sync.pushed` | `agent:runtime` | `{ peer_replica_id, direction: "inbound", accepted, duplicates, next_seq }` |
+| `sync.gap_detected` | `agent:runtime` | `{ peer_replica_id, direction, expected, actual, received }` |
+
+审计事件本身是账本普通事件（可随同步传播），但**只含 `sync.*` 元事件的导入不再生成新审计**——
+否则两台副本会围绕审计事件互相触发。出站 push 不另落 `sync.pushed`（对端接收时落一条），
+避免发送方审计反过来被下一次推送携带。
 
 ## SQLite 访问选型（验收第 5 条，结论记录在案）
 

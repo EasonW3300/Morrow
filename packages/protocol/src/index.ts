@@ -50,6 +50,15 @@ export {
   CAPABILITY_CHANNELS,
   SHELL_COMMAND_CATEGORIES,
 } from "./capability-contracts.ts";
+export type {
+  SyncCursorRecord,
+  SyncEnvelope,
+  SyncGapDetails,
+  SyncPullBatch,
+  SyncPushOutcome,
+  SyncPushRequest,
+  SyncStatus,
+} from "./sync-contracts.ts";
 export {
   canonicalJson,
   computeIntegrityHash,

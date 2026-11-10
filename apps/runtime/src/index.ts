@@ -15,6 +15,28 @@ export type {  IntegrityMismatch,
 export { startRuntime } from "./runtime.ts";
 export { DeviceRegistry } from "./devices.ts";
 export type { DeviceRecord, MarkPairedInput } from "./devices.ts";
+export {
+  SyncEngine,
+  SYNC_EVENT_TYPES,
+  SYNC_PULL_DEFAULT_LIMIT,
+  SYNC_PULL_MAX_LIMIT,
+} from "./sync/engine.ts";
+export type { PullOptions, PushOptions, SyncEngineOptions } from "./sync/engine.ts";
+export { SyncCursorStore } from "./sync/cursors.ts";
+export { ensureSyncTables, SYNC_TABLES_SQL } from "./sync/migrations.ts";
+export { SyncError } from "./sync/errors.ts";
+export type { SyncErrorCode } from "./sync/errors.ts";
+export { InMemorySyncTransport } from "./sync/transport.ts";
+export type {
+  InMemorySyncTransportOptions,
+  SyncPushReceipt,
+  SyncTransport,
+  SyncTransportPullResult,
+} from "./sync/transport.ts";
+export { HttpSyncTransport } from "./sync/http-transport.ts";
+export type { HttpSyncTransportOptions } from "./sync/http-transport.ts";
+export { syncRoutes } from "./sync/routes.ts";
+export type { SyncRoute, SyncRouteContext } from "./sync/routes.ts";
 // 设备配对与身份（M3-T2 / Issue #31，ADR-0008）
 export { DeviceIdentity } from "./pairing/identity.ts";
 export type { DeviceIdentityOptions } from "./pairing/identity.ts";
