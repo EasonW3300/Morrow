@@ -10,9 +10,13 @@ src/          React 前端（Vite）：App / SessionList / ChatView
   api.ts                控制面 fetch 封装（错误统一 { error: { code, message } } → ApiError）
   sse.ts                帧 → Chat 投影的纯归约（durable/易失帧语义，node:test 覆盖）
   runtime-endpoint.ts   控制面地址解析（壳内轮询 sidecar_status；浏览器联调用 ?runtime=）
+  notification-center.ts  通知消费纯逻辑：轮询状态机/去重/ack 退避/权限降级/投影（node:test）
+  notification-system.ts  Tauri 通知桥：权限查询/请求/发送（非 Tauri 环境降级）
+  NotificationCenter.tsx  顶栏铃铛 + 应用内通知中心面板
 src-tauri/    Tauri 壳（Rust）
   src/sidecar.rs        sidecar 生命周期：拉起 Runtime、stdout ready 协议、SIGTERM 退出
   src/main.rs           装配：setup 拉起 sidecar，sidecar_status 命令暴露给前端
+  capabilities/default.json  权限：core:default + notification:default（Issue #47）
 ```
 
 ## sidecar 启动协议
@@ -48,7 +52,7 @@ pnpm --filter @morrow/runtime build   # 先产 dist（sidecar 与打包资源的
 pnpm --filter @morrow/desktop dev     # vite dev（壳内调试用 tauri dev）
 pnpm --filter @morrow/desktop tauri dev    # 完整桌面壳开发模式
 pnpm --filter @morrow/desktop tauri build  # 产出 macOS .app（target/release/bundle/macos/）
-pnpm --filter @morrow/desktop test    # tsc + node:test（sse 归约）+ cargo test（sidecar，含 dist 全链路冒烟）
+pnpm --filter @morrow/desktop test    # tsc + node:test（sse/通知中心等纯逻辑）+ cargo test（sidecar，含 dist 全链路冒烟）
 ```
 
 ### 浏览器联调（无壳）
@@ -166,8 +170,9 @@ node --experimental-sqlite --experimental-strip-types apps/desktop/scripts/chann
 飞书适配器接 ChannelTestServer（token TTL 60s → 清单不断刷新后显示「token 已过期 / 不健康」），
 QQ 适配器接共享服务器上的 QQ 桩（健康态），微信适配器接 StubLocalBridge 且出厂 disabled
 （实验态 + 常驻「实验」徽标）。预置：三个渠道账号、微信/飞书白名单、两个联系人
-（林=query+task_execute、周=query）与一条身份歧义、五条通知规则（含跨天免打扰与停用行）、
-Outbox sent/failed/needs_review 三种真实状态（403 真实失败；发送超时真实转人工核对）。
+（林=query+task_execute、周=query）与一条身份歧义、六条通知规则（含跨天免打扰与停用行）、
+Outbox sent/failed/needs_review 三种真实状态（403 真实失败；发送超时真实转人工核对），
+以及 3 条桌面 pending 通知（completed / failed / 免打扰到点，见「桌面通知中心」）。
 浏览器级全流程（本票交付时已按此走查）：
 
 1. 设置 → 渠道：核对飞书/QQ/微信的类型、状态、health（连接/token 剩余或已过期/最近错误/
@@ -187,6 +192,29 @@ Outbox sent/failed/needs_review 三种真实状态（403 真实失败；发送�
 6. Outbox：needs_review 行显示内容摘要/失败原因/attempts →「我已核对，重发」→ 二次确认
    后状态重置为 pending（不自动重发，等投递器）；「标记已送达」写人工回执；最近 sent 列表
    始终作为对照。
+
+## 桌面通知中心（Issue #47 / PRD §4.8 FR-NOT-2）
+
+M4 的 runtime 控制面早已提供 `GET /v1/notifications/pending`、`POST /v1/notifications/:id/ack`，
+但桌面端此前从不消费（pending 永远停在数据库）。现在桌面壳补齐消费端：
+
+- **轮询**：默认 10s 拉一次 pending（`?notification_poll_ms=2500` 或
+  `VITE_NOTIFICATION_POLL_MS` 可配，`0` 关闭），逐条展示后 `POST /:id/ack`（pending → sent）。
+- **系统通知**：Tauri v2 官方 `tauri-plugin-notification`（Rust 侧 `.plugin(init())` +
+  `capabilities/default.json` 的 `notification:default`；JS 侧 `@tauri-apps/plugin-notification`）。
+  首次启动请求一次权限；被拒后写本地标记（`morrow.notification.permissionDenied`）不再自动
+  弹系统授权框，通知降级为应用内通知中心展示，面板顶部有说明与「重新请求权限」按钮。
+- **去重与重试**：同一 notification id 会话内只弹一次；已 ack 的由服务端 status 兜底。
+  ack 失败指数退避重试（上限 3 次），日志只记 id/事件类型/正文长度，**不打印正文**；
+  通知正文已由服务端按接收者裁剪，端侧不回读记忆/文件补全。
+- **应用内中心**：顶栏铃铛 + 未读数（= pending 条数）；列表含时间/事件类型/任务标题
+  （点击跳 Task 视图）/正文摘要；「全部标记已读」逐条 ack；空态有文案。
+- **免打扰**：由服务端处理（窗口内落 delayed，到点才出现在 pending），端侧不重复判定。
+
+浏览器级走查（无 Tauri，恒为应用内模式）：`channel-fixture` 预置 3 条 pending
+（completed / failed / 免打扰到点），打开后铃铛显示 3 条未读；点开面板可看到列表与权限说明；
+点任务标题跳转对应任务；「全部标记已读」后 `GET /v1/notifications/pending` 归零。
+追加 `&notification_permission=denied` 可复现「权限被拒」文案。
 
 ## 已知边界（M0）
 
