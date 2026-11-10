@@ -6,8 +6,12 @@
  */
 
 /**
- * 任务状态机（决策稿 §6；本票实现除 needs_reconcile 外全部）。
+ * 任务状态机（决策稿 §6、PRD §4.6 FR-DEP-4）。
  * 合法迁移表由 runtime 侧持有；终端态 failed/completed/cancelled 不可再迁移。
+ *
+ * needs_reconcile（M3-T4 / Issue #33）：双端各自独立执行过同一任务（或各自推进过
+ * task_version）时的冻结态——不自动合并、不假装某一边成功；由 Owner 显式裁决为
+ * completed 或 failed 后离开该状态（见 runtime 的 reconcile 端点）。
  */
 export type TaskStatus =
   | "created"
@@ -17,7 +21,8 @@ export type TaskStatus =
   | "waiting_input"
   | "failed"
   | "completed"
-  | "cancelled";
+  | "cancelled"
+  | "needs_reconcile";
 
 /**
  * 节点执行状态（DAG 投影；pending = 依赖未满足，调度器就绪判定见 runtime scheduler）。
@@ -120,4 +125,79 @@ export interface TaskDetail extends TaskSummary {
   nodes: TaskNodeRecord[];
   /** 规划失败/执行失败的人类可读原因（status=failed 时存在） */
   error?: string;
+}
+
+// --- 执行租约（M3-T4 / Issue #33，FR-DEP-4「执行权单点化」）--------------------
+//
+// 租约表 execution_leases 的只读投影。fencing_token 单调递增（首次=1，抢占/转移
+// 后继续 +1）；active 由 runtime 注入时钟判定（holder 非空且 expires_at 未到）。
+// holder_replica_id = null 表示已 release（token 计数保留，下一位持有者 token+1）。
+
+/** 执行租约投影（GET /v1/tasks/:id/execution 的 lease 字段） */
+export interface ExecutionLease {
+  task_id: string;
+  holder_replica_id: string | null;
+  fencing_token: number;
+  expires_at: string;
+  acquired_at: string;
+  heartbeat_at: string;
+  /** 当前是否被有效持有（holder 非空且未过期） */
+  active: boolean;
+}
+
+/** 双端独立执行的一侧证据（用于 needs_reconcile 报告，不自动合并） */
+export interface ReconcileEvidenceSource {
+  replica_id: string;
+  /** 产出证据的事件类型（task.started / task.node_started / task.revised …） */
+  sources: string[];
+  event_count: number;
+  first_sequence: number;
+  last_sequence: number;
+  /** 该副本推进过的 task_version（task.revised 事件 payload） */
+  task_versions: number[];
+}
+
+/** 执行权转移记录（task.execution_transferred 事件的投影） */
+export interface ExecutionTransferRecord {
+  from_replica_id: string;
+  to_replica_id: string;
+  sequence: number;
+  fencing_token?: number;
+}
+
+/**
+ * 双端独立执行证据（needs_reconcile 的判定依据）。replicas 为观察到的执行方全集，
+ * independent_replicas 为排除「经显式执行权转移授权」后的独立执行方；后者 ≥2 即
+ * 判定为双端独立执行（或双端各自推进过 task_version）。
+ */
+export interface ExecutionReconcileEvidence {
+  task_id: string;
+  replicas: string[];
+  independent_replicas: string[];
+  sources: ReconcileEvidenceSource[];
+  transfers: ExecutionTransferRecord[];
+  /** 人类可读判定原因（dual_execution / task_version_diverged） */
+  reasons: string[];
+}
+
+/** GET /v1/tasks/:id/execution 响应 */
+export interface TaskExecutionState {
+  task_id: string;
+  status: TaskStatus;
+  lease: ExecutionLease | null;
+  needs_reconcile: boolean;
+  evidence: ExecutionReconcileEvidence | null;
+}
+
+/** POST /v1/tasks/:id/transfer-execution 请求体 */
+export interface TransferExecutionRequest {
+  target_replica_id: string;
+}
+
+/** POST /v1/tasks/:id/transfer-execution 响应 */
+export interface TransferExecutionResponse {
+  task: TaskSummary;
+  lease: ExecutionLease | null;
+  transfer_event_id: string;
+  sequence: number;
 }

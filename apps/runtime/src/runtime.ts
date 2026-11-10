@@ -44,6 +44,9 @@ import { UUID_RE } from "./uuid-v7.ts";
 import { parsePaging, readJsonBody, sendError, sendJson } from "./http-util.ts";
 import { sendInvocationError } from "./invocation-errors.ts";
 import { LockTable } from "./locks.ts";
+import { LeaseStore } from "./lease/store.ts";
+import { FencingGuard } from "./lease/fencing.ts";
+import { detectDualExecution } from "./lease/reconcile.ts";
 import { WorktreeManager } from "./worktree.ts";
 import { DockerRunner } from "./sandbox/docker-runner.ts";
 import { ToolInvoker, type InvocationResult } from "./sandbox/invoker.ts";
@@ -115,6 +118,8 @@ interface RequestContext {
   skills: SkillService;
   /** 同步引擎（M3-T1 / Issue #30：导出/导入/游标/缺口检测；库形态可直用） */
   sync: SyncEngine;
+  /** 执行租约（M3-T4 / Issue #33：单点执行 + fencing token） */
+  leases: LeaseStore;
 }
 
 type Handler = (
@@ -203,6 +208,17 @@ export interface RuntimeOptions {
    * 拨快，避免真实等待。缺省系统时间。
    */
   pairingNow?: () => Date;
+  /**
+   * 执行租约注入（M3-T4 / Issue #33）：缺省按 dataDir 打开 events.sqlite 同库租约表。
+   * 注入共享实例用于双副本模拟；注入时本 runtime 不负责关闭。
+   */
+  leaseStore?: LeaseStore;
+  /** 租约时钟注入（过期/续租测试零 sleep）；缺省系统时间 */
+  leaseNow?: () => Date;
+  /** 租约 TTL（毫秒，默认 30s） */
+  leaseTtlMs?: number;
+  /** 心跳续租间隔（毫秒，默认 ttl/3） */
+  leaseHeartbeatMs?: number;
 }
 
 export interface RuntimeHandle {
@@ -235,6 +251,8 @@ export interface RuntimeHandle {
   skills: SkillService;
   /** 同步引擎（M3-T1 / Issue #30：exportBatch / receivePush / pullFromPeer / pushToPeer / status） */
   sync: SyncEngine;
+  /** 执行租约（M3-T4 / Issue #33：acquire/renew/release/validate/current，库形态可直用） */
+  leases: LeaseStore;
   /**
    * 优雅停止：停止接收请求 → 中止并释放会话运行时与在跑任务节点 → 记账 runtime.stopped
    * → 关闭任务投影库与账本（WAL checkpoint）。signal 传入收到的 POSIX 信号名，
@@ -279,6 +297,11 @@ const routes: Route[] = [
   { method: "POST", re: /^\/v1\/tasks\/([^/]+)\/nodes\/([^/]+)\/takeover$/, handler: handleTakeoverNode },
   { method: "POST", re: /^\/v1\/tasks\/([^/]+)\/nodes\/([^/]+)\/complete$/, handler: handleCompleteNode },
   { method: "POST", re: /^\/v1\/tasks\/([^/]+)\/nodes\/([^/]+)\/release$/, handler: handleReleaseNode },
+  // M3-T4 执行租约（Issue #33 / FR-DEP-4）：执行权查询/转移 + 双端独立执行的人工裁决
+  { method: "GET", re: /^\/v1\/tasks\/([^/]+)\/execution$/, handler: handleTaskExecution },
+  { method: "POST", re: /^\/v1\/tasks\/([^/]+)\/transfer-execution$/, handler: handleTransferExecution },
+  { method: "POST", re: /^\/v1\/tasks\/([^/]+)\/reconcile$/, handler: handleReconcileTask },
+  { method: "POST", re: /^\/v1\/tasks\/([^/]+)\/reconcile\/detect$/, handler: handleDetectReconcile },
   // M2-T5 Skill 族（GET /v1/capabilities/skills[?match=]、proposals、cases、approve/reject、
   // invoke + T6 别名 /v1/skills*）——必须先于 capabilityRoutes 展开：GET /v1/capabilities/:id
   // 的 `[^/]+` 会吞掉 /v1/capabilities/skills（grants 路由同款先具体后通配）
@@ -302,6 +325,13 @@ const routes: Route[] = [
 
 export async function startRuntime(config: RuntimeConfig, options: RuntimeOptions = {}): Promise<RuntimeHandle> {
   const ledger = EventLedger.open(config.dataDir);
+  // 执行租约（M3-T4 / Issue #33）：与任务投影同库。注入 store 时由宿主共享/关闭。
+  const ownsLeases = options.leaseStore === undefined;
+  const leases = options.leaseStore ?? new LeaseStore({
+    dataDir: config.dataDir,
+    ...(options.leaseNow === undefined ? {} : { now: options.leaseNow }),
+  });
+  const fencingGuard = new FencingGuard(leases);
   // Device 记录（票 #3 的 M0 最小实现 → M3-T2 设备注册表）：启动时从 replica-id
   // 演化出的 config.replicaId 种子本机行；配对/撤销见下 pairing。
   const devices = DeviceRegistry.open(config.dataDir);
@@ -387,6 +417,9 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     runner: sandboxRunnerInstance,
     permissionEngine: options.permissionEngine ?? createRegistryPermissionAdapter({ registry: capabilities, workspaceRoot }),
     workspaceRoot,
+    // 副作用提交前置校验（M3-T4 / Issue #33）：带任务租约上下文的调用在执行前校验
+    // fencing token；直接 Owner 调用无任务上下文，按设计跳过。
+    fencingGuard: (context) => fencingGuard.assertContext(context),
   });
   // 内置工具实现表（票 M2-T1）：注册表只管 manifest 与启停，实现工厂留在接线层。
   // 新 builtin 工具在此追加工厂并加入 capabilities/builtin.ts 的 manifest 全集。
@@ -471,6 +504,8 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     replicaId: config.replicaId,
     capabilities,
     invoker: options.skillInvoker ?? sandbox,
+    // Skill steps 携带任务租约上下文时逐步校验 fencing token（旧 token 在执行前拒绝）
+    fencingGuard: (context) => fencingGuard.assertContext(context),
     ...(options.skillPromotionThreshold === undefined ? {} : { promotionThreshold: options.skillPromotionThreshold }),
   });
   // 会话工具注入改查注册表（票 M2-T1）：enabled 且有内置实现的 typescript 能力才实例化
@@ -563,6 +598,9 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     checkpoints,
     worktrees,
     locks,
+    leases,
+    ...(options.leaseTtlMs === undefined ? {} : { leaseTtlMs: options.leaseTtlMs }),
+    ...(options.leaseHeartbeatMs === undefined ? {} : { leaseHeartbeatMs: options.leaseHeartbeatMs }),
     ...(options.taskConcurrency === undefined ? {} : { concurrency: options.taskConcurrency }),
   });
   // 启动清扫（M2-T4）：崩溃残留的 worktree/分支/孤儿锁；pending_review 节点的冲突
@@ -586,7 +624,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     memorySearch: (query) => memory.search(query).map((hit) => ({ content: hit.content, entry_kind: hit.stage })),
     workspaceRoot,
   });
-  const ctx: RequestContext = { ledger, replicaId: config.replicaId, sessions, providers, devices, pairing, tasks, scheduler, checkpoints, memory, projector, capabilities, sandbox, factory, skills, sync };
+  const ctx: RequestContext = { ledger, replicaId: config.replicaId, sessions, providers, devices, pairing, tasks, scheduler, checkpoints, memory, projector, capabilities, sandbox, factory, skills, sync, leases };
   const server = createServer((req, res) => {
     routeRequest(req, res, ctx);
   });
@@ -604,6 +642,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     syncCursors.close();
     pairing.close();
     devices.close();
+    if (ownsLeases) leases.close();
     ledger.close();
     throw err;
   }
@@ -650,6 +689,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     factory,
     skills,
     sync,
+    leases,
     async close(signal?: string): Promise<void> {
       if (closing) return;
       closing = true;
@@ -682,6 +722,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
       devices.close();
       memoryStore.close();
       syncCursors.close();
+      if (ownsLeases) leases.close();
       ledger.close();
     },
   };
@@ -1335,7 +1376,9 @@ function handleTaskError(res: ServerResponse, err: unknown): void {
               ? 503
               : err.code === "timeout"
                 ? 504
-                : 500;
+                : err.code === "lease_denied" || err.code === "lease_not_held" || err.code === "lease_lost"
+                  ? 409
+                  : 500;
     sendError(res, status, `task_${err.code}`, err.message);
     return;
   }
@@ -1547,4 +1590,117 @@ function handleReleaseNode(_req: IncomingMessage, res: ServerResponse, _url: URL
       handleTaskError(res, err);
     }
   })();
+}
+
+// --- M3-T4 执行租约端点（Issue #33 / FR-DEP-4）----------------------------------
+// GET  /v1/tasks/:id/execution         执行权查询（租约 + 双端独立执行证据）
+// POST /v1/tasks/:id/transfer-execution 当前持有者释放执行权（目标设备随后 acquire）
+// POST /v1/tasks/:id/reconcile           Owner 显式裁决 needs_reconcile → completed/failed
+// POST /v1/tasks/:id/reconcile/detect    同步/重启后按账本重新检测双端独立执行并冻结
+// 语义：不自动合并任何一侧结果；needs_reconcile 的离开只能由 Owner 的选择触发。
+
+interface TransferExecutionBody {
+  target_replica_id?: unknown;
+}
+
+function handleTransferExecution(req: IncomingMessage, res: ServerResponse, _url: URL, ctx: RequestContext, params: string[]): void {
+  void (async () => {
+    const body = await readJsonBody(req, res);
+    if (body === null) return;
+    const { target_replica_id: target } = body as TransferExecutionBody;
+    if (typeof target !== "string" || target.trim().length === 0) {
+      sendError(res, 400, "invalid_body", "target_replica_id must be a non-empty string");
+      return;
+    }
+    try {
+      const result = await ctx.scheduler.transferExecution(params[0], target.trim());
+      sendJson(res, 200, {
+        task: result.task,
+        lease: result.lease,
+        transfer_event_id: result.transferEventId,
+        sequence: result.sequence,
+      });
+    } catch (err) {
+      handleTaskError(res, err);
+    }
+  })();
+}
+
+/** 执行权查询：租约当前值（含 released/expired 的 token 计数）+ 双端执行证据 */
+function handleTaskExecution(_req: IncomingMessage, res: ServerResponse, _url: URL, ctx: RequestContext, params: string[]): void {
+  const detail = ctx.tasks.getTask(params[0]);
+  if (detail === null) {
+    sendError(res, 404, "task_not_found", `task "${params[0]}" not found`);
+    return;
+  }
+  const evidence = detectDualExecution(ctx.ledger, detail.task_id);
+  sendJson(res, 200, {
+    task_id: detail.task_id,
+    status: detail.status,
+    lease: ctx.leases.current(detail.task_id),
+    needs_reconcile: detail.status === "needs_reconcile",
+    evidence,
+  });
+}
+
+interface ReconcileBody {
+  resolution?: unknown;
+  note?: unknown;
+}
+
+/** Owner 显式裁决 needs_reconcile：completed | failed（不自动合并；note 进审计事件） */
+function handleReconcileTask(req: IncomingMessage, res: ServerResponse, _url: URL, ctx: RequestContext, params: string[]): void {
+  void (async () => {
+    const body = await readJsonBody(req, res);
+    if (body === null) return;
+    const { resolution, note } = body as ReconcileBody;
+    if (resolution !== "completed" && resolution !== "failed") {
+      sendError(res, 400, "invalid_body", "resolution must be \"completed\" or \"failed\"");
+      return;
+    }
+    if (note !== undefined && (typeof note !== "string" || note.trim().length === 0)) {
+      sendError(res, 400, "invalid_body", "note must be a non-empty string when present");
+      return;
+    }
+    try {
+      const transitioned = ctx.tasks.resolveNeedsReconcile(params[0], {
+        resolution,
+        ...(typeof note === "string" ? { note } : {}),
+      });
+      sendJson(res, 200, {
+        task: ctx.tasks.getTask(params[0]) ?? transitioned.task,
+        reconciliation: {
+          resolution,
+          event_id: transitioned.eventId,
+          sequence: transitioned.sequence,
+        },
+      });
+    } catch (err) {
+      handleTaskError(res, err);
+    }
+  })();
+}
+
+/** 按账本重新检测（同步导入/重启后的显式触发入口）：有证据才冻结，幂等 */
+function handleDetectReconcile(_req: IncomingMessage, res: ServerResponse, _url: URL, ctx: RequestContext, params: string[]): void {
+  const detail = ctx.tasks.getTask(params[0]);
+  if (detail === null) {
+    sendError(res, 404, "task_not_found", `task "${params[0]}" not found`);
+    return;
+  }
+  const evidence = detectDualExecution(ctx.ledger, detail.task_id);
+  if (evidence === null) {
+    sendJson(res, 200, { detected: false, task: detail, evidence: null });
+    return;
+  }
+  try {
+    const flagged = ctx.tasks.flagNeedsReconcile(detail.task_id, evidence);
+    sendJson(res, 200, {
+      detected: true,
+      task: ctx.tasks.getTask(detail.task_id) ?? flagged.task,
+      evidence,
+    });
+  } catch (err) {
+    handleTaskError(res, err);
+  }
 }

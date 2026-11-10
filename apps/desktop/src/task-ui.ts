@@ -24,6 +24,7 @@ const TASK_STATUS_LABELS: Record<TaskStatus, string> = {
   failed: "失败",
   completed: "已完成",
   cancelled: "已取消",
+  needs_reconcile: "待人工裁决",
 };
 
 const TASK_NODE_STATUS_LABELS: Record<TaskNodeStatus, string> = {
@@ -45,6 +46,7 @@ const TASK_STATUS_TONES: Record<TaskStatus, Tone> = {
   failed: "error",
   completed: "ok",
   cancelled: "idle",
+  needs_reconcile: "warn",
 };
 
 const TASK_NODE_STATUS_TONES: Record<TaskNodeStatus, Tone> = {

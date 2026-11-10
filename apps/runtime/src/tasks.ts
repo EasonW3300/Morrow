@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { Ajv2020 } from "ajv/dist/2020.js";
 import type { AgentRuntime, AgentStopReason } from "@morrow/pi-adapter";
 import type {
+  ExecutionReconcileEvidence,
   NodeResources,
   SideEffectClass,
   TaskDetail,
@@ -35,12 +36,16 @@ import { uuidv7 } from "./uuid-v7.ts";
  * 客户端：task.planning_failed（错误事件）+ task.failed 状态迁移，任务以 failed
  * 状态存在，全程留痕。
  *
- * 状态机（决策稿 §6，本票实现除 needs_reconcile 外全部）：
+ * 状态机（决策稿 §6、PRD §4.6 FR-DEP-4）：
  *   created → planned | failed | cancelled
- *   planned → running | failed | cancelled
- *   running → paused | waiting_input | failed | completed | cancelled
- *   paused | waiting_input → running | failed | cancelled
+ *   planned → running | needs_reconcile | failed | cancelled
+ *   running → paused | waiting_input | needs_reconcile | failed | completed | cancelled
+ *   paused | waiting_input → running | needs_reconcile | failed | cancelled
+ *   needs_reconcile → completed | failed（Owner 显式裁决；不自动合并）
  *   failed | completed | cancelled → （终端态，拒绝一切迁移）
+ * needs_reconcile（M3-T4 / Issue #33）是双端独立执行的冻结态：经 flagNeedsReconcile
+ * 进入（允许从 running/completed/failed 等回卷——租约冲突是事后发现的事实，不能被
+ * "已完成"假象挡住），由 resolveNeedsReconcile 以 owner actor 显式裁决离开。
  * paused→running / waiting_input→running 的恢复事件是 task.resumed（不是再次 started）。
  * 人工介入（M1-T6）：revise 是终端态回卷的正道——failed 任务经 reviseTask 回卷为
  * planned（不走 transition 表，terminal 直接迁移依旧全部拒绝）；running 任务 revise
@@ -74,6 +79,13 @@ export const TASK_EVENT_TYPES = {
   taskNodeTakenOver: "task.node_taken_over",
   taskNodeReleased: "task.node_released",
   taskNodeCompletedByOwner: "task.node_completed_by_owner",
+  // M3-T4 执行租约（Issue #33 / FR-DEP-4）：拒绝执行权、租约丢失、跨设备转移、
+  // 双端独立执行的待人工裁决（needs_reconcile）
+  taskLeaseDenied: "task.lease_denied",
+  taskLeaseLost: "task.lease_lost",
+  taskExecutionTransferred: "task.execution_transferred",
+  taskNeedsReconcile: "task.needs_reconcile",
+  taskReconciled: "task.reconciled",
 } as const;
 
 /**
@@ -85,10 +97,11 @@ export { TASK_CHECKPOINT_EVENT_TYPES } from "./checkpoint.ts";
 /** 合法迁移表（含义见文件头）；测试逐项覆盖 */
 export const TASK_TRANSITIONS: Readonly<Record<TaskStatus, readonly TaskStatus[]>> = {
   created: ["planned", "failed", "cancelled"],
-  planned: ["running", "failed", "cancelled"],
-  running: ["paused", "waiting_input", "failed", "completed", "cancelled"],
-  paused: ["running", "failed", "cancelled"],
-  waiting_input: ["running", "failed", "cancelled"],
+  planned: ["running", "needs_reconcile", "failed", "cancelled"],
+  running: ["paused", "waiting_input", "needs_reconcile", "failed", "completed", "cancelled"],
+  paused: ["running", "needs_reconcile", "failed", "cancelled"],
+  waiting_input: ["running", "needs_reconcile", "failed", "cancelled"],
+  needs_reconcile: ["completed", "failed"],
   failed: [],
   completed: [],
   cancelled: [],
@@ -104,6 +117,7 @@ const STATUS_EVENT_TYPES: Record<TaskStatus, string> = {
   failed: TASK_EVENT_TYPES.taskFailed,
   completed: TASK_EVENT_TYPES.taskCompleted,
   cancelled: TASK_EVENT_TYPES.taskCancelled,
+  needs_reconcile: TASK_EVENT_TYPES.taskNeedsReconcile,
 };
 
 export type TaskErrorCode =
@@ -113,7 +127,10 @@ export type TaskErrorCode =
   | "invalid_plan"
   | "invalid_revision"
   | "immutable_node"
-  | "timeout";
+  | "timeout"
+  | "lease_denied"
+  | "lease_not_held"
+  | "lease_lost";
 
 export class TaskError extends Error {
   readonly code: TaskErrorCode;
@@ -877,6 +894,11 @@ export interface TransitionOptions {
   payload?: Record<string, unknown>;
   /** 失败原因（写入 tasks.error 列并进 task.failed payload.message） */
   error?: string;
+  /**
+   * 迁移事件 actor（缺省 agent:runtime）。Owner 显式裁决（needs_reconcile →
+   * completed/failed）用 "owner"——审计必须区分系统自动迁移与人的决定。
+   */
+  actorId?: "owner" | "agent:runtime";
 }
 
 export interface TransitionResult {
@@ -1057,6 +1079,119 @@ export class TaskService {
     return this.ledger.list({ taskId, ...options });
   }
 
+  // --- 执行租约与 needs_reconcile（M3-T4 / Issue #33，FR-DEP-4）-------------------
+
+  /**
+   * 双端独立执行 → needs_reconcile（不静默合并）。允许从 planned/running/paused/
+   * waiting_input/completed/failed 任一态回卷：冲突是事后经同步发现的事实，"已完成"
+   * 不能挡住待人工裁决。cancelled（Owner 显式取消）与 created（无执行）拒绝。
+   *
+   * 幂等：已处于 needs_reconcile 时不重复写状态，返回最近一条 task.needs_reconcile
+   * 事件的 id/sequence。事件 payload 携带两侧证据（replicas/sources/transfers），
+   * 供 Owner 在 reconcile 界面看到"哪两边的什么推进"。
+   */
+  flagNeedsReconcile(
+    taskId: string,
+    evidence: ExecutionReconcileEvidence,
+    causeEventId: string | null = null,
+  ): TransitionResult {
+    const row = this.#store.getTask(taskId);
+    if (row === null) {
+      throw new TaskError("not_found", `task ${taskId} does not exist`);
+    }
+    const from = row.status as TaskStatus;
+    if (from === "needs_reconcile") {
+      const existing = this.ledger.scan({ taskId, eventType: TASK_EVENT_TYPES.taskNeedsReconcile }).at(-1);
+      return {
+        task: this.#summaryOf(row),
+        eventId: existing?.envelope.event_id ?? "",
+        sequence: existing?.sequence ?? 0,
+      };
+    }
+    if (from === "created" || from === "cancelled") {
+      throw new TaskError(
+        "invalid_transition",
+        `task ${taskId} is ${from}; dual-execution reconcile does not apply`,
+        { from, to: "needs_reconcile" },
+      );
+    }
+    const now = new Date().toISOString();
+    this.#store.updateTaskStatus(taskId, "needs_reconcile", null, now);
+    const event = this.#appendTaskEvent(taskId, TASK_EVENT_TYPES.taskNeedsReconcile, "agent:runtime", {
+      reason: "dual_execution_detected",
+      from_status: from,
+      evidence,
+    }, causeEventId);
+    const updated = this.#store.getTask(taskId) as TaskRow;
+    return { task: this.#summaryOf(updated), eventId: event.eventId, sequence: event.sequence };
+  }
+
+  /**
+   * Owner 显式裁决 needs_reconcile → completed | failed（不自动合并任何一侧结果）。
+   * task.reconciled（actor owner，含 resolution/note）先留审计，随后状态迁移事件同样
+   * 以 owner actor 落账（人类决定与系统迁移可区分）。未处于 needs_reconcile → 409。
+   */
+  resolveNeedsReconcile(
+    taskId: string,
+    input: { resolution: "completed" | "failed"; note?: string },
+  ): TransitionResult {
+    const row = this.#store.getTask(taskId);
+    if (row === null) {
+      throw new TaskError("not_found", `task ${taskId} does not exist`);
+    }
+    if (row.status !== "needs_reconcile") {
+      throw new TaskError(
+        "invalid_transition",
+        `task ${taskId} is ${row.status}, expected needs_reconcile`,
+        { from: row.status, to: input.resolution },
+      );
+    }
+    const reconciled = this.#appendTaskEvent(taskId, TASK_EVENT_TYPES.taskReconciled, "owner", {
+      resolution: input.resolution,
+      ...(input.note === undefined ? {} : { note: input.note }),
+    }, null);
+    return this.#transition(taskId, input.resolution, {
+      causeEventId: reconciled.eventId,
+      actorId: "owner",
+      payload: {
+        reason: "owner_reconcile",
+        resolution: input.resolution,
+        ...(input.note === undefined ? {} : { note: input.note }),
+      },
+      ...(input.resolution === "failed"
+        ? { error: input.note ?? "resolved as failed by owner after needs_reconcile" }
+        : {}),
+    });
+  }
+
+  /**
+   * 执行权转移审计（POST /v1/tasks/:id/transfer-execution）：actor owner，payload 带
+   * from/to replica 与释放时的 fencing token（目标副本 acquire 后拿到 token+1）。
+   */
+  recordExecutionTransferred(
+    taskId: string,
+    payload: {
+      from_replica_id: string;
+      to_replica_id: string;
+      fencing_token: number;
+      next_fencing_token: number;
+      had_inflight_execution: boolean;
+      checkpoint_id?: string;
+    },
+    causeEventId: string | null = null,
+  ): { eventId: string; sequence: number } {
+    if (this.#store.getTask(taskId) === null) {
+      throw new TaskError("not_found", `task ${taskId} does not exist`);
+    }
+    return this.#appendTaskEvent(
+      taskId,
+      TASK_EVENT_TYPES.taskExecutionTransferred,
+      "owner",
+      payload,
+      causeEventId,
+    );
+  }
+
   // --- 人工介入（M1-T6 / FR-TASK-3；全部操作以 owner actor 留审计事件）-----------
 
   /**
@@ -1082,10 +1217,10 @@ export class TaskService {
         { from: status },
       );
     }
-    if (status === "completed" || status === "cancelled") {
+    if (status === "completed" || status === "cancelled" || status === "needs_reconcile") {
       throw new TaskError(
         "invalid_transition",
-        `task ${taskId} is terminal (${status}); revision cannot roll it back`,
+        `task ${taskId} is ${status}; revise is not possible (needs_reconcile is resolved by Owner explicitly)`,
         { from: status },
       );
     }
@@ -1203,10 +1338,10 @@ export class TaskService {
       throw new TaskError("not_found", `task ${taskId} does not exist`);
     }
     const status = row.status as TaskStatus;
-    if (status === "failed" || status === "completed" || status === "cancelled") {
+    if (status === "failed" || status === "completed" || status === "cancelled" || status === "needs_reconcile") {
       throw new TaskError(
         "invalid_transition",
-        `task ${taskId} is terminal (${status}); context cannot be supplied`,
+        `task ${taskId} is ${status}; context cannot be supplied`,
         { from: status },
       );
     }
@@ -1338,10 +1473,15 @@ export class TaskService {
     if (detail === null) {
       throw new TaskError("not_found", `task ${taskId} does not exist`);
     }
-    if (detail.status === "failed" || detail.status === "completed" || detail.status === "cancelled") {
+    if (
+      detail.status === "failed"
+      || detail.status === "completed"
+      || detail.status === "cancelled"
+      || detail.status === "needs_reconcile"
+    ) {
       throw new TaskError(
         "invalid_transition",
-        `task ${taskId} is terminal (${detail.status}); ${op} is not possible`,
+        `task ${taskId} is ${detail.status}; ${op} is not possible`,
         { from: detail.status },
       );
     }
@@ -1433,7 +1573,7 @@ export class TaskService {
     const envelope = this.#appendTaskEvent(
       taskId,
       eventType,
-      "agent:runtime",
+      options.actorId ?? "agent:runtime",
       options.payload ?? {},
       options.causeEventId ?? null,
     );
