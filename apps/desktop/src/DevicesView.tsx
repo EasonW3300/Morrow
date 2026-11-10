@@ -7,6 +7,7 @@ import {
   type PairingJoinResponse,
   type SyncConflictView,
 } from "./api.ts";
+import { useConfirm } from "./design-system/ConfirmDialog.tsx";
 import {
   conflictSourceLabel,
   describeSyncFailure,
@@ -85,6 +86,7 @@ function DeviceListSection({ base }: { base: string }) {
   const [localReplicaId, setLocalReplicaId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
+  const [confirm, confirmDialog] = useConfirm();
 
   const reload = useCallback(async () => {
     try {
@@ -104,7 +106,13 @@ function DeviceListSection({ base }: { base: string }) {
   const revoke = async (record: DeviceInfo) => {
     const name = record.label ?? record.fingerprint_short ?? record.replica_id.slice(0, 8);
     // 二次确认：撤销是终态（该设备令牌立即失效，且不能凭旧码复活）
-    if (!window.confirm(`撤销设备「${name}」？\n撤销后该设备的令牌立即失效，且不能凭旧配对码重新加入。`)) {
+    const ok = await confirm({
+      title: "撤销设备",
+      message: `撤销设备「${name}」？\n撤销后该设备的令牌立即失效，且不能凭旧配对码重新加入。`,
+      confirmLabel: "撤销",
+      tone: "danger",
+    });
+    if (!ok) {
       return;
     }
     setBusyId(record.replica_id);
@@ -176,6 +184,7 @@ function DeviceListSection({ base }: { base: string }) {
       <p className="hint-inline">
         「最后同步」取自设备的 last_sync_at（由 Runtime 同步引擎写入）；从未同步过显示「从未」。
       </p>
+      {confirmDialog}
     </section>
   );
 }

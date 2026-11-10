@@ -10,6 +10,11 @@ src/          React 前端（Vite）：App / SessionList / ChatView
   api.ts                控制面 fetch 封装（错误统一 { error: { code, message } } → ApiError）
   sse.ts                帧 → Chat 投影的纯归约（durable/易失帧语义，node:test 覆盖）
   runtime-endpoint.ts   控制面地址解析（壳内轮询 sidecar_status；浏览器联调用 ?runtime=）
+  design-system/        Liquid Glass 设计系统（见 UI_DESIGN_SYSTEM.md）
+    tokens.css          颜色 / 玻璃 / 圆角 / 间距 / 字体 / 动效 tokens（light + dark）
+    theme.ts            主题持久化与 <html data-theme> 应用
+    primitives/         GlassSurface / Button / Badge
+    ConfirmDialog.tsx   应用内确认框（替代 window.confirm）
   notification-center.ts  通知消费纯逻辑：轮询状态机/去重/ack 退避/权限降级/投影（node:test）
   notification-system.ts  Tauri 通知桥：权限查询/请求/发送（非 Tauri 环境降级）
   NotificationCenter.tsx  顶栏铃铛 + 应用内通知中心面板
@@ -18,6 +23,9 @@ src-tauri/    Tauri 壳（Rust）
   src/main.rs           装配：setup 拉起 sidecar，sidecar_status 命令暴露给前端
   capabilities/default.json  权限：core:default + notification:default（Issue #47）
 ```
+
+UI 材质约定：玻璃只用于顶栏、侧栏、浮动输入区与浮层（弹窗/确认框）；
+消息、任务、设置、表格等正文一律使用标准内容面。深浅色由顶栏右侧按钮切换并持久化。
 
 ## sidecar 启动协议
 

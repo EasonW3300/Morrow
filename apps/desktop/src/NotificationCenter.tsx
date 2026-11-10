@@ -32,6 +32,7 @@ import {
   showSystemNotification,
   writePermissionDeniedFlag,
 } from "./notification-system.ts";
+import { GlassSurface } from "./design-system/primitives/GlassSurface.tsx";
 
 /** 会话级去重集合：组件重挂载（React StrictMode）也不重复弹同一 id 的系统通知 */
 const SESSION_DELIVERED_IDS = new Set<string>();
@@ -217,7 +218,7 @@ export function NotificationCenter({
       </button>
 
       {open && (
-        <section className="notify-panel" aria-label="通知中心">
+        <GlassSurface as="section" variant="elevated" className="notify-panel" aria-label="通知中心">
           <header className="notify-panel-head">
             <strong>通知中心</strong>
             <span className="notify-count">{count > 0 ? `${count} 条未读` : "暂无未读"}</span>
@@ -297,7 +298,7 @@ export function NotificationCenter({
               </footer>
             </>
           )}
-        </section>
+        </GlassSurface>
       )}
     </div>
   );

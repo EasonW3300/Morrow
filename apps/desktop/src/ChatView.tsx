@@ -10,6 +10,9 @@ import {
   type Frame,
 } from "./sse.ts";
 import { taskStatusLabel, taskStatusTone } from "./task-ui.ts";
+import { Badge } from "./design-system/primitives/Badge.tsx";
+import { Button } from "./design-system/primitives/Button.tsx";
+import { GlassSurface } from "./design-system/primitives/GlassSurface.tsx";
 
 /**
  * Chat 视图（票 T6 验收核心）：
@@ -157,7 +160,7 @@ export function ChatView({
               onClick={() => onOpenTask?.(task.task_id)}
               title="在 Task 视图中查看详情"
             >
-              <span className={`badge tone-${taskStatusTone(task.status)}`}>{taskStatusLabel(task.status)}</span>
+              <Badge tone={taskStatusTone(task.status)}>{taskStatusLabel(task.status)}</Badge>
               <span className="task-card-goal">{task.goal}</span>
               <span className="task-card-meta mono">v{task.task_version}</span>
             </button>
@@ -179,7 +182,7 @@ export function ChatView({
         )}
         <div ref={bottomRef} />
       </div>
-      <div className="composer">
+      <GlassSurface className="composer">
         <textarea
           value={draft}
           placeholder="输入消息，Enter 发送，Shift+Enter 换行"
@@ -191,10 +194,14 @@ export function ChatView({
             }
           }}
         />
-        <button onClick={() => void send()} disabled={sending || draft.trim().length === 0}>
+        <Button
+          variant="primary"
+          onClick={() => void send()}
+          disabled={sending || draft.trim().length === 0}
+        >
           发送
-        </button>
-      </div>
+        </Button>
+      </GlassSurface>
     </div>
   );
 }

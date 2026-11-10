@@ -1,0 +1,275 @@
+/*
+ * Liquid Glass design tokens（规范见 UI_DESIGN_SYSTEM.md）
+ * - 唯一的颜色 / 材质 / 圆角 / 间距 / 字体 / 动效来源，组件内不再写死数值。
+ * - 浅色为 :root 默认，深色由 <html data-theme="dark"> 切换。
+ * - 品牌主色 #3478f6；实底按钮/用户气泡用 accent-strong 保证白字对比度。
+ */
+:root {
+  color-scheme: light;
+
+  /* --- 画布与内容面（L0 / L1） --- */
+  --color-canvas: #f4f5f7;
+  --color-canvas-subtle: #eceef2;
+  --color-surface: #ffffff;
+  --color-surface-secondary: #f7f8fa;
+  --color-surface-muted: #eef0f4;
+  --color-text-primary: #17191d;
+  --color-text-secondary: #626873;
+  --color-text-tertiary: #8a909a;
+  --color-border: rgba(20, 25, 35, 0.09);
+  --color-border-strong: rgba(20, 25, 35, 0.16);
+  --color-separator: rgba(20, 25, 35, 0.07);
+
+  /* --- 品牌与状态 --- */
+  --color-accent: #3478f6;
+  --color-accent-strong: #2f6fe0;
+  --color-accent-strong-hover: #2a63cc;
+  --color-accent-soft: rgba(52, 120, 246, 0.12);
+  --color-accent-soft-strong: rgba(52, 120, 246, 0.2);
+  --color-on-accent: #ffffff;
+  --color-success: #239b68;
+  --color-success-strong: #167a52;
+  --color-success-soft: #eaf7f0;
+  --color-success-border: #bfe5d2;
+  --color-warning: #d88b22;
+  --color-warning-strong: #8f5a0a;
+  --color-warning-soft: #fff6e8;
+  --color-warning-border: #f0d3a5;
+  --color-danger: #d94a4a;
+  --color-danger-strong: #b3261e;
+  --color-danger-fill: #b3261e;
+  --color-danger-fill-hover: #971c16;
+  --color-danger-soft: #fdecec;
+  --color-danger-border: #f3c1bd;
+  --color-info: #4c8dd0;
+  --color-info-strong: #2f6fa8;
+  --color-run: #d09a3a;
+  --color-scrim: rgba(15, 20, 30, 0.42);
+  --color-code-bg: #f5f7fa;
+
+  /* --- 玻璃材质（L2 / L3） --- */
+  --glass-blur: 24px;
+  --glass-saturation: 165%;
+  --glass-bg: rgba(255, 255, 255, 0.62);
+  --glass-bg-strong: rgba(255, 255, 255, 0.78);
+  --glass-bg-fallback: rgba(248, 249, 252, 0.96);
+  --glass-border: rgba(255, 255, 255, 0.72);
+  --glass-highlight: rgba(255, 255, 255, 0.82);
+  --glass-inner-highlight: rgba(255, 255, 255, 0.34);
+  --glass-shadow:
+    0 8px 30px rgba(20, 28, 45, 0.08),
+    0 1px 2px rgba(20, 28, 45, 0.05);
+  --glass-shadow-strong:
+    0 16px 44px rgba(20, 28, 45, 0.14),
+    0 1px 2px rgba(20, 28, 45, 0.06);
+
+  /* 背景环境光：极低饱和，仅用于让玻璃有可折射的层次 */
+  --ambient-accent: rgba(52, 120, 246, 0.1);
+  --ambient-accent-soft: rgba(120, 180, 255, 0.1);
+
+  /* --- 阴影 --- */
+  --shadow-card: 0 1px 2px rgba(20, 28, 45, 0.04);
+  --shadow-card-hover:
+    0 2px 6px rgba(20, 28, 45, 0.06),
+    0 8px 24px rgba(20, 28, 45, 0.06);
+  --shadow-popover:
+    0 12px 36px rgba(20, 28, 45, 0.16),
+    0 1px 2px rgba(20, 28, 45, 0.06);
+  --shadow-modal:
+    0 24px 64px rgba(20, 28, 45, 0.24),
+    0 1px 2px rgba(20, 28, 45, 0.08);
+
+  /* --- 圆角 --- */
+  --radius-xs: 6px;
+  --radius-sm: 10px;
+  --radius-md: 14px;
+  --radius-lg: 18px;
+  --radius-xl: 24px;
+  --radius-2xl: 30px;
+  --radius-pill: 999px;
+
+  /* --- 间距（4px 基准） --- */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-10: 40px;
+  --space-12: 48px;
+
+  /* --- 字体 --- */
+  --font-sans:
+    -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", "PingFang SC",
+    "Microsoft YaHei", sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  --font-size-caption: 12px;
+  --font-size-label: 13px;
+  --font-size-body: 14px;
+  --font-size-body-lg: 16px;
+  --font-size-h3: 18px;
+  --font-size-h2: 22px;
+  --font-size-h1: 28px;
+  --font-size-display: 36px;
+  --font-weight-regular: 400;
+  --font-weight-medium: 500;
+  --font-weight-semibold: 600;
+  --line-height-tight: 1.25;
+  --line-height-body: 1.6;
+
+  /* --- 动效 --- */
+  --ease-standard: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --duration-press: 110ms;
+  --duration-hover: 140ms;
+  --duration-overlay: 200ms;
+  --duration-sheet: 240ms;
+  --transition-control:
+    background-color var(--duration-hover) var(--ease-standard),
+    border-color var(--duration-hover) var(--ease-standard),
+    color var(--duration-hover) var(--ease-standard),
+    box-shadow var(--duration-hover) var(--ease-standard),
+    transform var(--duration-press) var(--ease-standard);
+  --transition-popover:
+    opacity var(--duration-overlay) var(--ease-standard),
+    transform var(--duration-overlay) var(--ease-standard);
+
+  /* --- 焦点 --- */
+  --focus-ring-width: 2px;
+  --focus-ring-offset: 2px;
+
+  /* --- 层级 --- */
+  --z-topbar: 10;
+  --z-overlay: 100;
+}
+
+[data-theme="dark"] {
+  color-scheme: dark;
+
+  --color-canvas: #111318;
+  --color-canvas-subtle: #181b22;
+  --color-surface: #1d2129;
+  --color-surface-secondary: #242934;
+  --color-surface-muted: #2a303c;
+  --color-text-primary: #f3f5f8;
+  --color-text-secondary: #b0b7c3;
+  --color-text-tertiary: #858e9d;
+  --color-border: rgba(255, 255, 255, 0.1);
+  --color-border-strong: rgba(255, 255, 255, 0.18);
+  --color-separator: rgba(255, 255, 255, 0.08);
+
+  --color-accent: #75a7ff;
+  --color-accent-strong: #2f6fe0;
+  --color-accent-strong-hover: #2a63cc;
+  --color-accent-soft: rgba(117, 167, 255, 0.16);
+  --color-accent-soft-strong: rgba(117, 167, 255, 0.26);
+  --color-on-accent: #ffffff;
+  --color-success: #4cc995;
+  --color-success-strong: #3fb884;
+  --color-success-soft: rgba(76, 201, 149, 0.14);
+  --color-success-border: rgba(76, 201, 149, 0.36);
+  --color-warning: #f0b65d;
+  --color-warning-strong: #d99a3c;
+  --color-warning-soft: rgba(240, 182, 93, 0.14);
+  --color-warning-border: rgba(240, 182, 93, 0.36);
+  --color-danger: #ff7777;
+  --color-danger-strong: #ff8a8a;
+  --color-danger-fill: #b23a3a;
+  --color-danger-fill-hover: #c44a4a;
+  --color-danger-soft: rgba(255, 119, 119, 0.14);
+  --color-danger-border: rgba(255, 119, 119, 0.36);
+  --color-info: #8ab9ff;
+  --color-info-strong: #8ab9ff;
+  --color-run: #f0b65d;
+  --color-scrim: rgba(4, 6, 10, 0.56);
+  --color-code-bg: #181b22;
+
+  --glass-bg: rgba(30, 34, 43, 0.64);
+  --glass-bg-strong: rgba(30, 34, 43, 0.82);
+  --glass-bg-fallback: rgba(30, 34, 43, 0.97);
+  --glass-border: rgba(255, 255, 255, 0.13);
+  --glass-highlight: rgba(255, 255, 255, 0.18);
+  --glass-inner-highlight: rgba(255, 255, 255, 0.12);
+  --glass-shadow:
+    0 12px 34px rgba(0, 0, 0, 0.28),
+    0 1px 2px rgba(0, 0, 0, 0.18);
+  --glass-shadow-strong:
+    0 20px 52px rgba(0, 0, 0, 0.42),
+    0 1px 2px rgba(0, 0, 0, 0.24);
+
+  --ambient-accent: rgba(52, 120, 246, 0.14);
+  --ambient-accent-soft: rgba(117, 167, 255, 0.07);
+
+  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.2);
+  --shadow-card-hover:
+    0 2px 6px rgba(0, 0, 0, 0.24),
+    0 10px 28px rgba(0, 0, 0, 0.24);
+  --shadow-popover:
+    0 16px 44px rgba(0, 0, 0, 0.46),
+    0 1px 2px rgba(0, 0, 0, 0.3);
+  --shadow-modal:
+    0 28px 72px rgba(0, 0, 0, 0.56),
+    0 1px 2px rgba(0, 0, 0, 0.32);
+}
+
+/* 统一玻璃材质：只在导航、工具条、浮动控件与浮层上使用 */
+.glass-surface {
+  position: relative;
+  isolation: isolate;
+  background: var(--glass-bg);
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation));
+  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation));
+  border: 1px solid var(--glass-border);
+  box-shadow: var(--glass-shadow);
+}
+
+.glass-surface::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  box-shadow: inset 0 1px 0 var(--glass-inner-highlight);
+}
+
+.glass-surface--elevated {
+  background: var(--glass-bg-strong);
+  box-shadow: var(--glass-shadow-strong);
+}
+
+.glass-surface--clear {
+  background: color-mix(in srgb, var(--glass-bg) 70%, transparent);
+}
+
+/* 不支持 backdrop-filter 时回落到高不透明度材质 */
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .glass-surface,
+  .glass-surface--elevated,
+  .glass-surface--clear {
+    background: var(--glass-bg-fallback);
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+}
+
+/* 系统降低透明度 / 提高对比度：放弃模糊，保证可读性 */
+@media (prefers-reduced-transparency: reduce) {
+  .glass-surface,
+  .glass-surface--elevated,
+  .glass-surface--clear {
+    background: var(--glass-bg-fallback);
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+}
+
+@media (prefers-contrast: more) {
+  .glass-surface,
+  .glass-surface--elevated,
+  .glass-surface--clear {
+    background: var(--glass-bg-fallback);
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+    border-color: var(--color-border-strong);
+  }
+}
