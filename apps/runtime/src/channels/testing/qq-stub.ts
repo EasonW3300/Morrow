@@ -48,6 +48,18 @@ export interface QqTestStubOptions {
   botSecret?: string;
   tokenTtlSeconds?: number;
   now?: () => Date;
+  /** 主动消息被平台拒绝（群 304046 / 单聊 304050），也可 setup 后改 stub.rejectProactive */
+  rejectProactive?: boolean;
+  /** 任意 access token 都判失效 */
+  rejectAllTokens?: boolean;
+  /** token 端点失败 */
+  failTokenEndpoint?: boolean;
+  /** 429 注入：剩余拒绝次数 + Retry-After 秒数（内部会克隆，消费不改调用方对象） */
+  rateLimit?: { remaining: number; retryAfterSeconds: number };
+  /** 发送端点响应模式 */
+  mode?: "ok" | "forbidden" | "hang";
+  /** 事件签名模式（默认 valid） */
+  signatureMode?: "valid" | "invalid" | "missing";
 }
 
 export interface QqTestStub {
