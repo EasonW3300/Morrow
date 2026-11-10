@@ -444,3 +444,45 @@ test("regression: handleTrustedEvent 学会话形态，入站后可立即回复�
     await h.dispose();
   }
 });
+
+// 回归（QQ 真实联调发现，2026-11-10）：平台对群主动消息返回
+// `HTTP 400 {"message":"主动消息失败, 无权限","code":40034105}`。该码此前不在
+// QQ_PROACTIVE_REJECT_CODES 内，会被归为可重试平台错误 → Outbox 反复重试而非
+// 立即 needs_review。这里锁住"真实平台码必须在表内且分类为 proactive_rejected"。
+test("regression: 真实平台的主动消息拒绝码 40034105 归为 proactive_rejected（不可重试）", async () => {
+  const h = await setup({ stub: { rejectProactive: true } });
+  try {
+    // 先让适配器学会该群的会话形态（否则会在 proactive 判定之前就以
+    // unknown_conversation 拒发，测不到错误分类）
+    h.adapter.handleTrustedEvent({
+      op: 0,
+      t: "GROUP_AT_MESSAGE_CREATE",
+      d: {
+        id: "qq_pro_in_1",
+        content: " 你好",
+        timestamp: new Date().toISOString(),
+        group_openid: "qq_group_1",
+        author: { id: "u1", member_openid: "u1" },
+      },
+    });
+    await assert.rejects(
+      () =>
+        h.adapter.send({
+          channel: "qq",
+          account: "qq-default",
+          native_conversation_id: "qq_group_1",
+          text: "proactive ping",
+          idempotency_key: "regression:proactive:40034105",
+        }),
+      (err: unknown) => {
+        assert.ok(err instanceof ChannelSendError);
+        // 分类证据：错误码标注 proactive_rejected，且明确不可重试
+        assert.match(String(err.code ?? ""), /proactive/);
+        assert.equal(err.retryable, false);
+        return true;
+      },
+    );
+  } finally {
+    await h.dispose();
+  }
+});
