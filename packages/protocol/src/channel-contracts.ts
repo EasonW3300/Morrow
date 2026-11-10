@@ -166,6 +166,28 @@ export interface ChannelSummary {
   risk_notice?: string;
 }
 
+/**
+ * 渠道凭据字段投影（M4-T8 / Issue #45）：只报告「是否已配置」，绝不回传密文。
+ *
+ * 稳定适配器（飞书/QQ）的凭据写 SecretStore（服务名 `channel:<channel_id>`）；
+ * UI 的配置表单依据本投影渲染「已配置（不回显）」，只提交用户本次填写的新值。
+ */
+export interface ChannelSecretFieldView {
+  /** SecretStore account（= 字段名，如 app_id / app_secret） */
+  field: string;
+  /** 该字段是否已在 SecretStore 中配置（非空） */
+  configured: boolean;
+  /** 是否必填（缺失时适配器无法启动） */
+  required: boolean;
+}
+
+/** GET/PUT /v1/channels/:id/secrets 的响应（渠道凭据投影） */
+export interface ChannelSecretsView {
+  channel_id: string;
+  secret_service: string;
+  fields: ChannelSecretFieldView[];
+}
+
 /** GET /v1/channels/:id/health 的响应（适配器自报健康 + 状态投影） */
 export interface ChannelHealth {
   channel_id: string;
