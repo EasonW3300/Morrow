@@ -8,10 +8,14 @@
  *                              permission_context/session_id/message_id/task_id?）
  *   channel.inbound_rejected   入站被拒（payload 必含 reason；未注册渠道/账号、
  *                              未知发送者、未白名单群、未 @、解析失败、未知 Task 等）
+ *   channel.experimental_enabled 实验适配器经显式风险确认后启用（M4-T5）
+ *                              （payload: channel/account_id/experimental/confirm_risk/
+ *                              risk_notice/environment）
  */
 export const CHANNEL_EVENT_TYPES = {
   adapterStarted: "channel.adapter_started",
   adapterStopped: "channel.adapter_stopped",
   inboundReceived: "channel.inbound_received",
   inboundRejected: "channel.inbound_rejected",
+  experimentalEnabled: "channel.experimental_enabled",
 } as const;

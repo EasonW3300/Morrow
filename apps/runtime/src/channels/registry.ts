@@ -60,6 +60,21 @@ export interface ChannelAdapterRegistration {
   experimental?: boolean;
 }
 
+/** enableChannel 的结果（路由层映射 HTTP 状态；M4-T5） */
+export type EnableChannelResult =
+  | { ok: true; channel_id: string; enabled: true; risk_notice: string | null }
+  | {
+      ok: false;
+      code: "unknown_channel" | "not_experimental" | "risk_confirmation_required";
+      message: string;
+      risk_notice?: string;
+    };
+
+/** disableChannel 的结果（M4-T5） */
+export type DisableChannelResult =
+  | { ok: true; channel_id: string; enabled: false }
+  | { ok: false; code: "unknown_channel"; message: string };
+
 interface AdapterEntry {
   adapter: ChannelAdapter;
   state: ChannelAdapterState;
@@ -213,6 +228,10 @@ export class ChannelRegistry {
         capabilities: entry.adapter.capabilities(),
         enabled: entry.state === "running" && account?.enabled === true,
         experimental: entry.experimental,
+        ...(entry.adapter.environment === undefined
+          ? {}
+          : { environment: entry.adapter.environment }),
+        ...(entry.adapter.riskNotice === undefined ? {} : { risk_notice: entry.adapter.riskNotice }),
       });
     }
     return out;
@@ -229,6 +248,12 @@ export class ChannelRegistry {
       healthy: entry.state === "running" && reported.healthy,
       detail: entry.detail ?? reported.detail ?? null,
       checked_at: this.#now().toISOString(),
+      ...(reported.experimental === undefined || !entry.experimental
+        ? {}
+        : { experimental: true }),
+      ...(reported.environment === undefined ? {} : { environment: reported.environment }),
+      ...(reported.risk_notice === undefined ? {} : { risk_notice: reported.risk_notice }),
+      ...(reported.bridge === undefined ? {} : { bridge: reported.bridge }),
       ...(reported.connection === undefined ? {} : { connection: reported.connection }),
       ...(reported.token_expires_at === undefined ? {} : { token_expires_at: reported.token_expires_at }),
       ...(reported.last_error === undefined ? {} : { last_error: reported.last_error }),
@@ -239,49 +264,136 @@ export class ChannelRegistry {
     return this.getAdapter(channelId)?.capabilities() ?? null;
   }
 
-  /** 启动所有已注册适配器；无启用账号的适配器进入 error 态（清单可见，不静默） */
+  /** 启动所有已注册适配器；无启用账号/出厂 disabled 的适配器不强行启动（清单可见） */
   async start(): Promise<void> {
     for (const [channelId, entry] of this.#adapters) {
       if (entry.state === "running" || entry.state === "starting") continue;
-      const account = this.#store.findAccountByChannel(channelId);
-      if (account === null) {
-        entry.state = "error";
-        entry.detail = "no enabled channel account registered";
+      // 实验适配器（M4-T5）：出厂 disabled，必须经 enableChannel(confirmRisk=true)
+      if (entry.adapter.isEnabled !== undefined && !entry.adapter.isEnabled()) {
+        entry.state = "stopped";
+        entry.detail = "experimental adapter disabled (explicit risk confirmation required)";
         continue;
       }
-      entry.state = "starting";
+      await this.#startEntry(channelId, entry);
+    }
+  }
+
+  /**
+   * 显式启用实验适配器（M4-T5）：不做隐式启用。
+   *   - 非实验适配器/未实现 enable → not_experimental
+   *   - confirm_risk !== true → risk_confirmation_required（API 映射 409）
+   *   - 成功：启用 → 启动适配器 → 落 channel.experimental_enabled 审计
+   */
+  async enableChannel(
+    channelId: string,
+    options: { confirmRisk?: boolean } = {},
+  ): Promise<EnableChannelResult> {
+    const entry = this.#adapters.get(channelId);
+    if (entry === undefined) {
+      return { ok: false, code: "unknown_channel", message: `no channel adapter registered for "${channelId}"` };
+    }
+    if (!entry.experimental || entry.adapter.enable === undefined) {
+      return {
+        ok: false,
+        code: "not_experimental",
+        message: `channel "${channelId}" is not an experimental adapter`,
+      };
+    }
+    const riskNotice = entry.adapter.riskNotice ?? null;
+    if (options.confirmRisk !== true) {
+      return {
+        ok: false,
+        code: "risk_confirmation_required",
+        message: `enabling experimental channel "${channelId}" requires confirm_risk=true`,
+        ...(riskNotice === null ? {} : { risk_notice: riskNotice }),
+      };
+    }
+
+    const wasEnabled = entry.adapter.isEnabled?.() ?? false;
+    await entry.adapter.enable({ confirmRisk: true });
+    if (entry.state !== "running" && entry.state !== "starting") {
+      await this.#startEntry(channelId, entry);
+    }
+    if (!wasEnabled) {
+      this.#append(CHANNEL_EVENT_TYPES.experimentalEnabled, {
+        channel: channelId,
+        account_id: this.accountIdForChannel(channelId),
+        experimental: true,
+        confirm_risk: true,
+        risk_notice: riskNotice,
+        environment: entry.adapter.environment ?? null,
+      });
+    }
+    return { ok: true, channel_id: channelId, enabled: true, risk_notice: riskNotice };
+  }
+
+  /** 禁用实验适配器：立即停止收发（幂等）；未知渠道返回 unknown_channel */
+  async disableChannel(channelId: string): Promise<DisableChannelResult> {
+    const entry = this.#adapters.get(channelId);
+    if (entry === undefined) {
+      return { ok: false, code: "unknown_channel", message: `no channel adapter registered for "${channelId}"` };
+    }
+    const account = this.#store.findAccountByChannel(channelId);
+    await entry.adapter.disable?.();
+    if (entry.state === "running" || entry.state === "starting") {
       try {
-        await entry.adapter.start({
-          accountId: account.account_id,
-          onInbound: (raw) => {
-            this.ingest(channelId, raw);
-          },
-          onInboundRejected: (rejection) => {
-            this.#router.reject({
-              channel: channelId,
-              reason: "event_rejected",
-              error_code: rejection.code,
-              detail: rejection.message,
-            });
-          },
-        });
-        entry.state = "running";
-        entry.detail = null;
-        this.#append(CHANNEL_EVENT_TYPES.adapterStarted, {
-          channel: channelId,
-          account_id: account.account_id,
-          experimental: entry.experimental,
-        });
+        await entry.adapter.stop();
       } catch (err) {
-        entry.state = "error";
         entry.detail = err instanceof Error ? err.message : String(err);
-        this.#append(CHANNEL_EVENT_TYPES.adapterStopped, {
-          channel: channelId,
-          account_id: account.account_id,
-          reason: "start_failed",
-          error: entry.detail,
-        });
       }
+      this.#append(CHANNEL_EVENT_TYPES.adapterStopped, {
+        channel: channelId,
+        account_id: account?.account_id ?? null,
+        reason: "disabled",
+      });
+    }
+    entry.state = "stopped";
+    entry.detail = "adapter disabled by Owner (explicit risk confirmation required to re-enable)";
+    return { ok: true, channel_id: channelId, enabled: false };
+  }
+
+  /** 启动单个适配器条目（start / enable 共用）；失败只影响本渠道 */
+  async #startEntry(channelId: string, entry: AdapterEntry): Promise<void> {
+    const account = this.#store.findAccountByChannel(channelId);
+    if (account === null) {
+      entry.state = "error";
+      entry.detail = "no enabled channel account registered";
+      return;
+    }
+    entry.state = "starting";
+    try {
+      await entry.adapter.start({
+        accountId: account.account_id,
+        onInbound: (raw) => {
+          this.ingest(channelId, raw);
+        },
+        onInboundRejected: (rejection) => {
+          this.#router.reject({
+            channel: channelId,
+            reason: rejection.reason ?? "event_rejected",
+            error_code: rejection.code,
+            detail: rejection.message,
+          });
+        },
+        isConversationAllowed: (nativeConversationId) =>
+          this.#store.isConversationAllowed(account.account_id, nativeConversationId),
+      });
+      entry.state = "running";
+      entry.detail = null;
+      this.#append(CHANNEL_EVENT_TYPES.adapterStarted, {
+        channel: channelId,
+        account_id: account.account_id,
+        experimental: entry.experimental,
+      });
+    } catch (err) {
+      entry.state = "error";
+      entry.detail = err instanceof Error ? err.message : String(err);
+      this.#append(CHANNEL_EVENT_TYPES.adapterStopped, {
+        channel: channelId,
+        account_id: account.account_id,
+        reason: "start_failed",
+        error: entry.detail,
+      });
     }
   }
 

@@ -268,6 +268,29 @@ export type {
   QqTestStubOptions,
   QqTestStubRequestKind,
 } from "./channels/testing/qq-stub.ts";
+// 微信个人号实验适配器（M4-T5 / Issue #42；出厂 disabled，LocalBridge 可注入）
+export {
+  LocalBridgeError,
+  StubLocalBridge,
+  WECHAT_ENVIRONMENT,
+  WECHAT_EXPERIMENTAL,
+  WECHAT_RISK_NOTICE,
+  WeChatChannelAdapter,
+  WeChatExperimentalDisabledError,
+  WeChatRiskConfirmationRequiredError,
+} from "./channels/adapters/wechat/index.ts";
+export type {
+  LocalBridge,
+  LocalBridgeInboundMessage,
+  LocalBridgeLoginState,
+  LocalBridgeProcessState,
+  LocalBridgeSendInput,
+  LocalBridgeSendResult,
+  LocalBridgeStatus,
+  LocalBridgeWindowState,
+  StubLocalBridgeOptions,
+  WeChatChannelAdapterOptions,
+} from "./channels/adapters/wechat/index.ts";
 // 通知规则与路由（M4-T7 / Issue #44，FR-NOT-1/2）
 export {
   NotificationService,

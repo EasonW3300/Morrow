@@ -236,6 +236,142 @@ stub.groupMessages; stub.c2cMessages; stub.rejectedProactive; stub.count("group"
 
 T4 测试文件：`test/channels.qq.test.ts`、`test/channels.qq.e2e.test.ts`。
 
+## 微信个人号实验适配器（M4-T5 / Issue #42）
+
+代码：`apps/runtime/src/channels/adapters/wechat/`。**实验适配器，出厂默认关闭**
+（ADR-0005；GLOSSARY Experimental Adapter）。它不接入微信官方 Bot API，而是依赖
+「Windows + 最新版微信 + 本地自动化桥」，因此不承诺跨 OS 稳定，也不承诺账号安全。
+
+### 环境声明（API 与本文一致）
+
+| 字段 | 值 |
+|---|---|
+| `environment.os` | `Windows` |
+| `environment.client` | 最新版微信 Windows 桌面客户端 |
+| `environment.bridge` | `LocalBridge`（M4 仅 `StubLocalBridge`；真实桥未实现） |
+| `environment.real_integration` | `not_done` |
+
+`GET /v1/channels` 与 `GET /v1/channels/wechat/health` 都返回上述 `environment`，UI 不需要
+读文档即可呈现运行前提。
+
+### 风险声明（`risk_notice`）
+
+> 微信个人号适配器属于实验功能：基于非官方自动化，不稳定、可能随时失效，且可能
+> 违反微信平台服务条款，导致账号被限制或封禁；账号风险自担。出厂默认关闭，启用
+> 必须显式确认风险（confirm_risk=true）。真实微信联调尚未完成，需 Owner 的 Windows 机器。
+
+同一文案出现在：`GET /v1/channels`、`GET /v1/channels/wechat/health` 的 `risk_notice`
+字段，以及未确认风险时 `POST /v1/channels/wechat/enable` 的 409 响应。UI 在 M4-T8 呈现。
+
+### 启用 / 禁用（API 强制风险确认）
+
+```bash
+# 出厂 disabled：清单 state=stopped、enabled=false、experimental=true
+curl -s http://127.0.0.1:<port>/v1/channels
+
+# 未确认风险 → 409 risk_confirmation_required（附 risk_notice）
+curl -s -X POST http://127.0.0.1:<port>/v1/channels/wechat/enable \
+  -H 'content-type: application/json' -d '{}'
+
+# 显式确认风险 → 启用并启动适配器，落 channel.experimental_enabled 审计
+curl -s -X POST http://127.0.0.1:<port>/v1/channels/wechat/enable \
+  -H 'content-type: application/json' -d '{"confirm_risk":true}'
+
+# 立即停止收发（幂等；桥断开、后续消息丢弃）
+curl -s -X POST http://127.0.0.1:<port>/v1/channels/wechat/disable \
+  -H 'content-type: application/json' -d '{}'
+```
+
+启用前必须先把允许的会话写入 `channel_allowlist`（私聊与群聊一致）：
+
+```bash
+curl -s -X PUT http://127.0.0.1:<port>/v1/channels/wechat/allowlist \
+  -H 'content-type: application/json' \
+  -d '{"allowlist":[{"native_conversation_id":"wx-chat-1","mode":"mention_only"}]}'
+```
+
+不在白名单中的会话：入站不会进入会话链路（`channel.inbound_rejected`
+`reason=conversation_not_allowed`），适配器 `send()` 也以
+`ChannelSendError(code=conversation_not_allowed)` 明确拒发。
+
+### LocalBridge 内部接缝
+
+适配器只依赖 `apps/runtime/src/channels/adapters/wechat/local-bridge.ts` 的五个动作：
+
+```ts
+interface LocalBridge {
+  connect(): void | Promise<void>;
+  disconnect(): void | Promise<void>; // 必须幂等
+  status(): LocalBridgeStatus | Promise<LocalBridgeStatus>; // process/login/window/last_error
+  sendMessage(input: LocalBridgeSendInput): LocalBridgeSendResult | Promise<LocalBridgeSendResult>;
+  onMessage(handler: (message: LocalBridgeInboundMessage) => void): () => void; // 返回取消订阅
+}
+```
+
+M4 交付 `StubLocalBridge`（纯内存、零真实微信/网络）：
+`connectCalls/disconnectCalls`、`connected`、`sent`、`emit(message)`、`setStatus(...)`、
+`setSendError(...)`。测试用它注入桥接进程/登录态/窗口句柄/最近错误，并观察出站。
+
+生产接线的形状（M4 只有桩；替换 `bridge` 即接真实桥）：
+
+```ts
+const adapter = new WeChatChannelAdapter({
+  accountId: "wechat-default",
+  bridge: new StubLocalBridge(), // 真实桥实现 LocalBridge 后替换
+});
+await startRuntime(config, {
+  channelAdapters: [{
+    adapter,
+    account: {
+      account_id: "wechat-default",
+      channel_id: "wechat",
+      native_account_id: "wx_owner",
+      owner_native_ids: ["wx_owner"], // Owner 的微信 native id（本地身份映射）
+    },
+  }],
+});
+// 适配器启动后仍为 disabled；随后经 POST /v1/channels/wechat/enable 显式启用。
+```
+
+**真实桥未实现。** 所需环境与方案（外部依赖，需 Owner 提供 Windows 机器）：
+
+1. Windows 10/11 + 当前最新版微信桌面客户端，且保持登录。
+2. 本地自动化桥进程（例如基于 Windows UI Automation / 注入方案的独立进程），负责
+   定位微信窗口句柄、读取新消息、把消息推给 Runtime（本地 IPC 或回环 HTTP）。
+3. 桥必须实现上述 `LocalBridge`：`status()` 如实报告进程存活、微信登录态、窗口句柄
+   可用性；`sendMessage()` 返回平台消息 id 或明确失败；`onMessage()` 推送入站消息。
+4. 桥的启动/重连/窗口检测属于外部工程；在桥就绪前，Runtime 只使用 `StubLocalBridge`，
+   **不得以桩测试冒充真实微信验收。**
+
+### health 与诊断
+
+`GET /v1/channels/wechat/health` 除通用字段外返回：
+
+```json
+{
+  "experimental": true,
+  "environment": { "os": "Windows", "client": "最新版微信 Windows 桌面客户端", "...": "..." },
+  "risk_notice": "……账号风险自担……出厂默认关闭……",
+  "bridge": {
+    "process": "running",
+    "login": "logged_in",
+    "window": "available",
+    "last_error": null
+  }
+}
+```
+
+`process/login/window` 任一不满足（桥进程退出、微信未登录/掉线、窗口句柄不可用）时
+`healthy=false`、`connection=degraded`，`last_error` 与 `bridge.last_error` 给出原因；
+`bridge` 由注入的 `LocalBridge.status()` 提供，桩可逐项注入各状态。
+
+### 测试
+
+`apps/runtime/test/channels.wechat.test.ts` 覆盖：出厂 disabled（start/send 拒绝）、
+未确认风险启用被拒、确认后启用 + 白名单收发（StubLocalBridge）、非白名单不响应、
+health 各状态注入、禁用后停止收发（stop 幂等）、`risk_notice`/`environment` 存在，
+以及 `startRuntime` + API 全链路（409 → 启用 → 白名单 → Outbox 投递到桩 → 禁用）。
+
 ## ChannelTestServer（T4/T5 复用）
 
 代码：`apps/runtime/src/channels/testing/channel-test-server.ts`（runtime 公共出口已导出）。
