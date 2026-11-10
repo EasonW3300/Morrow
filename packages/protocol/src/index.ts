@@ -90,6 +90,17 @@ export type {
   OutboxTarget,
   OutboxTargetKind,
 } from "./outbox-contracts.ts";
+export type {
+  NotificationDeliveryKind,
+  NotificationDeliveryStatus,
+  NotificationEventType,
+  NotificationHistoryPage,
+  NotificationQuietHours,
+  NotificationRecord,
+  NotificationRule,
+  NotificationRuleInput,
+} from "./notification-contracts.ts";
+export { NOTIFICATION_EVENT_TYPE_VALUES } from "./notification-contracts.ts";
 export {
   CAPABILITY_CHANNELS,
   SHELL_COMMAND_CATEGORIES,

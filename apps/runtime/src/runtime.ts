@@ -46,6 +46,9 @@ import { ChannelRegistry } from "./channels/registry.ts";
 import { channelRoutes } from "./channels/routes.ts";
 import { ContactService } from "./contacts/service.ts";
 import { contactRoutes } from "./contacts/routes.ts";
+import { createChannelOutboxAdapter } from "./channels/outbox-adapter.ts";
+import { NotificationService } from "./notifications/service.ts";
+import { notificationRoutes } from "./notifications/routes.ts";
 import { TaskScheduler, type NodeAgentFactory, type TaskNodeExecInput } from "./scheduler.ts";
 import { CheckpointError, CheckpointService } from "./checkpoint.ts";
 import { PLANNER_SYSTEM_PROMPT, TaskError, TaskService, type PlannerFactory } from "./tasks.ts";
@@ -142,6 +145,8 @@ interface RequestContext {
   contacts: ContactService;
   /** 外发副作用发件箱（M4-T2 / Issue #39：先落库再投递 + outbound.* 审计） */
   outbox: OutboxService;
+  /** 通知规则与路由（M4-T7 / Issue #44：账本订阅 → 规则匹配 → 桌面/渠道） */
+  notifications: NotificationService;
 }
 
 type Handler = (
@@ -274,6 +279,15 @@ export interface RuntimeOptions {
   outboxSendTimeoutMs?: number;
   /** Outbox dispatchOnce 并发上限（默认 4） */
   outboxConcurrency?: number;
+  /** 通知时钟注入（免打扰/去重窗口测试零 sleep）；缺省系统时间 */
+  notificationNow?: () => Date;
+  /** 去重窗口（毫秒，默认 600000 = 10 分钟） */
+  notificationDedupeWindowMs?: number;
+  /**
+   * 通知调度间隔（毫秒）：定期放行到点的免打扰延迟行并投递 queued 渠道通知。
+   * 默认 1000；0 = 不启动定时器（测试手动 drain，避免时序不确定）。
+   */
+  notificationDrainIntervalMs?: number;
 }
 
 export interface RuntimeHandle {
@@ -330,6 +344,8 @@ export interface RuntimeHandle {
   contacts: ContactService;
   /** 外发副作用发件箱（M4-T2 / Issue #39：enqueue/dispatchOnce/retry/markSent，库形态可直用） */
   outbox: OutboxService;
+  /** 通知规则与路由（M4-T7 / Issue #44：handleEnvelope/flushDue/dispatchQueued，库形态可直用） */
+  notifications: NotificationService;
   /**
    * 优雅停止：停止接收请求 → 中止并释放会话运行时与在跑任务节点 → 记账 runtime.stopped
    * → 关闭任务投影库与账本（WAL checkpoint）。signal 传入收到的 POSIX 信号名，
@@ -385,6 +401,7 @@ const routes: Route[] = [
   ...skillRoutes,
   ...syncRoutes,
   ...outboxRoutes,
+  ...notificationRoutes,
   ...memoryRoutes,
   ...contactRoutes,
   ...channelRoutes,
@@ -781,6 +798,48 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     ...(options.enableEchoChannel === undefined ? {} : { enableEcho: options.enableEchoChannel }),
     taskExists: (taskId) => tasks.getTask(taskId) !== null,
   });
+  // Outbox → ChannelAdapter 桥（M4-T7）：渠道外发（通知及后续主动消息）统一经 Outbox。
+  // 宿主注入 outboxAdapter 时以注入为准（T2 契约测试的计数桩）。
+  if (options.outboxAdapter === undefined) {
+    outbox.setAdapter(createChannelOutboxAdapter(channels));
+  }
+  // 通知规则与路由（M4-T7 / Issue #44）：订阅账本 task.* 完成类事件 → 规则匹配 →
+  // 桌面落本地 pending 表 / 渠道入 Outbox。订阅是增强路径：监听器异常不阻断账本写入。
+  const notifications = new NotificationService({
+    dataDir: config.dataDir,
+    ledger,
+    replicaId: config.replicaId,
+    outbox,
+    ...(options.notificationNow === undefined ? {} : { now: options.notificationNow }),
+    ...(options.notificationDedupeWindowMs === undefined
+      ? {}
+      : { dedupeWindowMs: options.notificationDedupeWindowMs }),
+    taskLookup: (taskId) => tasks.getTask(taskId),
+    // 渠道正文裁剪的数据源：public 之外（private/locked）一律从正文移除。
+    privateMemoryContents: () =>
+      memory
+        .listFacts()
+        .filter((fact) => fact.sensitivity !== "public")
+        .map((fact) => fact.content),
+    channelAccountId: (channelId) => channels.accountIdForChannel(channelId),
+  });
+  const unsubscribeNotifications = ledger.subscribe((entry) => {
+    try {
+      notifications.handleEnvelope(entry.envelope);
+    } catch (err) {
+      console.error("[morrow] notification routing failed:", err);
+    }
+  });
+  const notificationDrainIntervalMs = options.notificationDrainIntervalMs ?? 1_000;
+  let notificationTimer: NodeJS.Timeout | null = null;
+  if (notificationDrainIntervalMs > 0) {
+    notificationTimer = setInterval(() => {
+      void notifications.drain().catch((err: unknown) => {
+        console.error("[morrow] notification drain failed:", err);
+      });
+    }, notificationDrainIntervalMs);
+    if (typeof notificationTimer.unref === "function") notificationTimer.unref();
+  }
   // Checkpoint 域（M1-T5 / Issue #17）：FR-TASK-5 快照 + 恢复落地；执行配置采集注入
   // runtime 版本、默认 Provider 投影（绝不含密钥）与工具版本表（M1 code-review 填实：
   // pi-adapter 版本可证；逐工具版本无来源——任务执行无工具通道，留空待后续票交付）。
@@ -873,6 +932,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     channels,
     contacts,
     outbox,
+    notifications,
   };
   const server = createServer((req, res) => {
     routeRequest(req, res, ctx);
@@ -885,6 +945,9 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     // 推导（通配地址对别的设备不可达，退化为 127.0.0.1 并只在本机有意义）。
     selfBaseUrl = resolveSelfBaseUrl(config, port);
   } catch (err) {
+    if (notificationTimer !== null) clearInterval(notificationTimer);
+    unsubscribeNotifications();
+    notifications.close();
     skills.close();
     factory.close();
     tasks.close();
@@ -964,9 +1027,15 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     channels,
     contacts,
     outbox,
+    notifications,
     async close(signal?: string): Promise<void> {
       if (closing) return;
       closing = true;
+      if (notificationTimer !== null) {
+        clearInterval(notificationTimer);
+        notificationTimer = null;
+      }
+      unsubscribeNotifications();
       server.closeAllConnections();
       await new Promise<void>((resolve) => server.close(() => resolve()));
       // 会话运行先收尾（中止在跑的轮次并释放 AgentRuntime），再记账、再关库
@@ -1003,6 +1072,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
       syncConflicts.close();
       tombstones.close();
       outbox.close();
+      notifications.close();
       if (ownsLeases) leases.close();
       ledger.close();
     },

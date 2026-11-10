@@ -124,6 +124,8 @@ CREATE INDEX IF NOT EXISTS events_task_idx ON events (task_id, seq);
 export class EventLedger {
   readonly #db: SqliteDatabase;
   #closed = false;
+  /** 进程内 append 订阅者（M4-T7 通知路由；不参与持久化） */
+  readonly #listeners = new Set<(entry: LedgerEntry) => void>();
 
   #insertStmt;
   #countAllStmt;
@@ -185,6 +187,19 @@ export class EventLedger {
   }
 
   /**
+   * 进程内 append 订阅（M4-T7 通知路由的「订阅任务事件」接缝）。
+   * 监听器在事件成功落库后同步收到；抛错被吞掉并记日志——通知是增强路径，
+   * 不允许把账本写入变成依赖监听器的操作。返回退订函数。
+   */
+  subscribe(listener: (entry: LedgerEntry) => void): () => void {
+    this.#assertOpen();
+    this.#listeners.add(listener);
+    return () => {
+      this.#listeners.delete(listener);
+    };
+  }
+
+  /**
    * 追加一个事件。schema 非法 → invalid_envelope；hash 与内容不符 → hash_mismatch；
    * event_id 已存在 → duplicate_event_id（同步层的幂等去重由调用方先查）。
    */
@@ -213,7 +228,18 @@ export class EventLedger {
         envelope.task_id ?? null,
         canonicalJson(envelope),
       );
-      return { sequence: Number(result.lastInsertRowid) };
+      const sequence = Number(result.lastInsertRowid);
+      if (this.#listeners.size > 0) {
+        const entry: LedgerEntry = { sequence, envelope };
+        for (const listener of this.#listeners) {
+          try {
+            listener(entry);
+          } catch (err) {
+            console.error("[morrow] ledger subscriber failed:", err);
+          }
+        }
+      }
+      return { sequence };
     } catch (err) {
       if (err instanceof Error && err.message.includes("UNIQUE constraint failed: events.event_id")) {
         throw new LedgerError("duplicate_event_id", `event_id ${envelope.event_id} already exists`);
