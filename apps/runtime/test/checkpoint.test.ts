@@ -188,7 +188,7 @@ test("checkpoint listing is deterministic for same-millisecond checkpoints (inse
       task_id: "t-1",
       task_version: 1,
       reason: "pause",
-      snapshot: {},
+      snapshot: {} as CheckpointSnapshot,
       created_at: frozen,
     });
     store.insert({
@@ -196,7 +196,7 @@ test("checkpoint listing is deterministic for same-millisecond checkpoints (inse
       task_id: "t-1",
       task_version: 1,
       reason: "pause",
-      snapshot: {},
+      snapshot: {} as CheckpointSnapshot,
       created_at: frozen,
     });
     assert.deepEqual(

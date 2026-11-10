@@ -191,6 +191,8 @@ export class MemoryService {
   /** 投影器（票 M1-T3，可选）：导入修订后单事实刷新、删除后投影文件移除由服务回调，
    *  保证导入/删除与投影目录一致；缺省（单元测试）时跳过文件操作。 */
   readonly #projector: MemoryProjector | null;
+  /** 删除事件观察者（票 M3-T3）：删除 tombstone 落账后通知同步层维护删除集合。 */
+  readonly #onFactDeleted: ((envelope: ReturnType<typeof buildEventEnvelope>) => void) | null;
 
   constructor(deps: {
     store: MemoryStore;
@@ -202,6 +204,8 @@ export class MemoryService {
     consolidator?: MemoryConsolidator;
     /** 投影器注入 seam（票 M1-T3）；缺省 = 不维护投影文件（全量投影经 MemoryProjector 命令） */
     projector?: MemoryProjector;
+    /** 删除事件观察者（票 M3-T3）：runtime 注入 TombstoneStore.recordFactDeletion。 */
+    onFactDeleted?: (envelope: ReturnType<typeof buildEventEnvelope>) => void;
   }) {
     this.#store = deps.store;
     this.#ledger = deps.ledger;
@@ -209,6 +213,7 @@ export class MemoryService {
     this.#extractor = deps.extractor ?? new HeuristicExtractor();
     this.#consolidator = deps.consolidator ?? new DefaultConsolidator();
     this.#projector = deps.projector ?? null;
+    this.#onFactDeleted = deps.onFactDeleted ?? null;
   }
 
   /**
@@ -488,8 +493,25 @@ export class MemoryService {
       causationId: sourceEventIds.at(-1) ?? null,
     });
     this.#ledger.append(tombstone);
+    // 通知同步层：该事实进入删除集合（离线副本的旧修订不得复活）
+    this.#onFactDeleted?.(tombstone);
     this.#projector?.removeFact(factId);
     return { deleted: true, fact_id: deleted.fact_id, version: deleted.version, deleted_at, event_id: tombstone.event_id };
+  }
+
+  /** 现存有效事实（读投影；M3-T3 同步语义与测试的自检面） */
+  listFacts(): ReturnType<MemoryStore["listFacts"]> {
+    return this.#store.listFacts();
+  }
+
+  /** 单事实（含已删标记；同步合并/测试用） */
+  getFact(factId: string): ReturnType<MemoryStore["getFact"]> {
+    return this.#store.getFact(factId);
+  }
+
+  /** 单事实版本历史（三方合并基线查找；同步语义用） */
+  listRevisions(factId: string): ReturnType<MemoryStore["listRevisions"]> {
+    return this.#store.listRevisions(factId);
   }
 
   // --- 抽取/巩固管线（票 M1-T2 / Issue #14）------------------------------------

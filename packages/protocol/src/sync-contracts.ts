@@ -42,6 +42,8 @@ export interface SyncPushOutcome {
   duplicates: number;
   /** 可推进到的来源 sequence；空批为 null */
   next_seq: number | null;
+  /** 命中删除集合（tombstone）而跳过的事件数（M3-T3；无跳过时省略） */
+  skipped?: number;
 }
 
 /** 每对 peer 的同步游标 */

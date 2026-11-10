@@ -33,6 +33,11 @@ import { SyncCursorStore } from "./sync/cursors.ts";
 import { SyncEngine } from "./sync/engine.ts";
 import { syncRoutes } from "./sync/routes.ts";
 import type { SyncTransport } from "./sync/transport.ts";
+import { TombstoneStore } from "./sync/tombstones.ts";
+import { SyncConflictStore } from "./sync/conflict-store.ts";
+import { MemorySyncService } from "./sync/memory-sync.ts";
+import { SyncFileMerger } from "./sync/files.ts";
+import { MemoryProjectionRebuilder } from "./memory/rebuild.ts";
 import { ProviderRegistry, ProviderRegistryError, ENV_PROVIDER_ID, type ProviderResolver, type ResolvedProvider } from "./providers.ts";
 import { SessionManager, type AgentRuntimeExtras, type SessionFrame } from "./sessions.ts";
 import { TaskScheduler, type NodeAgentFactory, type TaskNodeExecInput } from "./scheduler.ts";
@@ -115,6 +120,8 @@ interface RequestContext {
   skills: SkillService;
   /** 同步引擎（M3-T1 / Issue #30：导出/导入/游标/缺口检测；库形态可直用） */
   sync: SyncEngine;
+  /** 跨设备冲突元数据（M3-T3 / Issue #32：GET/POST /v1/sync/conflicts 的来源副本信息） */
+  syncConflicts: SyncConflictStore;
 }
 
 type Handler = (
@@ -235,6 +242,16 @@ export interface RuntimeHandle {
   skills: SkillService;
   /** 同步引擎（M3-T1 / Issue #30：exportBatch / receivePush / pullFromPeer / pushToPeer / status） */
   sync: SyncEngine;
+  /** 删除集合（M3-T3 / Issue #32：fact / event tombstone，导入跳过已删数据） */
+  tombstones: TombstoneStore;
+  /** 跨设备冲突元数据（M3-T3：来源 replica + 三方版本；冲突本体在 M1 队列） */
+  syncConflicts: SyncConflictStore;
+  /** 记忆同步语义层（M3-T3：三方合并 + 投影重建；测试/运维可直用） */
+  syncMemory: MemorySyncService;
+  /** 文件竞争合并（M3-T3：保留 `<name>.conflict-<replica-short>` 双版本） */
+  syncFiles: SyncFileMerger;
+  /** 记忆投影重建器（M3-T3：rebuild / check） */
+  memoryRebuilder: MemoryProjectionRebuilder;
   /**
    * 优雅停止：停止接收请求 → 中止并释放会话运行时与在跑任务节点 → 记账 runtime.stopped
    * → 关闭任务投影库与账本（WAL checkpoint）。signal 传入收到的 POSIX 信号名，
@@ -308,11 +325,17 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
   devices.touch(config.replicaId);
   // 同步引擎（M3-T1 / Issue #30）：游标表与账本同库；出站传输可经 RuntimeOptions 注入
   // （缺省无传输——HTTP 端点只负责对端驱动的事件导出/导入，出站编排由宿主接线）。
+  // M3-T3：删除集合随引擎启动从账本重建；导入批次末尾回调记忆语义层（晚绑定——
+  // MemoryStore/MemorySyncService 在下方构建）。
   const syncCursors = SyncCursorStore.open(config.dataDir);
+  const tombstones = TombstoneStore.open(config.dataDir);
+  let afterSyncImport: ((envelopes: EventEnvelope[], peerReplicaId: string) => void) | undefined;
   const sync = new SyncEngine({
     ledger,
     replicaId: config.replicaId,
     cursors: syncCursors,
+    tombstones,
+    afterImport: (envelopes, peerReplicaId) => afterSyncImport?.(envelopes, peerReplicaId),
     ...(options.syncTransport === undefined ? {} : { transport: options.syncTransport }),
   });
   // 设备身份与配对（M3-T2 / Issue #31）：私钥惰性生成进 OS 凭据库（service
@@ -364,6 +387,8 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     ledger,
     replicaId: config.replicaId,
     projector,
+    // 本机删除 → 删除集合立即生效（离线副本的旧修订在导入时被跳过）
+    onFactDeleted: (envelope) => tombstones.recordFactDeletion(envelope, ledger),
     ...(options.memoryExtractor !== undefined
       ? { extractor: options.memoryExtractor }
       : config.memoryExtractor === "llm"
@@ -375,6 +400,32 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
           }
         : {}),
   });
+  // 记忆同步语义层（M3-T3 / Issue #32）：三方合并 + 冲突入 M1 队列 + 投影重建。
+  // 晚绑定到 sync.afterImport：T1 引擎在每批导入落账后调用。
+  const syncConflicts = SyncConflictStore.open(config.dataDir);
+  const memoryRebuilder = new MemoryProjectionRebuilder({ store: memoryStore, ledger });
+  const syncMemory = new MemorySyncService({
+    store: memoryStore,
+    ledger,
+    replicaId: config.replicaId,
+    conflicts: syncConflicts,
+  });
+  const syncFiles = new SyncFileMerger({ dataDir: config.dataDir, ledger, replicaId: config.replicaId });
+  afterSyncImport = (envelopes, peerReplicaId) => {
+    syncMemory.handleImported(envelopes, peerReplicaId);
+  };
+  // 新副本首次启动（账本已从 peer 导入事实事件、记忆表尚空）→ 重建一次投影。
+  // 取舍：不无条件全量重建（O(账本) 且重置 FTS）；只在明确的「空表 + 有事实事件」下补建。
+  try {
+    const hasFactEvents =
+      ledger.scan({ eventType: "memory.fact_created" }).length > 0 ||
+      ledger.scan({ eventType: "memory.fact_updated" }).length > 0;
+    if (hasFactEvents && memoryStore.listAllFacts().length === 0) {
+      memoryRebuilder.rebuild();
+    }
+  } catch (err) {
+    console.error("[morrow] memory projection rebuild on startup failed:", err);
+  }
   // 沙箱执行 Worker（M2-T2 / Issue #23）：ToolInvoker 统一接缝（先于会话构建——Skill
   // 服务的缺省 invoker 复用同一实例）。runner 缺省 DockerRunner（每次执行前探测容器运行时；
   // 无运行时 → sandboxed 调用拒绝 sandbox_unavailable + install-hint）。权限引擎缺省 =
@@ -586,7 +637,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     memorySearch: (query) => memory.search(query).map((hit) => ({ content: hit.content, entry_kind: hit.stage })),
     workspaceRoot,
   });
-  const ctx: RequestContext = { ledger, replicaId: config.replicaId, sessions, providers, devices, pairing, tasks, scheduler, checkpoints, memory, projector, capabilities, sandbox, factory, skills, sync };
+  const ctx: RequestContext = { ledger, replicaId: config.replicaId, sessions, providers, devices, pairing, tasks, scheduler, checkpoints, memory, projector, capabilities, sandbox, factory, skills, sync, syncConflicts };
   const server = createServer((req, res) => {
     routeRequest(req, res, ctx);
   });
@@ -602,6 +653,8 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     capabilities.close();
     memoryStore.close();
     syncCursors.close();
+    syncConflicts.close();
+    tombstones.close();
     pairing.close();
     devices.close();
     ledger.close();
@@ -650,6 +703,11 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     factory,
     skills,
     sync,
+    tombstones,
+    syncConflicts,
+    syncMemory,
+    syncFiles,
+    memoryRebuilder,
     async close(signal?: string): Promise<void> {
       if (closing) return;
       closing = true;
@@ -682,6 +740,8 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
       devices.close();
       memoryStore.close();
       syncCursors.close();
+      syncConflicts.close();
+      tombstones.close();
       ledger.close();
     },
   };

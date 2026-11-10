@@ -82,7 +82,9 @@ provider 参数）；凭据库可经 `startRuntime(config, { secretStore })` 注
 | GET | `/v1/devices` | 本副本已知设备记录（只读；M0 最小实现，见下文「Device 记录」）→ `{ devices: [{ replica_id, label, created_at, last_seen_at }] }` |
 | GET | `/v1/sync/status` | 同步状态（M3-T1 / Issue #30）→ `{ replica_id, sequence: { min, max, count }, cursors: [{ peer_replica_id, last_pulled_sequence, last_acked_sequence, updated_at }] }` |
 | GET | `/v1/sync/pull` | 增量导出（逻辑事件，绝不复制 DB 文件）：query `since`（非负整数，缺省 0）、`limit`（1–1000，缺省 100）→ `{ envelopes: [{ source_replica_id, sequence, envelope }], next_seq, has_more }`；按账本 sequence 升序，limit 截断置 `has_more`；非法入参 400 `invalid_query` |
-| POST | `/v1/sync/push` | 增量导入，body `{ peer_replica_id, envelopes[] }` → `{ accepted, duplicates, next_seq }`；`event_id` 幂等（重复计入 duplicates、无副作用）、`integrity_hash` 复算不符 400 `sync_integrity_mismatch`（整批拒绝）、sequence 缺口 409 `sync_gap`（错误体含 `expected`/`actual`，游标不推进） |
+| POST | `/v1/sync/push` | 增量导入，body `{ peer_replica_id, envelopes[] }` → `{ accepted, duplicates, next_seq, skipped? }`；`event_id` 幂等（重复计入 duplicates、无副作用）、`integrity_hash` 复算不符 400 `sync_integrity_mismatch`（整批拒绝）、sequence 缺口 409 `sync_gap`（错误体含 `expected`/`actual`，游标不推进）；`skipped` = 命中删除集合（tombstone）未导入的事件数（M3-T3） |
+| GET | `/v1/sync/conflicts` | 跨设备冲突汇总（M3-T3 / Issue #32）：`status` 可选（`open` 待确认 / `resolved`）+ 分页 → `{ conflicts: [{ ...M1 冲突字段, origin: "sync" \| "local", local_replica_id, remote_replica_id, local_version, remote_version, base_version, remote_event_id, sync_resolved_at }] }`；与 `/v1/memory/conflicts` 是**同一队列**，只补来源副本与三方版本 |
+| POST | `/v1/sync/conflicts/:id/resolve` | 复用 M1 裁决语义（同一实现、同一 `memory_conflicts` 行）：body `{ resolution: "keep_new" \| "keep_old" \| "merge", content? }` → 200 `{ ...M1 resolve 响应, sync: { 来源副本/版本/已裁决时间 } }`；错误映射与 `/v1/memory/conflicts/:id/resolve` 一致 |
 | POST | `/v1/tasks` | 建任务并规划（M1-T4 / Issue #16），body `{ goal }`（非空字符串）→ 201 任务详情（DAG/状态/版本）；规划经 PiAdapter（生产默认 Provider + 规划系统提示词，测试注入 FakePi），规划成功即后台自动调度（见下节）；无 Provider 503 `planner_unavailable`、body 非法 400；坏规划输出不 5xx——任务以 `failed` 状态持久化，响应仍 201 |
 | GET | `/v1/tasks` | 任务列表 → `{ tasks: [{ task_id, goal, status, task_version, created_at, updated_at }] }` |
 | GET | `/v1/tasks/:id` | 任务详情（DAG/状态/版本）→ 200 `{ ...summary, nodes: [{ node_id, key, title, goal?, depends_on, agent_role?, model?, retriable, side_effect, status, attempts, result?, error? }], error? }` / 404 `task_not_found` |
@@ -496,10 +498,51 @@ upsert 种子；`GET /v1/devices` 只读。
 | `sync.pulled` | `agent:runtime` | `{ peer_replica_id, direction: "inbound", accepted, duplicates, next_seq }` |
 | `sync.pushed` | `agent:runtime` | `{ peer_replica_id, direction: "inbound", accepted, duplicates, next_seq }` |
 | `sync.gap_detected` | `agent:runtime` | `{ peer_replica_id, direction, expected, actual, received }` |
+| `sync.tombstone_skipped` | `agent:runtime` | `{ peer_replica_id, direction, event_id, event_type, reason: "deleted_event" \| "deleted_fact", fact_id? }`（M3-T3） |
+| `sync.merged` | `agent:runtime` | `{ fact_id, reason: "preference_update" \| "fast_forward", local_version, remote_version, base_version, result_version, local_replica_id, remote_replica_id, remote_event_id }`（M3-T3） |
+| `sync.conflict` | `agent:runtime` | `{ conflict_id, fact_id, reason, local_replica_id, remote_replica_id, local_version, remote_version, base_version, remote_event_id, remote_event_ids }`（M3-T3；`remote_event_ids` 是重放时跳过的未采纳远端修订） |
+| `sync.file_conflict` | `agent:runtime` | `{ relative_path, conflict_path, source_replica_id, replica_short, existing_sha256, incoming_sha256, existing_bytes, incoming_bytes }`（M3-T3） |
 
 审计事件本身是账本普通事件（可随同步传播），但**只含 `sync.*` 元事件的导入不再生成新审计**——
 否则两台副本会围绕审计事件互相触发。出站 push 不另落 `sync.pushed`（对端接收时落一条），
 避免发送方审计反过来被下一次推送携带。
+
+## 记忆 / 删除 / 冲突同步语义（M3-T3 / Issue #32，PRD §4.2 FR-DEP-5、§4.1 FR-MEM-8）
+
+**记忆是事件投影**：`facts / revisions / 来源关系 / 事实 FTS` 全部可由 `memory.*` 事件
+按账本 sequence 重放。`src/memory/rebuild.ts` 的 `rebuildMemoryProjection()` 一次事务
+整体替换投影（`MemoryStore.replaceMemoryProjection`）；`checkMemoryProjectionConsistency()`
+做只读对账。运行时在**每个含记忆事件的同步导入批次末尾**重建（不是每次启动都全量重放——
+O(账本) 且会重置 FTS；新副本首次启动若「账本有事实事件但事实表为空」会补建一次）。
+重放以删除为终态：同一 fact 的 `memory.fact_deleted` 之后不再应用任何事实事件。
+
+**删除集合（tombstone）**：`sync_tombstones`（与账本同库）两层——
+`kind=fact` 记录 `memory.fact_deleted` 的 fact_id 与删除时版本；`kind=event` 记录该事实的
+`fact_created/fact_updated/fact_deleted` 事件 id。导入路径（`SyncEngine`，含 push 与 pull）
+逐条检查：命中即**不落账本**、落 `sync.tombstone_skipped` 审计、游标照常推进。本机删除
+经 `MemoryService.onFactDeleted` 立即写入集合；引擎启动时从账本
+（`TombstoneStore.reconcileFromLedger`）重建。效果：A 删除、B 离线期间产生旧修订 →
+重连后 A 拒绝导入；反向 B 删除、A 携旧修订重连同理。已删事实不会被重放复活。
+
+**事实三方合并**：`src/sync/merge.ts` 的 `classifyFactMerge({ base, local, remote })`
+先排除非并发情形（内容相同 / 远端等于基线 / 本地等于基线且远端更新），并发修改时
+**直接调用 M1 `DefaultConsolidator`**（远端=候选、本地=既有事实）：
+- `locked`（本地或基线锁定）→ 永不自动合并，进待审核；
+- 敏感等级不同 → `sensitivity_change` 进待审核；
+- 同主题 `preference` → 自动合并；胜者按「版本 > 更新时间 > 内容字典序」确定性选取，
+  结果版本 = `max(local, remote) + 1`，两端独立计算得到同一文本与版本；
+- 其余 → `fact_conflict` 进待审核。
+自动合并落 `memory.fact_updated`（`reason=sync_merge`，显式版本）+ `sync.merged`；
+待审核把远端修订写成候选并调用 M1 `escalateConflict` 进 `memory_conflicts`，再落
+`sync.conflict`（含 `remote_event_ids`）。重放时跳过 `sync.conflict` 标记的远端事件，
+所以待审核期间记忆视图仍是本地值；裁决走 M1 resolve 端点（`/v1/sync/conflicts/:id/resolve`
+是同一实现的同步视图包装）。
+
+**文件竞争**：`src/sync/files.ts` 的 `SyncFileMerger.receive(relativePath, content,
+{ sourceReplicaId })`——目标文件已存在且字节不同 → 本地文件原地保留，来件写
+`<name>.conflict-<replica-short>`（同名冲突文件存在则追加 `-2`），落 `sync.file_conflict`。
+不删除任何一份，也不尝试二进制合并（FR-DEP-5「不承诺任意二进制自动合并」）。
+调用入口留给附件/投影文件传输入口；记忆投影目录可直接传 `memory/<fact_id>.md`。
 
 ## SQLite 访问选型（验收第 5 条，结论记录在案）
 
