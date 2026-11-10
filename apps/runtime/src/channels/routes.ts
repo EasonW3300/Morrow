@@ -45,6 +45,9 @@ export const channelRoutes: ChannelRoute[] = [
   { method: "PUT", re: /^\/v1\/channels\/([^/]+)\/allowlist$/, handler: handlePutAllowlist },
   { method: "POST", re: /^\/v1\/channels\/([^/]+)\/enable$/, handler: handleEnableChannel },
   { method: "POST", re: /^\/v1\/channels\/([^/]+)\/disable$/, handler: handleDisableChannel },
+  // 渠道凭据配置（M4-T8 / Issue #45）：只回 configured 投影，绝不回显密文
+  { method: "GET", re: /^\/v1\/channels\/([^/]+)\/secrets$/, handler: handleGetSecrets },
+  { method: "PUT", re: /^\/v1\/channels\/([^/]+)\/secrets$/, handler: handlePutSecrets },
 ];
 
 function handleListChannels(
@@ -71,6 +74,62 @@ async function handleChannelHealth(
     return;
   }
   sendJson(res, 200, health);
+}
+
+/** GET /v1/channels/:id/secrets：凭据字段投影（configured 布尔，不含密文） */
+async function handleGetSecrets(
+  _req: IncomingMessage,
+  res: ServerResponse,
+  _url: URL,
+  ctx: ChannelRouteContext,
+  params: string[],
+): Promise<void> {
+  const channelId = params[0] as string;
+  if (ctx.channels.getAdapter(channelId) === null) {
+    sendError(res, 404, "unknown_channel", `no channel adapter registered for "${channelId}"`);
+    return;
+  }
+  if (!ctx.channels.supportsSecrets(channelId)) {
+    sendError(res, 400, "channel_not_configurable", `channel "${channelId}" has no SecretStore-backed credentials`);
+    return;
+  }
+  const view = await ctx.channels.secrets(channelId);
+  if (view === null) {
+    sendError(res, 503, "secret_store_unavailable", "no secret store is wired into the runtime");
+    return;
+  }
+  sendJson(res, 200, view);
+}
+
+/** PUT /v1/channels/:id/secrets：{ secrets: { field: value } }；空串删除可选字段 */
+async function handlePutSecrets(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _url: URL,
+  ctx: ChannelRouteContext,
+  params: string[],
+): Promise<void> {
+  const channelId = params[0] as string;
+  if (ctx.channels.getAdapter(channelId) === null) {
+    sendError(res, 404, "unknown_channel", `no channel adapter registered for "${channelId}"`);
+    return;
+  }
+  if (!ctx.channels.supportsSecrets(channelId)) {
+    sendError(res, 400, "channel_not_configurable", `channel "${channelId}" has no SecretStore-backed credentials`);
+    return;
+  }
+  const body = await readJsonBody(req, res);
+  if (body === null) return;
+  const result = await ctx.channels.writeSecrets(channelId, (body as { secrets?: unknown }).secrets);
+  if (result === null) {
+    sendError(res, 503, "secret_store_unavailable", "no secret store is wired into the runtime");
+    return;
+  }
+  if (!result.ok) {
+    sendError(res, 400, result.code, result.message);
+    return;
+  }
+  sendJson(res, 200, result.view);
 }
 
 function handleGetAllowlist(

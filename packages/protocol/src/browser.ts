@@ -81,3 +81,46 @@ export {
   CAPABILITY_CHANNELS,
   SHELL_COMMAND_CATEGORIES,
 } from "./capability-contracts.ts";
+// 渠道 / 可信联系人 / 通知 / Outbox（M4-T8 / Issue #45：渠道与联系人 UI）。
+// 三类合约文件都只含纯类型与纯 JS 常量，无 node 内置模块依赖——浏览器安全。
+export type {
+  ChannelAdapterState,
+  ChannelCapabilities,
+  ChannelConversationKind,
+  ChannelEnvironment,
+  ChannelFeatureSupport,
+  ChannelHealth,
+  ChannelLocalBridgeHealth,
+  ChannelSecretFieldView,
+  ChannelSecretsView,
+  ChannelSummary,
+} from "./channel-contracts.ts";
+export type {
+  ChannelAllowMode,
+  ChannelAllowlistEntryView,
+  ContactAmbiguityView,
+  ContactCapabilityCategory,
+  ContactGrantView,
+  ContactIdentityView,
+  ContactInviteView,
+  ContactView,
+} from "./contact-contracts.ts";
+export { CONTACT_CAPABILITY_CATEGORIES } from "./contact-contracts.ts";
+export type {
+  NotificationDeliveryKind,
+  NotificationDeliveryStatus,
+  NotificationEventType,
+  NotificationQuietHours,
+  NotificationRecord,
+  NotificationRule,
+  NotificationRuleInput,
+} from "./notification-contracts.ts";
+export { NOTIFICATION_EVENT_TYPE_VALUES } from "./notification-contracts.ts";
+export type {
+  OutboxListPage,
+  OutboxMessageRecord,
+  OutboxReceipt,
+  OutboxStatus,
+  OutboxTarget,
+  OutboxTargetKind,
+} from "./outbox-contracts.ts";

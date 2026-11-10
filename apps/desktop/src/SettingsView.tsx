@@ -16,11 +16,13 @@ import {
   type ProviderFormValues,
 } from "./provider-form.ts";
 import { CapabilitiesView } from "./CapabilitiesView.tsx";
+import { ChannelsView } from "./ChannelsView.tsx";
 import { DevicesView } from "./DevicesView.tsx";
 
 /**
- * 设置页（PRD §5.1 设置区）：三个子页签——「Provider 与模型」（票 T7 / Issue #8）、
- * 「能力管理」（票 M2-T6 / Issue #27）与「设备与同步」（票 M3-T6 / Issue #35）。
+ * 设置页（PRD §5.1 设置区）：四个子页签——「Provider 与模型」（票 T7 / Issue #8）、
+ * 「能力管理」（票 M2-T6 / Issue #27）、「设备与同步」（票 M3-T6 / Issue #35）与
+ * 「渠道」（票 M4-T8 / Issue #45：适配器/白名单/联系人/通知规则/Outbox）。
  * 能力管理页签可由 Task 视图的能力引用卡跳入（initialCapabilityName 预选详情）。
  */
 export function SettingsView({
@@ -30,7 +32,7 @@ export function SettingsView({
   base: string;
   initialCapabilityName?: string | null;
 }) {
-  const [section, setSection] = useState<"providers" | "capabilities" | "devices">(
+  const [section, setSection] = useState<"providers" | "capabilities" | "devices" | "channels">(
     initialCapabilityName !== null ? "capabilities" : "providers",
   );
 
@@ -47,6 +49,7 @@ export function SettingsView({
             ["providers", "Provider 与模型"],
             ["capabilities", "能力管理"],
             ["devices", "设备与同步"],
+            ["channels", "渠道"],
           ] as const
         ).map(([key, label]) => (
           <button
@@ -63,6 +66,7 @@ export function SettingsView({
         <CapabilitiesView base={base} initialCapabilityName={initialCapabilityName} />
       )}
       {section === "devices" && <DevicesView base={base} />}
+      {section === "channels" && <ChannelsView base={base} />}
     </div>
   );
 }

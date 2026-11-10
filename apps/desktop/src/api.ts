@@ -8,8 +8,23 @@
 import type {
   CapabilityRecord,
   CapabilityVersionRecord,
+  ChannelHealth,
+  ChannelSecretsView,
+  ChannelSummary,
+  ChannelAllowMode,
+  ChannelAllowlistEntryView,
   ConnectivityResult,
+  ContactAmbiguityView,
+  ContactCapabilityCategory,
+  ContactGrantView,
+  ContactInviteView,
+  ContactView,
   DeviceInfo,
+  NotificationRule,
+  NotificationRuleInput,
+  OutboxListPage,
+  OutboxMessageRecord,
+  OutboxStatus,
   PairingClaimRequest,
   PairingClaimResponse,
   PairingCodeResponse,
@@ -27,8 +42,23 @@ import type {
 export type {
   CapabilityRecord,
   CapabilityVersionRecord,
+  ChannelHealth,
+  ChannelSecretsView,
+  ChannelSummary,
+  ChannelAllowMode,
+  ChannelAllowlistEntryView,
   ConnectivityResult,
+  ContactAmbiguityView,
+  ContactCapabilityCategory,
+  ContactGrantView,
+  ContactInviteView,
+  ContactView,
   DeviceInfo,
+  NotificationRule,
+  NotificationRuleInput,
+  OutboxListPage,
+  OutboxMessageRecord,
+  OutboxStatus,
   PairingClaimRequest,
   PairingClaimResponse,
   PairingCodeResponse,
@@ -79,12 +109,20 @@ async function request<T>(base: string, path: string, init?: RequestInit): Promi
     let message = res.statusText || `HTTP ${res.status}`;
     let details: Record<string, unknown> = {};
     try {
-      const body = (await res.json()) as { error?: { code?: string; message?: string } & Record<string, unknown> };
+      const body = (await res.json()) as {
+        error?: { code?: string; message?: string } & Record<string, unknown>;
+        [key: string]: unknown;
+      };
       if (body.error?.code) code = body.error.code;
       if (body.error?.message) message = body.error.message;
       if (body.error !== undefined && typeof body.error === "object") {
         const { code: _code, message: _message, ...rest } = body.error;
         details = rest;
+      }
+      // 部分端点把诊断字段放在错误信封之外（如 enable 409 的 risk_notice）——
+      // 保留根级字段，UI 才能在未确认风险时原样展示风险文案。
+      for (const [key, value] of Object.entries(body)) {
+        if (key !== "error") details[key] = value;
       }
     } catch {
       // 非 JSON 错误体，保留 statusText
@@ -619,6 +657,175 @@ export const api = {
     body: { resolution: "completed" | "failed"; note?: string },
   ): Promise<TaskReconcileResult> {
     return request<TaskReconcileResult>(base, `/v1/tasks/${encodeURIComponent(taskId)}/reconcile`, {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify(body),
+    });
+  },
+
+  // --- 渠道与联系人（M4-T8 / Issue #45；端点由 M4-T1/T2/T5/T6/T7 提供）-----------
+
+  /** GET /v1/channels：适配器清单（state/enabled/capabilities/experimental/risk_notice） */
+  listChannels(base: string): Promise<ChannelSummary[]> {
+    return request<{ channels: ChannelSummary[] }>(base, "/v1/channels").then((r) => r.channels);
+  },
+
+  /** GET /v1/channels/:id/health：连接/token 有效期/最近错误/本地桥 */
+  channelHealth(base: string, channelId: string): Promise<ChannelHealth> {
+    return request<ChannelHealth>(base, `/v1/channels/${encodeURIComponent(channelId)}/health`);
+  },
+
+  /** POST /v1/channels/:id/enable：实验适配器必须带 confirm_risk=true（否则 409） */
+  enableChannel(base: string, channelId: string, confirmRisk: boolean): Promise<{ channel: string; enabled: boolean }> {
+    return request<{ channel: string; enabled: boolean }>(
+      base,
+      `/v1/channels/${encodeURIComponent(channelId)}/enable`,
+      { method: "POST", headers: JSON_HEADERS, body: JSON.stringify({ confirm_risk: confirmRisk }) },
+    );
+  },
+
+  /** POST /v1/channels/:id/disable：实验适配器立即停止收发（幂等） */
+  disableChannel(base: string, channelId: string): Promise<{ channel: string; enabled: boolean }> {
+    return request<{ channel: string; enabled: boolean }>(
+      base,
+      `/v1/channels/${encodeURIComponent(channelId)}/disable`,
+      { method: "POST", headers: JSON_HEADERS, body: JSON.stringify({}) },
+    );
+  },
+
+  /** GET /v1/channels/:id/allowlist：群聊白名单（会话 id × 模式） */
+  getAllowlist(
+    base: string,
+    channelId: string,
+  ): Promise<{ channel: string; account_id: string | null; allowlist: ChannelAllowlistEntryView[] }> {
+    return request(base, `/v1/channels/${encodeURIComponent(channelId)}/allowlist`);
+  },
+
+  /** PUT /v1/channels/:id/allowlist：整表替换（mention_only | proactive_limited）+ 审计 */
+  putAllowlist(
+    base: string,
+    channelId: string,
+    entries: Array<{ native_conversation_id: string; mode: ChannelAllowMode }>,
+  ): Promise<{ channel: string; account_id: string | null; allowlist: ChannelAllowlistEntryView[] }> {
+    return request(base, `/v1/channels/${encodeURIComponent(channelId)}/allowlist`, {
+      method: "PUT",
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ allowlist: entries }),
+    });
+  },
+
+  /** GET /v1/channels/:id/secrets：凭据字段投影（configured 布尔，绝不回显密文） */
+  getChannelSecrets(base: string, channelId: string): Promise<ChannelSecretsView> {
+    return request<ChannelSecretsView>(base, `/v1/channels/${encodeURIComponent(channelId)}/secrets`);
+  },
+
+  /** PUT /v1/channels/:id/secrets：写 SecretStore（只提交本次要改的字段） */
+  putChannelSecrets(
+    base: string,
+    channelId: string,
+    secrets: Record<string, string>,
+  ): Promise<ChannelSecretsView> {
+    return request<ChannelSecretsView>(base, `/v1/channels/${encodeURIComponent(channelId)}/secrets`, {
+      method: "PUT",
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ secrets }),
+    });
+  },
+
+  /** GET /v1/contacts：联系人 + 授权 + 平台身份绑定 */
+  listContacts(base: string): Promise<ContactView[]> {
+    return request<{ contacts: ContactView[] }>(base, "/v1/contacts").then((r) => r.contacts);
+  },
+
+  /** POST /v1/contacts/invites：一次性邀请码（code 只返回一次，24h 有效） */
+  createContactInvite(
+    base: string,
+    body: { display_name?: string; contact_id?: string; ttl_ms?: number },
+  ): Promise<ContactInviteView> {
+    return request<ContactInviteView>(base, "/v1/contacts/invites", {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify(body),
+    });
+  },
+
+  /** PUT /v1/contacts/:id/grants：授权类别整表替换（query/task_execute/memory_reference） */
+  putContactGrants(
+    base: string,
+    contactId: string,
+    grants: Array<{ category: ContactCapabilityCategory; scope?: string[] }>,
+  ): Promise<{ contact_id: string; grants: ContactGrantView[] }> {
+    return request(base, `/v1/contacts/${encodeURIComponent(contactId)}/grants`, {
+      method: "PUT",
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ grants }),
+    });
+  },
+
+  /** GET /v1/contacts/ambiguities?status=open：身份歧义待 Owner 选择 */
+  listContactAmbiguities(base: string, status?: "open" | "resolved"): Promise<ContactAmbiguityView[]> {
+    const query = status === undefined ? "" : `?status=${status}`;
+    return request<{ ambiguities: ContactAmbiguityView[] }>(base, `/v1/contacts/ambiguities${query}`).then(
+      (r) => r.ambiguities,
+    );
+  },
+
+  /** POST /v1/contacts/ambiguities/:id/resolve：显式选择联系人（不自动合并） */
+  resolveContactAmbiguity(
+    base: string,
+    ambiguityId: string,
+    contactId: string,
+  ): Promise<ContactAmbiguityView> {
+    return request<ContactAmbiguityView>(
+      base,
+      `/v1/contacts/ambiguities/${encodeURIComponent(ambiguityId)}/resolve`,
+      { method: "POST", headers: JSON_HEADERS, body: JSON.stringify({ contact_id: contactId }) },
+    );
+  },
+
+  /** GET /v1/notifications/rules：事件 × 目标规则清单 */
+  listNotificationRules(base: string): Promise<NotificationRule[]> {
+    return request<{ rules: NotificationRule[] }>(base, "/v1/notifications/rules").then((r) => r.rules);
+  },
+
+  /** PUT /v1/notifications/rules：按 (event_type, target) key 合并 upsert */
+  putNotificationRules(base: string, rules: NotificationRuleInput[]): Promise<NotificationRule[]> {
+    return request<{ rules: NotificationRule[] }>(base, "/v1/notifications/rules", {
+      method: "PUT",
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ rules }),
+    }).then((r) => r.rules);
+  },
+
+  /** GET /v1/outbox?status=&limit=&offset=：外发审计列表（人工核对入口） */
+  listOutbox(
+    base: string,
+    options: { status?: OutboxStatus; limit?: number; offset?: number } = {},
+  ): Promise<OutboxListPage> {
+    const params = new URLSearchParams();
+    if (options.status !== undefined) params.set("status", options.status);
+    if (options.limit !== undefined) params.set("limit", String(options.limit));
+    if (options.offset !== undefined) params.set("offset", String(options.offset));
+    const query = params.size === 0 ? "" : `?${params.toString()}`;
+    return request<OutboxListPage>(base, `/v1/outbox${query}`);
+  },
+
+  /** POST /v1/outbox/:id/retry：failed 直接重试；needs_review 必须 confirmed=true */
+  retryOutbox(base: string, outboxId: string, confirmed: boolean): Promise<{ message: OutboxListPage["messages"][number] }> {
+    return request(base, `/v1/outbox/${encodeURIComponent(outboxId)}/retry`, {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify(confirmed ? { confirmed: true } : {}),
+    });
+  },
+
+  /** POST /v1/outbox/:id/mark-sent：线下核对后人工标记已送达（写 manual receipt） */
+  markOutboxSent(
+    base: string,
+    outboxId: string,
+    body: { platform_message_id?: string; note?: string } = {},
+  ): Promise<{ message: OutboxListPage["messages"][number] }> {
+    return request(base, `/v1/outbox/${encodeURIComponent(outboxId)}/mark-sent`, {
       method: "POST",
       headers: JSON_HEADERS,
       body: JSON.stringify(body),

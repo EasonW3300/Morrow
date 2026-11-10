@@ -802,6 +802,8 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     replicaId: config.replicaId,
     sessions,
     contacts,
+    // M4-T8 / Issue #45：飞书/QQ 凭据表单经 GET/PUT /v1/channels/:id/secrets 读写
+    secretStore,
     ...(options.enableEchoChannel === undefined ? {} : { enableEcho: options.enableEchoChannel }),
     ...(options.channelAdapters === undefined || options.channelAdapters.length === 0
       ? {}

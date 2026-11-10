@@ -155,6 +155,39 @@ node --experimental-sqlite --experimental-strip-types apps/desktop/scripts/devic
    「两设备独立执行过此任务，需你裁决」+ 执行证据（GET /v1/tasks/:id/execution）+
    可选裁决说明 → 「标记为已完成 / 标记为失败」→ 状态离开 needs_reconcile。
 
+### 渠道与联系人联调（票 M4-T8 / Issue #45）
+
+```bash
+node --experimental-sqlite --experimental-strip-types apps/desktop/scripts/channel-fixture.ts
+# 打开 http://127.0.0.1:1420/?runtime=http://127.0.0.1:<runtime端口>（stdout ready JSON 给出）
+```
+
+夹具 = 真实 Runtime（渠道注册表/联系人服务/通知规则/Outbox 全走控制面端点）+ 本地平台协议桩：
+飞书适配器接 ChannelTestServer（token TTL 60s → 清单不断刷新后显示「token 已过期 / 不健康」），
+QQ 适配器接共享服务器上的 QQ 桩（健康态），微信适配器接 StubLocalBridge 且出厂 disabled
+（实验态 + 常驻「实验」徽标）。预置：三个渠道账号、微信/飞书白名单、两个联系人
+（林=query+task_execute、周=query）与一条身份歧义、五条通知规则（含跨天免打扰与停用行）、
+Outbox sent/failed/needs_review 三种真实状态（403 真实失败；发送超时真实转人工核对）。
+浏览器级全流程（本票交付时已按此走查）：
+
+1. 设置 → 渠道：核对飞书/QQ/微信的类型、状态、health（连接/token 剩余或已过期/最近错误/
+   本地桥）、capabilities 徽标（主动消息一律「受限」或「不可用」，绝不出现「可用」）；
+   飞书/QQ 的「配置凭据…」只显示「已配置（不回显）」投影，填写缺失字段保存后界面
+   不出现任何明文（GET/PUT `/v1/channels/:id/secrets`）。
+2. 微信「启用（实验）…」→ 弹窗展示完整 risk_notice + 声明环境 → 未勾选时确认按钮
+   禁用并说明原因 → 勾选后「确认启用（自担风险）」→ 适配器实际运行、桥进程/登录/窗口
+   变为 running/logged_in/available（channel.experimental_enabled 审计）；「实验」徽标常驻。
+3. 群聊白名单：选微信 → 新增 `wx-group-ops` + 模式「有限主动消息」→ 保存 → GET allowlist
+   反映三行（channel.allowlist_updated 审计）。
+4. 可信联系人：输入显示名 → 生成一次性邀请码（MC-…）+ 24 小时倒计时 + 复制；为「周」
+   勾选「记忆引用（仅 public）」→ 保存授权（contact.grants_updated）；在身份歧义里选
+   「周（家人）」→ 选择此人（contact.ambiguity_resolved），列表转为无待裁决。
+5. 通知规则：新增 failed × channel:wechat，免打扰 21:00–06:00（跨天）→ 保存 → 刷新后
+   规则仍在（notification.rule_upserted）；起止相同/非法 HH:MM 会被前端拒绝。
+6. Outbox：needs_review 行显示内容摘要/失败原因/attempts →「我已核对，重发」→ 二次确认
+   后状态重置为 pending（不自动重发，等投递器）；「标记已送达」写人工回执；最近 sent 列表
+   始终作为对照。
+
 ## 已知边界（M0）
 
 - 历史回看来自 `GET /v1/sessions/:id/messages` 投影（user/assistant 消息）；历史轮次的

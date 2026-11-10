@@ -2,17 +2,25 @@ import type {
   ChannelAdapterState,
   ChannelCapabilities,
   ChannelHealth,
+  ChannelSecretsView,
   ChannelSummary,
   InboundMessage,
   OutboundMessage,
 } from "@morrow/protocol";
 import type { EventLedger } from "../ledger.ts";
+import type { SecretStore } from "../keyring.ts";
 import type { SessionManager } from "../sessions.ts";
 import type { ContactBindingResolver } from "../contacts/types.ts";
 import { CONTACT_EVENT_TYPES } from "../contacts/events.ts";
 import { buildEventEnvelope } from "../envelope.ts";
 import { CHANNEL_EVENT_TYPES } from "./events.ts";
 import { EchoChannelAdapter } from "./echo.ts";
+import {
+  channelCredentialSpec,
+  readChannelSecrets,
+  writeChannelSecrets,
+  type ChannelSecretWriteResult,
+} from "./credentials.ts";
 import { ChannelInboundRouter, type InboundRouteOptions, type InboundRouteResult } from "./inbound.ts";
 import { ChannelStore, type ChannelAccountInput, type ChannelAccountRecord, type ChannelIdentityInput, type ChannelMessageRecord, type ConversationAllowInput, type ConversationAllowRow, type ConversationRecord } from "./store.ts";
 import { isParseError, type ChannelAdapter } from "./types.ts";
@@ -45,6 +53,11 @@ export interface ChannelRegistryOptions {
   outboundSink?: { enqueue(outbound: OutboundMessage): unknown };
   /** 联系人接缝（M4-T6 / Issue #43）：邀请码绑定、身份歧义、会话归属、类别解析 */
   contacts?: ContactBindingResolver;
+  /**
+   * 凭据库（M4-T8 / Issue #45）：飞书/QQ 凭据配置端点读写 SecretStore。
+   * 缺省 null = 只读投影不可用（GET/PUT secrets 返回 unsupported）。
+   */
+  secretStore?: SecretStore | null;
   now?: () => Date;
 }
 
@@ -89,6 +102,7 @@ export class ChannelRegistry {
   readonly #store: ChannelStore;
   readonly #router: ChannelInboundRouter;
   readonly #now: () => Date;
+  readonly #secretStore: SecretStore | null;
   readonly #adapters = new Map<string, AdapterEntry>();
   #closed = false;
 
@@ -98,6 +112,7 @@ export class ChannelRegistry {
     this.#sessions = options.sessions;
     this.#store = ChannelStore.open(options.dataDir);
     this.#now = options.now ?? (() => new Date());
+    this.#secretStore = options.secretStore ?? null;
     this.#router = new ChannelInboundRouter({
       ledger: options.ledger,
       replicaId: options.replicaId,
@@ -235,6 +250,30 @@ export class ChannelRegistry {
       });
     }
     return out;
+  }
+
+  /**
+   * 渠道凭据投影（M4-T8 / Issue #45）：只报 configured，不回显密文。
+   * 未注册渠道或渠道无凭据概念（微信/echo）返回 null；路由层区分 404 与 400。
+   */
+  async secrets(channelId: string): Promise<ChannelSecretsView | null> {
+    if (!this.#adapters.has(channelId)) return null;
+    const spec = channelCredentialSpec(channelId);
+    if (spec === null || this.#secretStore === null) return null;
+    return readChannelSecrets(this.#secretStore, spec);
+  }
+
+  /** 渠道是否有可配置凭据（路由层把「已注册但无凭据概念」映射为 400） */
+  supportsSecrets(channelId: string): boolean {
+    return channelCredentialSpec(channelId) !== null;
+  }
+
+  /** PUT /v1/channels/:id/secrets：只写本次提交的字段；空字符串删除可选字段 */
+  async writeSecrets(channelId: string, input: unknown): Promise<ChannelSecretWriteResult | null> {
+    if (!this.#adapters.has(channelId)) return null;
+    const spec = channelCredentialSpec(channelId);
+    if (spec === null || this.#secretStore === null) return null;
+    return writeChannelSecrets(this.#secretStore, spec, input);
   }
 
   /** GET /v1/channels/:id/health；未知渠道 null（HTTP 404） */

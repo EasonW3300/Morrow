@@ -50,6 +50,8 @@ export type {
   ChannelLocalBridgeHealth,
   ChannelPermissionContext,
   ChannelPrincipal,
+  ChannelSecretFieldView,
+  ChannelSecretsView,
   ChannelSendReceipt,
   ChannelSummary,
   InboundAttachment,
