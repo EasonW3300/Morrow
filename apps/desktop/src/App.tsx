@@ -10,6 +10,7 @@ import { Button } from "./design-system/primitives/Button.tsx";
 import { GlassSurface } from "./design-system/primitives/GlassSurface.tsx";
 import { ThemeToggle } from "./design-system/ThemeToggle.tsx";
 import { applyTheme, getInitialTheme, saveTheme, type Theme } from "./design-system/theme.ts";
+import { NotificationCenter } from "./NotificationCenter.tsx";
 
 /**
  * 桌面壳根组件：解析控制面地址（sidecar ready）→ 顶栏导航（会话 / 任务 / 设置 / 健康）。
@@ -133,6 +134,7 @@ export default function App() {
           ))}
         </nav>
         <div className="topbar-actions">
+          <NotificationCenter base={base} onOpenTask={openTask} />
           <ThemeToggle theme={theme} onToggle={toggleTheme} />
         </div>
       </GlassSurface>

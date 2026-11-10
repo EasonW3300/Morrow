@@ -11,6 +11,10 @@
  *   channel.experimental_enabled 实验适配器经显式风险确认后启用（M4-T5）
  *                              （payload: channel/account_id/experimental/confirm_risk/
  *                              risk_notice/environment）
+ *   channel.enabled            稳定适配器经 Owner 显式启用（A1 修复批；持久化到
+ *                              channel_settings）
+ *   channel.disabled           稳定适配器经 Owner 显式停用（A1 修复批）
+ *   channel.notify_target_updated 默认通知会话变更（A3 修复批）
  */
 export const CHANNEL_EVENT_TYPES = {
   adapterStarted: "channel.adapter_started",
@@ -18,4 +22,7 @@ export const CHANNEL_EVENT_TYPES = {
   inboundReceived: "channel.inbound_received",
   inboundRejected: "channel.inbound_rejected",
   experimentalEnabled: "channel.experimental_enabled",
+  enabled: "channel.enabled",
+  disabled: "channel.disabled",
+  notifyTargetUpdated: "channel.notify_target_updated",
 } as const;

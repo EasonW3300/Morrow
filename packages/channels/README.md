@@ -57,7 +57,7 @@
 `apps/runtime/src/keyring.ts`（macOS Keychain / Windows 凭据管理器 / Linux secret-tool /
 `MORROW_SECRET_BACKEND=memory` 冒烟）。
 
-生产接线：
+生产接线（A1 修复批后，正常部署**无需手工 new**：`startRuntime` 按 SecretStore 已配置凭据自动装配，缺省 disabled，`POST /v1/channels/feishu/enable` 启用；下面的手工注入仅用于自定义选项/测试）：
 
 ```ts
 const adapter = new FeishuChannelAdapter({ accountId: "feishu-default", config });
@@ -145,7 +145,7 @@ Access Token **不落 SecretStore**，只在进程内缓存并按 `expires_in` �
 `https://bots.qq.com/app/getAppAccessToken`，可用此选项覆盖；`config.tokenEndpoint` 优先）、
 `requestTimeoutMs`、`tokenRefreshSkewMs`、事件传输等。
 
-生产接线：
+生产接线（A1 修复批后自动装配，缺省 disabled；手工注入仅用于自定义选项/测试）：
 
 ```ts
 const config = await loadQqConfig(secretStore); // channel:qq:app_id / app_secret
@@ -368,7 +368,9 @@ M4 交付 `StubLocalBridge`（纯内存、零真实微信/网络）：
 `connectCalls/disconnectCalls`、`connected`、`sent`、`emit(message)`、`setStatus(...)`、
 `setSendError(...)`。测试用它注入桥接进程/登录态/窗口句柄/最近错误，并观察出站。
 
-生产接线的形状（M4 只有桩；替换 `bridge` 即接真实桥）：
+生产接线的形状（M4 只有桩；替换 `bridge` 即接真实桥。A1 修复批后，配置了
+`channel:wechat:bridge_command`/`bridge_endpoint` 且宿主注入 `channelBootstrap.wechat.bridge`
+时也会自动装配；缺省仍出厂 disabled，需 `confirm_risk` 启用）：
 
 ```ts
 const adapter = new WeChatChannelAdapter({

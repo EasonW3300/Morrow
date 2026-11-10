@@ -48,6 +48,7 @@ import { createChannelOutboundSink } from "./channels/outbox.ts";
 import { ContactService } from "./contacts/service.ts";
 import { contactRoutes } from "./contacts/routes.ts";
 import { createChannelOutboxAdapter } from "./channels/outbox-adapter.ts";
+import { buildConfiguredChannels, type ChannelBootstrapOptions } from "./channels/bootstrap.ts";
 import { NotificationService } from "./notifications/service.ts";
 import { notificationRoutes } from "./notifications/routes.ts";
 import { TaskScheduler, type NodeAgentFactory, type TaskNodeExecInput } from "./scheduler.ts";
@@ -268,6 +269,20 @@ export interface RuntimeOptions {
    * 自动接到这些适配器（未显式提供 outboxAdapter 时）。
    */
   channelAdapters?: ChannelAdapterRegistration[];
+  /**
+   * 生产渠道自动装配（A1 修复批 / Issue #37）：默认 true——启动时按 SecretStore 中
+   * `channel:feishu:app_id` / `channel:qq:app_id` / `channel:wechat:*` 自动构造并注册
+   * 适配器（缺省未启用，Owner 经 POST /v1/channels/:id/enable 启用并持久化）。显式
+   * `channelAdapters` 中已出现的渠道不重复装配。false 仅用于需要完全手动接线的测试/宿主。
+   */
+  autoConfigureChannels?: boolean;
+  /** 自动装配的非机密覆盖（baseUrl/fetch/超时/Owner 原生 id/微信桥注入；测试用） */
+  channelBootstrap?: Omit<ChannelBootstrapOptions, "secretStore">;
+  /**
+   * Outbox 定时投递间隔（A2 修复批 / Issue #37）：默认 1000ms；0 = 关闭定时器
+   * （测试手动 dispatchOnce）。定时器 unref()，不阻止进程退出。
+   */
+  outboxDrainIntervalMs?: number;
   /**
    * Outbox 渠道适配器注入 seam（M4-T2 / Issue #39）：channel 域（M4-T1）启动后经
    * `runtime.outbox.setAdapter` 接线；测试注入计数桩。缺省 null = 未接线，
@@ -796,24 +811,44 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     ...(options.contactNow === undefined ? {} : { now: options.contactNow }),
   });
   contactToolCapabilities = (sessionId) => capabilities.contactCapabilitiesForSession(sessionId);
+  // 生产适配器自动装配（A1 修复批 / Issue #37）：按 SecretStore 中已配置凭据构造
+  // 飞书/QQ/微信适配器；显式注入的同渠道适配器优先（不重复装配）。缺省未启用——
+  // 启停状态持久化在 channel_settings，Owner 显式 enable 后才 start。
+  const explicitChannelAdapters = options.channelAdapters ?? [];
+  const configuredChannelAdapters =
+    options.autoConfigureChannels === false
+      ? []
+      : await buildConfiguredChannels({
+          secretStore,
+          ...(options.channelBootstrap ?? {}),
+        });
+  const explicitChannelIds = new Set(explicitChannelAdapters.map((registration) => registration.adapter.channelId));
+  const autoChannelAdapters = configuredChannelAdapters.filter(
+    (registration) => !explicitChannelIds.has(registration.adapter.channelId),
+  );
+  const allChannelAdapters = [...explicitChannelAdapters, ...autoChannelAdapters];
   const channels = new ChannelRegistry({
     dataDir: config.dataDir,
     ledger,
     replicaId: config.replicaId,
     sessions,
     contacts,
+    // A4 修复批 / Issue #37：入站消息解析出 contact:<id> 后经 PermissionEngine 判定类别
+    permissions: capabilities,
     // M4-T8 / Issue #45：飞书/QQ 凭据表单经 GET/PUT /v1/channels/:id/secrets 读写
     secretStore,
     ...(options.enableEchoChannel === undefined ? {} : { enableEcho: options.enableEchoChannel }),
-    ...(options.channelAdapters === undefined || options.channelAdapters.length === 0
-      ? {}
-      : { outboundSink: createChannelOutboundSink(outbox) }),
+    ...(allChannelAdapters.length === 0 ? {} : { outboundSink: createChannelOutboundSink(outbox) }),
     taskExists: (taskId) => tasks.getTask(taskId) !== null,
   });
   // 生产适配器注册（M4-T3）：适配器只做协议转换；回复经 Outbox 投递（AC-09 协议层闭环）。
-  for (const registration of options.channelAdapters ?? []) {
+  // 自动装配项标记 managed=true（A1）：启停读/写 channel_settings；手动注入项保持
+  // 「注册即启动」语义（测试/宿主显式接线）。
+  for (const registration of allChannelAdapters) {
+    const managed = autoChannelAdapters.includes(registration);
     channels.registerAdapter(registration.adapter, {
       ...(registration.experimental === undefined ? {} : { experimental: registration.experimental }),
+      ...(managed ? { managed: true } : {}),
     });
     channels.registerAccount(registration.account);
   }
@@ -842,6 +877,9 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
         .filter((fact) => fact.sensitivity !== "public")
         .map((fact) => fact.content),
     channelAccountId: (channelId) => channels.accountIdForChannel(channelId),
+    // A3 修复批 / Issue #37：channel:<id> 通知目标按渠道默认通知会话解析
+    // （PUT /v1/channels/:id/notify-target 指定；未配置时规则保存即 400）。
+    channelNotifyTarget: (channelId) => channels.notifyTarget(channelId)?.native_conversation_id ?? null,
   });
   const unsubscribeNotifications = ledger.subscribe((entry) => {
     try {
@@ -852,6 +890,10 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
   });
   const notificationDrainIntervalMs = options.notificationDrainIntervalMs ?? 1_000;
   let notificationTimer: NodeJS.Timeout | null = null;
+  // Outbox 自动投递定时器（A2 修复批）：入站回复/通知/人工 retry 入队后无需外部
+  // 触发；0 = 关闭（测试手动 dispatchOnce）。在 channels.start() 之后启动。
+  const outboxDrainIntervalMs = options.outboxDrainIntervalMs ?? 1_000;
+  let outboxTimer: NodeJS.Timeout | null = null;
   if (notificationDrainIntervalMs > 0) {
     notificationTimer = setInterval(() => {
       void notifications.drain().catch((err: unknown) => {
@@ -966,6 +1008,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     selfBaseUrl = resolveSelfBaseUrl(config, port);
   } catch (err) {
     if (notificationTimer !== null) clearInterval(notificationTimer);
+    if (outboxTimer !== null) clearInterval(outboxTimer);
     unsubscribeNotifications();
     notifications.close();
     skills.close();
@@ -1003,6 +1046,16 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
   // 渠道适配器启动（M4-T1）：在 runtime.started 之后落 channel.adapter_started。
   // 失败按适配器隔离（state=error 可在 GET /v1/channels 诊断），不阻断 runtime 启动。
   await channels.start();
+  // Outbox 定时投递（A2 修复批 / Issue #37）：适配器已接（上方 setAdapter），定时
+  // drain 让入站回复与通知真正发出去；单轮失败只记日志，不中断后续轮次。
+  if (outboxDrainIntervalMs > 0) {
+    outboxTimer = setInterval(() => {
+      void outbox.dispatchOnce().catch((err: unknown) => {
+        console.error("[morrow] outbox drain failed:", err);
+      });
+    }, outboxDrainIntervalMs);
+    if (typeof outboxTimer.unref === "function") outboxTimer.unref();
+  }
   // 调用接缝初始登记（#22 修复批 / FR-CAP-5）：把注册表里全部 enabled 能力登记进
   // ToolInvoker（本进程新建的经 onLifecycle 已登记；这里覆盖重启场景——历史行不重放
   // registered 事件）。登记失败的条目跳过并告警（invoke 404，不静默假装可调）。
@@ -1054,6 +1107,10 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
       if (notificationTimer !== null) {
         clearInterval(notificationTimer);
         notificationTimer = null;
+      }
+      if (outboxTimer !== null) {
+        clearInterval(outboxTimer);
+        outboxTimer = null;
       }
       unsubscribeNotifications();
       server.closeAllConnections();

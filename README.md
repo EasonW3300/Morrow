@@ -2,7 +2,7 @@
 
 单主人、长期记忆、可自主生成能力的个人 Agent。
 
-**当前状态**：M4 收官（渠道与通知域**协议层达成**：飞书/QQ 适配器、Outbox 外发审计、可信联系人、群聊白名单、通知规则、微信实验适配；**真实平台层未达成**——QQ 真实平台累计群 @ 15/20 + 私聊 1 次、飞书资质未注册、微信需 Owner Windows，见 [M4 门禁报告](docs/gates/m4-gate-report.md) 的双层结论）。M3 收官（三种部署形态、同步引擎、设备配对、离线回放、执行租约交付，见 [M3 门禁报告](docs/gates/m3-gate-report.md)；M2「缺能力→造工具→安全验证→重用」演示达成，见 [M2 门禁报告](docs/gates/m2-gate-report.md)；M1 两项主线门槛达成，见 [M1 门禁报告](docs/gates/m1-gate-report.md)；M0 冒烟门全绿，见 [M0 门禁报告](docs/gates/m0-gate-report.md)）。
+**当前状态**：M4 收官（渠道与通知域**协议层达成**：飞书/QQ 适配器、Outbox 外发审计、可信联系人、群聊白名单、通知规则、微信实验适配；桌面通知投递已端到端达成——`tauri-plugin-notification` 系统通知 + 应用内通知中心，权限被拒时自动降级；**真实平台层未达成**——QQ 真实平台累计群 @ 15/20 + 私聊 1 次、飞书资质未注册、微信需 Owner Windows，见 [M4 门禁报告](docs/gates/m4-gate-report.md) 的双层结论）。M3 收官（三种部署形态、同步引擎、设备配对、离线回放、执行租约交付，见 [M3 门禁报告](docs/gates/m3-gate-report.md)；M2「缺能力→造工具→安全验证→重用」演示达成，见 [M2 门禁报告](docs/gates/m2-gate-report.md)；M1 两项主线门槛达成，见 [M1 门禁报告](docs/gates/m1-gate-report.md)；M0 冒烟门全绿，见 [M0 门禁报告](docs/gates/m0-gate-report.md)）。
 
 ## 文档导航
 
@@ -24,12 +24,13 @@
 
 ```
 apps/desktop        Tauri 2 + React 桌面壳（Chat / Task / Voice / 设置）
-apps/runtime        核心 Node 应用：编排、记忆、能力、API（单二进制打包）
+apps/runtime        核心 Node 应用：编排、记忆、能力、渠道、API（单二进制打包）
+apps/runtime/src/channels 渠道网关实现：飞书 / QQ 官方 / 微信实验（适配器、统一入站路由、Outbox 桥、凭据管理）
 packages/protocol   事件 schema、API 合约、共享类型（TS + JSON Schema）
 packages/pi-adapter Pi 内核版本锁定适配层（ADR-0001）
 packages/memory     记忆管线：抽取 / 巩固 / 冲突 / Markdown 投影
 packages/sync       副本同步引擎：增量、租约、配对
-packages/channels   渠道网关：飞书 / QQ 官方 / 微信实验
+packages/channels   渠道域操作/复用手册（代码实现位于 apps/runtime/src/channels）
 packages/capability 能力工厂：生成 / 沙箱验证 / 注册 / 演进
 packages/voice      语音管线：VAD / ASR / TTS / 打断
 workers/go          Go 组件（系统适配、性能敏感服务、CLI）

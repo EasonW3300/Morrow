@@ -333,6 +333,7 @@ test("渠道目标经 Outbox 投递：先入队再发送，幂等键含 task+eve
     outbox,
     now: () => c.now(),
     channelAccountId: (channelId) => (channelId === "echo" ? "echo-default" : null),
+    channelNotifyTarget: (channelId) => (channelId === "echo" ? "echo:notify" : null),
   });
   try {
     service.upsertRules([{ event_type: "completed", target: "channel:echo", enabled: true }]);
@@ -404,6 +405,7 @@ test("内容裁剪：渠道接收者正文不含 private 记忆/文件路径/凭
     now: () => c.now(),
     privateMemoryContents: () => [privateFact],
     channelAccountId: () => "echo-default",
+    channelNotifyTarget: () => "echo:notify",
     taskLookup: () => ({
       task_id: TASK,
       goal: "Plan the trip",

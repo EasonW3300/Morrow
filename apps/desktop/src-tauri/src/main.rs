@@ -48,6 +48,7 @@ fn sidecar_status(state: tauri::State<SidecarState>) -> SidecarStatusView {
 fn main() {
     sidecar::install_signal_forwarding();
     tauri::Builder::default()
+        .plugin(tauri_plugin_notification::init())
         .manage(SidecarState::default())
         .setup(|app| {
             // release 打包：Runtime dist 经 tauri resources 落在资源目录 runtime/main.js；

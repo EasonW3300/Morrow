@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import { createFakePi } from "@morrow/pi-adapter";
 import type { ChannelHealth, ChannelSummary } from "@morrow/protocol";
 import type { RuntimeConfig } from "../src/config.ts";
+import { createInMemorySecretStore } from "../src/keyring.ts";
 import { startRuntime } from "../src/runtime.ts";
 import { EchoChannelAdapter } from "../src/channels/echo.ts";
 import { json, removeDir, tmpDir } from "./helpers.ts";
@@ -35,6 +36,8 @@ function fakeFactory() {
 test("GET /v1/channels lists adapters with capabilities and state; health is queryable", async (t) => {
   const dir = tmpDir("morrow-channels-api-");
   const runtime = await startRuntime(testConfig(dir), {
+    // 隔离：空的内存凭据库 → 不触发 A1 自动装配（宿主 Keychain 可能已有真实渠道凭据）
+    secretStore: createInMemorySecretStore(),
     agentAdapterFactory: fakeFactory(),
     enableEchoChannel: true,
   });
@@ -46,8 +49,11 @@ test("GET /v1/channels lists adapters with capabilities and state; health is que
   const list = await json<{ channels: ChannelSummary[] }>(
     await fetch(`http://127.0.0.1:${runtime.port}/v1/channels`),
   );
-  assert.equal(list.channels.length, 1);
-  const echo = list.channels[0];
+  // 已知渠道（feishu/qq/wechat）以 pending 占位常驻清单（Issue #37 A5：否则无法首次配置凭据），
+  // 这里只断言注入的 echo 本身。
+  const echo = list.channels.find((channel) => channel.channel_id === "echo");
+  assert.ok(echo, "echo 适配器应在清单中");
+  assert.equal(list.channels.filter((channel) => channel.state === "running").length, 1);
   assert.equal(echo.channel_id, "echo");
   assert.equal(echo.account, "echo-default");
   assert.equal(echo.state, "running");
@@ -73,6 +79,8 @@ test("GET /v1/channels lists adapters with capabilities and state; health is que
 test("echo adapter wired through runtime: injected inbound produces a session turn and a send callback", async (t) => {
   const dir = tmpDir("morrow-channels-api-");
   const runtime = await startRuntime(testConfig(dir), {
+    // 隔离：空的内存凭据库 → 不触发 A1 自动装配（宿主 Keychain 可能已有真实渠道凭据）
+    secretStore: createInMemorySecretStore(),
     agentAdapterFactory: fakeFactory(),
     enableEchoChannel: true,
   });

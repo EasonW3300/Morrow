@@ -10,11 +10,14 @@
  *     常驻「实验」标识；浏览器走查时经风险确认启用 → 通过 API 真实启用）。
  *
  * 预置数据：三个渠道账号、微信/飞书白名单、两个可信联系人（不同授权类别）+ 一条身份
- * 歧义、四条通知规则（含跨天免打扰与停用行）、Outbox sent / failed / needs_review
+ * 歧义、通知规则（含跨天免打扰与停用行）、Outbox sent / failed / needs_review
  * 三种状态（failed 用 QQ 403 真实失败；needs_review 用发送超时真实产生，绝不自动重发）。
+ * 另预置 3 条桌面 pending 通知（Issue #47 走查）：completed / failed / 免打扰到点放行，
+ * 用于验证铃铛计数、应用内面板、全部标记已读与权限降级文案。
  *
  *   node --experimental-sqlite --experimental-strip-types apps/desktop/scripts/channel-fixture.ts
  *   # 打开 http://127.0.0.1:1420/?runtime=http://127.0.0.1:<runtime端口>（stdout ready JSON 给出）
+ *   # 权限拒绝态走查再加 &notification_permission=denied
  *
  * stdout 单行 ready JSON；SIGTERM/SIGINT 优雅退出。密钥存内存 SecretStore（不碰钥匙串）。
  */
@@ -24,6 +27,7 @@ import { join } from "node:path";
 import { createInMemorySecretStore } from "../../runtime/src/keyring.ts";
 import { loadConfig } from "../../runtime/src/config.ts";
 import { startRuntime } from "../../runtime/src/runtime.ts";
+import { buildEventEnvelope } from "../../runtime/src/envelope.ts";
 import { ChannelTestServer } from "../../runtime/src/channels/testing/channel-test-server.ts";
 import { registerQqTestStub } from "../../runtime/src/channels/testing/qq-stub.ts";
 import { FeishuChannelAdapter, type FeishuConfig } from "../../runtime/src/channels/adapters/feishu/index.ts";
@@ -46,6 +50,20 @@ const QQ_CONFIG: QqConfig = {
   appSecret: "qq-fixture-app-secret",
   botSecret: "qq-fixture-bot-secret",
 };
+
+/** 通知面板「跳转任务」用的最小计划（任务保持 planned，不自动调度） */
+const FIXTURE_PLAN = JSON.stringify({
+  nodes: [
+    {
+      key: "archive",
+      title: "归档",
+      goal: "archive results",
+      depends_on: [],
+      retriable: true,
+      side_effect: "reversible",
+    },
+  ],
+});
 
 // --- 平台协议桩（本地回环） ---------------------------------------------------------
 
@@ -103,9 +121,17 @@ const envDataDir = process.env.MORROW_DATA_DIR;
 const dataDir = envDataDir ?? mkdtempSync(join(tmpdir(), "morrow-channel-"));
 const config = { ...loadConfig(), dataDir };
 
+// 通知服务可注入时钟（Issue #47 走查）：先让免打扰行落 delayed，再前移 2 分钟放行到 pending。
+let notificationClock = new Date();
+
 const runtime = await startRuntime(config, {
   secretStore,
   agentAdapterFactory: async () => createScriptedAgent(),
+  // 任务规划器（通知面板的「跳转任务」需要真实任务行）：单节点脚本化计划
+  taskPlannerFactory: async () => createPlanAgent(FIXTURE_PLAN),
+  // 节点执行不会发生（任务保持 planned），仍给一个安全桩避免默认 Provider 依赖
+  taskNodeAgentFactory: async () => createScriptedAgent(),
+  notificationNow: () => notificationClock,
   channelAdapters: [
     {
       adapter: feishuAdapter,
@@ -251,6 +277,75 @@ if (sentStatus !== "sent" || failedStatus !== "failed" || reviewStatus !== "need
   );
 }
 
+// --- 桌面 pending 通知（Issue #47 走查：铃铛计数 / 面板 / 全部已读 / 权限降级） -------
+const completedTask = await runtime.tasks.createTask("整理季度资料并归档", {});
+const failedTask = await runtime.tasks.createTask("扫描旧项目依赖并升级", {});
+const waitingTask = await runtime.tasks.createTask("确认生产部署窗口", {});
+
+function appendTaskEvent(
+  taskId: string,
+  eventType: string,
+  payload: Record<string, unknown>,
+): void {
+  runtime.ledger.append(
+    buildEventEnvelope({
+      replicaId: config.replicaId,
+      actorId: "agent:runtime",
+      eventType,
+      taskId,
+      payload,
+    }),
+  );
+}
+
+// failed 的桌面规则原本带跨天免打扰；临时置空确保本轮落 pending（随后恢复，保留规则演示）
+runtime.notifications.upsertRules([
+  { event_type: "failed", target: "desktop", quiet_hours: null, enabled: true },
+]);
+appendTaskEvent(completedTask.task_id, "task.completed", { goal: "整理季度资料并归档" });
+appendTaskEvent(failedTask.task_id, "task.failed", {
+  goal: "扫描旧项目依赖并升级",
+  message: "依赖解析失败：lockfile 与 workspace 不一致",
+});
+runtime.notifications.upsertRules([
+  { event_type: "failed", target: "desktop", quiet_hours: { start: "22:00", end: "08:00" }, enabled: true },
+]);
+
+// 免打扰到点：规则窗口覆盖「现在」→ 事件先落 delayed；时钟前移 2 分钟 → flushDue 放行 pending
+function utcClockMinutes(value: Date): number {
+  return value.getUTCHours() * 60 + value.getUTCMinutes();
+}
+function hhmm(minutes: number): string {
+  const normalized = ((minutes % 1440) + 1440) % 1440;
+  return `${String(Math.floor(normalized / 60)).padStart(2, "0")}:${String(normalized % 60).padStart(2, "0")}`;
+}
+const quietStart = utcClockMinutes(notificationClock);
+runtime.notifications.upsertRules([
+  {
+    event_type: "waiting_input",
+    target: "desktop",
+    quiet_hours: { start: hhmm(quietStart), end: hhmm(quietStart + 1) },
+    enabled: true,
+  },
+]);
+appendTaskEvent(waitingTask.task_id, "task.waiting_input", {
+  goal: "确认生产部署窗口",
+  message: "确认今晚 22:00 的部署窗口？",
+});
+notificationClock = new Date(notificationClock.getTime() + 2 * 60_000);
+const flushedQuietRows = runtime.notifications.flushDue();
+notificationClock = new Date();
+
+const pendingNotifications = runtime.notifications.pendingDesktop();
+if (pendingNotifications.length !== 3 || flushedQuietRows !== 1) {
+  throw new Error(
+    `channel-fixture: unexpected desktop pending seed: ${pendingNotifications.length} pending, ${flushedQuietRows} flushed`,
+  );
+}
+const pendingByEvent = Object.fromEntries(
+  pendingNotifications.map((row) => [row.event_type, row.notification_id]),
+);
+
 console.log(
   JSON.stringify({
     ready: true,
@@ -264,9 +359,19 @@ console.log(
       contacts: { lin: contactLin, zhou: contactZhou },
       ambiguity_id: ambiguityId,
       outbox: { sent: sentRow.id, failed: failedRow.id, needs_review: timeoutRow.id },
+      notifications: {
+        pending: pendingByEvent,
+        tasks: {
+          completed: completedTask.task_id,
+          failed: failedTask.task_id,
+          waiting_input: waitingTask.task_id,
+        },
+      },
     },
     hint:
       `浏览器打开 http://127.0.0.1:1420/?runtime=http://${runtime.host}:${runtime.port}；` +
+      "顶栏铃铛应显示 3 条未读（completed/failed/免打扰到点），点开面板可跳任务、全部标记已读；" +
+      "加 &notification_permission=denied 走查权限拒绝降级文案；" +
       "设置 → 渠道 → 启用微信（完整风险文案 + 勾选）→ 加白名单 → 加联系人授权 → 改通知规则 → " +
       "在 Outbox 对 needs_review 行「我已核对，重发」/「标记已送达」；飞书行会显示 token 临期降级。",
   }),
@@ -300,6 +405,29 @@ function createScriptedAgent() {
     async prompt(input: string | { content: string }[]): Promise<void> {
       const text = typeof input === "string" ? input : input.map((message) => message.content).join(" ");
       emit({ type: "text_delta", delta: `channel-fixture 收到：「${text}」` });
+      emit({ type: "agent_end", stopReason: "stop" });
+    },
+    subscribe(listener: (event: { type: string; [key: string]: unknown }) => void): () => void {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+    abort(): void {},
+    async waitForIdle(): Promise<void> {},
+    dispose(): void {
+      listeners.clear();
+    },
+  };
+}
+
+/** 规划 Agent：只吐一段计划 JSON（taskPlannerFactory 注入，任务保持 planned） */
+function createPlanAgent(plan: string) {
+  const listeners = new Set<(event: { type: string; [key: string]: unknown }) => void>();
+  const emit = (event: { type: string; [key: string]: unknown }): void => {
+    for (const listener of [...listeners]) listener(event);
+  };
+  return {
+    async prompt(): Promise<void> {
+      emit({ type: "text_delta", delta: plan });
       emit({ type: "agent_end", stopReason: "stop" });
     },
     subscribe(listener: (event: { type: string; [key: string]: unknown }) => void): () => void {

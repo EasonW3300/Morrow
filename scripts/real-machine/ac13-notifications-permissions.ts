@@ -197,6 +197,7 @@ async function main(): Promise<void> {
       enableEchoChannel: true,
       agentAdapterFactory: async () => createFakePi({ script: [{ kind: "text", deltas: ["AC-13 ", "ack"] }] }),
       notificationDrainIntervalMs: 0,
+      outboxDrainIntervalMs: 0,
     });
     const base = `http://127.0.0.1:${runtime.port}`;
     const rt = runtime;
@@ -323,6 +324,9 @@ async function main(): Promise<void> {
     assert.equal(denials.length, totalBlocked, "every denied decision is audited");
 
     // --- B. 通知规则与去重 -----------------------------------------------------
+    // A3 修复批：渠道通知目标必须解析到该渠道的默认通知会话（复用已建立的联系人会话）
+    const notifyTarget = rt.channels.setNotifyTarget("echo", "dm-carol");
+    assert.equal(notifyTarget.ok, true, "echo notify target configured");
     const rules: Array<Record<string, unknown>> = [];
     for (const eventType of EVENT_TYPES) {
       rules.push({ event_type: eventType, target: "desktop", enabled: true });
