@@ -42,6 +42,8 @@ import { MemoryProjectionRebuilder } from "./memory/rebuild.ts";
 import { TaskProjectionRebuilder } from "./task-rebuild.ts";
 import { ProviderRegistry, ProviderRegistryError, ENV_PROVIDER_ID, type ProviderResolver, type ResolvedProvider } from "./providers.ts";
 import { SessionManager, type AgentRuntimeExtras, type SessionFrame } from "./sessions.ts";
+import { ChannelRegistry } from "./channels/registry.ts";
+import { channelRoutes } from "./channels/routes.ts";
 import { TaskScheduler, type NodeAgentFactory, type TaskNodeExecInput } from "./scheduler.ts";
 import { CheckpointError, CheckpointService } from "./checkpoint.ts";
 import { PLANNER_SYSTEM_PROMPT, TaskError, TaskService, type PlannerFactory } from "./tasks.ts";
@@ -130,6 +132,8 @@ interface RequestContext {
   syncConflicts: SyncConflictStore;
   /** 执行租约（M3-T4 / Issue #33：单点执行 + fencing token） */
   leases: LeaseStore;
+  /** 渠道适配器注册表（M4-T1 / Issue #38：GET /v1/channels + 统一入站路由） */
+  channels: ChannelRegistry;
 }
 
 type Handler = (
@@ -237,6 +241,11 @@ export interface RuntimeOptions {
   leaseCoordination?: boolean;
   /** 同任务租约前拉取结果复用窗口（毫秒，默认 500；0 = 不节流） */
   leasePullThrottleMs?: number;
+  /**
+   * 渠道域（M4-T1 / Issue #38）：启用 echo 参考适配器（仅测试/开发）。缺省读
+   * MORROW_CHANNEL_ECHO=1；显式 true 用于测试注入。生产适配器在后续票接入。
+   */
+  enableEchoChannel?: boolean;
 }
 
 export interface RuntimeHandle {
@@ -287,6 +296,8 @@ export interface RuntimeHandle {
   leases: LeaseStore;
   /** 跨设备执行权协调器（Issue #34：pre-acquire 拉取/远端租约重放；测试与运维可直用） */
   leaseCoordinator: LeaseCoordinator;
+  /** 渠道适配器注册表（M4-T1 / Issue #38：清单/健康/入站路由，库形态可直用） */
+  channels: ChannelRegistry;
   /**
    * 优雅停止：停止接收请求 → 中止并释放会话运行时与在跑任务节点 → 记账 runtime.stopped
    * → 关闭任务投影库与账本（WAL checkpoint）。signal 传入收到的 POSIX 信号名，
@@ -342,6 +353,7 @@ const routes: Route[] = [
   ...skillRoutes,
   ...syncRoutes,
   ...memoryRoutes,
+  ...channelRoutes,
   // 能力调用端点（#22 修复批 / FR-CAP-5）：POST /v1/capabilities/:id/invoke（body = 工具
   // input）——经 ToolInvoker 统一执行链（权限复核在链上），builtin 进程内直呼、sandboxed
   // 走容器；capability.used 审计先落账本后返回。与既有生命周期路由无路径/方法冲突。
@@ -688,6 +700,17 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
   } catch (err) {
     console.error("[morrow] task projection rebuild on startup failed:", err);
   }
+  // 渠道域（M4-T1 / Issue #38）：适配器注册表 + 统一入站路由。接缝最小化——
+  // 生命周期 start/stop、清单/健康端点与 echo 参考适配器（默认关闭）。入站消息
+  // 经会话链路处理；Task 关联只经中间路由写入关联列，不覆盖平台原始记录。
+  const channels = new ChannelRegistry({
+    dataDir: config.dataDir,
+    ledger,
+    replicaId: config.replicaId,
+    sessions,
+    ...(options.enableEchoChannel === undefined ? {} : { enableEcho: options.enableEchoChannel }),
+    taskExists: (taskId) => tasks.getTask(taskId) !== null,
+  });
   // Checkpoint 域（M1-T5 / Issue #17）：FR-TASK-5 快照 + 恢复落地；执行配置采集注入
   // runtime 版本、默认 Provider 投影（绝不含密钥）与工具版本表（M1 code-review 填实：
   // pi-adapter 版本可证；逐工具版本无来源——任务执行无工具通道，留空待后续票交付）。
@@ -777,6 +800,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     sync,
     syncConflicts,
     leases,
+    channels,
   };
   const server = createServer((req, res) => {
     routeRequest(req, res, ctx);
@@ -794,6 +818,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     tasks.close();
     locks.close();
     capabilities.close();
+    channels.close();
     memoryStore.close();
     syncCursors.close();
     syncConflicts.close();
@@ -815,6 +840,9 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
   // builtin 工具 ensure-registered（票 M2-T1）：首见注册落 capability.registered（actor
   // agent:runtime），已注册同版本同内容 → no-op；builtin 常量与历史账本冲突时抛错（fail-fast）。
   ensureBuiltinCapabilities(capabilities);
+  // 渠道适配器启动（M4-T1）：在 runtime.started 之后落 channel.adapter_started。
+  // 失败按适配器隔离（state=error 可在 GET /v1/channels 诊断），不阻断 runtime 启动。
+  await channels.start();
   // 调用接缝初始登记（#22 修复批 / FR-CAP-5）：把注册表里全部 enabled 能力登记进
   // ToolInvoker（本进程新建的经 onLifecycle 已登记；这里覆盖重启场景——历史行不重放
   // registered 事件）。登记失败的条目跳过并告警（invoke 404，不静默假装可调）。
@@ -856,6 +884,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     taskRebuilder,
     leases,
     leaseCoordinator,
+    channels,
     async close(signal?: string): Promise<void> {
       if (closing) return;
       closing = true;
@@ -865,6 +894,8 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
       await sessions.dispose();
       // 任务调度：拒绝排队任务、中止在跑节点（收尾上限 2s），然后关任务投影库
       await scheduler.dispose();
+      // 渠道适配器先停（落 channel.adapter_stopped），再记账 runtime.stopped
+      await channels.stop();
       tasks.close();
       locks.close();
       checkpoints.close();
@@ -886,6 +917,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
       }
       pairing.close();
       devices.close();
+      channels.close();
       memoryStore.close();
       syncCursors.close();
       syncConflicts.close();
