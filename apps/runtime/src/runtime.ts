@@ -502,7 +502,9 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     syncMemory.handleImported(envelopes, peerReplicaId);
     // 任务投影随同步重建（M3 修复批 / #32 #36）：只重建可见投影，不触发调度器——
     // 对端任务只读可见，执行权仍由本地租约与 needs_reconcile 语义决定。
-    if (envelopes.some((envelope) => envelope.event_type.startsWith("task."))) {
+    // 排除纯租约事件（M3 code-review D2）：心跳 task.lease_renewed 每 ttl/3 一次，
+    // 若触发全量重放会让每批同步都 O(账本) 重建；这些事件不改变任务/节点投影。
+    if (envelopes.some(isProjectionTaskEvent)) {
       try {
         taskRebuilder.rebuild();
       } catch (err) {
@@ -1884,4 +1886,21 @@ function handleDetectReconcile(_req: IncomingMessage, res: ServerResponse, _url:
   } catch (err) {
     handleTaskError(res, err);
   }
+}
+
+/**
+ * 同步导入后是否需要重建任务投影（D2）：纯租约生命周期事件（心跳/拒绝/释放）不改变
+ * 任务/节点投影，排除它们避免每次心跳都触发全量重放。execution_transferred 与
+ * needs_reconcile/reconciled 仍重建（所有权/状态语义变化）。
+ */
+const PURE_LEASE_EVENT_TYPES = new Set([
+  "task.lease_acquired",
+  "task.lease_renewed",
+  "task.lease_released",
+  "task.lease_lost",
+  "task.lease_denied",
+]);
+
+function isProjectionTaskEvent(envelope: EventEnvelope): boolean {
+  return envelope.event_type.startsWith("task.") && !PURE_LEASE_EVENT_TYPES.has(envelope.event_type);
 }
