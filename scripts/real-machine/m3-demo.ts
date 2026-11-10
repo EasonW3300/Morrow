@@ -11,8 +11,8 @@
  *   5. 任务执行权转移：租约 token=1 → transfer-execution → 目标设备取得执行权
  *   6. needs_reconcile：异地执行证据入账本 → detect 冻结 → Owner 显式裁决
  *
- * 每轮 10 项断言，两轮独立执行。所有边界（任务投影不随同步复制、跨实例租约表独立、
- * 锁冲突重放缺陷）在 docs/gates/m3-gate-report.md §6 如实登记。
+ * 每轮 10 项断言，两轮独立执行。剩余边界（无共识协议下的拉取-acquire 竞态窗口、
+ * 附件文件传输未实现）在 docs/gates/m3-gate-report.md §6 如实登记。
  *
  * 用法：bash scripts/real-machine/m3-demo.sh [--out docs/gates/m3-demo-output.md] [--keep]
  */
@@ -307,6 +307,11 @@ async function runRound(round: number, keep: boolean): Promise<RoundResult> {
     );
     const transferEvents = await taskEvents(pair, transferTask.task_id);
     const transferEvent = findEvent(transferEvents, "task.execution_transferred", transferTask.task_id);
+    // 真实流程：转移事件必须先同步到目标设备，目标才可能看到预留的 fencing token。
+    // 不同步直接 acquire 会从 1 起号——那正是 review 发现的问题（旧 token 仍可提交）。
+    await postJson(pair.a, "/v1/sync/run", {});
+    await postJson(pair.b, "/v1/sync/run", {});
+    await postJson(pair.a, "/v1/sync/run", {});
     const targetAcquire = pair.b.runtime.leases.acquire(transferTask.task_id, REPLICA_B, 30_000);
     check(
       "任务执行权转移：A 持有 token=1 → transfer 释放 → 目标设备 B 取得执行权",
@@ -315,7 +320,10 @@ async function runRound(round: number, keep: boolean): Promise<RoundResult> {
         transferred.lease.holder_replica_id === null &&
         transferEvent !== undefined &&
         (transferEvent.payload as { to_replica_id?: string }).to_replica_id === REPLICA_B &&
-        "token" in targetAcquire,
+        "token" in targetAcquire &&
+        // 跨副本单调：目标采用 transfer 预留的 next_fencing_token（= before+1）
+        targetAcquire.token === 2 &&
+        pair.b.runtime.leases.validate(transferTask.task_id, 1) === false,
       `before.token=${beforeTransfer.lease?.fencing_token} after.active=${transferred.lease.active} event=${transferEvent?.event_id ?? "none"} target=${(transferEvent?.payload as { to_replica_id?: string }).to_replica_id ?? "none"} B.token=${"token" in targetAcquire ? targetAcquire.token : "held"}`,
     );
 

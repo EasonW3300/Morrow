@@ -15,7 +15,7 @@ T7 归档时的产品缺口在 §6 如实登记；其中 §6-4（任务投影不
 | 项 | 值 |
 |---|---|
 | 当前 tip | 6c3e47b（merge: integration/m0 合并态——AC-04/AC-05 复跑与门禁报告刷新），与 `integration/m0` 一致 |
-| 修复批 tip | 9fb82ab（`fix/m3-projection-conflict`：code-review A1 fencing token 跨副本单调、A2 同步游标命名空间拆分、B1/B2 memory-sync 版本关系与 valid_until、文档与清理；**未 push**） |
+| 修复批 tip | `fix/m3-projection-conflict`（code-review A1 fencing token 跨副本单调、A2 同步游标命名空间拆分、B1/B2 memory-sync 版本关系与 valid_until、文档与清理）+ 收尾修正：`LeaseStore` 取号前**自助从同库账本刷新远端租约观察值**（原先只有调度器路径喂观察值，库形态调用仍从 1 起号——demo 第 7 项即暴露），demo 现在断言 `B.token=2` 且 `validate(1)=false` |
 | 最新 run | [42767124433](https://github.com/EasonW3300/Morrow/actions/runs/42767124433)（push integration/m0，2026-11-10T06:14:02Z，约 4m13s）—— **success**（8 job 全绿：build ×3、gate ×3、gate report、`sandbox tests (ubuntu, real containers)`） |
 | Ubuntu 部署冒烟 job | `gate (linux)` 第 8 步 **Deployment smoke (server form, systemd-equivalent)** success（`scripts/deploy/smoke-server.sh --binary artifacts/runtime/morrow-runtime-linux-x64`，服务器单二进制前台等价形态） |
 | 前一条成功 run | [42762135949](https://github.com/EasonW3300/Morrow/actions/runs/42762135949)（a5d7eba，2026-11-10T05:26Z）—— 同为 8 job 全绿，含同一部署冒烟步骤 |
@@ -171,6 +171,13 @@ HTTP 传输已按设备凭据携带 bearer token，真实非回环路径具备�
    **诚实残余窗口**：拉取与 acquire 之间无共识协议，两端仍可能各自认为对方未持有；二次采样只缩小
    窗口。最终护栏是 fencing token（副作用提交前校验）+ `needs_reconcile` Owner 裁决；peer 不可达
    不阻断本地 acquire（离线优先）。
+   **取号路径无关性（收尾修正）**：观察值原先只由调度器/协调器写入，直接经 `LeaseStore`
+   库形态 acquire（测试、演示、运维脚本）仍从 1 起号——安全属性只在一条调用路径成立。
+   现改为 `LeaseStore.acquire/validate` 先从同库 `events` 表重放该任务的
+   `task.lease_acquired` / `task.execution_transferred` 刷新 granted/reserved，再取号。
+   证据：`m3-demo.ts` 第 7 项（transfer → 同步 → 目标 acquire）现在断言
+   `B.token=2` 且 `B.validate(1)=false`，两轮 20/20；`lease.fencing-sync.test.ts`
+   用两独立 store + 真实事件同步验证同一性质。
 2. ~~**Runtime 进程入口未接线出站同步传输**~~ → **已修复（#34，`d716b99`）**。`startRuntime` 缺省构建
    `DeviceSyncTransport` 注入 `SyncEngine`：base_url 读 `devices.base_url`（join 的 `base_url` 与
    claim 的 `device_base_url` 双向写入），token 读 SecretStore 的 `token:<peer>`；设备加入/撤销经

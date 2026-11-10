@@ -143,6 +143,10 @@ export class LeaseStore {
     const nowIso = now.toISOString();
     const expiresIso = new Date(nowMs + ttlMs).toISOString();
 
+    // 任何调用路径（调度器 / 库形态 / 脚本）都必须先看到同步来的租约事件，否则取号会
+    // 从 1 重新开始、转移预留的 token 被无视（跨副本旧 token 仍可提交）。
+    this.#refreshObservationFromLedger(taskId);
+
     this.#db.exec("BEGIN IMMEDIATE");
     try {
       const existing = this.#getStmt.get(taskId) as LeaseRow | undefined;
@@ -230,6 +234,7 @@ export class LeaseStore {
    */
   validate(taskId: string, token: number): boolean {
     this.#assertOpen();
+    this.#refreshObservationFromLedger(taskId);
     const observed = this.#observed(taskId);
     const floor = Math.max(observed.granted, observed.reserved);
     if (token < floor) return false;
@@ -248,6 +253,40 @@ export class LeaseStore {
     this.#assertOpen();
     if (!Number.isInteger(token) || token <= 0) return;
     this.#observeGrantedStmt.run(taskId, token);
+  }
+
+  /**
+   * 从同库 events 表重放该任务的租约事件，刷新 granted/reserved 观察值。
+   *
+   * 为什么放在 store 内而不是只靠调度器喂：库形态（测试/演示/运维脚本）与调度器走同一个
+   * acquire——安全属性必须在 store 层成立，而不是"某条调用路径成立"。事件按 task_id
+   * 过滤（专列 + 索引），单任务事件量有界。
+   */
+  #refreshObservationFromLedger(taskId: string): void {
+    if (this.#closed) return;
+    let rows: Array<{ envelope: string }>;
+    try {
+      rows = this.#db
+        .prepare("SELECT envelope FROM events WHERE task_id = ? ORDER BY seq")
+        .all(taskId) as unknown as Array<{ envelope: string }>;
+    } catch {
+      return; // events 表尚不存在（独立库）：无观察值，按本地取号
+    }
+    for (const row of rows) {
+      let envelope: { event_type?: string; payload?: Record<string, unknown> };
+      try {
+        envelope = JSON.parse(row.envelope) as typeof envelope;
+      } catch {
+        continue;
+      }
+      if (envelope.event_type === "task.lease_acquired") {
+        const token = Number(envelope.payload?.fencing_token ?? envelope.payload?.token);
+        if (Number.isInteger(token)) this.observeGrantedToken(taskId, token);
+      } else if (envelope.event_type === "task.execution_transferred") {
+        const reserved = Number(envelope.payload?.next_fencing_token);
+        if (Number.isInteger(reserved)) this.observeReservedToken(taskId, reserved);
+      }
+    }
   }
 
   /**
