@@ -10,15 +10,17 @@ import {
  *
  * 判定口径**直接复用 M1 巩固器**（DefaultConsolidator）：把远端修订当作候选、本地事实
  * 当作既有事实跑同一决策矩阵，因此 locked / sensitivity_change / 同主题 preference /
- * 重大事实冲突四个分支与 M1 不会漂移。三方信息只用来先排除「非并发」情形：
+ * 重大事实冲突四个分支与 M1 不会漂移。版本关系先于语义分类（M3 code-review B1：
+ * `min(version)-1` 的伪基线会让 fast_forward 变成死分支、把普通新版本误判冲突）：
  *
  *   identical       两侧归一化内容与敏感等级相同 → 无需动作（可补来源）
- *   remote_is_base  远端仍停留在基线 → 陈旧副本，忽略（不覆盖本地）
- *   fast_forward    本地仍停留在基线且远端版本更新 → 直接采纳远端（locked 除外）
- *   auto_merge      巩固器判 update_fact（同主题 preference）→ 自动合并；
- *                   胜者按版本/更新时间/内容字典序确定性选取，两端收敛
- *   escalate        巩固器判 escalate（locked / sensitivity_change / fact_conflict）
- *                   → 进待确认队列，绝不静默覆盖
+ *   stale_remote    远端版本低于本地 → 陈旧修订，忽略（不覆盖、不制造冲突）
+ *   locked          本地是 locked → 永不自动采纳（即使远端版本更高）
+ *   fast_forward    远端版本更高 → 直接采纳远端
+ *   auto_merge      **同版本**且内容不同、巩固器判 update_fact（同主题 preference）→
+ *                   自动合并；胜者按版本/更新时间/内容字典序确定性选取，两端收敛
+ *   escalate        **同版本**且内容不同、巩固器判 escalate（sensitivity_change /
+ *                   fact_conflict）→ 进待确认队列，绝不静默覆盖
  *
  * 版本/更新时间并列时用内容字典序做最终 tie-break：合并结果必须与「哪一端先算」无关，
  * 否则两台设备各自合并会得到不同文本，下一次同步又互相覆盖。
@@ -32,10 +34,16 @@ export interface FactVersionView {
   version: number;
   /** 事实最后更新时间（ISO 8601）；三方比较的次级 tie-break */
   updatedAt?: string;
+  /** 有效期截止（ISO 8601；null/缺省 = 长期有效）。过期事实不参与冲突判定（FR-DEP-5）。 */
+  validUntil?: string | null;
 }
 
 export interface FactMergeInput {
-  /** 共同基线（通常是 min(local.version, remote.version) - 1 的修订；未知传 null） */
+  /**
+   * 共同基线。M3 code-review B1 起版本关系直接由 local/remote 的 version 判定，
+   * 不再从 `min(version)-1` 伪造基线；此字段仅保留给调用方显式提供真实三方祖先
+   * （缺省/未知传 null）。
+   */
   base: FactVersionView | null;
   local: FactVersionView | null;
   remote: FactVersionView;
@@ -114,16 +122,15 @@ export function classifyFactMerge(input: FactMergeInput): FactMergeDecision {
   if (sameState(local, remote)) {
     return { ...baseDecision, action: "identical", reason: "same_content" };
   }
-  // 远端没动（仍是基线）→ 陈旧副本，忽略；不因「本地改了、远端没改」制造冲突。
-  if (base !== null && sameState(remote, base)) {
+  // 版本关系（B1）：远端更低 → 陈旧修订，忽略；不因「本地改了、远端是旧值」制造冲突。
+  if (remote.version < local.version) {
     return { ...baseDecision, action: "remote_is_base", reason: "stale_remote" };
   }
-  // locked 禁止一切自动改写（GLOSSARY）：即使本地仍停在基线，也不自动采纳远端变更。
+  // locked 禁止一切自动改写（GLOSSARY）：即使远端版本更高，也交由 Owner 裁决。
   if (local.sensitivity === "locked" || base?.sensitivity === "locked") {
     return escalateDecision(baseDecision, "locked", local, remote);
   }
-  const localIsBase = base !== null && sameState(local, base);
-  if (localIsBase && remote.version > local.version) {
+  if (remote.version > local.version) {
     return {
       ...baseDecision,
       action: "fast_forward",
@@ -134,7 +141,8 @@ export function classifyFactMerge(input: FactMergeInput): FactMergeDecision {
     };
   }
 
-  // 并发修改：完全沿用 M1 巩固器的决策矩阵（同主题 preference 自动，其余上报）。
+  // 同版本且内容不同 = 并发修改：完全沿用 M1 巩固器的决策矩阵
+  // （同主题 preference 自动，其余上报）。
   const [action] = new DefaultConsolidator().consolidate({
     candidates: [
       {
