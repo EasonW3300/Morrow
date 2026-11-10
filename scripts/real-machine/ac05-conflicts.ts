@@ -8,7 +8,9 @@
  *   3. A/B 各自离线写同一事实的 v2 竞争修订（内容/敏感等级按 20 个样本），重连同步；
  *   4. 逐项分类：6 个 preference 应自动合并（两端收敛到同一 v3）；14 个应进待审核
  *      （locked 3 / sensitivity_change 5 / fact_conflict 6），分类口径复用 M1 巩固器
- *      （DefaultConsolidator，展示在同一行）；
+ *      （DefaultConsolidator，展示在同一行）；同时断言待审核期间两端各自的本地 v2
+ *      仍可见（修复批 #32 #36：修复前 0/14 → 修复后 14/14）且冲突记录同时携带本地
+ *      版本引用与远端事件引用；
  *   5. 删除不复活双向：A 删 / B 离线改 → 同步；B 删 / A 离线改 → 同步；
  *      断言双方事实保持 deleted_at 非空、旧修订未导入、sync.tombstone_skipped 审计。
  *
@@ -87,7 +89,10 @@ interface RowResult {
   a_content: string | null;
   b_content: string | null;
   converged: boolean;
+  /** A 侧待审核期间的本地 v2 是否仍可见（修复前 0/14；修复后期望 14/14） */
   local_view_kept: boolean | null;
+  /** B 侧同一判定的镜像（两端各自保留自己的 v2） */
+  b_local_view_kept: boolean | null;
   pass: boolean;
 }
 
@@ -114,8 +119,12 @@ interface Ac05Report {
     locked: number;
     sensitivity_change: number;
     fact_conflict: number;
-    /** 待审核样本中，本地 v2 编辑仍可见的条数（缺陷观测；见 §6） */
+    /** 待审核样本中，A 侧本地 v2 仍可见的条数（修复前 0/14 → 修复后期望 14/14） */
     review_local_view_retained: number;
+    /** 同上，B 侧（修复前 0/14 → 修复后期望 14/14） */
+    review_local_view_retained_b: number;
+    /** 冲突记录同时保留 local 版本引用与 remote 事件引用的样本数（应为 14） */
+    conflict_records_with_local_ref: number;
   };
   rows: RowResult[];
   deletion: {
@@ -218,12 +227,12 @@ function renderMarkdown(report: Ac05Report): string {
     "",
     "## 1. 20 个竞争事实分类结果",
     "",
-    "| # | 样本 | kind | M1 巩固器分支 | 期望 | A 分类 | B 分类 | A v / B v | 收敛 | 本地视图保留 | 判定 |",
+    "| # | 样本 | kind | M1 巩固器分支 | 期望 | A 分类 | B 分类 | A v / B v | 收敛 | 本地视图保留 A/B | 判定 |",
     "|---|---|---|---|---|---|---|---|---|---|---|",
   ];
   report.rows.forEach((row, index) => {
     lines.push(
-      `| ${index + 1} | ${row.name} | ${row.kind} | ${row.m1_consolidator} | ${row.expected} | ${row.a_conflict_reason ?? "auto_merge"} | ${row.b_conflict_reason ?? "auto_merge"} | ${row.a_version ?? "-"} / ${row.b_version ?? "-"} | ${row.converged} | ${row.local_view_kept === null ? "-" : row.local_view_kept} | ${row.pass ? "PASS" : "FAIL"} |`,
+      `| ${index + 1} | ${row.name} | ${row.kind} | ${row.m1_consolidator} | ${row.expected} | ${row.a_conflict_reason ?? "auto_merge"} | ${row.b_conflict_reason ?? "auto_merge"} | ${row.a_version ?? "-"} / ${row.b_version ?? "-"} | ${row.converged} | ${row.local_view_kept === null ? "-" : row.local_view_kept} / ${row.b_local_view_kept === null ? "-" : row.b_local_view_kept} | ${row.pass ? "PASS" : "FAIL"} |`,
     );
   });
   lines.push(
@@ -233,11 +242,12 @@ function renderMarkdown(report: Ac05Report): string {
       `待审核期望 ${report.counts.review_expected} → 实际 ${report.counts.review_raised}；` +
       `locked ${report.counts.locked} / sensitivity_change ${report.counts.sensitivity_change} / fact_conflict ${report.counts.fact_conflict}。`,
     "",
-    `> **缺陷观测（如实登记，见门禁报告 §6）**：14 个待审核样本的**分类全部正确**，但两端都产生 ` +
-      `sync.conflict 后，跨端冲突审计互把对方本地 v2 修订记入 remote_event_ids，重放时双方可见值回落基线 v1；` +
-      `本地 v2 可见的条数 = ${report.counts.review_local_view_retained}/${report.counts.review_expected}。` +
-      `冲突队列（memory_conflicts）仍完整保留两侧内容，Owner 仍可裁决；缺陷在「重放过滤未按 local_replica_id 归属判定」，` +
-      `不影响 AC-05 的「预期合并或待审核」分类判定，但影响待审核期间的本地可见值。`,
+    `> **可见值判定（M3 修复批 / #32 #36）**：待审核期间两端各自的本地 v2 修订必须保持可见，` +
+      `回落到基线 v1 即失败。修复前归档为 A 0/14、B 0/14（两端互把对方本地 v2 记为不采纳）；` +
+      `本次运行 A ${report.counts.review_local_view_retained}/${report.counts.review_expected}、` +
+      `B ${report.counts.review_local_view_retained_b}/${report.counts.review_expected}。` +
+      `冲突记录同时保留本地版本引用（local_version/local_revision_id/local_event_id）与远端事件引用（remote_event_ids）：` +
+      `${report.counts.conflict_records_with_local_ref}/${report.counts.review_expected} 条具备两者。`,
     "",
     "## 2. 删除不复活（双向）",
     "",
@@ -338,19 +348,25 @@ async function main(): Promise<void> {
           b_content: bFact?.content ?? null,
           converged,
           local_view_kept: null,
+          b_local_view_kept: null,
           pass,
         };
       }
+      // 可见值判定（M3 修复批 / #32 #36）：待审核期间两侧各自的本地 v2 必须保持可见。
+      // A 的本地 v2 = localContent，B 的本地 v2 = remoteContent（方向不同但语义对称）。
       const localViewKept =
         aFact !== null && aFact.version === 2 && aFact.content === sample.localContent;
-      // AC-05 判定口径：分类正确（双方都进同一原因的待审核队列）即达成；
-      // 「本地可见值是否保留」单列为缺陷观测——两端同时竞争时跨端 sync.conflict
-      // 会把彼此本地修订也标记为不采纳，重放后可见值回落基线（见报告 §6）。
+      const bLocalViewKept =
+        bFact !== null && bFact.version === 2 && bFact.content === sample.remoteContent;
+      // AC-05 判定口径（修复后）：分类正确（双方都进同一原因的待审核队列）**且**本地
+      // v2 在重放后仍可见（不回落到基线 v1）——两者同时成立才算达成。
       const pass =
         aReason === sample.expect &&
         bReason === sample.expect &&
         aFact !== null &&
-        bFact !== null;
+        bFact !== null &&
+        localViewKept &&
+        bLocalViewKept;
       return {
         name: sample.name,
         kind: sample.kind,
@@ -364,6 +380,7 @@ async function main(): Promise<void> {
         b_content: bFact?.content ?? null,
         converged,
         local_view_kept: localViewKept,
+        b_local_view_kept: bLocalViewKept,
         pass,
       };
     });
@@ -479,6 +496,16 @@ async function main(): Promise<void> {
     const eventsB = await fetchAllEvents(pair.b);
     const autoRows = rows.filter((row) => row.expected === "auto");
     const reviewRows = rows.filter((row) => row.expected !== "auto");
+    const conflictRecordsWithLocalRef = new Set<string>();
+    for (const event of eventsA) {
+      if (event.event_type !== "sync.conflict") continue;
+      const payload = event.payload as Record<string, unknown>;
+      if (typeof payload.fact_id !== "string") continue;
+      if (typeof payload.local_event_id !== "string") continue;
+      if (typeof payload.local_revision_id !== "string") continue;
+      if (!Array.isArray(payload.remote_event_ids) || payload.remote_event_ids.length === 0) continue;
+      conflictRecordsWithLocalRef.add(payload.fact_id);
+    }
     const counts = {
       auto_expected: autoRows.length,
       auto_merged: autoRows.filter((row) => row.pass).length,
@@ -488,7 +515,15 @@ async function main(): Promise<void> {
       sensitivity_change: reviewRows.filter((row) => row.expected === "sensitivity_change").length,
       fact_conflict: reviewRows.filter((row) => row.expected === "fact_conflict").length,
       review_local_view_retained: reviewRows.filter((row) => row.local_view_kept === true).length,
+      review_local_view_retained_b: reviewRows.filter((row) => row.b_local_view_kept === true).length,
+      conflict_records_with_local_ref: 0,
     };
+    // 冲突记录的 local/remote 引用完整性：按样本 fact_id 对账（上面的集合）
+    counts.conflict_records_with_local_ref = reviewRows.filter((row) =>
+      conflictRecordsWithLocalRef.has(
+        sampleFacts.find(({ sample }) => sample.name === row.name)?.factId ?? "",
+      ),
+    ).length;
     const audit = {
       sync_merged_a: countByType(eventsA, "sync.merged"),
       sync_merged_b: countByType(eventsB, "sync.merged"),
@@ -506,6 +541,9 @@ async function main(): Promise<void> {
       counts.locked === 3 &&
       counts.sensitivity_change === 5 &&
       counts.fact_conflict === 6 &&
+      counts.review_local_view_retained === counts.review_expected &&
+      counts.review_local_view_retained_b === counts.review_expected &&
+      counts.conflict_records_with_local_ref === counts.review_expected &&
       deletionPass;
 
     const report: Ac05Report = {

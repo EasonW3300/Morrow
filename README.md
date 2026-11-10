@@ -84,6 +84,22 @@ Runtime 默认不监听公网；非回环访问必须持配对下发的 bearer t
 `pending_upload` 可能残留少量 `sync.*` 审计事件（本轮 pull 带入的对端审计 + 本条
 `sync.run_completed` 尚未推送），下次同步会继续推进。
 
+**投影随同步重建**：账本是唯一事实源，`memory_facts` 与 `tasks`/`task_nodes`/`task_edges`
+都是事件派生投影。同步只传事件信封，因此导入批次落账后会触发投影重建：
+
+- **记忆投影**（`memory/rebuild.ts`）：`memory.*` 事件按序重放 facts / revisions / 来源 / FTS；
+- **任务投影**（`task-rebuild.ts`）：`task.*` 事件按序重放任务状态、`task_version`、节点
+  状态/结果/attempts/resources/actor 与依赖边。对端任务在 `GET /v1/tasks` 可见、
+  `GET /v1/tasks/:id` 返回真实状态（不再是 404）。启动时若「任务表为空但账本有
+  `task.*` 事件」也会补建一次；重建是幂等的（重跑同结果）。
+- **不自动接管执行权**：重建只写投影，不触发调度器。同步来的未完成任务只读可见，
+  执行仍须本地显式 `resume`/`kick` 并经租约；双端独立执行过的任务由
+  `needs_reconcile` 冻结交 Owner 裁决。
+- **冲突可见值**：待审核冲突期间，`sync.conflict` 的 `remote_event_ids` 只在重放时
+  压制**非本副本创作**的远端修订；本地已合并版本保持可见（不会回落到基线）。
+  冲突记录同时保留本地版本引用（`local_version`/`local_revision_id`/`local_event_id`）
+  与远端事件引用。自动合并结果版本 = `max(本地, 远端) + 1`，重复同步/重放不再递增。
+
 **调用错误码**：`POST .../invoke`（能力与 Skill 重用共用）的 HTTP 状态按统一契约表映射（单源 `apps/runtime/src/invocation-errors.ts`）：`unknown_tool`→404、`permission_denied`→403、`invalid_sandbox_contract`/`tool_package_unsupported`/`capability_escalation`→400、`sandbox_unavailable`/`image_pull_failed`→503（附 install-hint）、`tool_timeout`→504、`tool_build_failed`→500、工具自身失败（`tool_error`/`tool_exit_nonzero`/`tool_protocol_error`/`tool_output_too_large`）→502。每次调用先落 `capability.used` 审计后返回（Skill 重用另落 `skill.invoked`）。
 
 里程碑与验收标准见 PRD §8/§9。
