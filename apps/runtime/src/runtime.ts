@@ -44,6 +44,8 @@ import { ProviderRegistry, ProviderRegistryError, ENV_PROVIDER_ID, type Provider
 import { SessionManager, type AgentRuntimeExtras, type SessionFrame } from "./sessions.ts";
 import { ChannelRegistry } from "./channels/registry.ts";
 import { channelRoutes } from "./channels/routes.ts";
+import { ContactService } from "./contacts/service.ts";
+import { contactRoutes } from "./contacts/routes.ts";
 import { TaskScheduler, type NodeAgentFactory, type TaskNodeExecInput } from "./scheduler.ts";
 import { CheckpointError, CheckpointService } from "./checkpoint.ts";
 import { PLANNER_SYSTEM_PROMPT, TaskError, TaskService, type PlannerFactory } from "./tasks.ts";
@@ -136,6 +138,8 @@ interface RequestContext {
   leases: LeaseStore;
   /** 渠道适配器注册表（M4-T1 / Issue #38：GET /v1/channels + 统一入站路由） */
   channels: ChannelRegistry;
+  /** 可信联系人（M4-T6 / Issue #43：邀请码/授权/歧义/记忆引用检索） */
+  contacts: ContactService;
   /** 外发副作用发件箱（M4-T2 / Issue #39：先落库再投递 + outbound.* 审计） */
   outbox: OutboxService;
 }
@@ -250,6 +254,8 @@ export interface RuntimeOptions {
    * MORROW_CHANNEL_ECHO=1；显式 true 用于测试注入。生产适配器在后续票接入。
    */
   enableEchoChannel?: boolean;
+  /** 联系人时钟注入（M4-T6：邀请码过期测试零等待）；缺省系统时间 */
+  contactNow?: () => Date;
   /**
    * Outbox 渠道适配器注入 seam（M4-T2 / Issue #39）：channel 域（M4-T1）启动后经
    * `runtime.outbox.setAdapter` 接线；测试注入计数桩。缺省 null = 未接线，
@@ -320,6 +326,8 @@ export interface RuntimeHandle {
   leaseCoordinator: LeaseCoordinator;
   /** 渠道适配器注册表（M4-T1 / Issue #38：清单/健康/入站路由，库形态可直用） */
   channels: ChannelRegistry;
+  /** 可信联系人（M4-T6 / Issue #43：邀请码/授权/歧义/记忆引用检索，库形态可直用） */
+  contacts: ContactService;
   /** 外发副作用发件箱（M4-T2 / Issue #39：enqueue/dispatchOnce/retry/markSent，库形态可直用） */
   outbox: OutboxService;
   /**
@@ -378,6 +386,7 @@ const routes: Route[] = [
   ...syncRoutes,
   ...outboxRoutes,
   ...memoryRoutes,
+  ...contactRoutes,
   ...channelRoutes,
   // 能力调用端点（#22 修复批 / FR-CAP-5）：POST /v1/capabilities/:id/invoke（body = 工具
   // input）——经 ToolInvoker 统一执行链（权限复核在链上），builtin 进程内直呼、sandboxed
@@ -680,6 +689,10 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     fencingGuard: (context) => fencingGuard.assertContext(context),
     ...(options.skillPromotionThreshold === undefined ? {} : { promotionThreshold: options.skillPromotionThreshold }),
   });
+  // 联系人会话的能力收窄（M4-T6）：晚绑定到 PermissionEngine 的
+  // contactCapabilitiesForSession——联系人会话只注入 scope 声明的能力工具；
+  // null/未接线 = Owner 或普通会话，不做联系人收窄。
+  let contactToolCapabilities: ((sessionId: string) => string[] | null) | null = null;
   // 会话工具注入改查注册表（票 M2-T1）：enabled 且有内置实现的 typescript 能力才实例化
   const sessions = new SessionManager({
     ledger,
@@ -708,11 +721,14 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
       },
     },
     // 工具注入改查注册表（票 M2-T1）：enabled 且有内置实现的 typescript 能力才实例化
-    agentTools: (sessionId) =>
-      capabilities
+    agentTools: (sessionId) => {
+      const contactScopes = contactToolCapabilities?.(sessionId) ?? null;
+      return capabilities
         .list({ status: "enabled", runtime: "typescript" })
         .filter((capability) => builtinToolFactories[capability.name] !== undefined)
-        .map((capability) => builtinToolFactories[capability.name](sessionId)),
+        .filter((capability) => contactScopes === null || contactScopes.includes(capability.name))
+        .map((capability) => builtinToolFactories[capability.name](sessionId));
+    },
   });
   // 任务域（M1-T4）：规划器/节点工厂注入语义对齐会话——注入时不做 Provider 预检，
   // 默认工厂路径要求存在可解析的默认 Provider（POST /v1/tasks 预检 503 依据）。
@@ -744,11 +760,24 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
   // 渠道域（M4-T1 / Issue #38）：适配器注册表 + 统一入站路由。接缝最小化——
   // 生命周期 start/stop、清单/健康端点与 echo 参考适配器（默认关闭）。入站消息
   // 经会话链路处理；Task 关联只经中间路由写入关联列，不覆盖平台原始记录。
+  // 可信联系人（M4-T6 / Issue #43）：邀请码绑定 + 授权类别 + 身份歧义。授权判定在
+  // PermissionEngine（单一入口）；本服务只维护行与审计，并把渠道接缝（绑定/歧义/
+  // 会话归属/类别解析）提供给 ChannelRegistry。
+  const contacts = new ContactService({
+    dataDir: config.dataDir,
+    ledger,
+    replicaId: config.replicaId,
+    engine: capabilities,
+    memory,
+    ...(options.contactNow === undefined ? {} : { now: options.contactNow }),
+  });
+  contactToolCapabilities = (sessionId) => capabilities.contactCapabilitiesForSession(sessionId);
   const channels = new ChannelRegistry({
     dataDir: config.dataDir,
     ledger,
     replicaId: config.replicaId,
     sessions,
+    contacts,
     ...(options.enableEchoChannel === undefined ? {} : { enableEcho: options.enableEchoChannel }),
     taskExists: (taskId) => tasks.getTask(taskId) !== null,
   });
@@ -842,6 +871,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     syncConflicts,
     leases,
     channels,
+    contacts,
     outbox,
   };
   const server = createServer((req, res) => {
@@ -862,6 +892,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     locks.close();
     capabilities.close();
     channels.close();
+    contacts.close();
     memoryStore.close();
     syncCursors.close();
     syncConflicts.close();
@@ -931,6 +962,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     leases,
     leaseCoordinator,
     channels,
+    contacts,
     outbox,
     async close(signal?: string): Promise<void> {
       if (closing) return;
@@ -948,6 +980,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
       checkpoints.close();
       factory.close();
       skills.close();
+      contacts.close();
       capabilities.close();
       try {
         ledger.append(

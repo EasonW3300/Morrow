@@ -126,10 +126,19 @@ export interface ChannelIdentityRecord {
 
 export type ConversationAllowMode = "mention_only" | "proactive_limited";
 
+export const CONVERSATION_ALLOW_MODES: readonly ConversationAllowMode[] = ["mention_only", "proactive_limited"];
+
 export interface ConversationAllowInput {
   account_id: string;
   native_conversation_id: string;
   mode: ConversationAllowMode;
+}
+
+export interface ConversationAllowRow {
+  account_id: string;
+  native_conversation_id: string;
+  mode: ConversationAllowMode;
+  created_at: string;
 }
 
 export interface ConversationRecord {
@@ -233,6 +242,9 @@ export class ChannelStore {
   #findIdentityStmt;
   #allowConversationStmt;
   #isConversationAllowedStmt;
+  #findAllowModeStmt;
+  #listAllowlistStmt;
+  #deleteAllowlistStmt;
   #upsertConversationStmt;
   #findConversationStmt;
   #getConversationByIdStmt;
@@ -281,6 +293,13 @@ export class ChannelStore {
     this.#isConversationAllowedStmt = db.prepare(
       "SELECT 1 AS hit FROM channel_allowlist WHERE account_id = ? AND native_conversation_id = ?",
     );
+    this.#findAllowModeStmt = db.prepare(
+      "SELECT mode FROM channel_allowlist WHERE account_id = ? AND native_conversation_id = ?",
+    );
+    this.#listAllowlistStmt = db.prepare(
+      "SELECT account_id, native_conversation_id, mode, created_at FROM channel_allowlist WHERE account_id = ? ORDER BY created_at, native_conversation_id",
+    );
+    this.#deleteAllowlistStmt = db.prepare("DELETE FROM channel_allowlist WHERE account_id = ?");
     this.#upsertConversationStmt = db.prepare(
       `INSERT INTO conversations (conversation_id, account_id, native_conversation_id, kind, session_id, permission_context, task_id, created_at, last_message_at)
        VALUES (?, ?, ?, ?, NULL, ?, NULL, ?, ?)
@@ -354,6 +373,9 @@ export class ChannelStore {
   }
 
   allowConversation(input: ConversationAllowInput, now: Date = new Date()): void {
+    if (!CONVERSATION_ALLOW_MODES.includes(input.mode)) {
+      throw new Error(`invalid conversation allow mode: ${String(input.mode)}`);
+    }
     this.#allowConversationStmt.run(
       input.account_id,
       input.native_conversation_id,
@@ -364,6 +386,45 @@ export class ChannelStore {
 
   isConversationAllowed(accountId: string, nativeConversationId: string): boolean {
     return this.#isConversationAllowedStmt.get(accountId, nativeConversationId) !== undefined;
+  }
+
+  /** 白名单模式（未列入 → null；mention_only / proactive_limited） */
+  findAllowMode(accountId: string, nativeConversationId: string): ConversationAllowMode | null {
+    const row = this.#findAllowModeStmt.get(accountId, nativeConversationId) as { mode: string } | undefined;
+    if (row === undefined) return null;
+    return CONVERSATION_ALLOW_MODES.includes(row.mode as ConversationAllowMode)
+      ? (row.mode as ConversationAllowMode)
+      : null;
+  }
+
+  listAllowlist(accountId: string): ConversationAllowRow[] {
+    return (this.#listAllowlistStmt.all(accountId) as unknown as Array<{
+      account_id: string;
+      native_conversation_id: string;
+      mode: string;
+      created_at: string;
+    }>).map((row) => ({
+      account_id: row.account_id,
+      native_conversation_id: row.native_conversation_id,
+      mode: row.mode as ConversationAllowMode,
+      created_at: row.created_at,
+    }));
+  }
+
+  /** PUT 语义：整表替换（空列表 = 清空白名单） */
+  replaceAllowlist(accountId: string, entries: Array<{ native_conversation_id: string; mode: ConversationAllowMode }>, now: Date = new Date()): void {
+    const iso = now.toISOString();
+    this.#db.exec("BEGIN");
+    try {
+      this.#deleteAllowlistStmt.run(accountId);
+      for (const entry of entries) {
+        this.#allowConversationStmt.run(accountId, entry.native_conversation_id, entry.mode, iso);
+      }
+      this.#db.exec("COMMIT");
+    } catch (err) {
+      this.#db.exec("ROLLBACK");
+      throw err;
+    }
   }
 
   getOrCreateConversation(input: {

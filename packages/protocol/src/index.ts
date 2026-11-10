@@ -72,6 +72,17 @@ export type {
   ShellCommandCategory,
 } from "./capability-contracts.ts";
 export type {
+  ChannelAllowMode,
+  ChannelAllowlistEntryView,
+  ContactAmbiguityView,
+  ContactCapabilityCategory,
+  ContactGrantView,
+  ContactIdentityView,
+  ContactInviteView,
+  ContactView,
+} from "./contact-contracts.ts";
+export { CONTACT_CAPABILITY_CATEGORIES } from "./contact-contracts.ts";
+export type {
   OutboxListPage,
   OutboxMessageRecord,
   OutboxReceipt,
