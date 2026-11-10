@@ -56,7 +56,7 @@ bash scripts/real-machine/m3-demo.sh --out docs/gates/m3-demo-output.md
 |---|---|
 | p50 | 1.66 ms |
 | p90 | 2.35 ms |
-| **p95** | **2.54 ms** |
+| **p95** | **2.43 ms**（两块修复批合并后重跑 `00c3905`；T7 归档时 2.54 ms） |
 | p99 | 3.74 ms |
 | min / max / mean | 1.39 / 5.71 / 1.83 ms |
 | 100 样本收敛到 B | 100/100 |
@@ -140,7 +140,7 @@ HTTP 传输已按设备凭据携带 bearer token，真实非回环路径具备�
 |---|---|---|
 | 三种部署均工作 | **达成（本机 + CI ubuntu 前台等价）**；真实 systemd 待 Owner | §3：local/server/hybrid 三冒烟全 PASS；CI `gate (linux)` 部署冒烟 success；真实 systemd SKIPPED 标注 |
 | 跨设备不重复执行同一任务 | **达成（回环基线，含诚实残余窗口）**：acquire 前跨设备租约检查 + 双持有冻结；fencing token 最终护栏 | §4；§6-1（#34，d716b99）；`lease.preacquire.test.ts`（A 持租约 B 被拒、双持有 → needs_reconcile、拉取节流） |
-| AC-04 增量双向同步 | **达成（回环基线）**：50×2 无丢失/无重复/顺序一致；p95 2.54 ms | §2.1；`docs/gates/m3-ac04-sync.{md,json}` |
+| AC-04 增量双向同步 | **达成（回环基线）**：50×2 无丢失/无重复/顺序一致；p95 2.43 ms（合并态重跑） | §2.1；`docs/gates/m3-ac04-sync.{md,json}` |
 | AC-05 冲突和删除 | **达成（分类 + 删除 + 待审核可见值）**：20/20 分类正确；本地 v2 可见 14/14 两侧（修复前 0/14） | §2.2；`docs/gates/m3-ac05-conflicts.{md,json}`；§6-5 |
 | 端到端演示（两轮 10/10） | **达成** | `docs/gates/m3-demo-output.md`（2 轮 × 10 项断言全 PASS） |
 | 任务投影随同步重建 | **达成（修复批）**：对端 `GET /v1/tasks` 可见、详情非 404；启动补建；执行器不自动接管 | §6-4；`apps/runtime/test/sync.tasks.test.ts` |
@@ -155,8 +155,8 @@ HTTP 传输已按设备凭据携带 bearer token，真实非回环路径具备�
 ## 6. 未达项与边界（如实登记）
 
 > **修复批状态**：原登记项 1/2/3 由 #34（`d716b99`）修复，4/5/6 由 #32/#36（`51ecc64`）修复；
-> 7–12 仍为开放边界。门禁数字（§2）中 AC-05 已按修复后重跑（可见值 14/14 两侧），AC-04 p95 未重跑
-> （修复只增加 acquire 前拉取，不改变同步吞吐路径）。
+> 7–12 仍为开放边界。AC-04 与 AC-05 均已在两块修复批合并后（`00c3905`）重跑：AC-04 p95 2.43 ms、
+> 50×2 对账 PASS；AC-05 可见值 14/14 两侧、冲突记录含本地引用 14/14；`m3-demo.ts` 两轮 20/20。
 
 1. ~~**跨设备执行权没有共享状态**~~ → **已修复（#34，`d716b99`）**。租约表仍按 dataDir 私有（本地
    协调态），但租约生命周期事件 `task.lease_acquired / .lease_renewed / .lease_released`（含既有
@@ -196,7 +196,7 @@ HTTP 传输已按设备凭据携带 bearer token，真实非回环路径具备�
 7. **附件/二进制大文件传输未做**：`SyncFileMerger` 只提供「整文件按内容寻址 + 双版本保留」的库形态
    seam，无 HTTP 路由、无附件目录同步、无大文件分块；同步面只传事件信封（PRD FR-DEP-3 的
    「附件引用」只有引用语义，没有实现文件搬运）。本票未新增。
-8. **p95 为回环基线**：2.54 ms 是 127.0.0.1 单机双实例的墙钟；真实 Wi-Fi/Tailscale 路径未测，
+8. **p95 为回环基线**：2.43 ms 是 127.0.0.1 单机双实例的墙钟；真实 Wi-Fi/Tailscale 路径未测，
    阈值（≤10 s）待 Owner 环境校准。修复批已接通 bearer token，非回环路径可复现认证链路，但双机
    实测仍待 Owner。
 9. **真实 systemd 待 Owner Ubuntu 机器验证**：本机 macOS 无 systemd；CI 只跑 systemd 等价前台。
