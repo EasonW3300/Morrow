@@ -9,6 +9,7 @@
 - [PRD v1.0](docs/prd/PRD-v1.0.md) —— 唯一需求真相源
 - [GLOSSARY](GLOSSARY.md) —— 领域统一语言
 - [ADR 目录](docs/adr/) —— 工程决策记录（含 0007 桌面壳裁决）
+- [部署指南](deploy/README.md) —— 三种部署形态（纯本地 / Ubuntu systemd / 本地+服务器混合）、私有网络（Tailscale/WireGuard）、安装升级回滚与备份、部署冒烟脚本
 - [M0 门禁报告](docs/gates/m0-gate-report.md) —— CI 三平台 + 真机门禁证据、PRD §9 门槛核对
 - [M1 门禁报告](docs/gates/m1-gate-report.md) —— 记忆回链 / 故障注入 / 人工介入覆盖盘点、PRD §9 M1 门槛核对
 - [M2 门禁报告](docs/gates/m2-gate-report.md) —— 能力工厂 harness 双路径 / 并行隔离 / 完整演示脚本（[归档输出](docs/gates/m2-demo-output.md)）、PRD §9 M2 门槛核对
@@ -33,6 +34,18 @@ docs/prd, docs/adr  PRD 与决策记录
 docs/gates          门禁报告归档（docs/security 威胁模型）
 docs/history        归档文档
 ```
+
+## 部署（三形态）
+
+同一个 Runtime（单二进制/同一源码）支持三种形态，详见 [部署指南](deploy/README.md)：
+
+- **纯本地**：桌面壳拉起 Runtime，默认只监听 `127.0.0.1`，零配置可用；
+- **纯服务器**：Ubuntu 单二进制 + systemd（`deploy/systemd/morrow.service`、`/etc/morrow/morrow.env`、数据 `/var/lib/morrow`），一键幂等安装 `scripts/deploy/install-ubuntu.sh`；
+- **混合**：本地优先、离线可用，重连后经增量同步与服务器对账。
+
+传输默认走私有网络（[ADR-0004](docs/adr/0004-private-network-first-transport.md)：Tailscale/WireGuard），
+Runtime 默认不监听公网；非回环访问必须持配对下发的 bearer token。发布前三形态冒烟：
+`scripts/deploy/smoke-{local,server,hybrid}.sh`。
 
 ## Runtime HTTP API（能力域摘要）
 

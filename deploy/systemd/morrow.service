@@ -1,0 +1,54 @@
+[Unit]
+# Morrow Runtime（ADR-0003：与桌面 sidecar 同一个单二进制；ADR-0004：只走私有网络）
+Description=Morrow Runtime (personal agent)
+Documentation=https://github.com/EasonW3300/Morrow/blob/main/deploy/README.md
+After=network-online.target
+Wants=network-online.target
+# 端口/令牌等全部来自环境文件；模板见仓库 deploy/morrow.env.example
+ConditionPathExists=/etc/morrow/morrow.env
+
+[Service]
+Type=simple
+User=morrow
+Group=morrow
+WorkingDirectory=/var/lib/morrow
+EnvironmentFile=/etc/morrow/morrow.env
+ExecStart=/usr/local/bin/morrow
+# SIGTERM 走 Runtime 的优雅退出（停收请求 → 记账 runtime.stopped → 关账本）
+KillSignal=SIGTERM
+TimeoutStopSec=20
+Restart=on-failure
+RestartSec=3
+
+# 数据目录：/var/lib/morrow（systemd 自动创建并归属 User=；MORROW_DATA_DIR 同值）
+StateDirectory=morrow
+StateDirectoryMode=0750
+ReadWritePaths=/var/lib/morrow
+
+# 加固：无特权提升、私有 /tmp、系统目录只读、不读用户 home。
+# 启用 Docker 沙箱能力时需显式放开容器运行时 socket（按需取消注释其一）：
+#   ReadWritePaths=/run/docker.sock
+#   ReadWritePaths=/run/podman/podman.sock
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+# 日志：journald（journalctl -u morrow）。审计事件仍落 <DATA_DIR> 的 append-only 账本。
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=morrow
+
+# 硬限（单人自用；重负载/本地模型编排时按机器规格上调）
+LimitNOFILE=65536
+TasksMax=512
+MemoryHigh=2G
+MemoryMax=4G
+
+[Install]
+WantedBy=multi-user.target
