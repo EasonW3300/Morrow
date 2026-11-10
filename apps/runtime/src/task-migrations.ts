@@ -105,9 +105,29 @@ CREATE TABLE IF NOT EXISTS task_locks (
 );
 `;
 
-/** 幂等建 checkpoint 表（CREATE IF NOT EXISTS）；由 checkpoint.ts 的 CheckpointStore 调用 */
+/**
+ * 幂等建 checkpoint 表（CREATE IF NOT EXISTS）+ 补 seq 列；由 checkpoint.ts 的
+ * CheckpointStore 调用。
+ *
+ * seq = 插入序，列表"最新在前"的权威排序键。不能按 created_at/checkpoint_id 排：
+ * 同一毫秒内创建的两个 checkpoint 的 created_at 相同，而 UUIDv7 在同一毫秒内的
+ * 随机位不保证递增——按 id 排会随代码时序变化给出非确定性顺序（实测 flaky）。
+ * 旧库回填按 rowid 升序（即历史插入顺序）。
+ */
 export function ensureCheckpointTable(db: SqliteDatabase): void {
   db.exec(TASK_CHECKPOINTS_SQL);
+  const hadSeq = (
+    db.prepare("SELECT name FROM pragma_table_info('task_checkpoints')").all() as unknown as Array<{
+      name: string;
+    }>
+  ).some((c) => c.name === "seq");
+  ensureColumn(db, "task_checkpoints", "seq", "INTEGER");
+  if (!hadSeq) {
+    // rowid 升序 → 1..N（COUNT 子查询按 rowid <= 自身计数）
+    db.exec(
+      "UPDATE task_checkpoints SET seq = (SELECT COUNT(*) FROM task_checkpoints AS t2 WHERE t2.rowid <= task_checkpoints.rowid) WHERE seq IS NULL",
+    );
+  }
 }
 
 /** 幂等建锁表（CREATE IF NOT EXISTS）；由 locks.ts 的 LockTable 调用 */

@@ -268,15 +268,18 @@ export class CheckpointStore {
   constructor(db: SqliteDatabase) {
     this.#db = db;
     ensureCheckpointTable(db);
+    // seq 在同一条语句内取 MAX+1：SQLite 写事务串行化，插入序单调且原子
     this.#insertStmt = db.prepare(
-      "INSERT INTO task_checkpoints (checkpoint_id, task_id, task_version, reason, snapshot, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+      "INSERT INTO task_checkpoints (checkpoint_id, task_id, task_version, reason, snapshot, created_at, seq) " +
+        "VALUES (?, ?, ?, ?, ?, ?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM task_checkpoints))",
     );
+    // 排序键只用 seq（插入序）：同毫秒创建的 checkpoint 也必须有确定顺序（见 task-migrations.ts）
     this.#listStmt = db.prepare(
-      "SELECT * FROM task_checkpoints WHERE task_id = ? ORDER BY created_at DESC, checkpoint_id DESC",
+      "SELECT * FROM task_checkpoints WHERE task_id = ? ORDER BY seq DESC",
     );
     this.#getStmt = db.prepare("SELECT * FROM task_checkpoints WHERE checkpoint_id = ?");
     this.#latestStmt = db.prepare(
-      "SELECT * FROM task_checkpoints WHERE task_id = ? ORDER BY created_at DESC, checkpoint_id DESC LIMIT 1",
+      "SELECT * FROM task_checkpoints WHERE task_id = ? ORDER BY seq DESC LIMIT 1",
     );
     this.#deleteStmt = db.prepare("DELETE FROM task_checkpoints WHERE checkpoint_id = ?");
   }

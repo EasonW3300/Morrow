@@ -14,6 +14,8 @@ import {
   type CheckpointSnapshot,
 } from "../src/checkpoint.ts";
 import { TaskService } from "../src/tasks.ts";
+import { openSqlite } from "../src/db.ts";
+import { CheckpointStore } from "../src/checkpoint.ts";
 import { removeDir, tmpDir } from "./helpers.ts";
 
 const REPLICA = "f47ac10b-58cc-4372-a567-0e02b2c3d479";
@@ -169,6 +171,42 @@ test("checkpoint listing returns newest first and latest resolves the newest", a
     assert.equal(h.checkpoints.getCheckpoint("01936b9d-8f7a-7abc-9f2e-000000000000"), null);
   } finally {
     h.close();
+  }
+});
+
+test("checkpoint listing is deterministic for same-millisecond checkpoints (insertion order, not id order)", () => {
+  // 回归（M3-T1 合并后实测 flaky）：曾按 created_at/checkpoint_id 排序——同毫秒下
+  // UUIDv7 的随机位决定顺序，代码时序一变就翻转。权威排序键必须是插入序 seq。
+  const dir = tmpDir("morrow-checkpoint-seq-");
+  const db = openSqlite(`${dir}/checkpoints.sqlite`);
+  try {
+    const store = new CheckpointStore(db);
+    const frozen = "2026-11-10T00:00:00.000Z";
+    // 故意让先插入者的 id 字典序更大，验证排序不依赖 id
+    store.insert({
+      checkpoint_id: "01936b9d-8f7a-7fff-9f2e-000000000001",
+      task_id: "t-1",
+      task_version: 1,
+      reason: "pause",
+      snapshot: {},
+      created_at: frozen,
+    });
+    store.insert({
+      checkpoint_id: "01936b9d-8f7a-7000-9f2e-000000000002",
+      task_id: "t-1",
+      task_version: 1,
+      reason: "pause",
+      snapshot: {},
+      created_at: frozen,
+    });
+    assert.deepEqual(
+      store.listForTask("t-1").map((c) => c.checkpoint_id),
+      ["01936b9d-8f7a-7000-9f2e-000000000002", "01936b9d-8f7a-7fff-9f2e-000000000001"],
+    );
+    assert.equal(store.latestForTask("t-1")?.checkpoint_id, "01936b9d-8f7a-7000-9f2e-000000000002");
+  } finally {
+    db.close();
+    removeDir(dir);
   }
 });
 
