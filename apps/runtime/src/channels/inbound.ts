@@ -1,11 +1,14 @@
 import type {
   ChannelPermissionContext,
+  ContactCapabilityCategory,
   InboundMessage,
   OutboundMessage,
+  SensitivityLevel,
 } from "@morrow/protocol";
 import type { EventLedger } from "../ledger.ts";
 import type { SessionFrame, SessionManager } from "../sessions.ts";
 import type { ContactBindingResolver } from "../contacts/types.ts";
+import type { PermissionEngine } from "../capabilities/engine.ts";
 import { buildEventEnvelope } from "../envelope.ts";
 import { uuidv7, UUID_RE } from "../uuid-v7.ts";
 import { CHANNEL_EVENT_TYPES } from "./events.ts";
@@ -74,6 +77,12 @@ export interface ChannelInboundRouterOptions {
   taskExists?: (taskId: string) => boolean;
   /** 联系人接缝（M4-T6）：邀请码绑定/歧义/会话归属/类别解析；缺省退化为 T1 身份映射 */
   contacts?: ContactBindingResolver;
+  /**
+   * 授权判定单一入口（A4 修复批 / Issue #37）：入站消息解析出 contact:<id> 后，
+   * 按消息意图（query / task_execute / memory_reference）调用 authorizeContactUse；
+   * 拒绝即拒绝整条入站（contact_permission_denied）且不产生回复。
+   */
+  permissions?: Pick<PermissionEngine, "authorizeContactUse">;
   now?: () => Date;
 }
 
@@ -86,6 +95,7 @@ export class ChannelInboundRouter {
   readonly #outboundSink: { enqueue(outbound: OutboundMessage): unknown } | null;
   readonly #taskExists: ((taskId: string) => boolean) | null;
   readonly #contacts: ContactBindingResolver | null;
+  readonly #permissions: Pick<PermissionEngine, "authorizeContactUse"> | null;
   readonly #now: () => Date;
 
   constructor(options: ChannelInboundRouterOptions) {
@@ -97,6 +107,7 @@ export class ChannelInboundRouter {
     this.#outboundSink = options.outboundSink ?? null;
     this.#taskExists = options.taskExists ?? null;
     this.#contacts = options.contacts ?? null;
+    this.#permissions = options.permissions ?? null;
     this.#now = options.now ?? (() => new Date());
   }
 
@@ -264,6 +275,42 @@ export class ChannelInboundRouter {
       }
     }
 
+    // 联系人授权判定（A4 修复批 / Issue #37）：类别由消息意图决定——查询问答=query；
+    // 任务执行=task_execute；涉及记忆引用=memory_reference（默认 public；文本显式要求
+    // 私密/敏感记忆时按 private 判，private 必然拒绝）。默认 query，判定依据随事件留痕。
+    let permissionDecision: {
+      category: ContactCapabilityCategory;
+      basis: string;
+      sensitivity?: SensitivityLevel;
+    } | null = null;
+    if (principal !== "owner" && contactId !== null && this.#permissions !== null) {
+      const intent = classifyContactIntent(inbound.text);
+      const decision =
+        intent.category === "memory_reference"
+          ? this.#permissions.authorizeContactUse({
+              contact_id: contactId,
+              action: "memory_read",
+              sensitivity: intent.sensitivity ?? "public",
+            })
+          : this.#permissions.authorizeContactUse({
+              contact_id: contactId,
+              action: "category",
+              category: intent.category,
+            });
+      if (!decision.allowed) {
+        return this.reject({
+          channel: inbound.channel,
+          reason: "contact_permission_denied",
+          account: inbound.account,
+          native_message_id: inbound.native_message_id,
+          native_conversation_id: inbound.native_conversation_id,
+          sender_native_id: inbound.sender.native_id,
+          detail: `${intent.category}: ${decision.reason ?? "denied"}; basis=${intent.basis}`,
+        });
+      }
+      permissionDecision = intent;
+    }
+
     // 权限类别经 PermissionEngine（联系人 → 类别 → 能力集）；无联系人接缝时回退 T1 快照
     const fallbackCategories = identity?.granted_categories ?? [];
     const grantedCategories =
@@ -351,6 +398,7 @@ export class ChannelInboundRouter {
         message_id: inserted.record.message_id,
         sender_native_id: inbound.sender.native_id,
         permission_context: permissionContext,
+        ...(permissionDecision === null ? {} : { permission_decision: permissionDecision }),
         ...(options.taskId === undefined ? {} : { task_id: options.taskId }),
       },
     });
@@ -516,3 +564,41 @@ export class ChannelInboundRouter {
     }
   }
 }
+
+/**
+ * 渠道消息意图 → 联系人授权类别（A4 修复批）。
+ *
+ * 判定是保守的确定性启发式（不调用模型）：显式记忆引用标记 → memory_reference；
+ * 显式任务执行标记 → task_execute；其余（含普通问答/问候/邀请码）→ query。
+ * 返回的 basis 随 channel.inbound_received / inbound_rejected 留痕，便于审计复现。
+ */
+export function classifyContactIntent(text: string): {
+  category: ContactCapabilityCategory;
+  basis: string;
+  sensitivity?: SensitivityLevel;
+} {
+  if (MEMORY_INTENT_RE.test(text)) {
+    const sensitivity: SensitivityLevel = PRIVATE_INTENT_RE.test(text) ? "private" : "public";
+    return {
+      category: "memory_reference",
+      basis: `memory-reference markers matched; sensitivity=${sensitivity}`,
+      sensitivity,
+    };
+  }
+  if (TASK_INTENT_RE.test(text)) {
+    return {
+      category: "task_execute",
+      basis: "task-execution markers matched",
+    };
+  }
+  return {
+    category: "query",
+    basis: "default: no task-execution or memory-reference markers; treated as query",
+  };
+}
+
+const MEMORY_INTENT_RE =
+  /(记忆|memor(?:y|ies)|remember|之前(?:说|提|聊)|上次(?:说|提)|曾经(?:说|提)|你记得)/i;
+const PRIVATE_INTENT_RE = /(私密|私有|敏感|不可外传|不要外传|仅限我|private|secret|confidential)/i;
+const TASK_INTENT_RE =
+  /(执行|运行|跑一下|跑个|创建任务|新建任务|安排任务|提交任务|任务|task\b|帮我做|帮我完成|处理一下|调用能力|invoke)/i;

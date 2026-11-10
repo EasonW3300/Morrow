@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import { createFakePi } from "@morrow/pi-adapter";
 import type { ChannelHealth, ChannelSummary } from "@morrow/protocol";
 import type { RuntimeConfig } from "../src/config.ts";
+import { createInMemorySecretStore } from "../src/keyring.ts";
 import { startRuntime } from "../src/runtime.ts";
 import { EchoChannelAdapter } from "../src/channels/echo.ts";
 import { json, removeDir, tmpDir } from "./helpers.ts";
@@ -35,6 +36,8 @@ function fakeFactory() {
 test("GET /v1/channels lists adapters with capabilities and state; health is queryable", async (t) => {
   const dir = tmpDir("morrow-channels-api-");
   const runtime = await startRuntime(testConfig(dir), {
+    // 隔离：空的内存凭据库 → 不触发 A1 自动装配（宿主 Keychain 可能已有真实渠道凭据）
+    secretStore: createInMemorySecretStore(),
     agentAdapterFactory: fakeFactory(),
     enableEchoChannel: true,
   });
@@ -73,6 +76,8 @@ test("GET /v1/channels lists adapters with capabilities and state; health is que
 test("echo adapter wired through runtime: injected inbound produces a session turn and a send callback", async (t) => {
   const dir = tmpDir("morrow-channels-api-");
   const runtime = await startRuntime(testConfig(dir), {
+    // 隔离：空的内存凭据库 → 不触发 A1 自动装配（宿主 Keychain 可能已有真实渠道凭据）
+    secretStore: createInMemorySecretStore(),
     agentAdapterFactory: fakeFactory(),
     enableEchoChannel: true,
   });

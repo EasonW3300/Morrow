@@ -48,6 +48,9 @@ export const channelRoutes: ChannelRoute[] = [
   // 渠道凭据配置（M4-T8 / Issue #45）：只回 configured 投影，绝不回显密文
   { method: "GET", re: /^\/v1\/channels\/([^/]+)\/secrets$/, handler: handleGetSecrets },
   { method: "PUT", re: /^\/v1\/channels\/([^/]+)\/secrets$/, handler: handlePutSecrets },
+  // 默认通知会话（A3 修复批 / Issue #37）：channel:<id> 通知目标的解析依据
+  { method: "GET", re: /^\/v1\/channels\/([^/]+)\/notify-target$/, handler: handleGetNotifyTarget },
+  { method: "PUT", re: /^\/v1\/channels\/([^/]+)\/notify-target$/, handler: handlePutNotifyTarget },
 ];
 
 function handleListChannels(
@@ -132,8 +135,66 @@ async function handlePutSecrets(
   sendJson(res, 200, result.view);
 }
 
-function handleGetAllowlist(
+/** GET /v1/channels/:id/notify-target：默认通知会话（未配置 native_conversation_id=null） */
+function handleGetNotifyTarget(
   _req: IncomingMessage,
+  res: ServerResponse,
+  _url: URL,
+  ctx: ChannelRouteContext,
+  params: string[],
+): void {
+  const channelId = params[0] as string;
+  if (ctx.channels.getAdapter(channelId) === null) {
+    sendError(res, 404, "unknown_channel", `no channel adapter registered for "${channelId}"`);
+    return;
+  }
+  const target = ctx.channels.notifyTarget(channelId);
+  sendJson(res, 200, {
+    channel: channelId,
+    account_id: ctx.channels.accountIdForChannel(channelId),
+    native_conversation_id: target?.native_conversation_id ?? null,
+    updated_at: target?.updated_at ?? null,
+  });
+}
+
+/**
+ * PUT /v1/channels/:id/notify-target
+ * body: { native_conversation_id: "<该渠道已存在/已白名单的会话>" }
+ * 未通过校验 → 400（conversation_not_found / no_account），不写库。
+ */
+async function handlePutNotifyTarget(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _url: URL,
+  ctx: ChannelRouteContext,
+  params: string[],
+): Promise<void> {
+  const channelId = params[0] as string;
+  if (ctx.channels.getAdapter(channelId) === null) {
+    sendError(res, 404, "unknown_channel", `no channel adapter registered for "${channelId}"`);
+    return;
+  }
+  const body = await readJsonBody(req, res);
+  if (body === null) return;
+  const nativeId = (body as { native_conversation_id?: unknown }).native_conversation_id;
+  if (typeof nativeId !== "string" || nativeId.trim().length === 0) {
+    sendError(res, 400, "invalid_body", "native_conversation_id must be a non-empty string");
+    return;
+  }
+  const result = ctx.channels.setNotifyTarget(channelId, nativeId.trim());
+  if (!result.ok) {
+    sendError(res, 400, result.code, result.message);
+    return;
+  }
+  sendJson(res, 200, {
+    channel: channelId,
+    account_id: result.account_id,
+    native_conversation_id: result.native_conversation_id,
+    updated_at: result.updated_at,
+  });
+}
+
+function handleGetAllowlist(  _req: IncomingMessage,
   res: ServerResponse,
   _url: URL,
   ctx: ChannelRouteContext,

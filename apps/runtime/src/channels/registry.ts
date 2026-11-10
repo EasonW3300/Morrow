@@ -11,6 +11,7 @@ import type { EventLedger } from "../ledger.ts";
 import type { SecretStore } from "../keyring.ts";
 import type { SessionManager } from "../sessions.ts";
 import type { ContactBindingResolver } from "../contacts/types.ts";
+import type { PermissionEngine } from "../capabilities/engine.ts";
 import { CONTACT_EVENT_TYPES } from "../contacts/events.ts";
 import { buildEventEnvelope } from "../envelope.ts";
 import { CHANNEL_EVENT_TYPES } from "./events.ts";
@@ -53,6 +54,8 @@ export interface ChannelRegistryOptions {
   outboundSink?: { enqueue(outbound: OutboundMessage): unknown };
   /** 联系人接缝（M4-T6 / Issue #43）：邀请码绑定、身份歧义、会话归属、类别解析 */
   contacts?: ContactBindingResolver;
+  /** 授权判定单一入口（A4 修复批）：入站路由按消息意图调用 authorizeContactUse */
+  permissions?: Pick<PermissionEngine, "authorizeContactUse">;
   /**
    * 凭据库（M4-T8 / Issue #45）：飞书/QQ 凭据配置端点读写 SecretStore。
    * 缺省 null = 只读投影不可用（GET/PUT secrets 返回 unsupported）。
@@ -73,7 +76,7 @@ export interface ChannelAdapterRegistration {
   experimental?: boolean;
 }
 
-/** enableChannel 的结果（路由层映射 HTTP 状态；M4-T5） */
+/** enableChannel 的结果（路由层映射 HTTP 状态；M4-T5 / A1 修复批） */
 export type EnableChannelResult =
   | { ok: true; channel_id: string; enabled: true; risk_notice: string | null }
   | {
@@ -83,16 +86,37 @@ export type EnableChannelResult =
       risk_notice?: string;
     };
 
-/** disableChannel 的结果（M4-T5） */
+/** disableChannel 的结果（M4-T5 / A1 修复批） */
 export type DisableChannelResult =
   | { ok: true; channel_id: string; enabled: false }
   | { ok: false; code: "unknown_channel"; message: string };
+
+/** 默认通知会话写入结果（A3 修复批） */
+export type SetNotifyTargetResult =
+  | {
+      ok: true;
+      account_id: string;
+      native_conversation_id: string;
+      updated_at: string;
+    }
+  | {
+      ok: false;
+      code: "unknown_channel" | "no_account" | "conversation_not_found";
+      message: string;
+    };
 
 interface AdapterEntry {
   adapter: ChannelAdapter;
   state: ChannelAdapterState;
   experimental: boolean;
   detail: string | null;
+  /**
+   * 是否由配置自动装配（A1 修复批）：managed 稳定适配器的启停持久化到
+   * channel_settings；手动注入的适配器保持既有「注册即启动」语义。
+   */
+  managed: boolean;
+  /** 配置层面的启用状态（false = 不随 start() 启动） */
+  configuredEnabled: boolean;
 }
 
 export class ChannelRegistry {
@@ -122,6 +146,7 @@ export class ChannelRegistry {
       ...(options.outboundSink === undefined ? {} : { outboundSink: options.outboundSink }),
       ...(options.taskExists === undefined ? {} : { taskExists: options.taskExists }),
       ...(options.contacts === undefined ? {} : { contacts: options.contacts }),
+      ...(options.permissions === undefined ? {} : { permissions: options.permissions }),
       now: this.#now,
     });
 
@@ -154,12 +179,29 @@ export class ChannelRegistry {
     return adapter;
   }
 
-  registerAdapter(adapter: ChannelAdapter, options: { experimental?: boolean } = {}): void {
+  /**
+   * 注册适配器。
+   * - `experimental`：实验适配器标记（缺省取 adapter.experimental）；
+   * - `managed`：由配置自动装配（A1 修复批）；启停持久化到 channel_settings；
+   * - `enabled`：仅 managed 生效——false/缺省 = 不随 start() 启动（缺省未启用）。
+   */
+  registerAdapter(
+    adapter: ChannelAdapter,
+    options: { experimental?: boolean; managed?: boolean; enabled?: boolean } = {},
+  ): void {
+    const managed = options.managed === true;
+    const configuredEnabled = managed
+      ? (options.enabled ?? this.#store.channelEnabled(adapter.channelId))
+      : true;
     this.#adapters.set(adapter.channelId, {
       adapter,
-      state: "registered",
+      state: configuredEnabled ? "registered" : "stopped",
       experimental: options.experimental ?? adapter.experimental === true,
-      detail: null,
+      detail: configuredEnabled
+        ? null
+        : "channel is configured but disabled; enable it with POST /v1/channels/:id/enable",
+      managed,
+      configuredEnabled,
     });
   }
 
@@ -229,6 +271,80 @@ export class ChannelRegistry {
   /** 渠道当前绑定的账号 id（通知/Outbox 外发的 account_id 来源）；未绑定 null */
   accountIdForChannel(channelId: string): string | null {
     return this.#store.findAccountByChannel(channelId)?.account_id ?? null;
+  }
+
+  /** 默认通知会话（A3 修复批）：channel:<id> 通知目标的解析依据；未配置 null */
+  notifyTarget(channelId: string): { account_id: string; native_conversation_id: string; updated_at: string } | null {
+    if (!this.#adapters.has(channelId)) return null;
+    const row = this.#store.getNotifyTarget(channelId);
+    return row === null
+      ? null
+      : {
+          account_id: row.account_id,
+          native_conversation_id: row.native_conversation_id,
+          updated_at: row.updated_at,
+        };
+  }
+
+  /**
+   * 指定默认通知会话（A3 修复批）。校验（fail-closed）：
+   *   - 渠道已注册且有启用账号；
+   *   - 会话在该渠道已存在（conversations 行）或在 channel_allowlist 中。
+   * 不满足时不写库，由路由层映射 400。
+   */
+  setNotifyTarget(channelId: string, nativeConversationId: string): SetNotifyTargetResult {
+    if (!this.#adapters.has(channelId)) {
+      return { ok: false, code: "unknown_channel", message: `no channel adapter registered for "${channelId}"` };
+    }
+    const account = this.#store.findAccountByChannel(channelId);
+    if (account === null) {
+      return {
+        ok: false,
+        code: "no_account",
+        message: `channel "${channelId}" has no enabled channel account`,
+      };
+    }
+    const exists =
+      this.#store.findConversation(account.account_id, nativeConversationId) !== null ||
+      this.#store.isConversationAllowed(account.account_id, nativeConversationId);
+    if (!exists) {
+      return {
+        ok: false,
+        code: "conversation_not_found",
+        message: `conversation "${nativeConversationId}" does not exist and is not allowlisted on channel "${channelId}"`,
+      };
+    }
+    const row = this.#store.setNotifyTarget({
+      channelId,
+      accountId: account.account_id,
+      nativeConversationId,
+      now: this.#now(),
+    });
+    this.#append(CHANNEL_EVENT_TYPES.notifyTargetUpdated, {
+      channel: channelId,
+      account_id: row.account_id,
+      native_conversation_id: row.native_conversation_id,
+    });
+    return {
+      ok: true,
+      account_id: row.account_id,
+      native_conversation_id: row.native_conversation_id,
+      updated_at: row.updated_at,
+    };
+  }
+
+  /** 清除默认通知会话（Owner 解除渠道通知规则的前置条件） */
+  clearNotifyTarget(channelId: string): boolean {
+    if (!this.#adapters.has(channelId)) return false;
+    const existing = this.#store.getNotifyTarget(channelId);
+    if (existing === null) return true;
+    this.#store.clearNotifyTarget(channelId);
+    this.#append(CHANNEL_EVENT_TYPES.notifyTargetUpdated, {
+      channel: channelId,
+      account_id: existing.account_id,
+      native_conversation_id: null,
+    });
+    return true;
   }
 
   /** GET /v1/channels：适配器清单 + 绑定账号 + capabilities + state */
@@ -303,10 +419,16 @@ export class ChannelRegistry {
     return this.getAdapter(channelId)?.capabilities() ?? null;
   }
 
-  /** 启动所有已注册适配器；无启用账号/出厂 disabled 的适配器不强行启动（清单可见） */
+  /** 启动所有已注册适配器；无启用账号/出厂 disabled/配置未启用的适配器不强行启动（清单可见） */
   async start(): Promise<void> {
     for (const [channelId, entry] of this.#adapters) {
       if (entry.state === "running" || entry.state === "starting") continue;
+      // 配置层未启用（A1 修复批）：保持 stopped，Owner 显式 enable 后才启动
+      if (!entry.configuredEnabled && !entry.experimental) {
+        entry.state = "stopped";
+        entry.detail = "channel is configured but disabled; enable it with POST /v1/channels/:id/enable";
+        continue;
+      }
       // 实验适配器（M4-T5）：出厂 disabled，必须经 enableChannel(confirmRisk=true)
       if (entry.adapter.isEnabled !== undefined && !entry.adapter.isEnabled()) {
         entry.state = "stopped";
@@ -331,7 +453,30 @@ export class ChannelRegistry {
     if (entry === undefined) {
       return { ok: false, code: "unknown_channel", message: `no channel adapter registered for "${channelId}"` };
     }
-    if (!entry.experimental || entry.adapter.enable === undefined) {
+    if (!entry.experimental) {
+      // 稳定适配器（A1 修复批）：自动装配的 managed 渠道可由 Owner 显式启用并持久化；
+      // 手动注入的稳定适配器保持既有语义（注册即启动，不存在 not_experimental 的启用路径）。
+      if (!entry.managed) {
+        return {
+          ok: false,
+          code: "not_experimental",
+          message: `channel "${channelId}" is not an experimental adapter`,
+        };
+      }
+      entry.configuredEnabled = true;
+      this.#store.setChannelEnabled(channelId, true, this.#now());
+      if (entry.state !== "running" && entry.state !== "starting") {
+        await this.#startEntry(channelId, entry);
+      }
+      const account = this.#store.findAccountByChannel(channelId);
+      this.#append(CHANNEL_EVENT_TYPES.enabled, {
+        channel: channelId,
+        account_id: account?.account_id ?? null,
+        experimental: false,
+      });
+      return { ok: true, channel_id: channelId, enabled: true, risk_notice: null };
+    }
+    if (entry.adapter.enable === undefined) {
       return {
         ok: false,
         code: "not_experimental",
@@ -350,6 +495,8 @@ export class ChannelRegistry {
 
     const wasEnabled = entry.adapter.isEnabled?.() ?? false;
     await entry.adapter.enable({ confirmRisk: true });
+    entry.configuredEnabled = true;
+    if (entry.managed) this.#store.setChannelEnabled(channelId, true, this.#now());
     if (entry.state !== "running" && entry.state !== "starting") {
       await this.#startEntry(channelId, entry);
     }
@@ -373,6 +520,14 @@ export class ChannelRegistry {
       return { ok: false, code: "unknown_channel", message: `no channel adapter registered for "${channelId}"` };
     }
     const account = this.#store.findAccountByChannel(channelId);
+    entry.configuredEnabled = false;
+    if (entry.managed) {
+      this.#store.setChannelEnabled(channelId, false, this.#now());
+      this.#append(CHANNEL_EVENT_TYPES.disabled, {
+        channel: channelId,
+        account_id: account?.account_id ?? null,
+      });
+    }
     await entry.adapter.disable?.();
     if (entry.state === "running" || entry.state === "starting") {
       try {

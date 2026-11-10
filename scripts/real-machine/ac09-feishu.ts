@@ -220,6 +220,7 @@ async function main(): Promise<void> {
       ],
       outboxBackoffBaseMs: 100,
       notificationDrainIntervalMs: 0,
+      outboxDrainIntervalMs: 0,
     });
     const base = `http://127.0.0.1:${runtime.port}`;
     const rt = runtime;

@@ -547,7 +547,13 @@ export type ContactAccessRequest =
   | { contact_id: string; action: "filesystem"; path: string }
   | { contact_id: string; action: "shell"; category: string }
   | { contact_id: string; action: "capability"; capability: string }
-  | { contact_id: string; action: "session"; session_id: string };
+  | { contact_id: string; action: "session"; session_id: string }
+  /**
+   * 渠道入站消息的授权类别判定（A4 修复批 / Issue #37）：消息意图 → 类别
+   * （query / task_execute / memory_reference）。联系人仅能触达其已授权类别；
+   * 拒绝落 contact.permission_denied（与其余五类同一审计出口）。
+   */
+  | { contact_id: string; action: "category"; category: ContactCapabilityCategory };
 
 export interface ContactAccessDecision {
   allowed: boolean;
@@ -844,7 +850,11 @@ export class PermissionEngine {
       return this.#denyContact(request, "contact_not_found");
     }
     const grants = this.#contacts.listGrants(request.contact_id);
-    const categories = new Set(grants.map((grant) => grant.category));
+    // 未显式授权 = 默认仅 query（PRD FR-NOT-3 / 与 contactCategories 同口径）；
+    // 其它动作（记忆/能力/会话）不会因该默认值获得任何开口。
+    const categories = new Set(
+      grants.length === 0 ? (["query"] as ContactCapabilityCategory[]) : grants.map((grant) => grant.category),
+    );
 
     switch (request.action) {
       case "memory_read": {
@@ -881,6 +891,13 @@ export class PermissionEngine {
       case "session": {
         if (!this.#contacts.hasContactSession(request.contact_id, request.session_id)) {
           return this.#denyContact(request, "session_not_owned");
+        }
+        return { allowed: true };
+      }
+      case "category": {
+        // A4 修复批：消息意图类别必须显式授权（默认仅 query）。
+        if (!categories.has(request.category)) {
+          return this.#denyContact(request, `${request.category}_not_granted`);
         }
         return { allowed: true };
       }
@@ -957,6 +974,7 @@ export class PermissionEngine {
     if (request.action === "shell") payload.category = request.category;
     if (request.action === "capability") payload.capability = request.capability;
     if (request.action === "session") payload.session_id = request.session_id;
+    if (request.action === "category") payload.category = request.category;
     const eventId = this.#append(
       CONTACT_EVENT_TYPES.permissionDenied,
       `contact:${request.contact_id}`,

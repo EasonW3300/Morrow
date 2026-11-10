@@ -144,9 +144,13 @@ function handleAck(
   }
 }
 
-/** NotificationError → HTTP：404 不存在；400 入参；409 状态不符 */
+/** NotificationError → HTTP：404 不存在；409 状态不符；400 入参/缺少通知目标 */
 function sendNotificationError(res: ServerResponse, err: unknown): boolean {
   if (!(err instanceof NotificationError)) return false;
+  if (err.code === "notify_target_required") {
+    sendError(res, 400, "notify_target_required", err.message);
+    return true;
+  }
   const status = err.code === "not_found" ? 404 : err.code === "invalid_status" ? 409 : 400;
   sendError(res, status, `notification_${err.code}`, err.message);
   return true;

@@ -89,6 +89,23 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 
 CREATE INDEX IF NOT EXISTS messages_conversation_idx ON messages (conversation_id, created_at);
+
+-- 渠道启停状态（A1 修复批）：自动装配的稳定适配器缺省未启用；Owner 显式启用后
+-- 跨进程保留。实验适配器另有 adapter.isEnabled()（confirm_risk）闸门，不由此表绕过。
+CREATE TABLE IF NOT EXISTS channel_settings (
+  channel_id TEXT PRIMARY KEY,
+  enabled    INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL
+);
+
+-- 渠道默认通知会话（A3 修复批）：channel:<id> 通知目标的解析依据。由 Owner 经
+-- PUT /v1/channels/:id/notify-target 指定，必须指向该渠道已存在/已白名单的会话。
+CREATE TABLE IF NOT EXISTS channel_notify_target (
+  channel_id             TEXT PRIMARY KEY,
+  account_id             TEXT NOT NULL,
+  native_conversation_id TEXT NOT NULL,
+  updated_at             TEXT NOT NULL
+);
 `;
 
 export interface ChannelAccountInput {
@@ -151,6 +168,21 @@ export interface ConversationRecord {
   task_id: string | null;
   created_at: string;
   last_message_at: string;
+}
+
+/** 渠道启停状态行（A1 修复批）：缺省不存在 = 未启用 */
+export interface ChannelSettingsRecord {
+  channel_id: string;
+  enabled: boolean;
+  updated_at: string;
+}
+
+/** 渠道默认通知会话（A3 修复批） */
+export interface ChannelNotifyTargetRecord {
+  channel_id: string;
+  account_id: string;
+  native_conversation_id: string;
+  updated_at: string;
 }
 
 export type MessageDirection = "inbound" | "outbound";
@@ -254,6 +286,11 @@ export class ChannelStore {
   #findMessageByIdStmt;
   #findMessageByNativeStmt;
   #listMessagesStmt;
+  #getSettingsStmt;
+  #upsertSettingsStmt;
+  #getNotifyTargetStmt;
+  #upsertNotifyTargetStmt;
+  #deleteNotifyTargetStmt;
 
   private constructor(db: SqliteDatabase) {
     this.#db = db;
@@ -324,6 +361,26 @@ export class ChannelStore {
     this.#listMessagesStmt = db.prepare(
       "SELECT * FROM messages WHERE conversation_id = ? ORDER BY created_at, rowid",
     );
+    this.#getSettingsStmt = db.prepare(
+      "SELECT channel_id, enabled, updated_at FROM channel_settings WHERE channel_id = ?",
+    );
+    this.#upsertSettingsStmt = db.prepare(
+      `INSERT INTO channel_settings (channel_id, enabled, updated_at)
+       VALUES (?, ?, ?)
+       ON CONFLICT(channel_id) DO UPDATE SET enabled = excluded.enabled, updated_at = excluded.updated_at`,
+    );
+    this.#getNotifyTargetStmt = db.prepare(
+      "SELECT channel_id, account_id, native_conversation_id, updated_at FROM channel_notify_target WHERE channel_id = ?",
+    );
+    this.#upsertNotifyTargetStmt = db.prepare(
+      `INSERT INTO channel_notify_target (channel_id, account_id, native_conversation_id, updated_at)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(channel_id) DO UPDATE SET
+         account_id = excluded.account_id,
+         native_conversation_id = excluded.native_conversation_id,
+         updated_at = excluded.updated_at`,
+    );
+    this.#deleteNotifyTargetStmt = db.prepare("DELETE FROM channel_notify_target WHERE channel_id = ?");
   }
 
   static open(dataDir: string): ChannelStore {
@@ -497,6 +554,40 @@ export class ChannelStore {
 
   listMessages(conversationId: string): ChannelMessageRecord[] {
     return (this.#listMessagesStmt.all(conversationId) as unknown as MessageRow[]).map(rowToMessage);
+  }
+
+  /** 渠道启用状态（缺省 false：自动装配的稳定适配器不隐式启动） */
+  channelEnabled(channelId: string): boolean {
+    const row = this.#getSettingsStmt.get(channelId) as { enabled: number } | undefined;
+    return row?.enabled === 1;
+  }
+
+  setChannelEnabled(channelId: string, enabled: boolean, now: Date = new Date()): void {
+    this.#upsertSettingsStmt.run(channelId, enabled ? 1 : 0, now.toISOString());
+  }
+
+  getNotifyTarget(channelId: string): ChannelNotifyTargetRecord | null {
+    const row = this.#getNotifyTargetStmt.get(channelId) as ChannelNotifyTargetRecord | undefined;
+    return row === undefined ? null : { ...row };
+  }
+
+  setNotifyTarget(input: {
+    channelId: string;
+    accountId: string;
+    nativeConversationId: string;
+    now?: Date;
+  }): ChannelNotifyTargetRecord {
+    this.#upsertNotifyTargetStmt.run(
+      input.channelId,
+      input.accountId,
+      input.nativeConversationId,
+      (input.now ?? new Date()).toISOString(),
+    );
+    return this.getNotifyTarget(input.channelId) as ChannelNotifyTargetRecord;
+  }
+
+  clearNotifyTarget(channelId: string): void {
+    this.#deleteNotifyTargetStmt.run(channelId);
   }
 
   close(): void {

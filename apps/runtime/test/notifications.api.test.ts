@@ -40,9 +40,21 @@ async function openRuntime(
     enableEchoChannel: true,
     // 测试手动 drain，避免后台定时器把 queued 提前发出去（确定性）
     notificationDrainIntervalMs: 0,
+    outboxDrainIntervalMs: 0,
     ...options,
   });
   return { runtime, base: `http://127.0.0.1:${runtime.port}` };
+}
+
+/** A3：渠道通知规则需要默认通知会话；echo 用一个白名单会话作为目标 */
+function configureEchoNotifyTarget(runtime: RuntimeHandle): void {
+  runtime.channels.allowConversation({
+    account_id: "echo-default",
+    native_conversation_id: "echo:notify",
+    mode: "mention_only",
+  });
+  const result = runtime.channels.setNotifyTarget("echo", "echo:notify");
+  assert.equal(result.ok, true);
 }
 
 test("规则 PUT 合并 + GET；非法规则 400；规则变更可审计", async (t) => {
@@ -52,6 +64,7 @@ test("规则 PUT 合并 + GET；非法规则 400；规则变更可审计", async
     await runtime.close();
     removeDir(dir);
   });
+  configureEchoNotifyTarget(runtime);
 
   const put = await fetch(`${base}/v1/notifications/rules`, {
     method: "PUT",
@@ -105,6 +118,7 @@ test("账本订阅路由：桌面落 pending 可拉取，渠道经 Outbox → ec
     await runtime.close();
     removeDir(dir);
   });
+  configureEchoNotifyTarget(runtime);
 
   const put = await fetch(`${base}/v1/notifications/rules`, {
     method: "PUT",
