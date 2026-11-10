@@ -5,6 +5,8 @@
 
 M3 门槛（PRD §9）：**「三种部署工作；跨设备不重复执行同一任务」**；对应 AC-04（增量双向同步，2 设备各离线 50 条 + 小事件 p95）、AC-05（20 个竞争事实 + 删除不复活）。本票改动范围为 `docs/` + `scripts/real-machine/`（runtime 产品代码零改动）；发现的产品缺口在 §6 如实登记，不在本票修复。
 
+**后续修复批**：`fix/m3-sync-wiring` @ `d716b99`（Issue #34/#36）闭合 §6-1/2/3（同步启动接线、bearer token 透传、跨设备事前租约互斥），并在 §5/§6/§7 同步改判；AC-04/AC-05 归档数字未重跑（修复不改变同步吞吐路径）。
+
 ## 1. CI 证据（integration/m0）
 
 | 项 | 值 |
@@ -58,8 +60,9 @@ bash scripts/real-machine/m3-demo.sh --out docs/gates/m3-demo-output.md
 | 阈值（PRD §8 待校准） | ≤ 10,000 ms → **MET** |
 
 **环境口径（必须随数字引用）**：127.0.0.1 本机回环、单机双实例、node 24——这是**回环基线**；
-真实 Tailscale/Wi-Fi 网络未测（待 Owner 环境），且 M3 的 HTTP 传输当前不携带 bearer token
-（§6-3），真实非回环路径尚不可直接复现。归档：`docs/gates/m3-ac04-sync.md` + `.json`。
+真实 Tailscale/Wi-Fi 网络未测（待 Owner 环境）。M3 同步接线修复（#34，提交 d716b99）后
+HTTP 传输已按设备凭据携带 bearer token，真实非回环路径具备认证接缝，但双机跨网络仍未实测。
+归档：`docs/gates/m3-ac04-sync.md` + `.json`。
 
 ### 2.2 AC-05 竞争事实与删除（20 样本 + 双向删除）—— **分类与删除 PASS；附带重放缺陷**
 
@@ -112,42 +115,67 @@ Owner 仍可裁决；缺陷在重放过滤未按 `local_replica_id` 归属判定
 | `scripts/real-machine/m3-demo.sh` 第 8–10 项 | 异地执行证据入账本 → detect 冻结（`task.needs_reconcile`，evidence 含 A/B）→ Owner 裁决 completed（`task.reconciled` owner）；needs_reconcile 期间/裁决后无有效租约 | **PASS × 2 轮** |
 
 事件名：`task.started`（双端证据）、`task.needs_reconcile`、`task.reconciled`、`task.completed`（owner）；
-租约拒绝/丢失路径另有 `task.lease_denied` / `task.lease_lost`（`lease.scheduler.test.ts` 覆盖）。
+租约路径另有 `task.lease_acquired` / `task.lease_denied` / `task.lease_renewed` / `task.lease_released` /
+`task.lease_lost`（`lease.scheduler.test.ts`、`lease.preacquire.test.ts` 覆盖）。
 
-**边界**：这组证据证明「同一任务被两端独立执行后会被冻结并交 Owner 裁决」，不证明「执行前跨设备互斥」
-——跨实例租约表各自独立（§6-1）。演示中的异地执行证据以直接入账本方式模拟，因为任务投影不随同步事件
-重建（§6-4）。
+**边界**：本节证据证明「同一任务被两端独立执行后会被冻结并交 Owner 裁决」。执行前的跨设备
+租约互斥已由 #34 修复批补齐（§6-1，提交 d716b99）：acquire 前只 pull 增量并重放远端租约，
+远端持有即拒绝；acquire 后二次采样检测双持有并立即冻结。无共识协议下「拉取与 acquire」
+之间的竞态窗口仍是设计边界（fencing token + needs_reconcile 兜底）。演示中的异地执行证据
+仍以直接入账本方式模拟，因为任务投影不随同步事件重建（§6-4 未闭合）；事前互斥测试也使用
+本机已存在的任务行 + 对端租约事件，真实「双端同任务投影」仍依赖 §6-4。
 
 ## 5. PRD §9 M3 门槛逐项核对
 
 | 门槛 | 判定 | 证据指针 |
 |---|---|---|
 | 三种部署均工作 | **达成（本机 + CI ubuntu 前台等价）**；真实 systemd 待 Owner | §3：local/server/hybrid 三冒烟全 PASS；CI `gate (linux)` 部署冒烟 success；真实 systemd SKIPPED 标注 |
-| 跨设备不重复执行同一任务 | **部分达成（未完全达门槛）**：本地单点执行 + 事后 `needs_reconcile`；跨设备**事前互斥**未实现 | §4；§6-1（租约表/ token 按副本独立，演示中 B acquire token=1） |
+| 跨设备不重复执行同一任务 | **达成（回环基线，含诚实残余窗口）**：acquire 前跨设备租约检查 + 双持有冻结；fencing token 最终护栏 | §4；§6-1（#34，d716b99）；`lease.preacquire.test.ts`（A 持租约 B 被拒、双持有 → needs_reconcile、拉取节流） |
 | AC-04 增量双向同步 | **达成（回环基线）**：50×2 无丢失/无重复/顺序一致；p95 2.54 ms | §2.1；`docs/gates/m3-ac04-sync.{md,json}` |
 | AC-05 冲突和删除 | **达成（分类 + 删除）**；待审核期间本地可见值有重放缺陷 | §2.2；`docs/gates/m3-ac05-conflicts.{md,json}`；§6-5 |
 | 端到端演示（两轮 10/10） | **达成** | `docs/gates/m3-demo-output.md`（2 轮 × 10 项断言全 PASS） |
-| 全 workspace 测试绿 | **达成** | §7（node:test 825/825 + sidecar Rust 9/9） |
+| 全 workspace 测试绿 | **达成** | §7（node:test 831/831 + sidecar Rust 9/9） |
 
-**M3 门禁判定：未完全通过**——三种部署与 AC-04/AC-05 达成；「跨设备不重复执行同一任务」只有事后检测
-与本地互斥，缺少跨设备共享租约/事前互斥，按 PRD §4.6 FR-DEP-4 的严格口径标为**未达项**。其余开放边界见 §6。
+**M3 门禁判定：条件性通过（产品侧阻断项已修复）**——三种部署与 AC-04/AC-05 达成；
+「跨设备不重复执行同一任务」补上了跨设备租约事件同步与 acquire 前检查（#34，d716b99），
+按 PRD §4.6 FR-DEP-4 的口径达成回环基线。仍未闭合：无共识协议下「拉取 → acquire」之间的
+竞态窗口（已文档化，靠 fencing token + needs_reconcile 兜底）、任务投影不随同步重建（§6-4）、
+真实 systemd/Tailscale/UI 人工走查等外部边界。其余开放边界见 §6。
 
 ## 6. 未达项与边界（如实登记）
 
-1. **跨设备执行权没有共享状态（主线门槛未完全达成的直接原因）**：`LeaseStore` 按 dataDir 打开各自的
-   `events.sqlite`，两个设备的租约表互不可见；fencing token 只在本地单调递增。演示 A 持有 token=1 →
-   转移事件声明 `next_fencing_token=2`，但 B 在自己库里 acquire 仍得到 **token=1**。因此两端可各自开始
-   执行同一任务，只能靠同步后的 `detectDualExecution` 冻结为 `needs_reconcile`——是**事后检测**，
-   不是事前单点互斥。证据：`docs/gates/m3-demo-output.md` 第 7 项（B.token=1）、`lease.scheduler.test.ts`。
-2. **Runtime 进程入口未接线出站同步传输**：`apps/runtime/src/main.ts` 调 `startRuntime` 时未注入
-   `SyncTransport`（库形态 seam 默认无）。独立进程上 `POST /v1/sync/run` 返回 HTTP 200 但
-   `totals.ok=0 / failed=1`，peer error = `no SyncTransport configured for outbound sync`（本报告实测，
-   两个 `main.ts` 进程 + join 配对后复现）。AC-04 脚本用公开 seam 注入 `HttpSyncTransport` 才能跑通；
-   桌面「手动同步」/真实部署若走主入口，`sync/run` 目前是空转。**需要产品票接线**（按设备表解析
-   base URL + 凭据库 token）。
-3. **HTTP 同步传输不带设备鉴权**：`HttpSyncTransport` 的 push/pull/status 请求无 `Authorization` 头；
-   非回环来源必须 bearer token（ADR-0008），真实 Tailscale 路径会 401。当前混合冒烟/AC-04 均走
-   127.0.0.1 回环豁免，未暴露该问题。真实 Tailscale 组网 + 鉴权接线待 Owner 环境与后续票。
+> **修复批状态（#34 / 提交 d716b99）**：原登记项 1/2/3 已修复并补测试；4–12 仍为开放边界。
+> 修复批改动 `apps/runtime/src/{sync,lease,pairing,runtime,scheduler}`、`packages/protocol` 与测试，
+> 门禁数字（§2）仍来自修复前归档，未重跑 AC-04 p95（修复只增加 acquire 前拉取，不改变同步吞吐路径）。
+
+1. ~~**跨设备执行权没有共享状态**~~ → **已修复（#34，d716b99）**。租约表仍按 dataDir 私有（这是本地
+   协调态，不是共享存储），但租约生命周期事件 `task.lease_acquired / task.lease_renewed /
+   task.lease_released`（含既有 `task.lease_denied / task.lease_lost / task.execution_transferred`）
+   随同步传播；`lease/view.ts` 按 task 重放出每个 holder 的当前租约。`LeaseCoordinator` 在调度器
+   acquire 前向全部已配对 peer **只 pull 增量**（同任务 500ms 内复用结果）并检查远端未过期租约：
+   远端持有 → **不写本地租约行**，记 `task.lease_denied`（`source: "remote_lease"` + 持有者/token/
+   到期/来源事件），任务保持 planned / waiting_input；acquire 成功后**强制二次拉取**，检测到双持有
+   → 立即释放本地租约并冻结 `needs_reconcile`（evidence.reasons 含 `dual_lease_hold`），不执行节点。
+   证据：`apps/runtime/test/lease.preacquire.test.ts`（真 HTTP 回环：A 持租约 B 被拒；近同时 acquire
+   → needs_reconcile；拉取节流）、`lease.scheduler.test.ts`。
+   **诚实残余窗口**：拉取与 acquire 之间没有共识协议，两端仍可能各自认为对方未持有；二次采样只能
+   缩小窗口，不能消除。最终护栏是 fencing token（副作用提交前校验）与 `needs_reconcile` 的 Owner
+   显式裁决；跨设备时钟偏差同理。peer 不可达不阻断本地 acquire（离线优先），错误见 status。
+2. ~~**Runtime 进程入口未接线出站同步传输**~~ → **已修复（#34，d716b99）**。`startRuntime` 缺省构建
+   `DeviceSyncTransport` 并注入 `SyncEngine`：base_url 读 `devices.base_url`（join 的 `base_url` 与
+   claim 的 `device_base_url` 双向写入），token 读 SecretStore 的 `token:<peer>`；设备加入/撤销经
+   `PairingService.onDeviceChanged` 即时失效缓存，读路径也按设备表惰性重建（选择：事件回调 + 惰性
+   解析，不监听设备表）。本机对外地址由 `MORROW_PUBLIC_BASE_URL` 或 listen host:port 推导。
+   证据：`apps/runtime/test/sync.wiring.test.ts` 以两个真实 `main.ts` 进程 + join 配对后调
+   `POST /v1/sync/run`，`totals.ok=1 / failed=0`（双向），不再是 `no SyncTransport` 空转。
+3. ~~**HTTP 同步传输不带设备鉴权**~~ → **已修复（#34，d716b99）**。`HttpSyncTransport` 所有
+   push/pull/status 请求在解析到 token 时携带 `Authorization: Bearer <token>`；无 token 不带头
+   （回环豁免），401/403 的错误 details 带 `auth: "none" | "bearer"` 与 `reason: "missing_token"`；
+   `GET /v1/sync/status` 的 `peers[].unreachable_reason` 暴露 `no_base_url / device_revoked /
+   missing_token / 网络错误`。证据：`sync.wiring.test.ts` 用要求 token 的对端强制校验，覆盖
+   有 token/缺 token/失效 token，以及撤销后 transport 不再发请求。
+   **剩余边界**：join 只为加入方发放 token，服务端→加入方的反向同步在回环豁免下可用；非回环
+   需要部署方为该方向另行提供凭据（当前没有反向发放协议），真实 Tailscale 双机仍待 Owner。
 4. **任务投影不随同步事件重建**：同步只把 task 事件写入对端账本；对端 `tasks` 表不重建，
    `GET /v1/tasks/:id` 在对端 404、`GET /v1/tasks` 为空（本报告实测：B 账本有 `task.started`，
    但任务列表 0、详情 404）。因此「收到同一任务并独立执行」的真实双端任务工作流尚未打通；
@@ -164,7 +192,8 @@ Owner 仍可裁决；缺陷在重放过滤未按 `local_replica_id` 归属判定
    seam，无 HTTP 路由、无附件目录同步、无大文件分块；同步面只传事件信封（PRD FR-DEP-3 的
    「附件引用」只有引用语义，没有实现文件搬运）。本票未新增。
 8. **p95 为回环基线**：2.54 ms 是 127.0.0.1 单机双实例的墙钟；真实 Wi-Fi/Tailscale 路径未测，
-   阈值（≤10 s）待 Owner 环境校准；§6-2/3 未闭合前也无法直接测真实网络。
+   阈值（≤10 s）待 Owner 环境校准。修复批已接通 bearer token，非回环路径可复现认证链路，但双机
+   实测仍待 Owner。
 9. **真实 systemd 待 Owner Ubuntu 机器验证**：本机 macOS 无 systemd；CI 只跑 systemd 等价前台。
    另承 deploy 文档：系统级服务下 Linux keyring（`secret-tool`）可能不可访问，配对端点会
    503 `secret_store_unavailable`，需 Owner 机器确认。
@@ -183,13 +212,13 @@ desktop 测试前先 `pnpm --filter @morrow/runtime build`）：
 
 | 套件 | 结果 |
 |---|---|
-| runtime（node:test，排除容器套件） | **603/603 PASS**（17.6s） |
+| runtime（node:test，排除容器套件） | **609/609 PASS**（17.1s；新增 6 项接线/事前互斥测试） |
 | protocol | 40/40 |
 | pi-adapter | 31/31 |
 | desktop（node:test） | 95/95 |
 | desktop sidecar（cargo test） | 9/9 |
 | packaging | 56/56 |
-| **node:test 合计** | **825/825**（M2 合并态 714 → 825） |
+| **node:test 合计** | **831/831**（M3 原归档 825 + 新增 6；M2 合并态 714） |
 
 真实容器套件（`sandbox.docker.test.ts` / `capability-factory.harness.container.test.ts`）按票面要求
 本机不跑（docker CLI 可能挂起），由 CI ubuntu 腿的 `sandbox tests (ubuntu, real containers)` job
@@ -197,12 +226,15 @@ desktop 测试前先 `pnpm --filter @morrow/runtime build`）：
 
 ## 8. 结论
 
-**M3 门禁：未完全通过（条件性）**。达成项：三种部署形态（本机 local/server/hybrid + CI ubuntu
-服务器形态）、AC-04 回环基线（50×2 对账无丢失/无重复/顺序一致，p95 2.54 ms）、AC-05 分类与删除
-（20/20 预期合并或待审核，双向删除不复活）、两轮端到端演示 20/20、needs_reconcile 检测与 Owner 裁决。
-未达项：**跨设备不重复执行同一任务**缺跨设备共享租约/事前互斥（只有本地单点 + 事后冻结）；
-以及 §6-2/3/4/5/6/7 的接线与重放缺陷、真实 systemd/Tailscale/UI 人工走查等外部边界。
+**M3 门禁：条件性通过（产品侧阻断项已修复）**。达成项：三种部署形态（本机 local/server/hybrid +
+CI ubuntu 服务器形态）、AC-04 回环基线（50×2 对账无丢失/无重复/顺序一致，p95 2.54 ms）、AC-05
+分类与删除（20/20 预期合并或待审核，双向删除不复活）、两轮端到端演示 20/20、
+needs_reconcile 检测与 Owner 裁决；**跨设备不重复执行同一任务**由 #34（d716b99）补齐
+「租约事件同步 + acquire 前远端检查 + 双持有冻结」，达成回环基线。剩余边界：无共识协议下
+拉取与 acquire 的竞态窗口（fencing token + needs_reconcile 兜底）、任务投影不随同步重建（§6-4）、
+AC-05 重放缺陷（§6-5/6）、附件文件搬运（§6-7），以及真实 systemd/Tailscale/UI 人工走查；
+服务端→加入方的非回环反向同步尚无 token 发放协议。
 
-后续最小闭环建议（不在本票范围）：① 同步传输按设备表接线 + bearer token（§6-2/3）；
-② 任务事件投影重建与跨设备任务可见（§6-4）；③ 跨设备租约/执行权协调或明确的「先冻结后执行」协议
-（§6-1）；④ 重放过滤按 `local_replica_id` 归属（§6-5/6）；⑤ 附件引用与实际文件传输（§6-7）。
+后续最小闭环建议：① 任务事件投影重建与跨设备任务可见（§6-4）；② 重放过滤按 `local_replica_id`
+归属（§6-5/6）；③ 附件引用与实际文件传输（§6-7）；④ 反向 token 发放 / 真实 Tailscale 双机验证
+（§6-3 剩余边界、§6-10）。
