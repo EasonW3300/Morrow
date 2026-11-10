@@ -17,6 +17,11 @@ export type {
 } from "./event-envelope.ts";
 export type {
   ConnectivityResult,
+  DeviceIdentityInfo,
+  DeviceInfo,
+  PairingClaimRequest,
+  PairingClaimResponse,
+  PairingCodeResponse,
   MemoryEntryKind,
   MemoryWriteInput,
   ProviderCompatConfig,

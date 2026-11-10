@@ -2,8 +2,11 @@
 // 边界：不做配对/撤销/多设备——M3 范围（PRD §5.2、AC-04/05）。
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import type { RuntimeConfig } from "../src/config.ts";
 import { DeviceRegistry } from "../src/devices.ts";
+import { DB_FILE_NAME } from "../src/ledger.ts";
 import { startRuntime } from "../src/runtime.ts";
 import { removeDir, tmpDir } from "./helpers.ts";
 
@@ -86,6 +89,49 @@ test("重启同一 dataDir：记录不重复，last_seen_at 前移，created_at 
     );
   } finally {
     await second.close();
+    removeDir(dir);
+  }
+});
+
+test("M0 旧 devices 表幂等迁移（M3-T2）：补齐配对列、旧行 trusted=1、重复打开不报错", () => {
+  const dir = tmpDir("morrow-devices-migrate-");
+  const createdAt = "2026-10-29T10:00:00.000Z";
+  // 手写 M0 形态的旧表（无 public_key/fingerprint/trusted/revoked/token_hash 等列）
+  const legacy = new DatabaseSync(join(dir, DB_FILE_NAME));
+  legacy.exec(`
+    CREATE TABLE devices (
+      replica_id   TEXT PRIMARY KEY,
+      label        TEXT,
+      created_at   TEXT NOT NULL,
+      last_seen_at TEXT NOT NULL
+    );
+  `);
+  legacy
+    .prepare("INSERT INTO devices (replica_id, label, created_at, last_seen_at) VALUES (?, ?, ?, ?)")
+    .run(REPLICA, null, createdAt, createdAt);
+  legacy.close();
+
+  const first = DeviceRegistry.open(dir);
+  try {
+    const rows = first.list();
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].replica_id, REPLICA);
+    assert.equal(rows[0].trusted, true, "M0 仅有本机行，迁移后视为可信");
+    assert.equal(rows[0].revoked, false);
+    assert.equal(rows[0].public_key, null);
+    assert.equal(rows[0].fingerprint, null);
+    assert.equal(rows[0].fingerprint_short, null);
+    assert.equal(rows[0].paired_at, null);
+    assert.equal(rows[0].last_sync_at, null);
+  } finally {
+    first.close();
+  }
+  // 幂等：再次打开（迁移列均已存在）不重复 ALTER、不丢行
+  const second = DeviceRegistry.open(dir);
+  try {
+    assert.equal(second.list().length, 1);
+  } finally {
+    second.close();
     removeDir(dir);
   }
 });
