@@ -6,6 +6,10 @@ import { SessionList } from "./SessionList.tsx";
 import { SettingsView } from "./SettingsView.tsx";
 import { HealthView } from "./HealthView.tsx";
 import { TaskView } from "./TaskView.tsx";
+import { Button } from "./design-system/primitives/Button.tsx";
+import { GlassSurface } from "./design-system/primitives/GlassSurface.tsx";
+import { ThemeToggle } from "./design-system/ThemeToggle.tsx";
+import { applyTheme, getInitialTheme, saveTheme, type Theme } from "./design-system/theme.ts";
 
 /**
  * 桌面壳根组件：解析控制面地址（sidecar ready）→ 顶栏导航（会话 / 任务 / 设置 / 健康）。
@@ -36,6 +40,16 @@ export default function App() {
   const [listError, setListError] = useState<string | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
+  const [theme, setTheme] = useState<Theme>(() => getInitialTheme());
+
+  useEffect(() => {
+    applyTheme(theme);
+    saveTheme(theme);
+  }, [theme]);
+
+  const toggleTheme = useCallback(() => {
+    setTheme((current) => (current === "light" ? "dark" : "light"));
+  }, []);
 
   useEffect(() => {
     resolveRuntimeBase()
@@ -104,33 +118,42 @@ export default function App() {
 
   return (
     <div className="app">
-      <header className="topbar">
+      <GlassSurface as="header" className="topbar">
         <span className="brand">Morrow</span>
         <nav className="topnav">
           {NAV_ITEMS.map((item) => (
-            <button
+            <Button
               key={item.key}
-              className={view === item.key ? "nav-item selected" : "nav-item"}
+              variant="nav"
+              selected={view === item.key}
               onClick={() => setView(item.key)}
             >
               {item.label}
-            </button>
+            </Button>
           ))}
         </nav>
-      </header>
+        <div className="topbar-actions">
+          <ThemeToggle theme={theme} onToggle={toggleTheme} />
+        </div>
+      </GlassSurface>
       {view === "chat" && (
         <div className="chat-layout">
-          <aside className="sidebar">
+          <GlassSurface as="aside" className="sidebar">
             <div className="sidebar-head">
               <span className="sidebar-title">会话</span>
-              <button onClick={() => void createSession()} disabled={creating}>
+              <Button
+                variant="primary"
+                size="sm"
+                onClick={() => void createSession()}
+                disabled={creating}
+              >
                 {creating ? "创建中…" : "新建会话"}
-              </button>
+              </Button>
             </div>
             <SessionList sessions={sessions} selectedId={selectedId} onSelect={setSelectedId} />
             {listError !== null && <div className="list-error">{listError}</div>}
             <div className="sidebar-foot">控制面 {base.replace("http://", "")}</div>
-          </aside>
+          </GlassSurface>
           <main className="main">
             {selectedId === null ? (
               <div className="boot">

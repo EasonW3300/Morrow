@@ -60,6 +60,8 @@ import {
   type CredentialFieldErrors,
   type NotificationRuleDraft,
 } from "./channel-ui.ts";
+import { GlassSurface } from "./design-system/primitives/GlassSurface.tsx";
+import { useConfirm } from "./design-system/ConfirmDialog.tsx";
 
 /**
  * 设置 →「渠道」子页签（M4-T8 / Issue #45；PRD §5.1 渠道管理、§4.4 渠道、§4.8 通知/联系人）。
@@ -162,9 +164,16 @@ function AdapterSection({
   const [credentialTarget, setCredentialTarget] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [askConfirm, confirmDialog] = useConfirm();
 
   const disable = async (channel: ChannelSummary) => {
-    if (!window.confirm(`停用「${channelDisplayName(channel.channel_id)}」？将立即停止收发（可再用风险确认重新启用）。`)) {
+    const ok = await askConfirm({
+      title: "停用渠道",
+      message: `停用「${channelDisplayName(channel.channel_id)}」？将立即停止收发（可再用风险确认重新启用）。`,
+      confirmLabel: "停用",
+      tone: "danger",
+    });
+    if (!ok) {
       return;
     }
     setBusyId(channel.channel_id);
@@ -323,6 +332,7 @@ function AdapterSection({
           onSaved={onChanged}
         />
       )}
+      {confirmDialog}
     </section>
   );
 }
@@ -349,6 +359,14 @@ function RiskDialog({
     riskNotice: channel.risk_notice,
   });
 
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent): void => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [onClose]);
+
   const confirm = async () => {
     if (!consent.canConfirm) return;
     setSubmitting(true);
@@ -364,7 +382,8 @@ function RiskDialog({
 
   return (
     <div className="modal-backdrop" role="presentation" onClick={onClose}>
-      <div
+      <GlassSurface
+        variant="elevated"
         className="modal-card"
         role="dialog"
         aria-modal="true"
@@ -417,7 +436,7 @@ function RiskDialog({
             取消
           </button>
         </div>
-      </div>
+      </GlassSurface>
     </div>
   );
 }
@@ -440,6 +459,14 @@ function CredentialDialog({
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent): void => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [onClose]);
 
   useEffect(() => {
     let cancelled = false;
@@ -486,7 +513,8 @@ function CredentialDialog({
 
   return (
     <div className="modal-backdrop" role="presentation" onClick={onClose}>
-      <div
+      <GlassSurface
+        variant="elevated"
         className="modal-card"
         role="dialog"
         aria-modal="true"
@@ -537,7 +565,7 @@ function CredentialDialog({
             </div>
           </>
         )}
-      </div>
+      </GlassSurface>
     </div>
   );
 }
@@ -1158,6 +1186,7 @@ function OutboxSection({ base, nowMs }: { base: string; nowMs: number }) {
   const [message, setMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [askConfirm, confirmDialog] = useConfirm();
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -1183,12 +1212,15 @@ function OutboxSection({ base, nowMs }: { base: string; nowMs: number }) {
 
   const retry = async (record: OutboxMessageRecord) => {
     const state = outboxActionState(record);
-    const confirm = retryConfirmed(record);
+    const needsConfirm = retryConfirmed(record);
     if (
-      confirm &&
-      !window.confirm(
-        "这条消息可能已经送达平台。重发可能造成重复消息——确认已线下核对、仍要重发吗？",
-      )
+      needsConfirm &&
+      !(await askConfirm({
+        title: "重发可能已送达的消息",
+        message: "这条消息可能已经送达平台。重发可能造成重复消息——确认已线下核对、仍要重发吗？",
+        confirmLabel: "仍要重发",
+        tone: "primary",
+      }))
     ) {
       return;
     }
@@ -1196,7 +1228,7 @@ function OutboxSection({ base, nowMs }: { base: string; nowMs: number }) {
     setError(null);
     setMessage(null);
     try {
-      await api.retryOutbox(base, record.id, confirm);
+      await api.retryOutbox(base, record.id, needsConfirm);
       setMessage("已重置为待投递，由 Outbox 投递器按幂等键发送。");
       await load();
     } catch (err) {
@@ -1207,7 +1239,13 @@ function OutboxSection({ base, nowMs }: { base: string; nowMs: number }) {
   };
 
   const markSent = async (record: OutboxMessageRecord) => {
-    if (!window.confirm("标记为已送达？将写入人工回执（manual receipt）并留审计，不会重新发送。")) {
+    const ok = await askConfirm({
+      title: "标记为已送达",
+      message: "标记为已送达？将写入人工回执（manual receipt）并留审计，不会重新发送。",
+      confirmLabel: "标记已送达",
+      tone: "primary",
+    });
+    if (!ok) {
       return;
     }
     setBusy(record.id);
@@ -1301,6 +1339,7 @@ function OutboxSection({ base, nowMs }: { base: string; nowMs: number }) {
           </ul>
         )}
       </div>
+      {confirmDialog}
     </section>
   );
 }

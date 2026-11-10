@@ -18,6 +18,7 @@ import {
 import { CapabilitiesView } from "./CapabilitiesView.tsx";
 import { ChannelsView } from "./ChannelsView.tsx";
 import { DevicesView } from "./DevicesView.tsx";
+import { useConfirm } from "./design-system/ConfirmDialog.tsx";
 
 /**
  * 设置页（PRD §5.1 设置区）：四个子页签——「Provider 与模型」（票 T7 / Issue #8）、
@@ -83,6 +84,7 @@ function ProvidersSection({ base }: { base: string }) {
   /** provider_id → 测试状态：testing / 结果 / 端点本身失败（区别于连通性四类结果） */
   const [tests, setTests] = useState<Record<string, TestState>>({});
   const [busyId, setBusyId] = useState<string | null>(null);
+  const [confirm, confirmDialog] = useConfirm();
 
   const reload = useCallback(async () => {
     try {
@@ -143,7 +145,13 @@ function ProvidersSection({ base }: { base: string }) {
   };
 
   const remove = async (record: ProviderRecord) => {
-    if (!window.confirm(`删除 Provider「${record.name}」？元数据与已存密钥将一并清除。`)) return;
+    const ok = await confirm({
+      title: "删除 Provider",
+      message: `删除 Provider「${record.name}」？元数据与已存密钥将一并清除。`,
+      confirmLabel: "删除",
+      tone: "danger",
+    });
+    if (!ok) return;
     setBusyId(record.provider_id);
     try {
       await api.deleteProvider(base, record.provider_id);
@@ -330,6 +338,7 @@ function ProvidersSection({ base }: { base: string }) {
           </div>
         </div>
       )}
+      {confirmDialog}
     </div>
   );
 }

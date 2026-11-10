@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, ApiError, type HealthPayload } from "./api.ts";
 import { describeHealth } from "./health-ui.ts";
+import { Button } from "./design-system/primitives/Button.tsx";
 
 /**
  * 健康面板（票 T7 / Issue #8）：反映 GET /v1/health 全量字段（status / version /
@@ -46,12 +47,12 @@ export function HealthView({ base }: { base: string }) {
 
   if (error !== null && health === null) {
     return (
-      <div className="page">
+      <div className="page health-page">
         <div className="page-head">
           <h2>系统健康</h2>
-          <button className="btn primary" onClick={() => void refresh()} disabled={refreshing}>
+          <Button variant="primary" onClick={() => void refresh()} disabled={refreshing}>
             {refreshing ? "刷新中…" : "立即刷新"}
-          </button>
+          </Button>
         </div>
         <div className="banner-error">{error}</div>
         <p className="page-hint">无法读取健康状态。请确认 Runtime 正在运行，然后手动刷新。</p>
@@ -60,7 +61,7 @@ export function HealthView({ base }: { base: string }) {
   }
   if (health === null) {
     return (
-      <div className="page">
+      <div className="page health-page">
         <p className="page-hint">正在读取健康状态…</p>
       </div>
     );
@@ -68,12 +69,12 @@ export function HealthView({ base }: { base: string }) {
 
   const out = describeHealth(health, refreshedAt);
   return (
-    <div className="page">
+    <div className="page health-page">
       <div className="page-head">
         <h2>系统健康</h2>
-        <button className="btn primary" onClick={() => void refresh()} disabled={refreshing}>
+        <Button variant="primary" onClick={() => void refresh()} disabled={refreshing}>
           {refreshing ? "刷新中…" : "立即刷新"}
-        </button>
+        </Button>
       </div>
       {error !== null && <div className="banner-error">最近一次轮询失败：{error}（将在下个周期自动重试）</div>}
       <div className={`health-card tone-${out.tone}`}>

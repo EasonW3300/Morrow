@@ -27,6 +27,8 @@ import {
   type TaskEventItem,
 } from "./task-ui.ts";
 import { collectCapabilityRefs, type CapabilityRef } from "./capability-ui.ts";
+import { Badge } from "./design-system/primitives/Badge.tsx";
+import { Button } from "./design-system/primitives/Button.tsx";
 
 /**
  * Task 视图（票 M1-T6 / Issue #18，PRD §5.1 Task 视图简版、FR-TASK-3/4）：
@@ -84,9 +86,7 @@ export function TaskView({
     <div className="page task-page">
       <div className="page-head">
         <h2>任务</h2>
-        <button className="btn" onClick={() => void refreshList()}>
-          刷新列表
-        </button>
+        <Button onClick={() => void refreshList()}>刷新列表</Button>
       </div>
       {listError !== null && <div className="banner-error">{listError}</div>}
       {tasks.some((task) => taskNeedsReconcile(task.status)) && (
@@ -110,7 +110,7 @@ export function TaskView({
                   {task.goal}
                 </span>
                 <span className="task-row-meta">
-                  <span className={`badge tone-${taskStatusTone(task.status)}`}>{taskStatusLabel(task.status)}</span>
+                  <Badge tone={taskStatusTone(task.status)}>{taskStatusLabel(task.status)}</Badge>
                   <span className="mono">v{task.task_version}</span>
                   <span>{shortTime(task.created_at)}</span>
                 </span>
@@ -244,25 +244,24 @@ function TaskDetailPanel({
         <div>
           <h3>{task.goal}</h3>
           <p className="task-head-meta">
-            <span className={`badge tone-${taskStatusTone(task.status)}`}>{taskStatusLabel(task.status)}</span>
+            <Badge tone={taskStatusTone(task.status)}>{taskStatusLabel(task.status)}</Badge>
             <span className="mono">task_version {task.task_version}</span>
             <span className="mono">{task.task_id}</span>
           </p>
         </div>
         <div className="task-actions">
-          <button className="btn" disabled={busy || task.status !== "running"} onClick={() => void run("暂停", () => api.pauseTask(base, task.task_id))}>
+          <Button disabled={busy || task.status !== "running"} onClick={() => void run("暂停", () => api.pauseTask(base, task.task_id))}>
             暂停
-          </button>
-          <button
-            className="btn"
+          </Button>
+          <Button
             disabled={busy || (task.status !== "paused" && task.status !== "waiting_input" && task.status !== "planned")}
             onClick={() => void run("恢复", () => api.resumeTask(base, task.task_id))}
           >
             恢复
-          </button>
-          <button className="btn" disabled={busy || terminal || task.status === "running"} onClick={() => setShowRevise((v) => !v)}>
+          </Button>
+          <Button disabled={busy || terminal || task.status === "running"} onClick={() => setShowRevise((v) => !v)}>
             修改…
-          </button>
+          </Button>
         </div>
       </div>
       {opError !== null && <div className="banner-error">{opError}</div>}
@@ -288,9 +287,9 @@ function TaskDetailPanel({
           </label>
           <div className="form-actions">
             {reconcileControls(task.status, busy).options.map((option) => (
-              <button
+              <Button
                 key={option.resolution}
-                className={option.resolution === "completed" ? "btn primary" : "btn danger"}
+                variant={option.resolution === "completed" ? "primary" : "danger"}
                 disabled={option.disabled}
                 title={option.hint}
                 onClick={() =>
@@ -303,7 +302,7 @@ function TaskDetailPanel({
                 }
               >
                 {busy ? "提交中…" : option.label}
-              </button>
+              </Button>
             ))}
           </div>
         </div>
@@ -405,12 +404,12 @@ function NodeRow({
   return (
     <div className={`node-row tone-border-${taskNodeStatusTone(node.status)} ${owned ? "node-owned" : ""}`}>
       <div className="node-line">
-        <span className={`badge tone-${taskNodeStatusTone(node.status)}`}>{taskNodeStatusLabel(node.status)}</span>
+        <Badge tone={taskNodeStatusTone(node.status)}>{taskNodeStatusLabel(node.status)}</Badge>
         <strong>{node.title}</strong>
         <span className="mono node-key">{node.key}</span>
         {node.model !== undefined && <span className="node-meta">模型 {node.model}</span>}
         {node.attempts > 0 && <span className="node-meta">尝试 {node.attempts} 次</span>}
-        {owned && <span className="badge tone-warn">Owner 接管中</span>}
+        {owned && <Badge tone="warn">Owner 接管中</Badge>}
       </div>
       {node.goal !== undefined && <p className="node-goal">{node.goal}</p>}
       {capabilityRefs.length > 0 && (
@@ -447,8 +446,8 @@ function NodeRow({
                 value={result}
                 onChange={(e) => setResult(e.target.value)}
               />
-              <button
-                className="btn primary"
+              <Button
+                variant="primary"
                 disabled={busy || result.trim().length === 0}
                 onClick={() => {
                   setCompleting(false);
@@ -456,36 +455,32 @@ function NodeRow({
                 }}
               >
                 提交结果
-              </button>
-              <button className="btn" onClick={() => setCompleting(false)}>
-                取消
-              </button>
+              </Button>
+              <Button onClick={() => setCompleting(false)}>取消</Button>
             </>
           ) : (
             <>
-              <button className="btn primary" disabled={busy} onClick={() => setCompleting(true)}>
+              <Button variant="primary" disabled={busy} onClick={() => setCompleting(true)}>
                 完成…
-              </button>
-              <button
-                className="btn"
+              </Button>
+              <Button
                 disabled={busy}
                 onClick={() => void run("交还节点", () => api.releaseNode(base, taskId, node.node_id))}
               >
                 交还调度
-              </button>
+              </Button>
             </>
           )}
         </div>
       )}
       {!owned && node.status === "pending" && (
         <div className="node-actions">
-          <button
-            className="btn"
+          <Button
             disabled={busy}
             onClick={() => void run("接管节点", () => api.takeoverNode(base, taskId, node.node_id))}
           >
             接管
-          </button>
+          </Button>
         </div>
       )}
     </div>
@@ -574,9 +569,9 @@ function ReviseForm({
       })}
       {additions.map((row, index) => (
         <div key={index} className="revise-row">
-          <button className="btn" onClick={() => setAdditions((prev) => prev.filter((_, i) => i !== index))}>
+          <Button size="sm" onClick={() => setAdditions((prev) => prev.filter((_, i) => i !== index))}>
             移除行
-          </button>
+          </Button>
           <input
             className="mono"
             placeholder="key（如 review-log）"
@@ -602,12 +597,12 @@ function ReviseForm({
         </div>
       ))}
       <div className="revise-actions">
-        <button className="btn" disabled={busy} onClick={() => setAdditions((prev) => [...prev, { key: "", title: "", goal: "", dependsOn: "" }])}>
+        <Button disabled={busy} onClick={() => setAdditions((prev) => [...prev, { key: "", title: "", goal: "", dependsOn: "" }])}>
           + 新增节点
-        </button>
-        <button className="btn primary" disabled={busy || submitting || !preview.ok} onClick={() => void submit()}>
+        </Button>
+        <Button variant="primary" disabled={busy || submitting || !preview.ok} onClick={() => void submit()}>
           {submitting ? "提交中…" : "提交修改"}
-        </button>
+        </Button>
       </div>
       {!preview.ok && preview.errors.length > 0 && (
         <div className="form-errors">
@@ -665,12 +660,20 @@ function EventStream({ base, taskId }: { base: string; taskId: string }) {
       <h4>执行事件流（{total} 条，每页 {EVENT_PAGE_SIZE}）</h4>
       {error !== null && <div className="banner-error">{error}</div>}
       <div className="event-pages">
-        <button className="btn" disabled={offset === null || !eventPageState(total, EVENT_PAGE_SIZE, offset).hasNewer} onClick={() => void load((offset ?? 0) + EVENT_PAGE_SIZE)}>
+        <Button
+          size="sm"
+          disabled={offset === null || !eventPageState(total, EVENT_PAGE_SIZE, offset).hasNewer}
+          onClick={() => void load((offset ?? 0) + EVENT_PAGE_SIZE)}
+        >
           ← 返回较新
-        </button>
-        <button className="btn" disabled={offset === null || !eventPageState(total, EVENT_PAGE_SIZE, offset).hasOlder} onClick={() => void load(Math.max(0, (offset ?? 0) - EVENT_PAGE_SIZE))}>
+        </Button>
+        <Button
+          size="sm"
+          disabled={offset === null || !eventPageState(total, EVENT_PAGE_SIZE, offset).hasOlder}
+          onClick={() => void load(Math.max(0, (offset ?? 0) - EVENT_PAGE_SIZE))}
+        >
           加载更早 →
-        </button>
+        </Button>
       </div>
       <div className="event-list">
         {items.map((item, index) => (
@@ -737,13 +740,13 @@ function CheckpointList({
           <span className="mono">{shortTime(cp.created_at)}</span>
           <span>{cp.reason}</span>
           <span className="mono">v{cp.task_version}</span>
-          <button
-            className="btn"
+          <Button
+            size="sm"
             disabled={busy || disabled}
             onClick={() => void run("恢复到检查点", () => api.restoreTask(base, taskId, cp.checkpoint_id))}
           >
             恢复到此检查点
-          </button>
+          </Button>
         </div>
       ))}
     </section>
