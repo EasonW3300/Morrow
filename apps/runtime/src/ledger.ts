@@ -136,6 +136,9 @@ export class EventLedger {
   #countByTaskStmt;
   #pageByTaskStmt;
   #byTaskStmt;
+  #listSinceStmt;
+  #hasEventStmt;
+  #sequenceRangeStmt;
 
   private constructor(db: SqliteDatabase) {
     this.#db = db;
@@ -167,6 +170,12 @@ export class EventLedger {
       "SELECT envelope FROM events WHERE task_id = ? ORDER BY seq LIMIT ? OFFSET ?",
     );
     this.#byTaskStmt = db.prepare("SELECT seq, envelope FROM events WHERE task_id = ? ORDER BY seq");
+    // 同步增量导出（M3-T1 / Issue #30）：按写入序号游标取批，保持账本顺序。
+    this.#listSinceStmt = db.prepare(
+      "SELECT seq, envelope FROM events WHERE seq > ? ORDER BY seq LIMIT ?",
+    );
+    this.#hasEventStmt = db.prepare("SELECT 1 AS hit FROM events WHERE event_id = ?");
+    this.#sequenceRangeStmt = db.prepare("SELECT MIN(seq) AS min, MAX(seq) AS max, COUNT(*) AS n FROM events");
   }
 
   /** 打开（必要时创建）数据目录下的账本文件 */
@@ -276,6 +285,39 @@ export class EventLedger {
       total: Number(countRow.n),
       limit,
       offset,
+    };
+  }
+
+  /**
+   * 增量导出（M3-T1 / Issue #30）：sequence 严格大于 sinceSeq 的条目，按 seq 升序。
+   * limit 由调用方钳制（账本层兜底 [1,10000]）；同步批的 has_more 由调用方多取一条判定。
+   */
+  listSince(sequenceExclusive: number, limit = 1000): LedgerEntry[] {
+    this.#assertOpen();
+    const since = Number.isInteger(sequenceExclusive) && sequenceExclusive > 0 ? sequenceExclusive : 0;
+    const safeLimit = clampInt(limit, 1, 10_000, 1000);
+    const rows = this.#listSinceStmt.all(since, safeLimit) as Array<{ seq: number | bigint; envelope: string }>;
+    return rows.map((row) => ({ sequence: Number(row.seq), envelope: JSON.parse(row.envelope) as EventEnvelope }));
+  }
+
+  /** event_id 是否已存在（同步导入的幂等预检；唯一约束仍是最终防线） */
+  hasEvent(eventId: string): boolean {
+    this.#assertOpen();
+    return this.#hasEventStmt.get(eventId) !== undefined;
+  }
+
+  /** 账本 sequence 范围（GET /v1/sync/status 的投影；空账本 min/max 为 null） */
+  sequenceRange(): { min: number | null; max: number | null; count: number } {
+    this.#assertOpen();
+    const row = this.#sequenceRangeStmt.get() as {
+      min: number | bigint | null;
+      max: number | bigint | null;
+      n: number | bigint;
+    };
+    return {
+      min: row.min === null ? null : Number(row.min),
+      max: row.max === null ? null : Number(row.max),
+      count: Number(row.n),
     };
   }
 

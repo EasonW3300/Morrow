@@ -25,6 +25,10 @@ import { createMemoryWriteTool } from "./memory/tool.ts";
 import { memoryRoutes } from "./memory/routes.ts";
 import { MemoryProjector } from "./memory/projection.ts";
 import { LlmMemoryExtractor, LLM_EXTRACTOR_SYSTEM_PROMPT, type MemoryExtractor } from "./memory/extraction.ts";
+import { SyncCursorStore } from "./sync/cursors.ts";
+import { SyncEngine } from "./sync/engine.ts";
+import { syncRoutes } from "./sync/routes.ts";
+import type { SyncTransport } from "./sync/transport.ts";
 import { ProviderRegistry, ProviderRegistryError, ENV_PROVIDER_ID, type ProviderResolver, type ResolvedProvider } from "./providers.ts";
 import { SessionManager, type AgentRuntimeExtras, type SessionFrame } from "./sessions.ts";
 import { TaskScheduler, type NodeAgentFactory, type TaskNodeExecInput } from "./scheduler.ts";
@@ -103,6 +107,8 @@ interface RequestContext {
   factory: CapabilityFactory;
   /** Skill 服务（票 M2-T5：案例收集/晋升提案/Owner 决策/重用调用/检索） */
   skills: SkillService;
+  /** 同步引擎（M3-T1 / Issue #30：导出/导入/游标/缺口检测；库形态可直用） */
+  sync: SyncEngine;
 }
 
 type Handler = (
@@ -181,6 +187,11 @@ export interface RuntimeOptions {
   };
   /** Skill 自动晋升阈值：同组合连续成功 ≥ N 产生提案（默认 2，最小 1） */
   skillPromotionThreshold?: number;
+  /**
+   * 同步出站传输注入 seam（M3-T1 / Issue #30）：pullFromPeer / pushToPeer 经此与 peer
+   * 交换事件。HTTP 端点（/v1/sync/*）不依赖它。测试注入 InMemorySyncTransport（零网络）。
+   */
+  syncTransport?: SyncTransport;
 }
 
 export interface RuntimeHandle {
@@ -209,6 +220,8 @@ export interface RuntimeHandle {
   factory: CapabilityFactory;
   /** Skill 服务（M2-T5 / Issue #26：recordCase / propose / decide / invoke / matchSkills，库形态可直用） */
   skills: SkillService;
+  /** 同步引擎（M3-T1 / Issue #30：exportBatch / receivePush / pullFromPeer / pushToPeer / status） */
+  sync: SyncEngine;
   /**
    * 优雅停止：停止接收请求 → 中止并释放会话运行时与在跑任务节点 → 记账 runtime.stopped
    * → 关闭任务投影库与账本（WAL checkpoint）。signal 传入收到的 POSIX 信号名，
@@ -254,6 +267,7 @@ const routes: Route[] = [
   // invoke + T6 别名 /v1/skills*）——必须先于 capabilityRoutes 展开：GET /v1/capabilities/:id
   // 的 `[^/]+` 会吞掉 /v1/capabilities/skills（grants 路由同款先具体后通配）
   ...skillRoutes,
+  ...syncRoutes,
   ...memoryRoutes,
   // 能力调用端点（#22 修复批 / FR-CAP-5）：POST /v1/capabilities/:id/invoke（body = 工具
   // input）——经 ToolInvoker 统一执行链（权限复核在链上），builtin 进程内直呼、sandboxed
@@ -276,6 +290,15 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
   // 不做配对/撤销（M3 范围）
   const devices = DeviceRegistry.open(config.dataDir);
   devices.touch(config.replicaId);
+  // 同步引擎（M3-T1 / Issue #30）：游标表与账本同库；出站传输可经 RuntimeOptions 注入
+  // （缺省无传输——HTTP 端点只负责对端驱动的事件导出/导入，出站编排由宿主接线）。
+  const syncCursors = SyncCursorStore.open(config.dataDir);
+  const sync = new SyncEngine({
+    ledger,
+    replicaId: config.replicaId,
+    cursors: syncCursors,
+    ...(options.syncTransport === undefined ? {} : { transport: options.syncTransport }),
+  });
   // 能力注册表（票 M2-T1 / Issue #22）：会话工具注入改查注册表（disable 即不再注入）；
   // builtin 工具的 ensure-registered 在 runtime.started 之后执行（审计顺序：进程启动 →
   // builtin 注册；幂等，同 dataDir 重启不产生新事件）。
@@ -530,7 +553,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     memorySearch: (query) => memory.search(query).map((hit) => ({ content: hit.content, entry_kind: hit.stage })),
     workspaceRoot,
   });
-  const ctx: RequestContext = { ledger, replicaId: config.replicaId, sessions, providers, devices, tasks, scheduler, checkpoints, memory, projector, capabilities, sandbox, factory, skills };
+  const ctx: RequestContext = { ledger, replicaId: config.replicaId, sessions, providers, devices, tasks, scheduler, checkpoints, memory, projector, capabilities, sandbox, factory, skills, sync };
   const server = createServer((req, res) => {
     routeRequest(req, res, ctx);
   });
@@ -545,6 +568,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     locks.close();
     capabilities.close();
     memoryStore.close();
+    syncCursors.close();
     devices.close();
     ledger.close();
     throw err;
@@ -590,6 +614,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     sandbox,
     factory,
     skills,
+    sync,
     async close(signal?: string): Promise<void> {
       if (closing) return;
       closing = true;
@@ -620,6 +645,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
       }
       devices.close();
       memoryStore.close();
+      syncCursors.close();
       ledger.close();
     },
   };
