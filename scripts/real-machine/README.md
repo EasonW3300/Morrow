@@ -2,6 +2,28 @@
 
 CI runner 无音频设备与 GUI 会话，冒烟门清单 #4 的真机项在本机执行；本目录放可重复执行的探针。
 
+## M4 门禁脚本（Issue #46）
+
+全部为**平台协议桩**口径（真实适配器 + `ChannelTestServer` / `registerQqTestStub` / `StubLocalBridge`，零真实网络）；真实平台层证据单列在 `docs/gates/m4-qq-live-evidence.md`，未达项见 `docs/gates/m4-gate-report.md` §3/§6。
+
+```bash
+export PATH="/opt/homebrew/bin:$PATH"
+node --experimental-sqlite --experimental-strip-types scripts/real-machine/ac09-feishu.ts --out docs/gates
+node --experimental-sqlite --experimental-strip-types scripts/real-machine/ac10-qq.ts --out docs/gates
+node --experimental-sqlite --experimental-strip-types scripts/real-machine/ac13-notifications-permissions.ts --out docs/gates
+node --experimental-sqlite --experimental-strip-types scripts/real-machine/ac15-wechat.ts --out docs/gates
+bash scripts/real-machine/m4-demo.sh --out docs/gates/m4-demo-output.md
+# 等价：node --experimental-sqlite --experimental-strip-types scripts/real-machine/m4-demo.ts --out docs/gates/m4-demo-output.md
+```
+
+| 脚本 | 覆盖 | 合并态结果 |
+|---|---|---|
+| `ac09-feishu.ts` | AC-09 五面 × 20 轮（私聊/群 @/可信联系人/外发审计/任务关联） | 20/20 × 5（80 条外发审计） |
+| `ac10-qq.ts` | AC-10 群 @ 与私聊 × 20 轮 + 主动消息受限拒绝 + token 刷新 | 20/20 × 2（40 条） |
+| `ac13-notifications-permissions.ts` | 五类越权 × 20 = 100 次阻断 + 四类通知 × 2 目标去重 | 100/100 阻断；160 送达/160 去重 |
+| `ac15-wechat.ts` | 配置/风险确认/白名单收发/健康/日志/关闭 | 20/20 收发，20/20 非白名单阻断 |
+| `m4-demo.ts` | AC-14 端到端两轮 × 10 项 | 20/20（语音段标注 M5） |
+
 ## m3-demo.sh（M3 门槛演示：两轮 × 10 项断言，Issue #36）
 
 ```bash

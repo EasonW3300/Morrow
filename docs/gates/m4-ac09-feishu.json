@@ -1,0 +1,351 @@
+{
+  "ticket": "M4-T9 / Issue #46 AC-09",
+  "generated_at": "2026-11-10T09:11:57.373Z",
+  "environment": {
+    "node": "v24.22.1",
+    "platform": "darwin-arm64"
+  },
+  "channel": {
+    "config": {
+      "appId": "cli_m4_ac09",
+      "appSecret": "ac09_app_secret",
+      "verificationToken": "ac09_verification_token",
+      "encryptKey": "ac09_encrypt_key",
+      "botOpenId": "ou_bot"
+    },
+    "capabilities": {
+      "direct_message": "supported",
+      "group_mention": "supported",
+      "group_proactive": "limited",
+      "attachments": "limited",
+      "edit": "unsupported"
+    },
+    "health": {
+      "healthy": true,
+      "state": "running",
+      "connection": "connected"
+    }
+  },
+  "rounds_requested": 20,
+  "rounds_completed": 20,
+  "aspects": {
+    "direct_message": {
+      "passed": 20,
+      "total": 20
+    },
+    "group_mention": {
+      "passed": 20,
+      "total": 20
+    },
+    "trusted_contact_authorization": {
+      "passed": 20,
+      "total": 20
+    },
+    "outbound_audit": {
+      "passed": 20,
+      "total": 20,
+      "messages": 80
+    },
+    "task_association": {
+      "passed": 20,
+      "total": 20
+    }
+  },
+  "totals": {
+    "outbound_messages": 80,
+    "platform_replies": 80,
+    "inbound_received": 80,
+    "outbound_queued": 80,
+    "outbound_sent": 80,
+    "contact_bound": 20,
+    "sessions": 61
+  },
+  "real_platform_layer": {
+    "status": "not_run_external_block",
+    "reason": "飞书自建应用资质未注册（Owner 侧滞后），真实平台联调按 Owner 要求暂缓；本报告全部数字为平台协议桩口径。",
+    "evidence_pointer": "docs/gates/m4-qq-live-evidence.md（QQ 真实平台；飞书无对应证据）"
+  },
+  "rounds": [
+    {
+      "round": 1,
+      "private_ok": true,
+      "group_mention_ok": true,
+      "contact_ok": true,
+      "contact_id": "01a1c4ba-74f8-7916-a15f-15520a68653e",
+      "task_association_ok": true,
+      "task_id": "01a1c4ba-7504-72ab-bb1e-e2f2ee4ff868",
+      "outbound_ok": true,
+      "outbound_messages": 4,
+      "platform_replies": 4,
+      "inbound_events": 4,
+      "errors": []
+    },
+    {
+      "round": 2,
+      "private_ok": true,
+      "group_mention_ok": true,
+      "contact_ok": true,
+      "contact_id": "01a1c4ba-752f-7774-8861-358dba9a60f2",
+      "task_association_ok": true,
+      "task_id": "01a1c4ba-753a-7f88-8d85-5aaef77ae8a4",
+      "outbound_ok": true,
+      "outbound_messages": 4,
+      "platform_replies": 4,
+      "inbound_events": 4,
+      "errors": []
+    },
+    {
+      "round": 3,
+      "private_ok": true,
+      "group_mention_ok": true,
+      "contact_ok": true,
+      "contact_id": "01a1c4ba-755e-7e21-a2ab-b46c50dd3d2b",
+      "task_association_ok": true,
+      "task_id": "01a1c4ba-7569-7d6d-a623-7e0eb897fbbb",
+      "outbound_ok": true,
+      "outbound_messages": 4,
+      "platform_replies": 4,
+      "inbound_events": 4,
+      "errors": []
+    },
+    {
+      "round": 4,
+      "private_ok": true,
+      "group_mention_ok": true,
+      "contact_ok": true,
+      "contact_id": "01a1c4ba-758d-7c6c-81cb-4943e66040b5",
+      "task_association_ok": true,
+      "task_id": "01a1c4ba-7598-7902-b8c1-6cbf6676b2d1",
+      "outbound_ok": true,
+      "outbound_messages": 4,
+      "platform_replies": 4,
+      "inbound_events": 4,
+      "errors": []
+    },
+    {
+      "round": 5,
+      "private_ok": true,
+      "group_mention_ok": true,
+      "contact_ok": true,
+      "contact_id": "01a1c4ba-75bc-73bd-bf30-3f6e9d472137",
+      "task_association_ok": true,
+      "task_id": "01a1c4ba-75c7-7e9b-9db5-2969abb0fa91",
+      "outbound_ok": true,
+      "outbound_messages": 4,
+      "platform_replies": 4,
+      "inbound_events": 4,
+      "errors": []
+    },
+    {
+      "round": 6,
+      "private_ok": true,
+      "group_mention_ok": true,
+      "contact_ok": true,
+      "contact_id": "01a1c4ba-75eb-7cd5-824c-fc881c9a172c",
+      "task_association_ok": true,
+      "task_id": "01a1c4ba-75f7-7838-aff9-8c073d08ed2a",
+      "outbound_ok": true,
+      "outbound_messages": 4,
+      "platform_replies": 4,
+      "inbound_events": 4,
+      "errors": []
+    },
+    {
+      "round": 7,
+      "private_ok": true,
+      "group_mention_ok": true,
+      "contact_ok": true,
+      "contact_id": "01a1c4ba-761c-74b2-9d2b-66836a2fbe59",
+      "task_association_ok": true,
+      "task_id": "01a1c4ba-7628-7b7d-b1c2-fe3e44658508",
+      "outbound_ok": true,
+      "outbound_messages": 4,
+      "platform_replies": 4,
+      "inbound_events": 4,
+      "errors": []
+    },
+    {
+      "round": 8,
+      "private_ok": true,
+      "group_mention_ok": true,
+      "contact_ok": true,
+      "contact_id": "01a1c4ba-764e-7632-bc5a-eedaa40da9b0",
+      "task_association_ok": true,
+      "task_id": "01a1c4ba-7659-7268-8b2a-94452ec890be",
+      "outbound_ok": true,
+      "outbound_messages": 4,
+      "platform_replies": 4,
+      "inbound_events": 4,
+      "errors": []
+    },
+    {
+      "round": 9,
+      "private_ok": true,
+      "group_mention_ok": true,
+      "contact_ok": true,
+      "contact_id": "01a1c4ba-767c-747f-9ef3-7307c8aae43a",
+      "task_association_ok": true,
+      "task_id": "01a1c4ba-7688-7243-a10e-5d051a43852e",
+      "outbound_ok": true,
+      "outbound_messages": 4,
+      "platform_replies": 4,
+      "inbound_events": 4,
+      "errors": []
+    },
+    {
+      "round": 10,
+      "private_ok": true,
+      "group_mention_ok": true,
+      "contact_ok": true,
+      "contact_id": "01a1c4ba-76ad-7415-8e9d-84b0e9413f43",
+      "task_association_ok": true,
+      "task_id": "01a1c4ba-76b8-77d0-8386-48f90b19c737",
+      "outbound_ok": true,
+      "outbound_messages": 4,
+      "platform_replies": 4,
+      "inbound_events": 4,
+      "errors": []
+    },
+    {
+      "round": 11,
+      "private_ok": true,
+      "group_mention_ok": true,
+      "contact_ok": true,
+      "contact_id": "01a1c4ba-76dc-7d5a-89a5-d4b441e84407",
+      "task_association_ok": true,
+      "task_id": "01a1c4ba-76e8-75f0-8c97-39853ce5fc8d",
+      "outbound_ok": true,
+      "outbound_messages": 4,
+      "platform_replies": 4,
+      "inbound_events": 4,
+      "errors": []
+    },
+    {
+      "round": 12,
+      "private_ok": true,
+      "group_mention_ok": true,
+      "contact_ok": true,
+      "contact_id": "01a1c4ba-770e-700d-bd58-fd6d3ea2cce8",
+      "task_association_ok": true,
+      "task_id": "01a1c4ba-7719-7409-a432-028229d09327",
+      "outbound_ok": true,
+      "outbound_messages": 4,
+      "platform_replies": 4,
+      "inbound_events": 4,
+      "errors": []
+    },
+    {
+      "round": 13,
+      "private_ok": true,
+      "group_mention_ok": true,
+      "contact_ok": true,
+      "contact_id": "01a1c4ba-773f-7d22-9d39-08001eb88153",
+      "task_association_ok": true,
+      "task_id": "01a1c4ba-774b-7f05-8c2f-3a6f47d33892",
+      "outbound_ok": true,
+      "outbound_messages": 4,
+      "platform_replies": 4,
+      "inbound_events": 4,
+      "errors": []
+    },
+    {
+      "round": 14,
+      "private_ok": true,
+      "group_mention_ok": true,
+      "contact_ok": true,
+      "contact_id": "01a1c4ba-7772-7530-9887-44dd7cba514c",
+      "task_association_ok": true,
+      "task_id": "01a1c4ba-777e-7385-931c-128940679312",
+      "outbound_ok": true,
+      "outbound_messages": 4,
+      "platform_replies": 4,
+      "inbound_events": 4,
+      "errors": []
+    },
+    {
+      "round": 15,
+      "private_ok": true,
+      "group_mention_ok": true,
+      "contact_ok": true,
+      "contact_id": "01a1c4ba-77a6-7280-9af6-257623975421",
+      "task_association_ok": true,
+      "task_id": "01a1c4ba-77b2-70ab-b86c-1e5181bce9e0",
+      "outbound_ok": true,
+      "outbound_messages": 4,
+      "platform_replies": 4,
+      "inbound_events": 4,
+      "errors": []
+    },
+    {
+      "round": 16,
+      "private_ok": true,
+      "group_mention_ok": true,
+      "contact_ok": true,
+      "contact_id": "01a1c4ba-77d7-7df9-9dd4-205962df08aa",
+      "task_association_ok": true,
+      "task_id": "01a1c4ba-77e2-7e5c-bf19-a0918d5138f8",
+      "outbound_ok": true,
+      "outbound_messages": 4,
+      "platform_replies": 4,
+      "inbound_events": 4,
+      "errors": []
+    },
+    {
+      "round": 17,
+      "private_ok": true,
+      "group_mention_ok": true,
+      "contact_ok": true,
+      "contact_id": "01a1c4ba-7808-7cc3-91bc-8d5826d24cda",
+      "task_association_ok": true,
+      "task_id": "01a1c4ba-7814-7d64-ae29-d01118ca2609",
+      "outbound_ok": true,
+      "outbound_messages": 4,
+      "platform_replies": 4,
+      "inbound_events": 4,
+      "errors": []
+    },
+    {
+      "round": 18,
+      "private_ok": true,
+      "group_mention_ok": true,
+      "contact_ok": true,
+      "contact_id": "01a1c4ba-783a-785b-a65b-5b6a86dcdbd4",
+      "task_association_ok": true,
+      "task_id": "01a1c4ba-7846-7498-b9bc-30830c5bd844",
+      "outbound_ok": true,
+      "outbound_messages": 4,
+      "platform_replies": 4,
+      "inbound_events": 4,
+      "errors": []
+    },
+    {
+      "round": 19,
+      "private_ok": true,
+      "group_mention_ok": true,
+      "contact_ok": true,
+      "contact_id": "01a1c4ba-786b-7bd2-beb9-7976cc0aafe9",
+      "task_association_ok": true,
+      "task_id": "01a1c4ba-7877-79c0-a630-0bfdaf5f09af",
+      "outbound_ok": true,
+      "outbound_messages": 4,
+      "platform_replies": 4,
+      "inbound_events": 4,
+      "errors": []
+    },
+    {
+      "round": 20,
+      "private_ok": true,
+      "group_mention_ok": true,
+      "contact_ok": true,
+      "contact_id": "01a1c4ba-789d-7333-ba1d-b4643f88e549",
+      "task_association_ok": true,
+      "task_id": "01a1c4ba-78aa-76fd-a6f6-4224e4c08b88",
+      "outbound_ok": true,
+      "outbound_messages": 4,
+      "platform_replies": 4,
+      "inbound_events": 4,
+      "errors": []
+    }
+  ],
+  "pass": true
+}
