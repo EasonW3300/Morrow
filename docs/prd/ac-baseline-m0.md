@@ -104,3 +104,17 @@ CI 侧：node 22（runner 托管）、bun 1.4.4（oven-sh setup-bun pin）、Rus
 - **M2 门槛演示数据（登记入 §5）**：`scripts/real-machine/m2-demo.sh`（可重复执行，PASS=10 FAIL=0 × 2 次）+ 归档输出 `docs/gates/m2-demo-output.md`；生成口径为夹具注入的脚本化生成器（FakePi 同款，零 LLM）——AC-06 的「生成成功率」在真实 LLM 接入前以该口径为分母，真实模型行为待 Owner 密钥（§4）。
 - **新登记的 runtime 缺口（待修复票）**：Skill invoke 缺省接线（ToolInvoker 未注册任何工具 → 缺省 unknown_tool）——AC-06/PRD §4.2 重用调用在真实 Runtime 缺省配置下不成立，见 `docs/gates/m2-gate-report.md` §5-1。
 - **仍未校准**：AC-06 的三类成功率分类统计（正式口径）、AC-08 的并行度量化指标待多轮实测；本节只登记 M2 实测现状与分母定版。
+
+## 9. M3 校准注记（2026-11-10，M3-T7 / Issue #36 合并态实测）
+
+基线补记（PRD §8「M3 校准」的 M3 部分，环境仍以 §1/§2 为准；本机 node 24.22.1、macOS 15.5、M4 Pro 24 GB）：
+
+- **AC-04 测试数据与复跑（登记入 §5）**：可重复脚本 `scripts/real-machine/ac04-sync.ts`（两独立 Runtime + `POST /v1/pairing/join` 配对 + 真实 HTTP `POST /v1/sync/run`）。合并态 79c8fa8 实测：A/B 各离线 50 条 `session.created` → 双向同步 → 两侧各 100 条业务事件，**缺失 0 / 重复 0 / 同一来源相对顺序一致（4 项顺序断言全 true）**。归档 `docs/gates/m3-ac04-sync.md` + `.json`。
+- **AC-04 p95 实测（本机回环基线）**：100 个样本 = 每轮 1 条 `session.created`（最大 406 B ≤1KB）→ 一次 `POST /v1/sync/run` 完成（pull→push→push→pull）的墙钟。**p50 1.66 ms / p90 2.35 ms / p95 2.54 ms / p99 3.74 ms**（min 1.39 / max 5.71 / mean 1.83 ms）；100/100 样本到达对端。阈值 ≤10 s（PRD §8 初始候选）在回环基线下 MET。**环境口径**：127.0.0.1 单机双实例，非 Tailscale/Wi-Fi；真实网络待 Owner 环境校准（当前 HTTP 传输未携带 bearer token，见 `docs/gates/m3-gate-report.md` §6-3）。按 §3 要求，本值只作为「同机回环」路径的数。
+- **AC-05 样本集登记（登记入 §5）**：`scripts/real-machine/ac05-conflicts.ts`，20 个竞争事实（与 `apps/runtime/test/sync.merge.test.ts` 同集合）：**6 preference 自动合并 + 14 待审核（locked 3 / sensitivity_change 5 / fact_conflict 6）**。合并态复跑：自动合并 6/6（两端收敛同一 v3 内容/版本），待审核 14/14（A/B 两侧冲突原因均与 M1 巩固器分支一致）；同步审计每侧 `sync.merged` 6、`sync.conflict` 28。删除不复活双向：A 删/B 离线改、B 删/A 离线改 → 双方 `deleted_at` 非空、旧修订未导入、`sync.tombstone_skipped` 审计命中。归档 `docs/gates/m3-ac05-conflicts.md` + `.json`。
+- **AC-05 缺陷登记**：两端同时竞争时，跨端 `sync.conflict` 的 `remote_event_ids` 会把对方**本地**修订也视为「不采纳」，重放后待审核事实的可见值回落到基线 v1（本地 v2 可见 0/14）；冲突队列仍完整保留两侧内容。分类与删除判定不受影响。详见 `docs/gates/m3-gate-report.md` §6-5/6。
+- **三部署证据（登记入 §5）**：本机 `scripts/deploy/smoke-{local,server,hybrid}.sh` 三形态全 PASS（server 的真实 systemd 标注 SKIPPED 待 Owner）；CI 最新 run [42767124433](https://github.com/EasonW3300/Morrow/actions/runs/42767124433)（79c8fa8）8 job 全绿，`gate (linux)` 的 Deployment smoke（服务器单二进制、systemd 等价前台）success。纯本地/混合未加入 CI。
+- **needs_reconcile 证据（登记入 §5）**：`apps/runtime/test/lease.scheduler.test.ts`（双端独立执行 → `task.needs_reconcile`，Owner 裁决 → `task.reconciled` + `task.completed` actor=owner）与 `lease.api.test.ts`（detect/reconcile 端点）合并态全绿；`scripts/real-machine/m3-demo.sh` 两轮 20/20。边界：跨实例租约表独立，B 侧 acquire 仍从 token=1 起（无事前跨设备互斥）；任务投影不随同步重建（对端任务详情 404）。见门禁报告 §6-1/4。
+- **M3 门槛演示数据（登记入 §5）**：`scripts/real-machine/m3-demo.sh`（两轮独立执行，每轮 10 项断言，20/20 PASS）+ 归档 `docs/gates/m3-demo-output.md`；覆盖 join 配对、双向同步、删除传播、冲突分类（自动/待审核）、执行权转移、needs_reconcile 检测与裁决。
+- **测试规模（M3 合并态 79c8fa8 实测）**：runtime **603**（M2 合并态 520 → 603，排除两个真实容器套件）、desktop 95（67 → 95）+ sidecar Rust 9、protocol 40、pi-adapter 31、packaging 56；全 workspace node:test 合计 **825**（M2 714 → 825），全部绿（exit 0）。真实容器套件由 CI ubuntu 腿独立判定。
+- **仍未校准/未达成**：AC-04 的**真实网络**（Tailscale/Wi-Fi）p95 未测；跨设备「同一任务单点执行」缺共享租约与事前互斥（只有事后 `needs_reconcile`）；真实 systemd、附件/大文件传输、桌面 UI 人工走查保持开放。详见 `docs/gates/m3-gate-report.md` §5/§6。

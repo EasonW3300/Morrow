@@ -1,0 +1,279 @@
+{
+  "ticket": "M3-T7 / Issue #36 AC-04",
+  "generated_at": "2026-11-10T06:29:14.103Z",
+  "environment": {
+    "node": "v24.22.1",
+    "platform": "darwin-arm64",
+    "cwd": "/Users/wys3300/Desktop/project/Morrow-wt/m3t7"
+  },
+  "replicas": {
+    "a": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+    "b": "9a3f6c1e-4b2d-4c8a-8f1e-2a7b3c4d5e6f"
+  },
+  "pairing": {
+    "method": "POST /v1/pairing/join",
+    "join_response_has_token": false,
+    "devices_a": 2,
+    "devices_b": 2,
+    "both_trusted": true
+  },
+  "offline": {
+    "per_side": 50,
+    "a_written": 50,
+    "b_written": 50,
+    "isolated_before_sync": true
+  },
+  "sync": {
+    "rounds": [
+      {
+        "round": 1,
+        "a": {
+          "requested_peer_replica_id": null,
+          "peers": [
+            {
+              "peer_replica_id": "9a3f6c1e-4b2d-4c8a-8f1e-2a7b3c4d5e6f",
+              "pulled": 54,
+              "pushed": 54,
+              "duplicates": 106,
+              "gaps": 0,
+              "errors": [],
+              "ok": true
+            }
+          ],
+          "totals": {
+            "peers": 1,
+            "ok": 1,
+            "failed": 0,
+            "pulled": 54,
+            "pushed": 54,
+            "duplicates": 106,
+            "gaps": 0
+          }
+        },
+        "b": {
+          "requested_peer_replica_id": null,
+          "peers": [
+            {
+              "peer_replica_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+              "pulled": 2,
+              "pushed": 2,
+              "duplicates": 114,
+              "gaps": 0,
+              "errors": [],
+              "ok": true
+            }
+          ],
+          "totals": {
+            "peers": 1,
+            "ok": 1,
+            "failed": 0,
+            "pulled": 2,
+            "pushed": 2,
+            "duplicates": 114,
+            "gaps": 0
+          }
+        }
+      },
+      {
+        "round": 2,
+        "a": {
+          "requested_peer_replica_id": null,
+          "peers": [
+            {
+              "peer_replica_id": "9a3f6c1e-4b2d-4c8a-8f1e-2a7b3c4d5e6f",
+              "pulled": 1,
+              "pushed": 0,
+              "duplicates": 5,
+              "gaps": 0,
+              "errors": [],
+              "ok": true
+            }
+          ],
+          "totals": {
+            "peers": 1,
+            "ok": 1,
+            "failed": 0,
+            "pulled": 1,
+            "pushed": 0,
+            "duplicates": 5,
+            "gaps": 0
+          }
+        },
+        "b": {
+          "requested_peer_replica_id": null,
+          "peers": [
+            {
+              "peer_replica_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+              "pulled": 1,
+              "pushed": 0,
+              "duplicates": 2,
+              "gaps": 0,
+              "errors": [],
+              "ok": true
+            }
+          ],
+          "totals": {
+            "peers": 1,
+            "ok": 1,
+            "failed": 0,
+            "pulled": 1,
+            "pushed": 0,
+            "duplicates": 2,
+            "gaps": 0
+          }
+        }
+      },
+      {
+        "round": 3,
+        "a": {
+          "requested_peer_replica_id": null,
+          "peers": [
+            {
+              "peer_replica_id": "9a3f6c1e-4b2d-4c8a-8f1e-2a7b3c4d5e6f",
+              "pulled": 1,
+              "pushed": 0,
+              "duplicates": 2,
+              "gaps": 0,
+              "errors": [],
+              "ok": true
+            }
+          ],
+          "totals": {
+            "peers": 1,
+            "ok": 1,
+            "failed": 0,
+            "pulled": 1,
+            "pushed": 0,
+            "duplicates": 2,
+            "gaps": 0
+          }
+        },
+        "b": {
+          "requested_peer_replica_id": null,
+          "peers": [
+            {
+              "peer_replica_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+              "pulled": 1,
+              "pushed": 0,
+              "duplicates": 2,
+              "gaps": 0,
+              "errors": [],
+              "ok": true
+            }
+          ],
+          "totals": {
+            "peers": 1,
+            "ok": 1,
+            "failed": 0,
+            "pulled": 1,
+            "pushed": 0,
+            "duplicates": 2,
+            "gaps": 0
+          }
+        }
+      }
+    ],
+    "status_a": {
+      "replica_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+      "sequence": {
+        "min": 1,
+        "max": 524,
+        "count": 524
+      },
+      "last_sync_at": "2026-11-10T06:29:14.097Z",
+      "cursors": [
+        {
+          "peer_replica_id": "9a3f6c1e-4b2d-4c8a-8f1e-2a7b3c4d5e6f",
+          "last_pulled_sequence": 523,
+          "last_acked_sequence": 524,
+          "last_synced_at": "2026-11-10T06:29:14.097Z",
+          "updated_at": "2026-11-10T06:29:14.097Z"
+        }
+      ],
+      "peers": [
+        {
+          "peer_replica_id": "9a3f6c1e-4b2d-4c8a-8f1e-2a7b3c4d5e6f",
+          "last_pulled_sequence": 523,
+          "last_acked_sequence": 524,
+          "last_synced_at": "2026-11-10T06:29:14.097Z",
+          "pending_upload": 0,
+          "pending_download": 2,
+          "unreachable": false,
+          "remote_max_sequence": 525
+        }
+      ]
+    },
+    "status_b": {
+      "replica_id": "9a3f6c1e-4b2d-4c8a-8f1e-2a7b3c4d5e6f",
+      "sequence": {
+        "min": 1,
+        "max": 525,
+        "count": 525
+      },
+      "last_sync_at": "2026-11-10T06:29:14.098Z",
+      "cursors": [
+        {
+          "peer_replica_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+          "last_pulled_sequence": 524,
+          "last_acked_sequence": 524,
+          "last_synced_at": "2026-11-10T06:29:14.098Z",
+          "updated_at": "2026-11-10T06:29:14.098Z"
+        }
+      ],
+      "peers": [
+        {
+          "peer_replica_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+          "last_pulled_sequence": 524,
+          "last_acked_sequence": 524,
+          "last_synced_at": "2026-11-10T06:29:14.098Z",
+          "pending_upload": 1,
+          "pending_download": 0,
+          "unreachable": false,
+          "remote_max_sequence": 524
+        }
+      ]
+    },
+    "audit": {
+      "sync_run_completed": 219,
+      "sync_pulled": 216,
+      "sync_pushed": 204
+    }
+  },
+  "reconciliation": {
+    "a_written": 50,
+    "b_written": 50,
+    "a_business": 100,
+    "b_business": 100,
+    "expected_business": 100,
+    "a_missing": [],
+    "b_missing": [],
+    "a_duplicates": 0,
+    "b_duplicates": 0,
+    "a_extra": [],
+    "b_extra": [],
+    "order_a_from_a": true,
+    "order_a_from_b": true,
+    "order_b_from_a": true,
+    "order_b_from_b": true,
+    "order_ok": true,
+    "lossless": true,
+    "duplicate_free": true
+  },
+  "p95": {
+    "samples": 100,
+    "threshold_ms": 10000,
+    "p50_ms": 1.66,
+    "p90_ms": 2.35,
+    "p95_ms": 2.54,
+    "p99_ms": 3.74,
+    "min_ms": 1.39,
+    "max_ms": 5.71,
+    "mean_ms": 1.83,
+    "all_samples_converged": true,
+    "max_event_bytes": 406,
+    "small_event_within_1kb": true,
+    "met": true,
+    "environment_note": "本机回环基线（127.0.0.1，单机双实例，node 24）：100 次「1 条 session.created（≤1KB）→ POST /v1/sync/run 完成」的墙钟耗时，百分位用最近秩法。真实 Tailscale/Wi-Fi 网络未测，阈值待校准（PRD §8）。"
+  },
+  "pass": true
+}
