@@ -35,6 +35,8 @@ export type {
 } from "./sync/transport.ts";
 export { HttpSyncTransport } from "./sync/http-transport.ts";
 export type { HttpSyncTransportOptions } from "./sync/http-transport.ts";
+export { DeviceSyncTransport } from "./sync/device-transport.ts";
+export type { DeviceSyncTransportOptions } from "./sync/device-transport.ts";
 export { syncRoutes } from "./sync/routes.ts";
 export type { SyncRoute, SyncRouteContext } from "./sync/routes.ts";
 // 设备配对与身份（M3-T2 / Issue #31，ADR-0008）
@@ -109,6 +111,15 @@ export { EXECUTION_LEASES_SQL, ensureLeaseTable } from "./lease/migrations.ts";
 export { FencingGuard, LeaseLostError } from "./lease/fencing.ts";
 export type { FencingContext } from "./lease/fencing.ts";
 export { detectDualExecution } from "./lease/reconcile.ts";
+export { LeaseCoordinator } from "./lease/coordinator.ts";
+export type {
+  LeaseCoordinatorOptions,
+  LeaseGateDecision,
+  LeasePullError,
+  LeasePullSummary,
+} from "./lease/coordinator.ts";
+export { activeLeases, detectDualLeaseHold, findRemoteActiveLease, replayLeases } from "./lease/view.ts";
+export type { ReplayedLease } from "./lease/view.ts";
 export {
   CheckpointService,
   CheckpointStore,

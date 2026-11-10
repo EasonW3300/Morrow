@@ -88,6 +88,11 @@ export const TASK_EVENT_TYPES = {
   // 双端独立执行的待人工裁决（needs_reconcile）
   taskLeaseDenied: "task.lease_denied",
   taskLeaseLost: "task.lease_lost",
+  // 租约生命周期（M3 同步接线修复 / Issue #34）：acquired / renewed / released 随账本
+  // 同步传播，使远端能按事件重放重建「谁持有执行权」——事前互斥的数据源。
+  taskLeaseAcquired: "task.lease_acquired",
+  taskLeaseRenewed: "task.lease_renewed",
+  taskLeaseReleased: "task.lease_released",
   taskExecutionTransferred: "task.execution_transferred",
   taskNeedsReconcile: "task.needs_reconcile",
   taskReconciled: "task.reconciled",

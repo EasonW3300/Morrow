@@ -8,9 +8,10 @@
  *     `POST /v1/sync/run` 做 pull→push→push→pull 双向收敛；
  *   - 设备私钥只在进程内存（createInMemorySecretStore），不碰 OS 凭据库。
  *
- * 说明（如实边界）：Runtime 进程入口 main.ts 尚未接线出站同步传输——库形态 startRuntime
- * 支持注入；本夹具正是用该公开 seam 做真 HTTP 回环。真实跨网络（Tailscale/Tailscale +
- * bearer token）待 Owner 环境，见 docs/gates/m3-gate-report.md §6。
+ * 说明（如实边界）：#34 修复批起 startRuntime 已按 devices 表默认接线出站同步传输
+ * （main.ts 无需额外注入），本夹具仍显式注入 HttpSyncTransport 以固定两端地址表、独立于
+ * 配对流程做 AC 复跑。真实跨网络（Tailscale + bearer token）待 Owner 环境，见
+ * docs/gates/m3-gate-report.md §6。
  */
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";

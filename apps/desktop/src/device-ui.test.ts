@@ -131,6 +131,7 @@ const SYNC_STATUS: SyncStatus = {
       pending_upload: 12,
       pending_download: 5,
       unreachable: false,
+      unreachable_reason: null,
       remote_max_sequence: 14,
     },
     {
@@ -141,6 +142,7 @@ const SYNC_STATUS: SyncStatus = {
       pending_upload: 0,
       pending_download: 0,
       unreachable: false,
+      unreachable_reason: null,
       remote_max_sequence: 17,
     },
   ],

@@ -70,9 +70,9 @@ Runtime 默认不监听公网；非回环访问必须持配对下发的 bearer t
 | GET | /v1/devices | 设备列表（`last_sync_at` 由同步引擎在每次成功同步后按 peer 写入） |
 | POST | /v1/pairing/codes | 已信任设备生成一次性 6 位配对码（5 分钟 TTL）+ 本机指纹 |
 | POST | /v1/pairing/claim | 新设备凭码换取 bearer token（服务端只存哈希） |
-| POST | /v1/pairing/join | **本机作为新设备**加入对端：宿主侧 claim + 本地指纹校验 + token 写本机 OS 凭据库 + 对端公钥写设备表；指纹不符则撤销对端信任（rollback）。响应 `{device, server_fingerprint}`，**绝不回传 token** |
+| POST | /v1/pairing/join | **本机作为新设备**加入对端：宿主侧 claim + 本地指纹校验 + token 写本机 OS 凭据库 + 对端公钥与地址写设备表；指纹不符则撤销对端信任（rollback）。claim 携带 `device_base_url` 使对端也能反向出站同步。响应 `{device, server_fingerprint}`，**绝不回传 token** |
 | DELETE | /v1/devices/:id | 撤销设备（revoked + 审计墓碑） |
-| GET | /v1/sync/status | 本副本 sequence + `peers[]`：`last_pulled_sequence` / `last_acked_sequence` / `last_synced_at` / `pending_upload` / `pending_download` / `unreachable`；顶层 `last_sync_at`。缺省实时探测对端账本上界；`?probe=local` 只回本地快照（传输层防递归） |
+| GET | /v1/sync/status | 本副本 sequence + `peers[]`：`last_pulled_sequence` / `last_acked_sequence` / `last_synced_at` / `pending_upload` / `pending_download` / `unreachable` / `unreachable_reason`；顶层 `last_sync_at`。缺省实时探测对端账本上界；`?probe=local` 只回本地快照（传输层防递归）。不可达原因（`no_base_url` / `device_revoked` / `missing_token` / 网络错误）写入 `unreachable_reason` |
 | POST | /v1/sync/run | **立即同步一轮**：body 可选 `{peer_replica_id?}`（缺省全部已配对 peer）。对每个 peer 执行 pull→push→push→pull，返回 `{peers[], totals}`（`pulled/pushed/duplicates/gaps/errors`）；单 peer 失败不中断其他 peer，落 `sync.run_completed` 审计 |
 | GET | /v1/sync/pull?since=&limit= | 按来源账本 sequence 增量导出事件信封（不复制 DB 文件） |
 | POST | /v1/sync/push | 幂等导入（event_id 去重 + integrity 复算 + 缺口拒绝） |
@@ -99,6 +99,27 @@ Runtime 默认不监听公网；非回环访问必须持配对下发的 bearer t
   压制**非本副本创作**的远端修订；本地已合并版本保持可见（不会回落到基线）。
   冲突记录同时保留本地版本引用（`local_version`/`local_revision_id`/`local_event_id`）
   与远端事件引用。自动合并结果版本 = `max(本地, 远端) + 1`，重复同步/重放不再递增。
+
+**同步启动接线（M3 同步接线修复 / Issue #34）**：`startRuntime` 启动时即按 `devices`
+表构建 `DeviceSyncTransport` 并注入 `SyncEngine`——**独立进程（`main.ts`）的
+`POST /v1/sync/run` 不再返回 `ok=false`**。base URL 取设备记录的 `base_url`（join 的
+`base_url` 与 claim 的 `device_base_url` 双向写入），bearer token 取本机 OS 凭据库的
+`token:<peer replica_id>`；所有出站请求带 `Authorization: Bearer <token>`，无 token 时
+不带（回环豁免）并在错误/detail 中标注 `auth: "none"`。设备配对/撤销经回调立即失效
+传输缓存，读路径也会按设备表惰性重建。跨网络部署需设 `MORROW_PUBLIC_BASE_URL`
+（通配监听地址退化为 127.0.0.1，仅本机可用）。
+
+**跨设备不重复执行（事前互斥）**：任务 acquire 租约前，调度器向全部已配对 peer 做
+**一次增量拉取（只 pull 不 push，同任务 500ms 内复用）**，并按
+`task.lease_acquired / .renewed / .released / .lost / .execution_transferred` 事件重放
+远端租约：远端持有未过期租约 → 本机拒绝 acquire，记 `task.lease_denied`（payload 带
+持有者、token、到期、`source: "remote_lease"` 与来源事件），任务保持 planned /
+waiting_input；acquire 成功后强制二次采样，若检测到双持有 → 立即释放本地租约并把任务
+置 `needs_reconcile`，不执行任何节点。fencing token 仍是副作用提交前的最终护栏。
+**残余窗口（诚实边界）**：拉取与 acquire 之间没有共识协议，两端仍可能各自认为对方未
+持有；二次采样只能缩小窗口，最终靠 fencing token + Owner 裁决兜底。服务端→加入方的
+反向同步在回环下可用；非回环需要部署方为该方向提供 token（当前 join 只向加入方发放
+token），见门禁报告 §6。
 
 **调用错误码**：`POST .../invoke`（能力与 Skill 重用共用）的 HTTP 状态按统一契约表映射（单源 `apps/runtime/src/invocation-errors.ts`）：`unknown_tool`→404、`permission_denied`→403、`invalid_sandbox_contract`/`tool_package_unsupported`/`capability_escalation`→400、`sandbox_unavailable`/`image_pull_failed`→503（附 install-hint）、`tool_timeout`→504、`tool_build_failed`→500、工具自身失败（`tool_error`/`tool_exit_nonzero`/`tool_protocol_error`/`tool_output_too_large`）→502。每次调用先落 `capability.used` 审计后返回（Skill 重用另落 `skill.invoked`）。
 

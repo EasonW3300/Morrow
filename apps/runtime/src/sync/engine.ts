@@ -215,11 +215,22 @@ export class SyncEngine {
     const peerIds = this.#peerIds(cursors);
     const probes = await Promise.all(
       peerIds.map(async (peerId) => {
-        if (this.#transport === undefined) return { peerId, probe: null };
+        if (this.#transport === undefined) {
+          return { peerId, probe: null, reason: "no_transport_configured" };
+        }
         try {
-          return { peerId, probe: await this.#transport.status(peerId) };
-        } catch {
-          return { peerId, probe: null };
+          return { peerId, probe: await this.#transport.status(peerId), reason: null };
+        } catch (err) {
+          // 不可达原因（M3 同步接线修复 / Issue #34）：缺 token、设备撤销、无 base_url
+          // 与网络错误必须可区分——status 暴露它，运维才能判断是接线还是网络问题。
+          const detailReason =
+            err instanceof SyncError && typeof err.details?.reason === "string" ? err.details.reason : null;
+          const message = err instanceof Error ? err.message : String(err);
+          return {
+            peerId,
+            probe: null,
+            reason: detailReason === null ? message : `${detailReason}: ${message}`,
+          };
         }
       }),
     );
@@ -329,9 +340,10 @@ export class SyncEngine {
     cursors: SyncCursorRecord[],
     localMax: number | null,
     probed: boolean,
-    probes: Array<{ peerId: string; probe: { max_sequence: number | null } | null }>,
+    probes: Array<{ peerId: string; probe: { max_sequence: number | null } | null; reason?: string | null }>,
   ): SyncPeerStatus[] {
     const probeById = new Map(probes.map((entry) => [entry.peerId, entry.probe]));
+    const reasonById = new Map(probes.map((entry) => [entry.peerId, entry.reason ?? null]));
     const cursorById = new Map(cursors.map((cursor) => [cursor.peer_replica_id, cursor]));
     // 已配对但从未同步的 peer 也要出现在状态表（pending 从 0 游标算起）
     const ids = this.#peerIds(cursors);
@@ -345,6 +357,7 @@ export class SyncEngine {
       };
       const probe = probeById.get(peerId) ?? null;
       const remoteMax = probe?.max_sequence ?? null;
+      const unreachable = probed && probe === null;
       return {
         peer_replica_id: peerId,
         last_pulled_sequence: cursor.last_pulled_sequence,
@@ -354,10 +367,19 @@ export class SyncEngine {
         pending_upload: Math.max(0, (localMax ?? 0) - cursor.last_acked_sequence),
         pending_download:
           remoteMax === null ? null : Math.max(0, remoteMax - cursor.last_pulled_sequence),
-        unreachable: probed && probe === null,
+        unreachable,
+        unreachable_reason: unreachable ? (reasonById.get(peerId) ?? "unreachable") : null,
         remote_max_sequence: remoteMax,
       };
     });
+  }
+
+  /**
+   * 已配对 peer 全集（knownPeers 注入时 = devices 中 trusted 且未撤销的远端设备）。
+   * 执行权协调器在 acquire 前用它决定向谁做增量拉取（M3 同步接线修复 / Issue #34）。
+   */
+  peerIds(): string[] {
+    return this.#peerIds(this.#cursors.list());
   }
 
   #markSynced(peerReplicaId: string): void {

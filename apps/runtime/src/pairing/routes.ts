@@ -88,6 +88,10 @@ async function handleClaimPairing(
     sendError(res, 400, "invalid_body", "device_replica_id must be a string when present");
     return;
   }
+  if (body.device_base_url !== undefined && typeof body.device_base_url !== "string") {
+    sendError(res, 400, "invalid_body", "device_base_url must be a string when present");
+    return;
+  }
   if (body.server_fingerprint !== undefined && typeof body.server_fingerprint !== "string") {
     sendError(res, 400, "invalid_body", "server_fingerprint must be a string when present");
     return;
@@ -99,6 +103,7 @@ async function handleClaimPairing(
       devicePublicKey,
       deviceLabel: body.device_label,
       deviceReplicaId: body.device_replica_id,
+      deviceBaseUrl: body.device_base_url,
       expectedServerFingerprint: body.server_fingerprint,
       remoteKey: req.socket.remoteAddress,
     });
