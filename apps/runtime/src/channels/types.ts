@@ -1,5 +1,7 @@
 import type {
   ChannelCapabilities,
+  ChannelEnvironment,
+  ChannelLocalBridgeHealth,
   ChannelSendReceipt,
   InboundMessage,
   OutboundMessage,
@@ -28,12 +30,22 @@ export interface ChannelAdapterContext {
    * registry 写 `channel.inbound_rejected` 留痕（reason=event_rejected, error_code）。
    */
   onInboundRejected?(event: ChannelInboundRejection): void;
+  /**
+   * 会话白名单判定（M4-T5）：registry 从本地 channel_allowlist 读取。
+   * 实验适配器（微信个人号）用它做收发前的 fail-closed 门槛；稳定适配器不需要。
+   */
+  isConversationAllowed?(nativeConversationId: string): boolean;
 }
 
 /** 适配器层拒绝事件的结构化原因（尚未进入 parseInbound） */
 export interface ChannelInboundRejection {
   code: string;
   message: string;
+  /**
+   * 账本 reason（缺省 event_rejected）；实验适配器可用 conversation_not_allowed
+   * 等更精确的原因，便于与路由层拒绝口径一致。
+   */
+  reason?: string;
   /** 诊断用原始帧（不落敏感载荷；由 registry 决定是否写 detail） */
   raw?: unknown;
 }
@@ -41,6 +53,7 @@ export interface ChannelInboundRejection {
 /**
  * 适配器自报健康（GET /v1/channels/:id/health 的核心字段；状态由 registry 补充）。
  * 生产适配器可给出 token 有效期与最近错误，便于渠道管理 UI 诊断。
+ * 实验适配器（M4-T5）另报 environment / risk_notice / bridge。
  */
 export interface ChannelAdapterHealth {
   healthy: boolean;
@@ -51,6 +64,14 @@ export interface ChannelAdapterHealth {
   token_expires_at?: string | null;
   /** 最近一次错误（成功路径清空；诊断用，不含密钥） */
   last_error?: string | null;
+  /** 实验适配器标记（M4-T5） */
+  experimental?: boolean;
+  /** 实验适配器环境声明（M4-T5：Windows + 最新版微信） */
+  environment?: ChannelEnvironment;
+  /** 实验适配器风险声明（M4-T5：不稳定/条款/风险自担/默认关闭） */
+  risk_notice?: string;
+  /** 实验适配器本地桥健康（M4-T5：进程/登录/窗口句柄/最近错误） */
+  bridge?: ChannelLocalBridgeHealth;
 }
 
 /**
@@ -95,6 +116,27 @@ export interface ChannelAdapter {
   readonly channelId: string;
   /** 实验适配器标记（微信个人号等）；echo 参考适配器为 true，清单如实呈现 */
   readonly experimental?: boolean;
+  /**
+   * 实验适配器环境声明（M4-T5）：清单/health 原样暴露给 UI。
+   * 稳定适配器不提供。
+   */
+  readonly environment?: ChannelEnvironment;
+  /** 实验适配器风险声明（M4-T5）：API/UI 双处呈现；稳定适配器不提供 */
+  readonly riskNotice?: string;
+  /**
+   * 该渠道是否只处理 channel_allowlist 中的会话（M4-T5 微信个人号 = true）。
+   * 路由层据此对私聊也做 fail-closed 白名单校验（群聊始终校验）。
+   */
+  readonly requiresConversationAllowlist?: boolean;
+  /** 实验适配器是否已由 Owner 显式启用（缺省视为已启用，兼容稳定适配器） */
+  isEnabled?(): boolean;
+  /**
+   * 显式启用实验适配器（M4-T5）：必须 confirmRisk=true；否则抛错拒绝。
+   * 稳定适配器不实现。
+   */
+  enable?(options: { confirmRisk?: boolean }): void | Promise<void>;
+  /** 禁用实验适配器：立即停止收发（幂等）；稳定适配器不实现 */
+  disable?(): void | Promise<void>;
   start(context: ChannelAdapterContext): void | Promise<void>;
   stop(): void | Promise<void>;
   send(outbound: OutboundMessage): ChannelSendReceipt | Promise<ChannelSendReceipt>;

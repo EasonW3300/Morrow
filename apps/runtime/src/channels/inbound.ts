@@ -101,7 +101,8 @@ export class ChannelInboundRouter {
   }
 
   route(inbound: InboundMessage, options: InboundRouteOptions = {}): InboundRouteResult {
-    if (this.#adapterFor(inbound.channel) === null) {
+    const adapter = this.#adapterFor(inbound.channel);
+    if (adapter === null) {
       return this.reject({
         channel: inbound.channel,
         reason: "channel_not_registered",
@@ -127,6 +128,22 @@ export class ChannelInboundRouter {
       return this.reject({
         channel: inbound.channel,
         reason: "account_disabled",
+        account: inbound.account,
+        native_message_id: inbound.native_message_id,
+        native_conversation_id: inbound.native_conversation_id,
+        sender_native_id: inbound.sender.native_id,
+      });
+    }
+
+    // 实验适配器（M4-T5 微信个人号）：只有 channel_allowlist 中的会话才处理——
+    // 私聊与群聊一致（稳定渠道的私聊仍直接处理；群聊在下方统一校验）。
+    if (
+      adapter.requiresConversationAllowlist === true &&
+      !this.#store.isConversationAllowed(inbound.account, inbound.native_conversation_id)
+    ) {
+      return this.reject({
+        channel: inbound.channel,
+        reason: "conversation_not_allowed",
         account: inbound.account,
         native_message_id: inbound.native_message_id,
         native_conversation_id: inbound.native_conversation_id,

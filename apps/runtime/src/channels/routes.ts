@@ -12,9 +12,14 @@ import { CONVERSATION_ALLOW_MODES, type ConversationAllowRow } from "./store.ts"
  *   GET /v1/channels/:id/health   单个适配器健康检查（状态 + 自报健康 + 检查时间）
  *   GET /v1/channels/:id/allowlist   群聊白名单（account × native_conversation_id × mode）
  *   PUT /v1/channels/:id/allowlist   整表替换（mention_only | proactive_limited）+ 审计
+ *   POST /v1/channels/:id/enable     实验适配器显式启用（M4-T5）：必须
+ *                                    { confirm_risk: true }，否则 409；成功落
+ *                                    channel.experimental_enabled 审计
+ *   POST /v1/channels/:id/disable    禁用实验适配器（立即停止收发，幂等）
  *
  * 未注册渠道 → 404 unknown_channel。未列入白名单的群全部不响应（T1 入站路由已有判定，
- * 本票补齐管理端点与 channel.allowlist_updated 审计）。
+ * 本票补齐管理端点与 channel.allowlist_updated 审计）。微信实验适配器对私聊也要求
+ * 白名单（适配器/路由双重 fail-closed）。
  */
 
 export interface ChannelRoute {
@@ -38,6 +43,8 @@ export const channelRoutes: ChannelRoute[] = [
   { method: "GET", re: /^\/v1\/channels\/([^/]+)\/health$/, handler: handleChannelHealth },
   { method: "GET", re: /^\/v1\/channels\/([^/]+)\/allowlist$/, handler: handleGetAllowlist },
   { method: "PUT", re: /^\/v1\/channels\/([^/]+)\/allowlist$/, handler: handlePutAllowlist },
+  { method: "POST", re: /^\/v1\/channels\/([^/]+)\/enable$/, handler: handleEnableChannel },
+  { method: "POST", re: /^\/v1\/channels\/([^/]+)\/disable$/, handler: handleDisableChannel },
 ];
 
 function handleListChannels(
@@ -132,6 +139,67 @@ async function handlePutAllowlist(
     return;
   }
   sendJson(res, 200, allowlistResponse(channelId, view.account_id, view.entries));
+}
+
+async function handleEnableChannel(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _url: URL,
+  ctx: ChannelRouteContext,
+  params: string[],
+): Promise<void> {
+  const channelId = params[0] as string;
+  const body = await readJsonBody(req, res);
+  if (body === null) return;
+
+  const result = await ctx.channels.enableChannel(channelId, {
+    confirmRisk: body.confirm_risk === true,
+  });
+  if (!result.ok) {
+    if (result.code === "unknown_channel") {
+      sendError(res, 404, "unknown_channel", result.message);
+      return;
+    }
+    if (result.code === "not_experimental") {
+      sendError(res, 400, "not_experimental_channel", result.message);
+      return;
+    }
+    // 未确认风险：明确拒绝，并原样返回风险文案供 UI 展示
+    sendJson(res, 409, {
+      error: { code: result.code, message: result.message },
+      ...(result.risk_notice === undefined ? {} : { risk_notice: result.risk_notice }),
+    });
+    return;
+  }
+
+  const summary = ctx.channels.list().find((channel) => channel.channel_id === channelId);
+  sendJson(res, 200, {
+    channel: channelId,
+    enabled: true,
+    experimental: summary?.experimental ?? true,
+    risk_notice: result.risk_notice,
+    ...(summary?.environment === undefined ? {} : { environment: summary.environment }),
+  });
+}
+
+async function handleDisableChannel(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _url: URL,
+  ctx: ChannelRouteContext,
+  params: string[],
+): Promise<void> {
+  const channelId = params[0] as string;
+  // 写端点统一要求 JSON content-type（CSRF 防线）；body 本身可为空对象
+  const body = await readJsonBody(req, res);
+  if (body === null) return;
+
+  const result = await ctx.channels.disableChannel(channelId);
+  if (!result.ok) {
+    sendError(res, 404, "unknown_channel", result.message);
+    return;
+  }
+  sendJson(res, 200, { channel: channelId, enabled: false });
 }
 
 function allowlistResponse(
