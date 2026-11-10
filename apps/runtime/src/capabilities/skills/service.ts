@@ -126,8 +126,14 @@ export interface SkillInvoker {
   invoke(
     name: string,
     input: unknown,
-    context?: { actorId?: string; sessionId?: string },
+    context?: { actorId?: string; sessionId?: string; taskId?: string; fencingToken?: number },
   ): Promise<{ ok: boolean; result?: unknown; error_code?: string; error?: string; via?: string; duration_ms?: number }>;
+}
+
+/** 任务租约上下文（M3-T4 / Issue #33）：skill 调用所属 Run 的 fencing token */
+export interface SkillFencingContext {
+  taskId?: string;
+  fencingToken?: number;
 }
 
 export interface SkillServiceOptions {
@@ -139,6 +145,11 @@ export interface SkillServiceOptions {
   invoker?: SkillInvoker;
   /** 自动晋升阈值：同组合连续成功 ≥ N 产生提案（默认 2，最小 1） */
   promotionThreshold?: number;
+  /**
+   * 副作用提交前置校验（M3-T4 / Issue #33）：invoke 携带任务租约上下文时，逐步调用
+   * 前校验 fencing token；无任务上下文的直接调用按设计跳过。
+   */
+  fencingGuard?: (context: SkillFencingContext) => void;
 }
 
 export interface RecordCaseInput {
@@ -164,6 +175,7 @@ export class SkillService {
   readonly #replicaId: string;
   readonly #capabilities: SkillCapabilityLookup;
   readonly #invoker: SkillInvoker | undefined;
+  readonly #fencingGuard: SkillServiceOptions["fencingGuard"];
   readonly #threshold: number;
   #closed = false;
   /** ingestFromLedger 水位（进程内；跨重启靠 source_event 唯一约束幂等） */
@@ -175,6 +187,7 @@ export class SkillService {
     this.#replicaId = options.replicaId;
     this.#capabilities = options.capabilities;
     this.#invoker = options.invoker;
+    this.#fencingGuard = options.fencingGuard;
     const threshold = options.promotionThreshold ?? 2;
     if (!Number.isInteger(threshold) || threshold < 1) {
       throw new SkillError("invalid_input", "promotionThreshold must be an integer >= 1");
@@ -355,7 +368,11 @@ export class SkillService {
    * 审计（#26/威胁模型域 2，修复批贯通）：每步尝试落 capability.used、整链收尾落
    * skill.invoked（先落事件后返回，与仓库「行先于事件/账本可追踪」口径一致）。
    */
-  async invoke(skillId: string, params: unknown, options: { actorId?: string; sessionId?: string } = {}): Promise<SkillInvokeResult> {
+  async invoke(
+    skillId: string,
+    params: unknown,
+    options: { actorId?: string; sessionId?: string; taskId?: string; fencingToken?: number } = {},
+  ): Promise<SkillInvokeResult> {
     this.#assertOpen();
     const row = this.#store.getSkill(skillId);
     if (row === null) {
@@ -370,6 +387,12 @@ export class SkillService {
     if (typeof params !== "object" || params === null || Array.isArray(params)) {
       throw new SkillError("invalid_input", "params must be a JSON object when present");
     }
+    // 副作用提交前置校验（M3-T4 / Issue #33）：任何一步执行前先校验租约 token。
+    // 无 taskId/fencingToken 的直接调用按设计跳过（不在任一 Run 租约下）。
+    this.#fencingGuard?.({
+      ...(options.taskId === undefined ? {} : { taskId: options.taskId }),
+      ...(options.fencingToken === undefined ? {} : { fencingToken: options.fencingToken }),
+    });
     const actorId = options.actorId ?? "agent:skill";
     const input = params as Record<string, unknown>;
     const steps = JSON.parse(row.steps_json) as SkillStep[];
@@ -401,6 +424,8 @@ export class SkillService {
         const call = await this.#invoker.invoke(step.capability_id, fill.args, {
           actorId,
           ...(options.sessionId !== undefined ? { sessionId: options.sessionId } : {}),
+          ...(options.taskId === undefined ? {} : { taskId: options.taskId }),
+          ...(options.fencingToken === undefined ? {} : { fencingToken: options.fencingToken }),
         });
         projected.push({
           index,

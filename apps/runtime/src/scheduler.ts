@@ -12,6 +12,8 @@ import {
 import { SESSION_EVENT_TYPES } from "./sessions.ts";
 import type { LockTable } from "./locks.ts";
 import type { WorktreeManager, WorktreeRecord } from "./worktree.ts";
+import { detectDualExecution } from "./lease/reconcile.ts";
+import type { ExecutionLeaseRecord, LeaseStore } from "./lease/store.ts";
 
 /**
  * 单机任务调度器（票 M1-T4 / Issue #16，FR-TASK-1 的调度半边；M1-T5 / Issue #17 扩展
@@ -62,11 +64,13 @@ import type { WorktreeManager, WorktreeRecord } from "./worktree.ts";
  */
 
 export const DEFAULT_TASK_CONCURRENCY = 2;
+export const DEFAULT_LEASE_TTL_MS = 30_000;
 const MAX_ATTEMPTS_RETRIABLE = 2;
 const PAUSE_SETTLE_TIMEOUT_MS = 10_000;
 const PAUSE_POLL_MS = 20;
+const TRANSFER_SETTLE_TIMEOUT_MS = 2_000;
 
-const TERMINAL_TASK_STATUSES = new Set(["failed", "completed", "cancelled"]);
+const TERMINAL_TASK_STATUSES = new Set(["failed", "completed", "cancelled", "needs_reconcile"]);
 
 /** 节点执行工作区（M2-T4）：git_repo 代码节点的 worktree（非代码节点缺省无此字段） */
 export interface NodeWorkspaceInfo {
@@ -125,6 +129,17 @@ export interface TaskSchedulerOptions {
    * 缺省 null = 无互斥；声明 lock 的节点同样派发即失败。
    */
   locks?: LockTable | null;
+  /**
+   * 执行租约（M3-T4 / Issue #33，FR-DEP-4）：生产由 startRuntime 注入（同库）。
+   * 缺省 null = 未启用（单机旧行为；测试/宿主可显式注入以启用单点执行）。
+   * 启用后：planned→running 前 acquire（失败保持 planned + task.lease_denied）；
+   * 执行期间心跳续租；节点完成/合并提交前校验 fencing token。
+   */
+  leases?: LeaseStore | null;
+  /** 租约 TTL（毫秒，默认 30s） */
+  leaseTtlMs?: number;
+  /** 心跳续租间隔（毫秒，默认 ttl/3） */
+  leaseHeartbeatMs?: number;
 }
 
 interface NodeOutcome {
@@ -153,6 +168,14 @@ export interface ResumeResult {
   drive: Promise<void>;
 }
 
+/** 执行权转移结果（M3-T4 / Issue #33）：释放后的租约行保留 token 计数 */
+export interface TransferExecutionResult {
+  task: TaskSummary;
+  lease: ExecutionLeaseRecord | null;
+  transferEventId: string;
+  sequence: number;
+}
+
 export class TaskScheduler {
   readonly #tasks: TaskService;
   readonly #ledger: EventLedger;
@@ -162,7 +185,18 @@ export class TaskScheduler {
   readonly #concurrency: number;
   readonly #worktrees: WorktreeManager | null;
   readonly #locks: LockTable | null;
+  readonly #leases: LeaseStore | null;
+  readonly #leaseTtlMs: number;
+  readonly #leaseHeartbeatMs: number;
   readonly #active = new Set<AgentRuntime>();
+  /** 任务 → 在跑 AgentRuntime（租约丢失/执行权转移时按任务中止） */
+  readonly #activeByTask = new Map<string, Set<AgentRuntime>>();
+  /** 本进程持有的租约 token + 心跳计时器 */
+  readonly #leaseHandles = new Map<string, { token: number; timer: ReturnType<typeof setInterval> | null }>();
+  /** 租约已丢失（心跳续租失败 / fencing token 被抢占）——本进程不再提交任何副作用 */
+  readonly #leaseLost = new Set<string>();
+  /** 执行权已转移离开本副本（本进程不再驱动该任务） */
+  readonly #detached = new Set<string>();
   /** 待调度的任务 FIFO（schedule/resume/restore 共用；并发上限按调度器全局记账） */
   readonly #queue: Array<{ run: () => Promise<void>; resolve: () => void; reject: (err: unknown) => void }> = [];
   /** pause 已受理、正在等边界的任务（drive 主循环见之让位） */
@@ -183,6 +217,12 @@ export class TaskScheduler {
     this.#concurrency = Math.max(1, Math.floor(options.concurrency ?? DEFAULT_TASK_CONCURRENCY));
     this.#worktrees = options.worktrees ?? null;
     this.#locks = options.locks ?? null;
+    this.#leases = options.leases ?? null;
+    this.#leaseTtlMs = Math.max(1, Math.floor(options.leaseTtlMs ?? DEFAULT_LEASE_TTL_MS));
+    this.#leaseHeartbeatMs = Math.max(
+      1,
+      Math.floor(options.leaseHeartbeatMs ?? Math.max(1, Math.floor(this.#leaseTtlMs / 3))),
+    );
   }
 
   /**
@@ -196,6 +236,12 @@ export class TaskScheduler {
     const task = this.#tasks.getTask(taskId);
     if (task === null) {
       return Promise.reject(new TaskError("not_found", `task ${taskId} does not exist`));
+    }
+    if (this.#detached.has(taskId)) {
+      return Promise.reject(new TaskError(
+        "lease_not_held",
+        `execution of task ${taskId} was transferred away from replica ${this.#replicaId}`,
+      ));
     }
     return this.#enqueue(taskId, () => this.#scheduleOne(taskId));
   }
@@ -273,17 +319,42 @@ export class TaskScheduler {
     if (task === null) {
       throw new TaskError("not_found", `task ${taskId} does not exist`);
     }
+    if (this.#detached.has(taskId)) {
+      throw new TaskError(
+        "lease_not_held",
+        `execution of task ${taskId} was transferred away from replica ${this.#replicaId}`,
+      );
+    }
     if (task.status !== "waiting_input") return task;
-    const rootEventId = this.#tasks.transition(taskId, "running", {
-      payload: { reason },
-    }).eventId;
-    await this.#enqueue(taskId, async () => {
-      try {
-        await this.#drive(taskId, rootEventId);
-      } finally {
-        this.#driving.delete(taskId);
-      }
-    });
+    // 双端独立执行证据 → 冻结为 needs_reconcile，不重新驱动
+    const evidence = detectDualExecution(this.#ledger, taskId);
+    if (evidence !== null) {
+      this.#tasks.flagNeedsReconcile(taskId, evidence);
+      return this.#tasks.getTask(taskId) ?? task;
+    }
+    const acquired = this.#acquireLease(taskId, null);
+    if (!acquired.ok) {
+      throw new TaskError(
+        "lease_denied",
+        `execution lease for task ${taskId} is held by replica ${acquired.heldBy}`,
+        { task_id: taskId, holder_replica_id: acquired.heldBy, expires_at: acquired.expiresAt },
+      );
+    }
+    try {
+      const rootEventId = this.#tasks.transition(taskId, "running", {
+        payload: { reason },
+      }).eventId;
+      await this.#enqueue(taskId, async () => {
+        try {
+          await this.#drive(taskId, rootEventId);
+        } finally {
+          this.#driving.delete(taskId);
+        }
+      });
+    } catch (err) {
+      this.#releaseLease(taskId);
+      throw err;
+    }
     return this.#tasks.getTask(taskId) ?? task;
   }
 
@@ -300,6 +371,10 @@ export class TaskScheduler {
         Promise.allSettled(runtimes.map((runtime) => runtime.waitForIdle())),
         new Promise((resolve) => setTimeout(resolve, 2000)),
       ]);
+    }
+    // 优雅退出释放本副本持有的租约（崩溃路径由 TTL 兜底）：另一副本可立即接管
+    for (const taskId of [...this.#leaseHandles.keys()]) {
+      this.#releaseLease(taskId);
     }
   }
 
@@ -347,6 +422,12 @@ export class TaskScheduler {
         { from: task.status, to: "running" },
       );
     }
+    if (this.#detached.has(taskId)) {
+      throw new TaskError(
+        "lease_not_held",
+        `execution of task ${taskId} was transferred away from replica ${this.#replicaId}`,
+      );
+    }
     if (task.status === "created") {
       throw new TaskError(
         "invalid_transition",
@@ -375,6 +456,27 @@ export class TaskScheduler {
     const taskId = task.task_id;
     this.#driving.add(taskId);
     try {
+      // 双端独立执行证据：冻结为 needs_reconcile（不 restore、不驱动）
+      const evidence = detectDualExecution(this.#ledger, taskId);
+      if (evidence !== null) {
+        this.#tasks.flagNeedsReconcile(taskId, evidence);
+        this.#driving.delete(taskId);
+        const fresh = this.#tasks.getTask(taskId) as TaskSummary;
+        return {
+          task: fresh,
+          report: { actions: [], pending_review_keys: [], pending_compensations: [], replay_keys: [] },
+          checkpoint_id: null,
+          drive: Promise.resolve(),
+        };
+      }
+      const acquired = this.#acquireLease(taskId, null);
+      if (!acquired.ok) {
+        throw new TaskError(
+          "lease_denied",
+          `execution lease for task ${taskId} is held by replica ${acquired.heldBy}`,
+          { task_id: taskId, holder_replica_id: acquired.heldBy, expires_at: acquired.expiresAt },
+        );
+      }
       const outcome = this.#checkpoints.restoreCheckpoint(taskId, checkpointId);
       let rootEventId = outcome.eventId;
       if (task.status === "planned" || task.status === "paused" || task.status === "waiting_input") {
@@ -403,6 +505,7 @@ export class TaskScheduler {
       };
     } catch (err) {
       this.#driving.delete(taskId);
+      this.#releaseLease(taskId);
       throw err;
     }
   }
@@ -476,10 +579,27 @@ export class TaskScheduler {
       const plannedEvent = this.#ledger
         .scan({ taskId, eventType: TASK_EVENT_TYPES.taskPlanned })
         .at(-1);
-      const started = this.#tasks.transition(taskId, "running", {
-        causeEventId: plannedEvent?.envelope.event_id ?? null,
-      });
-      await this.#drive(taskId, started.eventId);
+      const plannedEventId = plannedEvent?.envelope.event_id ?? null;
+      // 双端独立执行证据（同步进本账本的异地执行事件）→ needs_reconcile，不执行
+      const evidence = detectDualExecution(this.#ledger, taskId);
+      if (evidence !== null) {
+        this.#tasks.flagNeedsReconcile(taskId, evidence, plannedEventId);
+        return;
+      }
+      // 执行权单点化（FR-DEP-4）：planned→running 前必须持租约；失败保持 planned
+      // 并记 task.lease_denied（payload 带持有者），不把任务标成失败。
+      const acquired = this.#acquireLease(taskId, plannedEventId);
+      if (!acquired.ok) return;
+      try {
+        const started = this.#tasks.transition(taskId, "running", {
+          causeEventId: plannedEventId,
+        });
+        await this.#drive(taskId, started.eventId);
+      } catch (err) {
+        // 迁移/驱动异常：不留下无人续租的租约（终结态由 #drive finally 释放）
+        this.#releaseLease(taskId);
+        throw err;
+      }
     } finally {
       this.#driving.delete(taskId);
     }
@@ -487,9 +607,19 @@ export class TaskScheduler {
 
   // --- 调度主循环 --------------------------------------------------------------
 
+  /** 驱动主体收尾统一释放已终结任务的租约（paused/waiting_input 保留，供本副本续驱） */
   async #drive(taskId: string, startedEventId: string): Promise<void> {
+    try {
+      await this.#driveBody(taskId, startedEventId);
+    } finally {
+      this.#releaseLeaseIfFinished(taskId);
+    }
+  }
+
+  async #driveBody(taskId: string, startedEventId: string): Promise<void> {
     const inflight = new Map<string, { promise: Promise<void>; entry: { done: boolean } }>();
     while (!this.#disposed) {
+      if (this.#detached.has(taskId) || this.#leaseLost.has(taskId)) return; // 执行权已离开本副本
       if (this.#pausing.has(taskId)) return; // pause 已受理：让位（不再派发/不再终结任务）
       const task = this.#tasks.getTask(taskId);
       if (task === null || task.status !== "running") return; // 被外部 paused/cancelled/failed
@@ -647,8 +777,22 @@ export class TaskScheduler {
         } else {
           outcome = await this.#attemptNode(taskId, node, attempt, nodeStarted.eventId, worktree);
 
+          // 执行权转移离开本副本：不记录节点终态（半写 running 留给新持有者按
+          // checkpoint reconcile）；租约丢失：中止且置 pending_review（不假装失败、
+          // 不提交结果），并已由心跳路径记 task.lease_lost。
+          if (this.#detached.has(taskId)) return;
+          if (this.#leaseLost.has(taskId)) {
+            this.#abandonNodeForLeaseLoss(taskId, node, attempt, outcome, nodeStarted.eventId);
+            return;
+          }
+
           // M2-T4：Agent Loop 成功的代码节点 → worktree 变更合回主区
           if (outcome.ok && worktree !== null && gitRepo !== undefined) {
+            // 真实文件副作用提交前校验 fencing token（FR-DEP-4）：旧 token 不合并
+            if (!this.#assertLeaseValid(taskId)) {
+              this.#abandonNodeForLeaseLoss(taskId, node, attempt, outcome, nodeStarted.eventId);
+              return;
+            }
             const merge = await this.#mergeNodeWorktree(taskId, node, worktree, gitRepo.verify, nodeStarted.eventId);
             if (merge.kind === "conflict") {
               // 冲突 → pending_review（needs_reconcile 语义的节点级落地）：不重试，
@@ -694,6 +838,11 @@ export class TaskScheduler {
         }
 
         const status = outcome.ok ? "completed" : "failed";
+        // 节点完成提交前再校验一次 fencing token（合并可能耗时，租约可能在期间被抢占）
+        if (outcome.ok && !this.#assertLeaseValid(taskId)) {
+          this.#abandonNodeForLeaseLoss(taskId, node, attempt, outcome, nodeStarted.eventId);
+          return;
+        }
         const payload: Record<string, unknown> = {
           node_id: node.node_id,
           key: node.key,
@@ -778,6 +927,264 @@ export class TaskScheduler {
     return run;
   }
 
+  // --- 执行租约（M3-T4 / Issue #33，FR-DEP-4）----------------------------------
+
+  /**
+   * 申请执行租约；失败时记 task.lease_denied（payload 带持有者/到期/token）并返回
+   * 失败结果——任务保持 planned/waiting_input，不执行，也不标 failed。
+   */
+  #acquireLease(taskId: string, causeEventId: string | null): { ok: true } | { ok: false; heldBy: string; expiresAt: string } {
+    if (this.#leases === null) return { ok: true };
+    if (this.#leaseLost.has(taskId) || this.#detached.has(taskId)) {
+      return { ok: false, heldBy: "<detached>", expiresAt: new Date(0).toISOString() };
+    }
+    const outcome = this.#leases.acquire(taskId, this.#replicaId, this.#leaseTtlMs);
+    if ("heldBy" in outcome) {
+      this.#appendTaskEvent(taskId, TASK_EVENT_TYPES.taskLeaseDenied, {
+        replica_id: this.#replicaId,
+        holder_replica_id: outcome.heldBy,
+        expires_at: outcome.expires_at,
+        fencing_token: outcome.fencing_token,
+      }, causeEventId);
+      return { ok: false, heldBy: outcome.heldBy, expiresAt: outcome.expires_at };
+    }
+    const existing = this.#leaseHandles.get(taskId);
+    if (existing !== undefined && existing.token === outcome.token) {
+      // 幂等 acquire（同一 holder 未过期）：沿用既有心跳，不重复起计时器
+      return { ok: true };
+    }
+    if (existing !== undefined) this.#clearLeaseTimer(taskId);
+    this.#leaseHandles.set(taskId, { token: outcome.token, timer: null });
+    this.#startLeaseHeartbeat(taskId, outcome.token);
+    return { ok: true };
+  }
+
+  /** 心跳续租（默认 ttl/3）；renew 失败 = token 已被抢占/过期 → 中止并记 task.lease_lost。 */
+  #startLeaseHeartbeat(taskId: string, token: number): void {
+    if (this.#leaseHeartbeatMs <= 0) return;
+    const timer = setInterval(() => {
+      const handle = this.#leaseHandles.get(taskId);
+      if (handle === undefined || handle.token !== token) return;
+      if (this.#detached.has(taskId) || this.#leaseLost.has(taskId)) return;
+      if (this.#leases === null) return;
+      if (!this.#leases.renew(taskId, this.#replicaId, token)) {
+        this.#handleLeaseLost(taskId, token, "renew_failed");
+      }
+    }, this.#leaseHeartbeatMs);
+    if (typeof timer.unref === "function") timer.unref();
+    const handle = this.#leaseHandles.get(taskId);
+    if (handle !== undefined) handle.timer = timer;
+  }
+
+  /**
+   * 租约丢失：记 task.lease_lost（含 token/原因）并中止该任务在跑节点。本进程此后
+   * 不再驱动或提交该任务；节点行由 #runNode 置 pending_review（半写证据保留）。
+   */
+  #handleLeaseLost(taskId: string, token: number, reason: string): void {
+    if (this.#leaseLost.has(taskId)) return;
+    this.#leaseLost.add(taskId);
+    this.#clearLeaseTimer(taskId);
+    this.#appendTaskEvent(taskId, TASK_EVENT_TYPES.taskLeaseLost, {
+      replica_id: this.#replicaId,
+      fencing_token: token,
+      reason,
+    }, null);
+    this.#abortTask(taskId);
+  }
+
+  /** 副作用提交前校验：token 仍有效则 true；失效 → 按租约丢失处理并返回 false。 */
+  #assertLeaseValid(taskId: string): boolean {
+    if (this.#leases === null) return true;
+    if (this.#leaseLost.has(taskId) || this.#detached.has(taskId)) return false;
+    const handle = this.#leaseHandles.get(taskId);
+    if (handle === undefined) return false;
+    if (!this.#leases.validate(taskId, handle.token)) {
+      this.#handleLeaseLost(taskId, handle.token, "fencing_token_invalid");
+      return false;
+    }
+    return true;
+  }
+
+  /** 租约丢失后节点落 pending_review：保留已产出的文本供 Owner 核对，不提交结果。 */
+  #abandonNodeForLeaseLoss(
+    taskId: string,
+    node: TaskNodeRecord,
+    attempt: number,
+    outcome: NodeOutcome,
+    nodeStartedEventId: string,
+  ): void {
+    const message = "execution lease lost (fencing token is stale); node run aborted before commit";
+    this.#tasks.setNodeState(node.node_id, {
+      status: "pending_review",
+      result: outcome.text.length > 0 ? outcome.text : null,
+      error: message,
+    });
+    this.#appendTaskEvent(taskId, TASK_EVENT_TYPES.taskNodeFinished, {
+      node_id: node.node_id,
+      key: node.key,
+      status: "pending_review",
+      attempt,
+      ...(outcome.text.length > 0 ? { result: outcome.text } : {}),
+      error: message,
+    }, nodeStartedEventId);
+  }
+
+  /** 释放本副本持有的租约（幂等；token 计数保留在行上） */
+  #releaseLease(taskId: string): void {
+    const handle = this.#leaseHandles.get(taskId);
+    if (handle === undefined) return;
+    this.#clearLeaseTimer(taskId);
+    if (this.#leases !== null) {
+      try {
+        this.#leases.release(taskId, this.#replicaId, handle.token);
+      } catch (err) {
+        // 关闭竞态（库已 finalize）不影响进程退出；崩溃/正常退出后的租约由 TTL 兜底
+        if (!this.#disposed) console.error("[morrow] lease release failed:", err);
+      }
+    }
+    this.#leaseHandles.delete(taskId);
+  }
+
+  /** 任务终结/待裁决时释放租约；paused/waiting_input/running 保留（本副本续驱） */
+  #releaseLeaseIfFinished(taskId: string): void {
+    let task: ReturnType<TaskService["getTask"]>;
+    try {
+      task = this.#tasks.getTask(taskId);
+    } catch {
+      // 优雅退出竞态：任务库已关闭，直接释放并让 TTL 兜底
+      this.#releaseLease(taskId);
+      return;
+    }
+    if (task === null || TERMINAL_TASK_STATUSES.has(task.status)) {
+      this.#releaseLease(taskId);
+    }
+  }
+
+  #clearLeaseTimer(taskId: string): void {
+    const handle = this.#leaseHandles.get(taskId);
+    if (handle?.timer !== null && handle?.timer !== undefined) clearInterval(handle.timer);
+    if (handle !== undefined) handle.timer = null;
+  }
+
+  /** 中止某任务全部在跑 AgentRuntime（租约丢失/执行权转移） */
+  #abortTask(taskId: string): void {
+    const runtimes = this.#activeByTask.get(taskId);
+    if (runtimes === undefined) return;
+    for (const runtime of [...runtimes]) runtime.abort();
+  }
+
+  /** 等待某任务在跑节点收尾（上限 timeoutMs；超时返回而非抛错） */
+  async #waitTaskIdle(taskId: string, timeoutMs: number): Promise<void> {
+    const runtimes = [...(this.#activeByTask.get(taskId) ?? [])];
+    if (runtimes.length === 0) return;
+    await Promise.race([
+      Promise.allSettled(runtimes.map((runtime) => runtime.waitForIdle())),
+      new Promise((resolve) => setTimeout(resolve, timeoutMs)),
+    ]);
+  }
+
+  #trackActive(taskId: string, runtime: AgentRuntime): void {
+    this.#active.add(runtime);
+    const set = this.#activeByTask.get(taskId) ?? new Set<AgentRuntime>();
+    set.add(runtime);
+    this.#activeByTask.set(taskId, set);
+  }
+
+  #untrackActive(taskId: string, runtime: AgentRuntime): void {
+    this.#active.delete(runtime);
+    const set = this.#activeByTask.get(taskId);
+    if (set === undefined) return;
+    set.delete(runtime);
+    if (set.size === 0) this.#activeByTask.delete(taskId);
+  }
+
+  /**
+   * 执行权转移（POST /v1/tasks/:id/transfer-execution，FR-DEP-4）。
+   *
+   * 顺序：校验当前持有者 = 本副本 → 标记 detached（本进程不再驱动）→ 中止在跑节点 →
+   * 落 reason=execution_transfer 的 checkpoint（目标副本恢复基准）→ release 租约 →
+   * task.execution_transferred 事件。目标副本随后 acquire 得到 token+1；不可转移
+   * 终端态（completed/failed/cancelled/needs_reconcile）任务。
+   *
+   * 边界：本端点只释放本副本的执行权，不代替目标设备 acquire（跨设备由目标设备收到
+   * 转移事件后自行调用 /v1/tasks/:id/resume 前的 acquire 路径）；若任务未在本进程
+   * 驱动（planned/paused/waiting_input），不中止任何运行时，仅释放并留痕。
+   */
+  async transferExecution(taskId: string, targetReplicaId: string): Promise<TransferExecutionResult> {
+    const task = this.#tasks.getTask(taskId);
+    if (task === null) {
+      throw new TaskError("not_found", `task ${taskId} does not exist`);
+    }
+    if (typeof targetReplicaId !== "string" || targetReplicaId.trim().length === 0) {
+      throw new TaskError("invalid_revision", "target_replica_id must be a non-empty string");
+    }
+    const target = targetReplicaId.trim();
+    if (target === this.#replicaId) {
+      throw new TaskError(
+        "invalid_transition",
+        "cannot transfer execution to the current holder replica; target must be another device",
+      );
+    }
+    if (TERMINAL_TASK_STATUSES.has(task.status)) {
+      throw new TaskError(
+        "invalid_transition",
+        `task ${taskId} is ${task.status}; execution cannot be transferred`,
+        { from: task.status },
+      );
+    }
+    if (this.#leases === null) {
+      throw new TaskError("invalid_transition", "execution leases are not configured for this runtime");
+    }
+    const current = this.#leases.current(taskId);
+    if (current === null || !current.active || current.holder_replica_id !== this.#replicaId) {
+      throw new TaskError(
+        "lease_not_held",
+        `task ${taskId} execution lease is not held by replica ${this.#replicaId}`,
+        { holder_replica_id: current?.holder_replica_id ?? null, fencing_token: current?.fencing_token ?? null },
+      );
+    }
+    const token = current.fencing_token;
+    const hadInflight = this.#driving.has(taskId) || (this.#activeByTask.get(taskId)?.size ?? 0) > 0;
+
+    this.#detached.add(taskId);
+    let checkpointId: string | undefined;
+    if (hadInflight) {
+      this.#abortTask(taskId);
+      await this.#waitTaskIdle(taskId, TRANSFER_SETTLE_TIMEOUT_MS);
+      try {
+        const checkpoint = await this.#checkpoints.createCheckpoint(taskId, "execution_transfer");
+        checkpointId = checkpoint.checkpoint_id;
+      } catch (err) {
+        // checkpoint 失败不阻断转移（账本事件仍是恢复证据），但必须在事件里留痕
+        console.error("[morrow] checkpoint before execution transfer failed:", err);
+      }
+    }
+    const released = this.#leases.release(taskId, this.#replicaId, token);
+    if (!released) {
+      this.#detached.delete(taskId);
+      throw new TaskError(
+        "lease_not_held",
+        `execution lease for task ${taskId} changed while transferring`,
+      );
+    }
+    this.#clearLeaseTimer(taskId);
+    this.#leaseHandles.delete(taskId);
+    const event = this.#tasks.recordExecutionTransferred(taskId, {
+      from_replica_id: this.#replicaId,
+      to_replica_id: target,
+      fencing_token: token,
+      next_fencing_token: token + 1,
+      had_inflight_execution: hadInflight,
+      ...(checkpointId === undefined ? {} : { checkpoint_id: checkpointId }),
+    });
+    return {
+      task: this.#tasks.getTask(taskId) ?? task,
+      lease: this.#leases.current(taskId),
+      transferEventId: event.eventId,
+      sequence: event.sequence,
+    };
+  }
+
   /** 派发期失败（资源配置错误等非尝试性失败）：直接落 failed 留痕，不进尝试循环 */
   #failNodeAtDispatch(taskId: string, node: TaskNodeRecord, startedEventId: string, message: string): void {
     this.#tasks.setNodeFinished(node.node_id, "failed", { error: message });
@@ -838,7 +1245,7 @@ export class TaskScheduler {
     runtime: AgentRuntime,
     nodeStartedEventId: string,
   ): Promise<NodeOutcome> {
-    this.#active.add(runtime);
+    this.#trackActive(taskId, runtime);
     // 累积值收在 holder 对象里：闭包内赋值 + await 后读取，避免 TS CFA 过窄收窄
     const run: { text: string; error: string | null; stopReason: string | null } = {
       text: "",
@@ -906,7 +1313,7 @@ export class TaskScheduler {
       }
     } finally {
       unsubscribe();
-      this.#active.delete(runtime);
+      this.#untrackActive(taskId, runtime);
       runtime.dispose();
     }
 

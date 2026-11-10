@@ -29,14 +29,21 @@ export type {
   SensitivityLevel,
 } from "./api-contracts.ts";
 export type {
+  ExecutionLease,
+  ExecutionReconcileEvidence,
+  ExecutionTransferRecord,
   NodeGitRepoResource,
   NodeResources,
+  ReconcileEvidenceSource,
   SideEffectClass,
   TaskDetail,
+  TaskExecutionState,
   TaskNodeRecord,
   TaskNodeStatus,
   TaskStatus,
   TaskSummary,
+  TransferExecutionRequest,
+  TransferExecutionResponse,
 } from "./task-contracts.ts";
 export type {
   CapabilityAuthor,

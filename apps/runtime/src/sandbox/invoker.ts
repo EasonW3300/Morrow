@@ -61,6 +61,12 @@ export interface ToolRegistration {
 export interface InvokeContext {
   actorId?: string;
   sessionId?: string;
+  /**
+   * 执行租约上下文（M3-T4 / Issue #33）：由任务 Run 发起的调用携带 task_id 与
+   * fencing token，执行体运行前经 fencingGuard 校验（旧 token 拒绝）。
+   */
+  taskId?: string;
+  fencingToken?: number;
 }
 
 export interface ToolInvokerOptions {
@@ -68,6 +74,11 @@ export interface ToolInvokerOptions {
   permissionEngine: SandboxPermissionEngine;
   /** workspace 根（sandboxed 工具按 manifest 接线挂载） */
   workspaceRoot: string;
+  /**
+   * 副作用提交前置校验（M3-T4 / Issue #33）：带 {taskId, fencingToken} 的调用在执行
+   * 前校验租约 token；无任务上下文的直接 Owner 调用按设计跳过（不在任一 Run 租约下）。
+   */
+  fencingGuard?: (context: InvokeContext | undefined) => void;
 }
 
 export class ToolInvoker {
@@ -75,11 +86,13 @@ export class ToolInvoker {
   private readonly runner: SandboxRunner;
   private readonly permissionEngine: SandboxPermissionEngine;
   private readonly workspaceRoot: string;
+  private readonly fencingGuard: ToolInvokerOptions["fencingGuard"];
 
   constructor(options: ToolInvokerOptions) {
     this.runner = options.runner;
     this.permissionEngine = options.permissionEngine;
     this.workspaceRoot = options.workspaceRoot;
+    this.fencingGuard = options.fencingGuard;
   }
 
   /** 注册能力（manifest.sandbox 非法 → SandboxContractError，fail fast 不进注册表） */
@@ -142,6 +155,10 @@ export class ToolInvoker {
     if (tool === undefined) {
       throw new UnknownToolError(name);
     }
+
+    // 副作用提交前置校验（M3-T4 / Issue #33）：旧 fencing token 在权限复核与执行体
+    // 运行之前即拒绝。无任务上下文的直接 Owner 调用不进入租约校验（见 fencing.ts 边界）。
+    this.fencingGuard?.(context);
 
     // 执行前运行时复核（M2-T1 PermissionEngine 接缝；先权限后执行，fail-closed）
     await this.permissionEngine.assertRuntimeUse({

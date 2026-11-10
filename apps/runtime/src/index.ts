@@ -94,13 +94,21 @@ export type {  PlannerFactory,
   TransitionResult,
   TaskErrorCode,
 } from "./tasks.ts";
-export { TaskScheduler, DEFAULT_TASK_CONCURRENCY } from "./scheduler.ts";
+export { TaskScheduler, DEFAULT_TASK_CONCURRENCY, DEFAULT_LEASE_TTL_MS } from "./scheduler.ts";
 export type {  NodeAgentFactory,
   TaskNodeExecInput,
   TaskSchedulerOptions,
   PauseResult,
   ResumeResult,
+  TransferExecutionResult,
 } from "./scheduler.ts";
+// 执行租约（M3-T4 / Issue #33，FR-DEP-4）
+export { LeaseStore } from "./lease/store.ts";
+export type { ExecutionLeaseRecord, LeaseAcquireOutcome, LeaseStoreOptions } from "./lease/store.ts";
+export { EXECUTION_LEASES_SQL, ensureLeaseTable } from "./lease/migrations.ts";
+export { FencingGuard, LeaseLostError } from "./lease/fencing.ts";
+export type { FencingContext } from "./lease/fencing.ts";
+export { detectDualExecution } from "./lease/reconcile.ts";
 export {
   CheckpointService,
   CheckpointStore,

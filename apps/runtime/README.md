@@ -231,10 +231,12 @@ FR-TASK-3 的范围；客户端轮询详情与事件观察执行进度（curl �
 `failed` 状态存在。规划工厂可经 `startRuntime(config, { taskPlannerFactory, taskNodeAgentFactory })`
 注入（测试 FakePi 脚本化，零网络）；节点执行工厂默认用会话默认 Provider（node.model 仅记录）。
 
-**状态机**（决策稿 §6；`needs_reconcile` 留后）：`created → planned → running →
-(paused | waiting_input | failed | completed | cancelled)`，`paused | waiting_input → running`
-的恢复记 `task.resumed`；终端态拒绝一切迁移（非法迁移不落任何事件，服务层
-`TaskService.transition` 抛 `invalid_transition`，HTTP 409 `task_invalid_transition`）。
+**状态机**（决策稿 §6；M3-T4 起含 `needs_reconcile`）：`created → planned → running →
+(paused | waiting_input | needs_reconcile | failed | completed | cancelled)`；
+`paused | waiting_input → running` 的恢复记 `task.resumed`；`needs_reconcile → completed |
+failed` 只能由 Owner 经 `POST /v1/tasks/:id/reconcile` 显式裁决。终端态拒绝一切迁移（非法迁移
+不落任何事件，服务层 `TaskService.transition` 抛 `invalid_transition`，HTTP 409
+`task_invalid_transition`）。
 
 **事件族**（event_type 清单只增不减；信封 `task_id` 关联任务，全部入账本 `task_id` 专列）：
 
@@ -682,6 +684,28 @@ workers/go/build.sh   # CGO_ENABLED=0 go build → bin/textstats（宿主平台�
 注册形态 `manifest {author:"human", runtime:"go", sandbox:{type:"builtin"}}`，经
 ToolInvoker 同一接缝注册 + 调用（`test/sandbox.go-worker.test.ts`：本机有 go 真编译真跑，
 无 go 且无产物 → skip 并注明理由）。协议与容器内 TS 工具一致（protocol.ts）。
+
+### 执行租约与单点执行（M3-T4 / Issue #33，FR-DEP-4）
+
+`execution_leases`（与任务投影同库）：`task_id` 主键、`holder_replica_id`、
+`fencing_token`（首次 1，抢占/转移严格 +1）、`expires_at` / `acquired_at` /
+`heartbeat_at`。`LeaseStore`（`src/lease/`）注入时钟，测试零 sleep：
+
+- 调度器 `planned→running` 前 acquire；失败保持 planned 并记 `task.lease_denied`
+  （payload 带持有者/到期/token）。
+- 执行期心跳续租（默认 ttl/3）；renew 失败（token 被抢占/过期）→ 中止在跑节点、
+  记 `task.lease_lost`，节点转 `pending_review`（不提交结果、不假装失败）。
+- 副作用提交前校验 fencing token：节点完成提交、worktree 合回主区；capability /
+  Skill 调用携带 `{taskId, fencingToken}` 上下文时在执行体运行前校验
+  （`FencingGuard`）。旧 token 一律拒绝。
+- `GET /v1/tasks/:id/execution`：租约 + 双端独立执行证据；
+  `POST /v1/tasks/:id/transfer-execution {target_replica_id}`：当前持有者 release +
+  `task.execution_transferred`（目标副本随后 acquire 得 token+1，目标必须 ≠ 自身）；
+  `POST /v1/tasks/:id/reconcile`：Owner 显式裁决 `needs_reconcile → completed|failed`；
+  `POST /v1/tasks/:id/reconcile/detect`：同步/重启后按账本重新检测并冻结。
+- 双端独立执行检测：同一 task 的账本出现 ≥2 个 replica 的执行证据（或被授权转移之外
+  的执行），或 ≥2 个 replica 各自推进过 task_version → `needs_reconcile` +
+  `task.needs_reconcile`（payload 带两侧 replica/事件/转移记录），**不静默合并**。
 
 ### 测试与 CI
 
