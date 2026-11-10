@@ -13,7 +13,7 @@
 | 凭据有效性 | `POST /app/getAppAccessToken` × 3 端点 | `bots.qq.com` 200 / `api.bot.qq.com` 200（142ms）/ `api.sgroup.qq.com` 404「不支持的调用」（该端点不在此host，符合预期）；access token 79 字符，`expires_in=7200` |
 | 网关接入 | `GET /gateway` + WebSocket | 连通，`op 10 Hello` → `op 2 Identify`（intents `1<<25` 群与单聊），收到 `READY` |
 | 入站事件 | 群内 @ 机器人 | 收到 `GROUP_AT_MESSAGE_CREATE`：`conv=AAE239F16FBC29E20853F6154D78719A`、`sender=FBE72705F609C036A8E7C3D59970721D`、`text="哈喽"` |
-| 出站回复 | 适配器被动回复 API | Owner 端确认收到回复文本（`/v2/groups/{group_openid}/messages`，带 `msg_id` + `msg_seq`） |
+| 出站回复 | 适配器被动回复 API | Owner 端确认收到；适配器日志回执行 `[qq] replied to ROBOT1.0_FB…: id=ROBOT1.0_VMWaTzUx…`（平台返回消息 id，`/v2/groups/{group_openid}/messages`，带 `msg_id` + `msg_seq`）；退出统计 `events=1 rejected=0 replies=1` |
 
 ## 2. 真实联调发现并修复的缺陷（协议桩未暴露）
 
