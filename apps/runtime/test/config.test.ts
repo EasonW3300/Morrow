@@ -3,7 +3,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { loadConfig, defaultDataDir, parseProviderConfig } from "../src/config.ts";
+import { loadConfig, defaultDataDir, parseProviderConfig, parseSecretBackend } from "../src/config.ts";
 import { removeDir, tmpDir } from "./helpers.ts";
 
 test("loadConfig falls back to safe defaults", () => {
@@ -14,6 +14,27 @@ test("loadConfig falls back to safe defaults", () => {
   assert.equal(defaultDataDir(), join(homedir(), ".morrow", "data"));
   assert.match(config.replicaId, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
   removeDir(dir);
+});
+
+test("default bind address is loopback only, never a wildcard/public interface (ADR-0004)", () => {
+  const dir = tmpDir("morrow-bind-");
+  const config = loadConfig({ MORROW_DATA_DIR: dir });
+  // 默认值必须只监听回环；0.0.0.0 / :: 会把私网部署意外暴露到所有网卡（含公网）。
+  assert.equal(config.host, "127.0.0.1");
+  assert.notEqual(config.host, "0.0.0.0");
+  assert.notEqual(config.host, "::");
+  // 非回环地址只能显式配置（部署文档：Tailscale/WireGuard 接口地址）。
+  const explicit = loadConfig({ MORROW_DATA_DIR: dir, MORROW_HOST: "100.64.0.7" });
+  assert.equal(explicit.host, "100.64.0.7");
+  removeDir(dir);
+});
+
+test("MORROW_SECRET_BACKEND: auto default, memory opt-in for hermetic smokes, unknown rejected", () => {
+  assert.equal(parseSecretBackend({}), "auto");
+  assert.equal(parseSecretBackend({ MORROW_SECRET_BACKEND: "" }), "auto");
+  assert.equal(parseSecretBackend({ MORROW_SECRET_BACKEND: "auto" }), "auto");
+  assert.equal(parseSecretBackend({ MORROW_SECRET_BACKEND: "memory" }), "memory");
+  assert.throws(() => parseSecretBackend({ MORROW_SECRET_BACKEND: "keychain" }), /MORROW_SECRET_BACKEND/);
 });
 
 test("loadConfig honors MORROW_* environment overrides", () => {

@@ -197,6 +197,13 @@ jobs:
           path: gate-report-${{ matrix.name }}.md
           if-no-files-found: error
 
+      # 部署冒烟（M3-T5 / Issue #34）：ubuntu 腿用服务器单二进制跑 systemd 等价前台形态
+      # （unit/env 模板静态契约 + ready → health → SIGTERM 优雅退出）。真实 systemd 加载
+      # 需要活跃 systemd 会话，runner 上不做；由 Owner Ubuntu 机器按 deploy/README.md 验证。
+      - name: Deployment smoke (server form, systemd-equivalent)
+        if: matrix.name == 'linux'
+        run: scripts/deploy/smoke-server.sh --binary artifacts/runtime/morrow-runtime-linux-x64
+
   report:
     name: gate report (aggregate)
     needs: [build, gate]

@@ -75,6 +75,22 @@ function parseMemoryExtractor(env: Record<string, string | undefined>): "heurist
   throw new Error(`invalid MORROW_MEMORY_EXTRACTOR: "${raw}" ("heuristic" or "llm" expected)`);
 }
 
+/** 设备密钥后端（MORROW_SECRET_BACKEND）：auto = 平台凭据库；memory = 仅进程内存。 */
+export type SecretBackend = "auto" | "memory";
+
+/**
+ * 密钥后端选择（默认 auto = macOS Keychain / Windows 凭据管理器 / Linux secret-tool）。
+ *
+ * `memory` 只为部署冒烟/CI 提供封闭环境：设备私钥不落盘、不进 OS 凭据库，进程退出即
+ * 丢失（副本身份不变，但设备公钥指纹每次启动都会变）。生产部署不要使用。
+ */
+export function parseSecretBackend(env: Record<string, string | undefined> = process.env): SecretBackend {
+  const raw = env.MORROW_SECRET_BACKEND;
+  if (raw === undefined || raw === "" || raw === "auto") return "auto";
+  if (raw === "memory") return "memory";
+  throw new Error(`invalid MORROW_SECRET_BACKEND: "${raw}" ("auto" or "memory" expected)`);
+}
+
 /**
  * Provider 环境变量解析（T5 起作为 env 回退种子，票面约定：显式 CRUD > 环境变量）：
  * 三个变量都缺省 → null（未配置 Provider）。任一出现则 BASE_URL 与 MODEL 必填；
