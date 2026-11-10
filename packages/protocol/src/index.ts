@@ -41,6 +41,22 @@ export type {
   TransferExecutionResponse,
 } from "./task-contracts.ts";
 export type {
+  ChannelAdapterState,
+  ChannelCapabilities,
+  ChannelConversationKind,
+  ChannelFeatureSupport,
+  ChannelHealth,
+  ChannelPermissionContext,
+  ChannelPrincipal,
+  ChannelSendReceipt,
+  ChannelSummary,
+  InboundAttachment,
+  InboundMention,
+  InboundMessage,
+  InboundSender,
+  OutboundMessage,
+} from "./channel-contracts.ts";
+export type {
   CapabilityAuthor,
   CapabilityChannel,
   CapabilityManifest,

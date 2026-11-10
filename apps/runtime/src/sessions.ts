@@ -1,5 +1,5 @@
 import type { AgentRuntime, MorrowAgentEvent, MorrowTool } from "@morrow/pi-adapter";
-import type { EventEnvelope } from "@morrow/protocol";
+import type { ActorId, EventEnvelope } from "@morrow/protocol";
 import { buildEventEnvelope } from "./envelope.ts";
 import type { EventLedger, LedgerEntry } from "./ledger.ts";
 import type { ProviderResolver, ResolvedProvider } from "./providers.ts";
@@ -283,8 +283,15 @@ export class SessionManager {
   /**
    * 记账用户输入并入队。同会话串行：Agent Loop 空闲则立即驱动（"processing"），
    * 否则 FIFO 排队（"queued"）。消息本身已落盘，处理顺序由队列保证。
+   *
+   * options.actorId（M4-T1 / Issue #38）：渠道入站按本地解析出的主体归因
+   * （owner / contact:<id>）；缺省 owner（桌面/语音入口语义不变）。
    */
-  sendUserMessage(sessionId: string, text: string): {
+  sendUserMessage(
+    sessionId: string,
+    text: string,
+    options: { actorId?: ActorId } = {},
+  ): {
     status: "processing" | "queued";
     messageId: string;
     eventId: string;
@@ -295,7 +302,7 @@ export class SessionManager {
     const envelope = this.#append(
       sessionId,
       SESSION_EVENT_TYPES.messageUser,
-      "owner",
+      options.actorId ?? "owner",
       { message_id: messageId, text },
       null,
     );
@@ -536,7 +543,7 @@ export class SessionManager {
   #append(
     sessionId: string,
     eventType: string,
-    actorId: "owner" | "agent:runtime",
+    actorId: ActorId,
     payload: Record<string, unknown>,
     causationId: string | null,
   ): LedgerEntry {
