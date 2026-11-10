@@ -1,6 +1,6 @@
 # Morrow M3 门禁报告（T7 / Issue #36）
 
-**归档日期**：2026-11-10 ｜ **分支基线**：`integration/m0` @ 4426740（M3 六张开发票 #30–#35 + 缺口修复批 + T7 门禁收尾的合并态；修复批分支 `fix/m3-projection-conflict` @ 51ecc64） ｜ **真机**：MacBook Pro（Mac16,8，Apple M4 Pro，24 GB，macOS 15.5 Build 24F74）
+**归档日期**：2026-11-10 ｜ **分支基线**：`integration/m0` @ 6c3e47b（M3 六张开发票 #30–#35 + 缺口修复批 + T7 门禁收尾的合并态；修复批分支 `fix/m3-projection-conflict` @ 9fb82ab 起，含 code-review A1/A2/B1/B2 修复） ｜ **真机**：MacBook Pro（Mac16,8，Apple M4 Pro，24 GB，macOS 15.5 Build 24F74）
 **参考环境**：`docs/prd/ac-baseline-m0.md`（§9 为 M3 校准注记） ｜ **格式基准**：`docs/gates/m2-gate-report.md`
 
 M3 门槛（PRD §9）：**「三种部署工作；跨设备不重复执行同一任务」**；对应 AC-04（增量双向同步，2 设备各离线 50 条 + 小事件 p95）、AC-05（20 个竞争事实 + 删除不复活）。
@@ -15,6 +15,7 @@ T7 归档时的产品缺口在 §6 如实登记；其中 §6-4（任务投影不
 | 项 | 值 |
 |---|---|
 | 当前 tip | 6c3e47b（merge: integration/m0 合并态——AC-04/AC-05 复跑与门禁报告刷新），与 `integration/m0` 一致 |
+| 修复批 tip | 9fb82ab（`fix/m3-projection-conflict`：code-review A1 fencing token 跨副本单调、A2 同步游标命名空间拆分、B1/B2 memory-sync 版本关系与 valid_until、文档与清理；**未 push**） |
 | 最新 run | [42767124433](https://github.com/EasonW3300/Morrow/actions/runs/42767124433)（push integration/m0，2026-11-10T06:14:02Z，约 4m13s）—— **success**（8 job 全绿：build ×3、gate ×3、gate report、`sandbox tests (ubuntu, real containers)`） |
 | Ubuntu 部署冒烟 job | `gate (linux)` 第 8 步 **Deployment smoke (server form, systemd-equivalent)** success（`scripts/deploy/smoke-server.sh --binary artifacts/runtime/morrow-runtime-linux-x64`，服务器单二进制前台等价形态） |
 | 前一条成功 run | [42762135949](https://github.com/EasonW3300/Morrow/actions/runs/42762135949)（a5d7eba，2026-11-10T05:26Z）—— 同为 8 job 全绿，含同一部署冒烟步骤 |
