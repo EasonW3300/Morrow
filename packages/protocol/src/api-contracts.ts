@@ -154,3 +154,36 @@ export interface PairingClaimResponse {
   token_account: string;
   paired_at: string;
 }
+
+/**
+ * POST /v1/pairing/join 请求体（M3 修复批 / Issue #35，PRD §5.2 流程 1）：
+ * **本机 Runtime 作为新设备**加入 `base_url` 指向的已信任 Runtime。
+ *
+ * 与浏览器的区别：Runtime 可以在宿主侧完成 claim、校验指纹，并把拿到的 bearer token
+ * 写入本机 OS 凭据库（浏览器 WebView 无法安全持久化），因此「加入设备」真正可用。
+ */
+export interface PairingJoinRequest {
+  /** 要加入的 Runtime 基地址（http/https，不含末尾斜杠亦可） */
+  base_url: string;
+  /** 已信任设备生成的一次性 6 位配对码 */
+  code: string;
+  /** 本机设备标签（对端设备列表里显示） */
+  device_label?: string;
+  /**
+   * 可选：从对端屏幕离线获得的指纹。**本机校验对端 claim 响应里的指纹**；
+   * 不一致立即中止并撤销对端刚建立的信任（rollback），不落任何本地凭据。
+   */
+  expect_server_fingerprint?: string;
+}
+
+/**
+ * POST /v1/pairing/join 响应：**绝不含 bearer token 明文**（token 只写本机凭据库）。
+ * `device` 是加入后本机 devices 表中对端（服务端）的可信投影。
+ */
+export interface PairingJoinResponse {
+  device: DeviceInfo;
+  /** 对端（服务端）指纹（完整 16 hex，供 UI 展示/留档） */
+  server_fingerprint: string;
+  /** 短格式指纹（AB12-CD34-EF56-7890） */
+  server_fingerprint_short: string;
+}

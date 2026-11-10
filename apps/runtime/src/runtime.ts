@@ -365,6 +365,15 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     replicaId: config.replicaId,
     cursors: syncCursors,
     tombstones,
+    // M3 修复批（Issue #35）：「全部已配对 peer」= devices 表中 trusted、未撤销的远端
+    // 设备；status.peers 与 POST /v1/sync/run 共用这一口径。同步成功后写设备
+    // last_sync_at（设备列表「最后同步」不再是死字段）。
+    knownPeers: () =>
+      devices
+        .list()
+        .filter((device) => device.replica_id !== config.replicaId && device.trusted && !device.revoked)
+        .map((device) => device.replica_id),
+    onSynced: (peerReplicaId, at) => devices.markSynced(peerReplicaId, at),
     afterImport: (envelopes, peerReplicaId) => afterSyncImport?.(envelopes, peerReplicaId),
     ...(options.syncTransport === undefined ? {} : { transport: options.syncTransport }),
   });
@@ -383,6 +392,8 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     devices,
     identity: deviceIdentity,
     ledger,
+    // join 拿到的对端 bearer token 只写本机 OS 凭据库（浏览器 WebView 无法安全持久化）
+    secretStore,
     ...(options.pairingNow !== undefined ? { now: options.pairingNow } : {}),
   });
   // 能力注册表（票 M2-T1 / Issue #22）：会话工具注入改查注册表（disable 即不再注入）；

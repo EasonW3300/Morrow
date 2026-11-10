@@ -1,7 +1,6 @@
 import type { SyncEnvelope } from "@morrow/protocol";
 import type { SyncEngine } from "./engine.ts";
 import { SyncError } from "./errors.ts";
-
 /**
  * SyncTransport —— 同步引擎的内部接缝（M3-T1 / Issue #30，M3 规格「接缝」条目）。
  *
@@ -25,9 +24,17 @@ export interface SyncTransportPullResult {
   hasMore: boolean;
 }
 
+/** 对端账本上界探测结果（status 的 pending_download 真实值来源；M3 修复批） */
+export interface SyncPeerProbe {
+  replica_id: string | null;
+  max_sequence: number | null;
+}
+
 export interface SyncTransport {
   push(peerId: string, envelopes: SyncEnvelope[]): Promise<SyncPushReceipt>;
   pull(peerId: string, sinceSeq: number, limit: number): Promise<SyncTransportPullResult>;
+  /** 探测对端账本最大 sequence（GET /v1/sync/status?probe=local，不递归探测 peer） */
+  status(peerId: string): Promise<SyncPeerProbe>;
 }
 
 export interface InMemorySyncTransportOptions {
@@ -57,6 +64,12 @@ export class InMemorySyncTransport implements SyncTransport {
     const peer = this.#peer(peerId);
     const batch = peer.exportBatch(sinceSeq, limit);
     return { envelopes: batch.envelopes, nextSeq: batch.next_seq, hasMore: batch.has_more };
+  }
+
+  async status(peerId: string): Promise<SyncPeerProbe> {
+    const peer = this.#peer(peerId);
+    const local = peer.status();
+    return { replica_id: local.replica_id, max_sequence: local.sequence.max };
   }
 
   #peer(peerId: string): SyncEngine {

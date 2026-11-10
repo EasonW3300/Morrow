@@ -1,12 +1,20 @@
 import { randomUUID } from "node:crypto";
-import type { PairingClaimResponse, PairingCodeResponse, DeviceIdentityInfo, DeviceInfo } from "@morrow/protocol";
+import type {
+  PairingClaimResponse,
+  PairingCodeResponse,
+  DeviceIdentityInfo,
+  DeviceInfo,
+  PairingJoinResponse,
+} from "@morrow/protocol";
 import { buildEventEnvelope } from "../envelope.ts";
 import type { DeviceRecord, DeviceRegistry } from "../devices.ts";
 import type { EventLedger } from "../ledger.ts";
+import type { SecretStore } from "../keyring.ts";
 import { UUID_RE } from "../uuid-v7.ts";
 import type { DeviceIdentity } from "./identity.ts";
 import { PairingStore } from "./store.ts";
 import {
+  DEVICE_KEY_SERVICE,
   deviceTokenAccount,
   formatFingerprint,
   generateBearerToken,
@@ -51,7 +59,11 @@ export type PairingErrorCode =
   | "device_revoked"
   | "cannot_revoke_self"
   | "too_many_attempts"
-  | "secret_store_unavailable";
+  | "secret_store_unavailable"
+  | "peer_unreachable"
+  | "invalid_claim_response"
+  | "cannot_join_self"
+  | "invalid_base_url";
 
 export class PairingError extends Error {
   readonly code: PairingErrorCode;
@@ -71,6 +83,8 @@ export interface PairingServiceOptions {
   devices: DeviceRegistry;
   identity: DeviceIdentity;
   ledger: EventLedger;
+  /** 本机 OS 凭据库（join 拿到的对端 bearer token 只写这里，绝不落库/日志/响应） */
+  secretStore: SecretStore;
   /** 可注入时钟（测试配对码过期）；默认系统时间 */
   now?: () => Date;
   /** 配对码 TTL（默认 5 分钟） */
@@ -78,6 +92,10 @@ export interface PairingServiceOptions {
   /** 每个来源地址在窗口内的失败上限（默认 10 次 / 5 分钟） */
   claimAttemptLimit?: number;
   claimAttemptWindowMs?: number;
+  /** 出站 fetch（join 调对端 claim/revoke；测试可用真 HTTP 回环或注入桩） */
+  fetchImpl?: typeof fetch;
+  /** join 出站请求超时（毫秒，默认 15s） */
+  joinTimeoutMs?: number;
 }
 
 export interface ClaimInput {
@@ -94,9 +112,19 @@ export interface ClaimResult extends PairingClaimResponse {
   token_account: string;
 }
 
+export interface JoinInput {
+  baseUrl: string;
+  code: string;
+  deviceLabel?: string | undefined;
+  expectedServerFingerprint?: string | undefined;
+}
+
+export interface JoinResult extends PairingJoinResponse {}
+
 const DEFAULT_CODE_TTL_MS = 5 * 60 * 1000;
 const DEFAULT_ATTEMPT_LIMIT = 10;
 const DEFAULT_ATTEMPT_WINDOW_MS = 5 * 60 * 1000;
+const DEFAULT_JOIN_TIMEOUT_MS = 15_000;
 const MAX_LABEL_LENGTH = 128;
 
 export class PairingService {
@@ -104,11 +132,14 @@ export class PairingService {
   readonly #devices: DeviceRegistry;
   readonly #identity: DeviceIdentity;
   readonly #ledger: EventLedger;
+  readonly #secrets: SecretStore;
   readonly #replicaId: string;
   readonly #now: () => Date;
   readonly #codeTtlMs: number;
   readonly #attemptLimit: number;
   readonly #attemptWindowMs: number;
+  readonly #fetch: typeof fetch;
+  readonly #joinTimeoutMs: number;
   #attempts = new Map<string, { count: number; windowStart: number }>();
   #closed = false;
 
@@ -117,11 +148,14 @@ export class PairingService {
     this.#devices = options.devices;
     this.#identity = options.identity;
     this.#ledger = options.ledger;
+    this.#secrets = options.secretStore;
     this.#replicaId = options.replicaId;
     this.#now = options.now ?? (() => new Date());
     this.#codeTtlMs = options.codeTtlMs ?? DEFAULT_CODE_TTL_MS;
     this.#attemptLimit = options.claimAttemptLimit ?? DEFAULT_ATTEMPT_LIMIT;
     this.#attemptWindowMs = options.claimAttemptWindowMs ?? DEFAULT_ATTEMPT_WINDOW_MS;
+    this.#fetch = options.fetchImpl ?? fetch;
+    this.#joinTimeoutMs = options.joinTimeoutMs ?? DEFAULT_JOIN_TIMEOUT_MS;
   }
 
   /** 已信任设备生成一次性配对码（调用方须先通过鉴权；本方法再校验 issuer 信任态） */
@@ -263,6 +297,121 @@ export class PairingService {
   }
 
   /**
+   * 宿主侧「加入设备」（M3 修复批 / Issue #35，PRD §5.2 流程 1）：本机 Runtime 作为
+   * 新设备向 `baseUrl` 指向的已信任 Runtime 发起 claim。
+   *
+   * 与浏览器路径的本质差异：token 由宿主进程拿回并写入本机 OS 凭据库
+   * （account = `token:<对端 replica_id>`），对端公钥写本机 devices 表；响应绝不回传
+   * token 明文。指纹校验在**本机**完成（不把期望值委托给对端）：
+   *   - `expect_server_fingerprint` 与对端自证指纹不一致 → 立即撤销对端刚建立的本机
+   *     信任（DELETE /v1/devices/:id，带本次 token），本地凭据/设备行均不落地；
+   *   - 对端公钥与自证指纹不自洽（公钥派生指纹 ≠ server.fingerprint）同样按
+   *     invalid_claim_response 中止并撤销。
+   */
+  async join(input: JoinInput): Promise<JoinResult> {
+    const baseUrl = normalizeBaseUrl(input.baseUrl);
+    if (!/^\d{6}$/.test(input.code)) {
+      throw new PairingError("invalid_code", 400, "pairing code must be exactly 6 digits");
+    }
+    const label = normalizeLabel(input.deviceLabel);
+    const self = await this.#ensureIdentity();
+    const claim = await this.#claimRemote(baseUrl, {
+      code: input.code,
+      device_public_key: self.public_key,
+      device_replica_id: this.#replicaId,
+      ...(label === null ? {} : { device_label: label }),
+    });
+
+    // 对端必须把我们登记成提交的身份（replica_id + 公钥），否则视为响应被篡改。
+    const claimedDevice = claim.device;
+    if (
+      typeof claimedDevice !== "object" ||
+      claimedDevice === null ||
+      claimedDevice.replica_id !== this.#replicaId ||
+      claimedDevice.public_key !== self.public_key
+    ) {
+      await this.#rollbackJoin(baseUrl, claim);
+      throw new PairingError("invalid_claim_response", 502, "peer registered a different device identity than requested");
+    }
+
+    // 对端身份自洽性：公钥派生指纹必须等于其自报指纹（否则无法作为信任锚）。
+    let derivedFingerprint: string;
+    try {
+      derivedFingerprint = parseDevicePublicKey(claim.server.public_key).fingerprint;
+    } catch {
+      await this.#rollbackJoin(baseUrl, claim);
+      throw new PairingError("invalid_claim_response", 502, "peer returned an unparsable server public key");
+    }
+    if (derivedFingerprint !== normalizeFingerprint(claim.server.fingerprint)) {
+      await this.#rollbackJoin(baseUrl, claim);
+      throw new PairingError("invalid_claim_response", 502, "peer server fingerprint does not match its public key");
+    }
+    if (claim.server.replica_id === this.#replicaId) {
+      // 加入自己：不能撤销自身（服务端 409 cannot_revoke_self），直接拒绝。
+      throw new PairingError("cannot_join_self", 409, "a runtime cannot join itself");
+    }
+
+    // 双端指纹核对：期望值由 Owner 从对端屏幕抄来；不一致立即撤销，不落任何本地状态。
+    if (input.expectedServerFingerprint !== undefined) {
+      const expected = normalizeFingerprint(input.expectedServerFingerprint);
+      if (expected !== normalizeFingerprint(claim.server.fingerprint)) {
+        await this.#rollbackJoin(baseUrl, claim);
+        throw new PairingError(
+          "fingerprint_mismatch",
+          409,
+          `server fingerprint mismatch: expected ${formatFingerprint(expected)}, got ${formatFingerprint(claim.server.fingerprint)}`,
+        );
+      }
+    }
+
+    const existing = this.#devices.get(claim.server.replica_id);
+    if (existing !== null && existing.revoked) {
+      await this.#rollbackJoin(baseUrl, claim);
+      throw new PairingError("device_revoked", 403, "the target runtime was revoked on this device; restore is not supported");
+    }
+
+    // 写本机凭据库：token 只进 OS 凭据库，绝不进 devices 表 / 账本 / 响应 / 日志。
+    const tokenAccount = deviceTokenAccount(claim.server.replica_id);
+    try {
+      await this.#secrets.setSecret(DEVICE_KEY_SERVICE, tokenAccount, claim.token);
+    } catch (err) {
+      await this.#rollbackJoin(baseUrl, claim);
+      throw new PairingError(
+        "secret_store_unavailable",
+        503,
+        `cannot persist the peer token to the OS credential store: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+
+    try {
+      this.#devices.markJoinedPeer({
+        replicaId: claim.server.replica_id,
+        label: null,
+        publicKey: claim.server.public_key,
+        fingerprint: normalizeFingerprint(claim.server.fingerprint),
+        now: this.#now(),
+      });
+    } catch (err) {
+      await this.#secrets.deleteSecret(DEVICE_KEY_SERVICE, tokenAccount).catch(() => undefined);
+      await this.#rollbackJoin(baseUrl, claim);
+      throw err;
+    }
+
+    const device = this.#devices.get(claim.server.replica_id);
+    if (device === null) {
+      // 理论不可达（刚写入）；按失败处理而不是伪造响应。
+      await this.#secrets.deleteSecret(DEVICE_KEY_SERVICE, tokenAccount).catch(() => undefined);
+      await this.#rollbackJoin(baseUrl, claim);
+      throw new PairingError("invalid_claim_response", 502, "joined device projection is unavailable");
+    }
+    return {
+      device: device as DeviceRecord,
+      server_fingerprint: normalizeFingerprint(claim.server.fingerprint),
+      server_fingerprint_short: formatFingerprint(normalizeFingerprint(claim.server.fingerprint)),
+    };
+  }
+
+  /**
    * 撤销设备：置 revoked + 保留 token 摘要作吊销墓碑；落 device.revoked 审计。
    * 本机自身不可撤销（否则回环之外所有管理入口失去意义）。
    * 返回更新后的投影；设备不存在返回 null（路由层 404）。
@@ -326,6 +475,85 @@ export class PairingService {
     }
   }
 
+  /** 向对端 POST /v1/pairing/claim 并校验响应形状；网络/协议错误映射为 PairingError */
+  async #claimRemote(baseUrl: string, body: Record<string, unknown>): Promise<PairingClaimResponse> {
+    const response = await this.#joinFetch(`${baseUrl}/v1/pairing/claim`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    let payload: unknown;
+    try {
+      payload = await response.json();
+    } catch {
+      payload = null;
+    }
+    if (!response.ok) {
+      const error =
+        typeof payload === "object" && payload !== null && "error" in payload
+          ? ((payload as { error?: Record<string, unknown> }).error ?? {})
+          : {};
+      const code = typeof error.code === "string" ? error.code : "claim_failed";
+      const message = typeof error.message === "string" ? error.message : `peer returned HTTP ${response.status}`;
+      // 服务端的配对语义错误（invalid_code/code_expired/...）原样透传；未知一律 502。
+      const status = response.status >= 400 && response.status < 500 ? response.status : 502;
+      throw new PairingError(
+        isPairingErrorCode(code) ? code : "peer_unreachable",
+        status,
+        message,
+      );
+    }
+    if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
+      throw new PairingError("invalid_claim_response", 502, "peer returned a non-object claim response");
+    }
+    const claim = payload as Partial<PairingClaimResponse>;
+    const server = claim.server;
+    if (
+      typeof claim.token !== "string" ||
+      claim.token.length === 0 ||
+      typeof server !== "object" ||
+      server === null ||
+      typeof server.replica_id !== "string" ||
+      !UUID_RE.test(server.replica_id) ||
+      typeof server.public_key !== "string" ||
+      typeof server.fingerprint !== "string"
+    ) {
+      throw new PairingError("invalid_claim_response", 502, "peer claim response is malformed");
+    }
+    return claim as PairingClaimResponse;
+  }
+
+  /**
+   * join 失败回滚：撤销对端刚为本次 claim 建立的本机设备行（带本次 token）。本地状态
+   * 在指纹校验通过前不写入，因此无需清理；若调用方已写入 token，应另行删除（见 join）。
+   * 回滚失败不掩盖原始错误——仍抛原始 PairingError，遗留信任可由设备列表人工撤销。
+   */
+  async #rollbackJoin(baseUrl: string, claim: PairingClaimResponse): Promise<void> {
+    try {
+      await this.#joinFetch(`${baseUrl}/v1/devices/${encodeURIComponent(this.#replicaId)}`, {
+        method: "DELETE",
+        headers: { authorization: `Bearer ${claim.token}` },
+      });
+    } catch {
+      // 对端不可达/撤销失败：本地未落任何状态；原始错误继续上抛。
+    }
+  }
+
+  async #joinFetch(url: string, init: RequestInit): Promise<Response> {
+    try {
+      return await this.#fetch(url, {
+        ...init,
+        signal: AbortSignal.timeout(this.#joinTimeoutMs),
+      });
+    } catch (err) {
+      throw new PairingError(
+        "peer_unreachable",
+        502,
+        `cannot reach the target runtime: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
   #assertAttemptAllowed(remoteKey: string): void {
     const now = this.#now().getTime();
     const entry = this.#attempts.get(remoteKey);
@@ -358,4 +586,45 @@ function normalizeLabel(value: string | undefined): string | null {
     throw new PairingError("invalid_device_label", 400, `device_label must be at most ${MAX_LABEL_LENGTH} characters`);
   }
   return trimmed;
+}
+
+/** join 的 base_url 归一化：只接受 http/https，去掉末尾斜杠（query/hash 一律拒绝） */
+function normalizeBaseUrl(value: string): string {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new PairingError("invalid_base_url", 400, "base_url must be an absolute http(s) URL");
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new PairingError("invalid_base_url", 400, "base_url must use http or https");
+  }
+  if (url.search.length > 0 || url.hash.length > 0) {
+    throw new PairingError("invalid_base_url", 400, "base_url must not contain a query string or fragment");
+  }
+  return `${url.origin}${url.pathname}`.replace(/\/+$/, "");
+}
+
+const PAIRING_ERROR_CODES: ReadonlySet<string> = new Set<PairingErrorCode>([
+  "issuer_not_trusted",
+  "invalid_code",
+  "code_expired",
+  "code_already_used",
+  "fingerprint_mismatch",
+  "invalid_device_public_key",
+  "invalid_device_label",
+  "invalid_device_replica_id",
+  "device_key_conflict",
+  "device_revoked",
+  "cannot_revoke_self",
+  "too_many_attempts",
+  "secret_store_unavailable",
+  "peer_unreachable",
+  "invalid_claim_response",
+  "cannot_join_self",
+  "invalid_base_url",
+]);
+
+function isPairingErrorCode(code: string): code is PairingErrorCode {
+  return PAIRING_ERROR_CODES.has(code);
 }

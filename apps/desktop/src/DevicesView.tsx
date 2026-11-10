@@ -3,16 +3,16 @@ import {
   api,
   ApiError,
   type DeviceInfo,
-  type PairingClaimResponse,
   type PairingCodeResponse,
+  type PairingJoinResponse,
   type SyncConflictView,
 } from "./api.ts";
 import {
-  claimReview,
   conflictSourceLabel,
   describeSyncFailure,
   diffLines,
   isPairingCodeShape,
+  joinReview,
   joinWizardNext,
   mapSyncStatus,
   normalizePairingCodeInput,
@@ -33,8 +33,8 @@ import {
  *      「加入设备」向导（输入码 → claim → 双端指纹核对 → 确认 / 不一致即撤销）；
  *   3. 同步状态面板 + 冲突审核入口（GET /v1/sync/status、GET/POST /v1/sync/conflicts）。
  *
- * 全部走控制面 API；「手动同步」在 Runtime 尚无同步循环端点时如实退化为状态查询，
- * 并在按钮旁注明原因（票面允许：无端点则明确标注查询）。
+ * 全部走控制面 API；「立即同步一轮」调用 Runtime 的 POST /v1/sync/run（M3 修复批 /
+ * Issue #35），「加入设备」调用本机 POST /v1/pairing/join（token 由宿主写 OS 凭据库）。
  */
 export function DevicesView({ base }: { base: string }) {
   return (
@@ -268,9 +268,9 @@ function PairingSection({ base }: { base: string }) {
 
 // --- 加入设备向导 -----------------------------------------------------------------
 
-interface ClaimOutcome {
-  response: PairingClaimResponse;
-  /** 被加入的 Runtime 地址（撤销时也要回到它） */
+interface JoinOutcome {
+  response: PairingJoinResponse;
+  /** 被加入的 Runtime 地址（展示用） */
   peerBase: string;
   expected: string;
 }
@@ -279,11 +279,11 @@ interface ClaimOutcome {
  * 新设备侧向导（PRD §5.2 流程 1）：
  *   input --submit--> claiming --claimed--> review --confirm--> done
  *                                \--claim_failed--> input
- *   review --reject--> mismatch（信任已建立，补救 = 撤销该设备）
+ *   review --reject--> mismatch（本机信任已建立，补救 = 撤销该设备）
  *
- * 设备公钥在浏览器里用 WebCrypto 现生成（ed25519 raw 32B），只用于本次 claim；
- * 响应里的 bearer token 仅此一次出现，本 UI **不展示也不持久化**（桌面壳应存 OS
- * 凭据库），避免令牌落进 WebView 存储。
+ * M3 修复批（Issue #35）：claim 改由**本机 Runtime** 的 POST /v1/pairing/join 完成——
+ * 设备密钥与 bearer token 都在宿主侧生成/落 OS 凭据库，浏览器不再持有令牌，
+ * 也不再需要 WebCrypto 生成一次性密钥。
  */
 function JoinDeviceCard({ defaultBase, onJoined }: { defaultBase: string; onJoined: () => void }) {
   const [state, setState] = useState<JoinWizardState>({ step: "input", busy: false, error: null });
@@ -291,7 +291,7 @@ function JoinDeviceCard({ defaultBase, onJoined }: { defaultBase: string; onJoin
   const [codeInput, setCodeInput] = useState("");
   const [label, setLabel] = useState("");
   const [expected, setExpected] = useState("");
-  const [outcome, setOutcome] = useState<ClaimOutcome | null>(null);
+  const [outcome, setOutcome] = useState<JoinOutcome | null>(null);
   const [revokeBusy, setRevokeBusy] = useState(false);
 
   const advance = (event: Parameters<typeof joinWizardNext>[1], patch: Partial<JoinWizardState> = {}) => {
@@ -311,27 +311,21 @@ function JoinDeviceCard({ defaultBase, onJoined }: { defaultBase: string; onJoin
     }
     setState({ ...state, step: joinWizardNext(state, { type: "submit" }), busy: true, error: null });
     try {
-      const key = await generateDevicePublicKey();
-      if (!key.ok) {
-        setState({ step: "input", busy: false, error: key.error });
-        return;
-      }
-      const response = await api.claimPairing(peer, {
+      const response = await api.joinPairing(defaultBase, {
+        base_url: peer,
         code: codeInput,
-        device_public_key: key.base64,
-        device_label: label.trim().length > 0 ? label.trim() : undefined,
-        device_replica_id: crypto.randomUUID(),
-        ...(expected.trim().length > 0 ? { server_fingerprint: expected.trim() } : {}),
+        ...(label.trim().length > 0 ? { device_label: label.trim() } : {}),
+        ...(expected.trim().length > 0 ? { expect_server_fingerprint: expected.trim() } : {}),
       });
       setOutcome({ response, peerBase: peer, expected });
       advance({ type: "claimed" }, { busy: false });
     } catch (err) {
       if (err instanceof ApiError && err.code === "fingerprint_mismatch") {
-        // 服务端口径：指纹不一致立即 409 且不消耗配对码——改期望值后可重试
+        // Runtime 已本地复核指纹并在不符时回滚对端信任；配对码可能已被 claim 消费。
         setState({
           step: "input",
           busy: false,
-          error: `指纹不一致：${err.message}\n配对码未被消耗，请核对对端显示的指纹后重试。`,
+          error: `指纹不一致：${err.message}\nRuntime 已撤销本次 claim，请核对对端显示的指纹后重新生成配对码。`,
         });
         return;
       }
@@ -343,7 +337,8 @@ function JoinDeviceCard({ defaultBase, onJoined }: { defaultBase: string; onJoin
     if (outcome === null) return;
     setRevokeBusy(true);
     try {
-      await api.revokeDevice(outcome.peerBase, outcome.response.device.replica_id);
+      // join 后本机 devices 中已有对端可信行；撤销走本机控制面（token 已在凭据库）。
+      await api.revokeDevice(defaultBase, outcome.response.device.replica_id);
       onJoined();
       setOutcome(null);
       setCodeInput("");
@@ -355,7 +350,7 @@ function JoinDeviceCard({ defaultBase, onJoined }: { defaultBase: string; onJoin
     }
   };
 
-  const review = outcome === null ? null : claimReview(outcome.response, outcome.expected);
+  const review = outcome === null ? null : joinReview(outcome.response, outcome.expected);
 
   return (
     <div className="pairing-card">
@@ -457,9 +452,9 @@ function JoinDeviceCard({ defaultBase, onJoined }: { defaultBase: string; onJoin
 
       {state.step === "done" && (
         <div className="claim-done">
-          <p>已加入「{outcome?.response.server.replica_id.slice(0, 8)}」的信任网络。</p>
+          <p>已加入「{outcome?.response.device.replica_id.slice(0, 8)}」的信任网络。</p>
           <p className="hint-inline">
-            bearer token 仅在 claim 响应中出现一次，本页面不展示也不保存；桌面壳应把它写入操作系统凭据库。
+            bearer token 已由本机 Runtime 写入操作系统凭据库，浏览器全程不接触；对端公钥已写入设备表。
           </p>
           <button
             className="btn"
@@ -478,7 +473,7 @@ function JoinDeviceCard({ defaultBase, onJoined }: { defaultBase: string; onJoin
       {state.step === "mismatch" && (
         <div className="claim-mismatch">
           <p className="banner-error">
-            指纹不一致：信任已由 claim 建立，唯一安全的补救是立即撤销刚加入的设备。
+            指纹不一致：Runtime 已回滚对端信任；若设备列表仍显示该设备，请立即撤销。
           </p>
           <button className="btn danger" onClick={() => void revokeJustJoined()} disabled={revokeBusy}>
             {revokeBusy ? "撤销中…" : "立即撤销该设备"}
@@ -492,31 +487,6 @@ function JoinDeviceCard({ defaultBase, onJoined }: { defaultBase: string; onJoin
   );
 }
 
-/** 浏览器侧生成 ed25519 公钥（raw 32B base64）；不支持的运行时给明确错误 */
-type DeviceKeyResult = { ok: true; base64: string } | { ok: false; error: string };
-
-async function generateDevicePublicKey(): Promise<DeviceKeyResult> {
-  try {
-    const subtle = globalThis.crypto?.subtle;
-    if (subtle === undefined) {
-      return { ok: false, error: "当前环境没有 WebCrypto，无法生成设备密钥。" };
-    }
-    const pair = (await subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"])) as CryptoKeyPair;
-    const raw = new Uint8Array(await subtle.exportKey("raw", pair.publicKey));
-    if (raw.byteLength !== 32) {
-      return { ok: false, error: `公钥长度异常（${raw.byteLength}B），要求 32B raw ed25519。` };
-    }
-    let binary = "";
-    for (const byte of raw) binary += String.fromCharCode(byte);
-    return { ok: true, base64: btoa(binary) };
-  } catch (err) {
-    return {
-      ok: false,
-      error: `当前浏览器不支持 Ed25519 密钥生成（${err instanceof Error ? err.message : String(err)}）。请用较新的桌面 WebView 打开。`,
-    };
-  }
-}
-
 // --- 同步状态面板 -----------------------------------------------------------------
 
 const SYNC_POLL_MS = 5000;
@@ -525,6 +495,8 @@ function SyncSection({ base }: { base: string }) {
   const [panel, setPanel] = useState<SyncPanelView | null>(null);
   const [error, setError] = useState<{ code: string; message: string; details: Record<string, unknown> } | null>(null);
   const [loading, setLoading] = useState(false);
+  const [running, setRunning] = useState(false);
+  const [runSummary, setRunSummary] = useState<string | null>(null);
   const [checkedAt, setCheckedAt] = useState<number | null>(null);
 
   const load = useCallback(async () => {
@@ -553,22 +525,65 @@ function SyncSection({ base }: { base: string }) {
 
   const notice = error === null ? null : describeSyncFailure(error.code, error.message, error.details);
 
+  const runNow = async () => {
+    setRunning(true);
+    setRunSummary(null);
+    try {
+      // Runtime 端点：POST /v1/sync/run（空 body = 全部已配对 peer）
+      const report = await api.syncRun(base);
+      if (report.peers.length === 0) {
+        setRunSummary("没有已配对的设备，无需同步。");
+      } else {
+        const failed = report.peers.filter((peer) => !peer.ok);
+        const summary = `已同步 ${report.totals.ok}/${report.totals.peers} 台设备：拉取 ${report.totals.pulled} 条，推送 ${report.totals.pushed} 条，重复 ${report.totals.duplicates} 条。`;
+        setRunSummary(
+          failed.length === 0
+            ? summary
+            : `${summary} 失败 ${failed.length} 台：${failed
+                .map((peer) => `${peer.peer_replica_id.slice(0, 8)}（${peer.errors.join("；") || "未知错误"}）`)
+                .join("，")}`,
+        );
+        setError(
+          failed.length === 0
+            ? null
+            : {
+                code: "sync_peer_failed",
+                message: failed.map((peer) => peer.errors.join("；")).join(" | "),
+                details: {},
+              },
+        );
+      }
+      await load();
+    } catch (err) {
+      if (err instanceof ApiError) {
+        setError({ code: err.code, message: err.message, details: err.details });
+      } else {
+        setError({ code: "unknown", message: err instanceof Error ? err.message : String(err), details: {} });
+      }
+    } finally {
+      setRunning(false);
+    }
+  };
+
   return (
     <section className="task-section device-section">
       <div className="section-head">
         <h4>同步状态</h4>
         <div className="sync-actions">
           {checkedAt !== null && <span className="hint-inline">状态查询于 {relative(new Date(checkedAt).toISOString())}</span>}
-          {/* Runtime（M3-T1/T4）只提供 pull/push 端点与状态查询，没有「立即同步一轮」的控制端点；
-              按票面允许，按钮退化为状态查询并明确标注，避免假装触发同步。 */}
-          <button className="btn" onClick={() => void load()} disabled={loading} title="Runtime 暂无手动同步端点，此按钮只重新查询状态">
+          <button className="btn" onClick={() => void load()} disabled={loading || running} title="重新查询同步状态">
             {loading ? "查询中…" : "刷新同步状态"}
+          </button>
+          <button className="btn primary" onClick={() => void runNow()} disabled={loading || running} title="对全部已配对设备执行一轮双向同步">
+            {running ? "同步中…" : "立即同步一轮"}
           </button>
         </div>
       </div>
       <p className="hint-inline">
-        同步由 Runtime 同步引擎在事件交换时推进；本页的「刷新同步状态」只读查询（Runtime 未提供手动同步循环端点）。
+        同步由 Runtime 同步引擎推进；「立即同步一轮」会调用 POST /v1/sync/run，对每个已配对 peer
+        执行 pull→push→push→pull。单台设备失败不会中断其他设备。
       </p>
+      {runSummary !== null && <p className="hint-inline">{runSummary}</p>}
       {notice !== null && (
         <div className={`sync-notice tone-${notice.tone}`}>
           <strong>{notice.title}</strong>
@@ -601,12 +616,12 @@ function SyncSection({ base }: { base: string }) {
             </div>
             <div className="sync-card" title={panel.pendingDownloadReason}>
               <span className="field-label">待下载</span>
-              <span>未知</span>
+              <span>{panel.pendingDownload === null ? "未知" : `${panel.pendingDownload} 条`}</span>
             </div>
           </div>
-          <p className="hint-inline">{panel.pendingDownloadReason}（因此只显示未知，不臆造数字）。</p>
+          <p className="hint-inline">{panel.pendingDownloadReason}</p>
           {panel.empty ? (
-            <p className="empty-note">还没有任何 peer 游标：从未与另一台设备同步过。</p>
+            <p className="empty-note">还没有已配对 peer：从未与另一台设备同步过。</p>
           ) : (
             <table className="cursor-table">
               <thead>
@@ -614,8 +629,9 @@ function SyncSection({ base }: { base: string }) {
                   <th>Peer 副本</th>
                   <th>已拉取</th>
                   <th>已确认</th>
-                  <th>待上传估算</th>
-                  <th>更新时间</th>
+                  <th>待上传</th>
+                  <th>待下载</th>
+                  <th>最后同步</th>
                 </tr>
               </thead>
               <tbody>
@@ -627,7 +643,8 @@ function SyncSection({ base }: { base: string }) {
                     <td className="mono">seq {cursor.pulled}</td>
                     <td className="mono">seq {cursor.acked}</td>
                     <td>{cursor.pendingUpload === null ? "未知" : `${cursor.pendingUpload} 条`}</td>
-                    <td>{relative(cursor.updatedAt)}</td>
+                    <td>{cursor.pendingDownload === null ? "未知" : `${cursor.pendingDownload} 条`}</td>
+                    <td>{cursor.lastSyncedAt === null ? relative(cursor.updatedAt) : relative(cursor.lastSyncedAt)}</td>
                   </tr>
                 ))}
               </tbody>

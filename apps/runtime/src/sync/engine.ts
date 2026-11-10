@@ -1,9 +1,13 @@
 import {
   computeIntegrityHash,
   type EventEnvelope,
+  type SyncCursorRecord,
   type SyncEnvelope,
+  type SyncPeerRunResult,
+  type SyncPeerStatus,
   type SyncPullBatch,
   type SyncPushOutcome,
+  type SyncRunReport,
   type SyncStatus,
 } from "@morrow/protocol";
 import { buildEventEnvelope } from "../envelope.ts";
@@ -35,6 +39,7 @@ export const SYNC_EVENT_TYPES = {
   merged: "sync.merged",
   conflict: "sync.conflict",
   fileConflict: "sync.file_conflict",
+  runCompleted: "sync.run_completed",
 } as const;
 
 export const SYNC_PULL_DEFAULT_LIMIT = 100;
@@ -56,6 +61,19 @@ export interface SyncEngineOptions {
    * runtime 注入 MemorySyncService.handleImported 做三方合并/投影重建。缺省不触发。
    */
   afterImport?: (envelopes: EventEnvelope[], peerReplicaId: string) => void;
+  /**
+   * 已配对 peer 的 replica_id 来源（M3 修复批 / Issue #35）：status 的 peers 与
+   * POST /v1/sync/run 的「全部已配对 peer」都从这里取。runtime 注入 devices 表中
+   * trusted 且未撤销的远端设备；缺省只用已有同步游标。
+   */
+  knownPeers?: () => string[];
+  /**
+   * 每个 peer 成功同步后回调（M3 修复批）：runtime 用它写 devices.last_sync_at。
+   * 只在 pull / push / 接收 push 成功后调用（失败不更新）。
+   */
+  onSynced?: (peerReplicaId: string, at: Date) => void;
+  /** 可注入时钟（last_synced_at 测试零真实等待）；缺省系统时间 */
+  now?: () => Date;
 }
 
 export interface PullOptions {
@@ -78,6 +96,9 @@ export class SyncEngine {
   readonly #cursors: SyncCursorStore;
   readonly #tombstones: TombstoneStore | undefined;
   readonly #afterImport: ((envelopes: EventEnvelope[], peerReplicaId: string) => void) | undefined;
+  readonly #knownPeers: (() => string[]) | undefined;
+  readonly #onSynced: ((peerReplicaId: string, at: Date) => void) | undefined;
+  readonly #now: () => Date;
   #transport: SyncTransport | undefined;
 
   constructor(options: SyncEngineOptions) {
@@ -87,6 +108,9 @@ export class SyncEngine {
     this.#transport = options.transport;
     this.#tombstones = options.tombstones;
     this.#afterImport = options.afterImport;
+    this.#knownPeers = options.knownPeers;
+    this.#onSynced = options.onSynced;
+    this.#now = options.now ?? (() => new Date());
     // 启动时从账本重建删除集合（本机历史删除 + 上次会话已导入的删除）
     this.#tombstones?.reconcileFromLedger(this.#ledger);
   }
@@ -120,24 +144,30 @@ export class SyncEngine {
    * 缺口或完整性校验失败时整批不落库、游标不推进，并落 sync.gap_detected 审计。
    */
   receivePush(peerReplicaId: string, envelopes: SyncEnvelope[]): SyncPushOutcome {
-    return this.#importEnvelopes(peerReplicaId, envelopes, "acked");
+    const outcome = this.#importEnvelopes(peerReplicaId, envelopes, "acked");
+    // 接收对端推送也是一次成功同步（空批也算——对端确实来沟通了）
+    this.#markSynced(peerReplicaId);
+    return outcome;
   }
 
   /** 从 peer 拉取一批（since = last_pulled_sequence 缺省）并导入 */
-  async pullFromPeer(peerReplicaId: string, options: PullOptions = {}): Promise<SyncPullBatch> {
+  async pullFromPeer(peerReplicaId: string, options: PullOptions = {}): Promise<SyncPullBatch & { accepted: number; duplicates: number }> {
     const transport = this.#requireTransport();
     const cursor = this.#cursors.getOrZero(peerReplicaId);
     const since = normalizeSince(options.since ?? cursor.last_pulled_sequence);
     const limit = normalizeLimit(options.limit);
     const result = await transport.pull(peerReplicaId, since, limit);
-    this.#importEnvelopes(peerReplicaId, result.envelopes, "pulled");
+    const outcome = this.#importEnvelopes(peerReplicaId, result.envelopes, "pulled");
     // 正常推进游标：以批内最后一条实际 sequence 为准（不盲信对端 nextSeq，避免跳过空洞）
     const lastSequence = result.envelopes.length > 0 ? result.envelopes[result.envelopes.length - 1].sequence : since;
     this.#cursors.advancePulled(peerReplicaId, lastSequence);
+    this.#markSynced(peerReplicaId);
     return {
       envelopes: result.envelopes,
       next_seq: result.nextSeq,
       has_more: result.hasMore,
+      accepted: outcome.accepted,
+      duplicates: outcome.duplicates,
     };
   }
 
@@ -147,22 +177,193 @@ export class SyncEngine {
     const acked = this.#cursors.getOrZero(peerReplicaId).last_acked_sequence;
     const batch = this.exportBatch(acked, normalizeLimit(options.limit));
     if (batch.envelopes.length === 0) {
+      this.#markSynced(peerReplicaId);
       return { accepted: 0, duplicates: 0, next_seq: acked };
     }
     const receipt = await transport.push(peerReplicaId, batch.envelopes);
     this.#cursors.advanceAcked(peerReplicaId, batch.next_seq);
+    this.#markSynced(peerReplicaId);
     // 出站侧不另落 sync.pushed：对端接收时必落一条（同一次动作的单侧审计），
     // 避免发送方审计事件反过来被下一次推送携带、形成审计自增殖。
     return { accepted: receipt.accepted, duplicates: receipt.duplicates, next_seq: batch.next_seq };
   }
 
-  /** GET /v1/sync/status：本副本 sequence 范围 + 各 peer 游标 */
+  /**
+   * GET /v1/sync/status 的本地快照（不发网络请求）：sequence 范围 + 游标 + peers
+   * （pending_download 未知 → null、unreachable=false）。HTTP 层缺省走 statusWithPeers。
+   */
   status(): SyncStatus {
+    const sequence = this.#ledger.sequenceRange();
+    const cursors = this.#cursors.list();
     return {
       replica_id: this.replicaId,
-      sequence: this.#ledger.sequenceRange(),
-      cursors: this.#cursors.list(),
+      sequence,
+      last_sync_at: latestSyncTime(cursors.map((cursor) => cursor.last_synced_at)),
+      cursors,
+      peers: this.#peerStatuses(cursors, sequence.max, false, []),
     };
+  }
+
+  /**
+   * GET /v1/sync/status 的完整快照（M3 修复批 / Issue #35）：向每个 peer 实时探测
+   * 对端账本上界以计算 pending_download；单个 peer 不可达只影响该 peer
+   * （pending_download=null + unreachable=true），绝不让整张状态表 5xx。
+   */
+  async statusWithPeers(): Promise<SyncStatus> {
+    const sequence = this.#ledger.sequenceRange();
+    const cursors = this.#cursors.list();
+    const peerIds = this.#peerIds(cursors);
+    const probes = await Promise.all(
+      peerIds.map(async (peerId) => {
+        if (this.#transport === undefined) return { peerId, probe: null };
+        try {
+          return { peerId, probe: await this.#transport.status(peerId) };
+        } catch {
+          return { peerId, probe: null };
+        }
+      }),
+    );
+    return {
+      replica_id: this.replicaId,
+      sequence,
+      last_sync_at: latestSyncTime(cursors.map((cursor) => cursor.last_synced_at)),
+      cursors,
+      peers: this.#peerStatuses(cursors, sequence.max, true, probes),
+    };
+  }
+
+  /**
+   * POST /v1/sync/run（M3 修复批 / Issue #35）：对给定或全部已配对 peer 执行一轮
+   * pull → push → push → pull（每步排空到底）。双向两轮确保一次调用后两端收敛：
+   *   1. pull 把对端事件带入本地；
+   *   2. push 把本地（含刚拉到的）事件推给对端；
+   *   3. 第二次 push 处理第 2 步期间对端新增事件被拉取前的增量；
+   *   4. 第二次 pull 收下 push 期间对端产生的审计/业务事件。
+   * 单 peer 失败（缺口/不可达/integrity）只记录到该 peer 的 errors，继续其他 peer。
+   */
+  async runOnce(peerReplicaId?: string): Promise<SyncRunReport> {
+    const requested = peerReplicaId ?? null;
+    const peerIds = requested === null ? this.#peerIds(this.#cursors.list()) : [requested];
+    const peers: SyncPeerRunResult[] = [];
+    for (const peerId of peerIds) {
+      peers.push(await this.#runPeerRound(peerId));
+    }
+    const totals = {
+      peers: peers.length,
+      ok: peers.filter((peer) => peer.ok).length,
+      failed: peers.filter((peer) => !peer.ok).length,
+      pulled: peers.reduce((sum, peer) => sum + peer.pulled, 0),
+      pushed: peers.reduce((sum, peer) => sum + peer.pushed, 0),
+      duplicates: peers.reduce((sum, peer) => sum + peer.duplicates, 0),
+      gaps: peers.reduce((sum, peer) => sum + peer.gaps, 0),
+    };
+    this.#audit(SYNC_EVENT_TYPES.runCompleted, {
+      requested_peer_replica_id: requested,
+      ...totals,
+      errors: peers.flatMap((peer) => peer.errors.map((error) => ({ peer_replica_id: peer.peer_replica_id, error }))),
+    });
+    return { requested_peer_replica_id: requested, peers, totals };
+  }
+
+  /** 单个 peer 的一轮；任何步骤失败即停止该 peer（不影响其他 peer） */
+  async #runPeerRound(peerId: string): Promise<SyncPeerRunResult> {
+    const result: SyncPeerRunResult = {
+      peer_replica_id: peerId,
+      pulled: 0,
+      pushed: 0,
+      duplicates: 0,
+      gaps: 0,
+      errors: [],
+      ok: true,
+    };
+    try {
+      for (const step of ["pull", "push", "push", "pull"] as const) {
+        if (step === "pull") await this.#drainPull(peerId, result);
+        else await this.#drainPush(peerId, result);
+      }
+    } catch (err) {
+      result.ok = false;
+      if (err instanceof SyncError && err.code === "sync_gap") result.gaps += 1;
+      result.errors.push(err instanceof Error ? err.message : String(err));
+    }
+    return result;
+  }
+
+  async #drainPull(peerId: string, result: SyncPeerRunResult): Promise<void> {
+    // 排空到底（limit 由引擎上限钳制）；254 页防御性上限避免对端异常导致死循环。
+    for (let page = 0; page < 254; page++) {
+      const batch = await this.pullFromPeer(peerId);
+      result.pulled += batch.accepted;
+      result.duplicates += batch.duplicates;
+      if (!batch.has_more) return;
+    }
+  }
+
+  async #drainPush(peerId: string, result: SyncPeerRunResult): Promise<void> {
+    for (let page = 0; page < 254; page++) {
+      const before = this.#cursors.getOrZero(peerId).last_acked_sequence;
+      const outcome = await this.pushToPeer(peerId);
+      result.pushed += outcome.accepted;
+      result.duplicates += outcome.duplicates;
+      if (outcome.next_seq === null || outcome.next_seq <= before) return;
+    }
+  }
+
+  /**
+   * peer 全集：注入了「已配对设备」来源时只用它（trusted 且未撤销——被撤销的 peer 不再
+   * 参与同步/状态）；未注入时（引擎单测）退回已有游标的 peer。去重保序。
+   */
+  #peerIds(cursors: SyncCursorRecord[]): string[] {
+    const source = this.#knownPeers?.() ?? cursors.map((cursor) => cursor.peer_replica_id);
+    const ids: string[] = [];
+    const seen = new Set<string>();
+    for (const id of source) {
+      if (id === this.replicaId || seen.has(id)) continue;
+      seen.add(id);
+      ids.push(id);
+    }
+    return ids;
+  }
+
+  #peerStatuses(
+    cursors: SyncCursorRecord[],
+    localMax: number | null,
+    probed: boolean,
+    probes: Array<{ peerId: string; probe: { max_sequence: number | null } | null }>,
+  ): SyncPeerStatus[] {
+    const probeById = new Map(probes.map((entry) => [entry.peerId, entry.probe]));
+    const cursorById = new Map(cursors.map((cursor) => [cursor.peer_replica_id, cursor]));
+    // 已配对但从未同步的 peer 也要出现在状态表（pending 从 0 游标算起）
+    const ids = this.#peerIds(cursors);
+    return ids.map((peerId) => {
+      const cursor = cursorById.get(peerId) ?? {
+        peer_replica_id: peerId,
+        last_pulled_sequence: 0,
+        last_acked_sequence: 0,
+        last_synced_at: null,
+        updated_at: null,
+      };
+      const probe = probeById.get(peerId) ?? null;
+      const remoteMax = probe?.max_sequence ?? null;
+      return {
+        peer_replica_id: peerId,
+        last_pulled_sequence: cursor.last_pulled_sequence,
+        last_acked_sequence: cursor.last_acked_sequence,
+        last_synced_at: cursor.last_synced_at,
+        // 口径：本副本账本最大 seq − 该 peer 已确认的 sequence（钳到 0）。
+        pending_upload: Math.max(0, (localMax ?? 0) - cursor.last_acked_sequence),
+        pending_download:
+          remoteMax === null ? null : Math.max(0, remoteMax - cursor.last_pulled_sequence),
+        unreachable: probed && probe === null,
+        remote_max_sequence: remoteMax,
+      };
+    });
+  }
+
+  #markSynced(peerReplicaId: string): void {
+    const at = this.#now();
+    this.#cursors.markSynced(peerReplicaId, at);
+    this.#onSynced?.(peerReplicaId, at);
   }
 
   #importEnvelopes(
@@ -372,4 +573,14 @@ function normalizeLimit(value: number | undefined): number {
 
 function normalizeSince(value: number): number {
   return Number.isInteger(value) && value > 0 ? value : 0;
+}
+
+/** 多个 ISO 时间取最大（null 跳过）；全空返回 null */
+function latestSyncTime(values: Array<string | null>): string | null {
+  let latest: string | null = null;
+  for (const value of values) {
+    if (value === null) continue;
+    if (latest === null || value > latest) latest = value;
+  }
+  return latest;
 }

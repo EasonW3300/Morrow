@@ -15,6 +15,7 @@ import {
   describeSyncFailure,
   diffLines,
   fingerprintCheck,
+  joinReview,
   mapSyncStatus,
   normalizeFingerprintInput,
   normalizePairingCodeInput,
@@ -104,18 +105,43 @@ test("pairingCountdown：显示剩余 mm:ss，过期后归零并提示重新生�
 const SYNC_STATUS: SyncStatus = {
   replica_id: "11111111-1111-4111-8111-111111111111",
   sequence: { min: 3, max: 42, count: 40 },
+  last_sync_at: "2026-11-10T09:30:00.000Z",
   cursors: [
     {
       peer_replica_id: "22222222-2222-4222-8222-222222222222",
       last_pulled_sequence: 9,
       last_acked_sequence: 30,
+      last_synced_at: "2026-11-10T09:00:00.000Z",
       updated_at: "2026-11-10T09:00:00.000Z",
     },
     {
       peer_replica_id: "33333333-3333-4333-8333-333333333333",
       last_pulled_sequence: 17,
       last_acked_sequence: 42,
+      last_synced_at: "2026-11-10T09:30:00.000Z",
       updated_at: "2026-11-10T09:30:00.000Z",
+    },
+  ],
+  peers: [
+    {
+      peer_replica_id: "22222222-2222-4222-8222-222222222222",
+      last_pulled_sequence: 9,
+      last_acked_sequence: 30,
+      last_synced_at: "2026-11-10T09:00:00.000Z",
+      pending_upload: 12,
+      pending_download: 5,
+      unreachable: false,
+      remote_max_sequence: 14,
+    },
+    {
+      peer_replica_id: "33333333-3333-4333-8333-333333333333",
+      last_pulled_sequence: 17,
+      last_acked_sequence: 42,
+      last_synced_at: "2026-11-10T09:30:00.000Z",
+      pending_upload: 0,
+      pending_download: 0,
+      unreachable: false,
+      remote_max_sequence: 17,
     },
   ],
 };
@@ -134,23 +160,61 @@ test("mapSyncStatus：本副本 seq 范围/条数、各 peer 游标、最后同�
   assert.equal(view.empty, false);
 });
 
-test("mapSyncStatus：待上传按 本地 seq 上界 − 已确认 估算（钳到 0 并合计），待下载因缺对端状态标未知", () => {
+test("mapSyncStatus：待上传/待下载直接消费 Runtime peers 字段（钳到 0 并合计）", () => {
   const view = mapSyncStatus(SYNC_STATUS, Date.parse("2026-11-10T10:00:00.000Z"));
-  assert.equal(view.cursors[0].pendingUpload, 12); // 42 - 30
-  assert.equal(view.cursors[1].pendingUpload, 0); // 42 - 42
+  assert.equal(view.cursors[0].pendingUpload, 12);
+  assert.equal(view.cursors[1].pendingUpload, 0);
   assert.equal(view.pendingUpload, 12);
+  assert.equal(view.cursors[0].pendingDownload, 5);
+  assert.equal(view.cursors[1].pendingDownload, 0);
+  assert.equal(view.pendingDownload, 5);
+  assert.match(view.pendingDownloadReason, /待下载合计/);
+  assert.equal(view.cursors[0].lastSyncedAt, "2026-11-10T09:00:00.000Z");
+});
+
+test("mapSyncStatus：旧状态缺 peers 时回退估算，待下载标未知（不臆造 0）", () => {
+  const legacy = {
+    ...SYNC_STATUS,
+    peers: [],
+  } satisfies SyncStatus;
+  const view = mapSyncStatus(legacy, Date.parse("2026-11-10T10:00:00.000Z"));
+  assert.equal(view.cursors[0].pendingUpload, 12, "回退到本地 max − acked");
   assert.equal(view.pendingDownload, null);
-  assert.match(view.pendingDownloadReason, /对端/);
+  assert.match(view.pendingDownloadReason, /未提供对端账本上界/);
+});
+
+test("mapSyncStatus：对端不可达时待下载为未知并给出原因", () => {
+  const unreachable: SyncStatus = {
+    ...SYNC_STATUS,
+    peers: SYNC_STATUS.peers.map((peer) => ({
+      ...peer,
+      pending_download: null,
+      unreachable: true,
+      remote_max_sequence: null,
+    })),
+  };
+  const view = mapSyncStatus(unreachable, Date.parse("2026-11-10T10:00:00.000Z"));
+  assert.equal(view.pendingDownload, null);
+  assert.match(view.pendingDownloadReason, /不可达/);
+  assert.equal(view.cursors[0].pendingDownload, null);
+  assert.equal(view.cursors[0].unreachable, true);
 });
 
 test("mapSyncStatus：无游标（从未同步）时估算为未知、状态面板给出空态", () => {
   const empty = mapSyncStatus(
-    { replica_id: "11111111-1111-4111-8111-111111111111", sequence: { min: null, max: null, count: 0 }, cursors: [] },
+    {
+      replica_id: "11111111-1111-4111-8111-111111111111",
+      sequence: { min: null, max: null, count: 0 },
+      last_sync_at: null,
+      cursors: [],
+      peers: [],
+    },
     Date.parse("2026-11-10T10:00:00.000Z"),
   );
   assert.equal(empty.empty, true);
   assert.equal(empty.seqRangeLabel, "空账本");
   assert.equal(empty.pendingUpload, null);
+  assert.equal(empty.pendingDownload, null);
   assert.equal(empty.lastSyncedAt, null);
   assert.equal(empty.lastSyncedLabel, "从未同步");
 });
@@ -162,7 +226,9 @@ test("lastSyncedLabel：分钟/小时/天与绝对时间分档（无游标时间
       {
         replica_id: "11111111-1111-4111-8111-111111111111",
         sequence: { min: 1, max: 1, count: 1 },
-        cursors: [{ peer_replica_id: "22222222-2222-4222-8222-222222222222", last_pulled_sequence: 1, last_acked_sequence: 1, updated_at: iso }],
+        last_sync_at: null,
+        cursors: [{ peer_replica_id: "22222222-2222-4222-8222-222222222222", last_pulled_sequence: 1, last_acked_sequence: 1, last_synced_at: null, updated_at: iso }],
+        peers: [],
       },
       now,
       [device({ replica_id: "22222222-2222-4222-8222-222222222222", last_sync_at: lastSync })],
@@ -176,7 +242,9 @@ test("lastSyncedLabel：分钟/小时/天与绝对时间分档（无游标时间
     {
       replica_id: "11111111-1111-4111-8111-111111111111",
       sequence: { min: 1, max: 1, count: 1 },
-      cursors: [{ peer_replica_id: "22222222-2222-4222-8222-222222222222", last_pulled_sequence: 1, last_acked_sequence: 1, updated_at: "2026-11-10T09:00:00.000Z" }],
+      last_sync_at: null,
+      cursors: [{ peer_replica_id: "22222222-2222-4222-8222-222222222222", last_pulled_sequence: 1, last_acked_sequence: 1, last_synced_at: null, updated_at: "2026-11-10T09:00:00.000Z" }],
+      peers: [],
     },
     now,
     [device({ replica_id: "22222222-2222-4222-8222-222222222222", last_sync_at: "2026-11-10T11:30:00.000Z" })],
@@ -321,6 +389,37 @@ test("claimReview：claim 响应双方指纹 + 期望指纹比对结论（不一
   assert.equal(review.rejectAdvice, null);
 
   const mismatch = claimReview(response, "0000-0000-0000-0000");
+  assert.equal(mismatch.matchesExpected, false);
+  assert.match(mismatch.rejectAdvice ?? "", /撤销/);
+});
+
+test("joinReview：宿主侧 join 响应只展示对端指纹（不含 token）并核对期望值", () => {
+  const response = {
+    device: {
+      replica_id: "11111111-1111-4111-8111-111111111111",
+      label: "书房服务器",
+      public_key: "pk",
+      fingerprint: "5678ef995678ef99",
+      fingerprint_short: "5678-EF99-5678-EF99",
+      created_at: "2026-11-10T09:00:00.000Z",
+      last_seen_at: "2026-11-10T10:00:00.000Z",
+      last_sync_at: null,
+      paired_at: "2026-11-10T10:00:00.000Z",
+      trusted: true,
+      revoked: false,
+      revoked_at: null,
+    },
+    server_fingerprint: "5678ef995678ef99",
+    server_fingerprint_short: "5678-EF99-5678-EF99",
+  };
+  const ok = joinReview(response, "5678-ef99-5678-ef99");
+  assert.equal(ok.serverShort, "5678-EF99-5678-EF99");
+  assert.equal(ok.deviceLabel, "书房服务器");
+  assert.equal(ok.matchesExpected, true);
+  assert.equal(ok.rejectAdvice, null);
+  assert.equal(JSON.stringify(ok).includes("token"), false, "review 视图不包含 token");
+
+  const mismatch = joinReview(response, "0000-0000-0000-0000");
   assert.equal(mismatch.matchesExpected, false);
   assert.match(mismatch.rejectAdvice ?? "", /撤销/);
 });

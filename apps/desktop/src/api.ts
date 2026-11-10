@@ -13,8 +13,11 @@ import type {
   PairingClaimRequest,
   PairingClaimResponse,
   PairingCodeResponse,
+  PairingJoinRequest,
+  PairingJoinResponse,
   PermissionGrant,
   ProviderRecord,
+  SyncRunReport,
   SyncStatus,
   TaskDetail,
   TaskExecutionState,
@@ -29,8 +32,11 @@ export type {
   PairingClaimRequest,
   PairingClaimResponse,
   PairingCodeResponse,
+  PairingJoinRequest,
+  PairingJoinResponse,
   PermissionGrant,
   ProviderRecord,
+  SyncRunReport,
   SyncStatus,
   TaskDetail,
   TaskExecutionState,
@@ -545,6 +551,18 @@ export const api = {
     });
   },
 
+  /**
+   * POST /v1/pairing/join：让**本机 Runtime** 作为新设备加入 `base_url` 对端。
+   * token 由 Runtime 写本机 OS 凭据库，浏览器全程不接触。
+   */
+  joinPairing(base: string, body: PairingJoinRequest): Promise<PairingJoinResponse> {
+    return request<PairingJoinResponse>(base, "/v1/pairing/join", {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify(body),
+    });
+  },
+
   /** DELETE /v1/devices/:id：撤销（revoked=1 + 清鉴权能力，保留审计墓碑） */
   revokeDevice(base: string, deviceId: string): Promise<{ device: DeviceInfo; changed: boolean }> {
     return request<{ device: DeviceInfo; changed: boolean }>(
@@ -554,9 +572,18 @@ export const api = {
     );
   },
 
-  /** GET /v1/sync/status：本副本 sequence 范围 + 各 peer 游标（无待上传/下载字段） */
+  /** GET /v1/sync/status：本副本 sequence + 各 peer 游标/待上传/待下载/最后同步 */
   syncStatus(base: string): Promise<SyncStatus> {
     return request<SyncStatus>(base, "/v1/sync/status");
+  },
+
+  /** POST /v1/sync/run：立即同步一轮（可指定单个 peer；缺省全部已配对） */
+  syncRun(base: string, peerReplicaId?: string): Promise<SyncRunReport> {
+    return request<SyncRunReport>(base, "/v1/sync/run", {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify(peerReplicaId === undefined ? {} : { peer_replica_id: peerReplicaId }),
+    });
   },
 
   /** GET /v1/sync/conflicts?status=：跨设备冲突汇总（复用 M1 冲突队列） */

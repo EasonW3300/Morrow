@@ -22,6 +22,8 @@ export type {
   PairingClaimRequest,
   PairingClaimResponse,
   PairingCodeResponse,
+  PairingJoinRequest,
+  PairingJoinResponse,
   MemoryEntryKind,
   MemoryWriteInput,
   ProviderCompatConfig,
@@ -51,9 +53,13 @@ export type {
   SyncCursorRecord,
   SyncEnvelope,
   SyncGapDetails,
+  SyncPeerRunResult,
+  SyncPeerStatus,
   SyncPullBatch,
   SyncPushOutcome,
   SyncPushRequest,
+  SyncRunReport,
+  SyncRunRequest,
   SyncStatus,
 } from "./sync-contracts.ts";
 export type {

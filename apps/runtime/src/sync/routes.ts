@@ -11,7 +11,11 @@ import { listSyncConflicts } from "./memory-sync.ts";
 /**
  * 同步控制面路由（M3-T1 / Issue #30，PRD §4.6 FR-DEP-3 / §6.2；M3-T3 冲突汇总）：
  *
- *   GET  /v1/sync/status                       本副本 sequence 范围 + 各 peer 游标
+ *   GET  /v1/sync/status                       本副本 sequence 范围 + 各 peer 游标/待同步量；
+ *                                              缺省实时探测对端上界（?probe=local 只回本地
+ *                                              快照，供传输层探测避免相互递归）
+ *   POST /v1/sync/run                          body 可选 { peer_replica_id? }——立即对给定/
+ *                                              全部已配对 peer 执行一轮双向同步（M3 修复批）
  *   GET  /v1/sync/pull?since=<seq>&limit=      按本副本账本 sequence 升序导出 SyncEnvelope
  *                                              批次（默认 100，上限 1000；截断 has_more）
  *   POST /v1/sync/push                         body { peer_replica_id, envelopes[] }——
@@ -48,19 +52,53 @@ export interface SyncRoute {
 
 export const syncRoutes: SyncRoute[] = [
   { method: "GET", re: /^\/v1\/sync\/status$/, handler: handleStatus },
+  { method: "POST", re: /^\/v1\/sync\/run$/, handler: handleSyncRun },
   { method: "GET", re: /^\/v1\/sync\/pull$/, handler: handlePull },
   { method: "POST", re: /^\/v1\/sync\/push$/, handler: handlePush },
   { method: "GET", re: /^\/v1\/sync\/conflicts$/, handler: handleSyncConflicts },
   { method: "POST", re: /^\/v1\/sync\/conflicts\/([^/]+)\/resolve$/, handler: handleSyncResolveConflict },
 ];
 
-function handleStatus(
+async function handleStatus(
   _req: IncomingMessage,
+  res: ServerResponse,
+  url: URL,
+  ctx: SyncRouteContext,
+): Promise<void> {
+  // ?probe=local：只回本地快照（不发对端探测请求）。传输层 status() 用它取对端账本
+  // 上界；若对端也缺省探测 peer，会形成 A→B→A 的递归查询。
+  if (url.searchParams.get("probe") === "local") {
+    sendJson(res, 200, ctx.sync.status());
+    return;
+  }
+  sendJson(res, 200, await ctx.sync.statusWithPeers());
+}
+
+async function handleSyncRun(
+  req: IncomingMessage,
   res: ServerResponse,
   _url: URL,
   ctx: SyncRouteContext,
-): void {
-  sendJson(res, 200, ctx.sync.status());
+): Promise<void> {
+  // body 可选：无 body（未带 content-type）时跑全部已配对 peer；带 body 时必须是 JSON
+  // 对象（readJsonBody 同时守住 CSRF 的 content-type 防线）。
+  let body: Record<string, unknown> = {};
+  if (req.headers["content-type"] !== undefined) {
+    const parsed = await readJsonBody(req, res);
+    if (parsed === null) return;
+    body = parsed;
+  }
+  const peer = body.peer_replica_id;
+  if (peer !== undefined && (typeof peer !== "string" || !UUID_RE.test(peer))) {
+    sendErrorWithCode(res, 400, "invalid_body", "peer_replica_id must be a lowercase uuid when present");
+    return;
+  }
+  try {
+    const report = await ctx.sync.runOnce(typeof peer === "string" ? peer : undefined);
+    sendJson(res, 200, report);
+  } catch (err) {
+    if (!sendSyncError(res, err)) throw err;
+  }
 }
 
 function handlePull(
