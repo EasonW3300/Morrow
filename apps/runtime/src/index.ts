@@ -14,7 +14,7 @@ export type {  IntegrityMismatch,
 } from "./ledger.ts";
 export { startRuntime } from "./runtime.ts";
 export { DeviceRegistry } from "./devices.ts";
-export type { DeviceRecord } from "./devices.ts";
+export type { DeviceRecord, MarkPairedInput } from "./devices.ts";
 export {
   SyncEngine,
   SYNC_EVENT_TYPES,
@@ -37,6 +37,31 @@ export { HttpSyncTransport } from "./sync/http-transport.ts";
 export type { HttpSyncTransportOptions } from "./sync/http-transport.ts";
 export { syncRoutes } from "./sync/routes.ts";
 export type { SyncRoute, SyncRouteContext } from "./sync/routes.ts";
+// 设备配对与身份（M3-T2 / Issue #31，ADR-0008）
+export { DeviceIdentity } from "./pairing/identity.ts";
+export type { DeviceIdentityOptions } from "./pairing/identity.ts";
+export { PairingService, PairingError, DEVICE_EVENT_TYPES } from "./pairing/service.ts";
+export type { PairingServiceOptions, PairingErrorCode, ClaimInput, ClaimResult } from "./pairing/service.ts";
+export { PairingStore } from "./pairing/store.ts";
+export { authorizeRequest, extractBearerToken, isLoopbackAddress } from "./pairing/auth.ts";
+export type { AuthorizationDecision, AuthorizationInput } from "./pairing/auth.ts";
+export { pairingRoutes } from "./pairing/routes.ts";
+export {
+  DEVICE_KEY_SERVICE,
+  derivePublicKey,
+  deviceKeyAccount,
+  deviceTokenAccount,
+  fingerprintFromPublicKey,
+  formatFingerprint,
+  generateBearerToken,
+  generateDeviceKeyPair,
+  generatePairingCode,
+  hashPairingCode,
+  hashToken,
+  normalizeFingerprint,
+  parseDevicePublicKey,
+} from "./pairing/crypto.ts";
+export type { DeviceKeyPair } from "./pairing/crypto.ts";
 export type { RuntimeHandle, RuntimeOptions } from "./runtime.ts";
 export { loadConfig, defaultDataDir, resolveReplicaId, parseProviderConfig } from "./config.ts";
 export type { RuntimeConfig, ProviderConfig } from "./config.ts";

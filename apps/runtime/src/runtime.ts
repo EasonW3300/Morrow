@@ -17,6 +17,10 @@ import type { RuntimeConfig } from "./config.ts";
 import { testProviderConnectivity } from "./connectivity.ts";
 import { DeviceRegistry, type DeviceRecord } from "./devices.ts";
 import { detectSecretStore, type SecretStore } from "./keyring.ts";
+import { DeviceIdentity } from "./pairing/identity.ts";
+import { PairingService } from "./pairing/service.ts";
+import { authorizeRequest } from "./pairing/auth.ts";
+import { pairingRoutes } from "./pairing/routes.ts";
 import { probeSandbox } from "./health.ts";
 import { EventLedger } from "./ledger.ts";
 import { MemoryService } from "./memory/service.ts";
@@ -91,6 +95,8 @@ interface RequestContext {
   sessions: SessionManager;
   providers: ProviderRegistry;
   devices: DeviceRegistry;
+  /** 设备配对服务（M3-T2 / Issue #31：配对码 / claim / 撤销 / token 校验） */
+  pairing: PairingService;
   tasks: TaskService;
   /** 任务调度器（POST /v1/tasks 规划成功后的后台触发点；生命周期归 startRuntime） */
   scheduler: TaskScheduler;
@@ -192,14 +198,21 @@ export interface RuntimeOptions {
    * 交换事件。HTTP 端点（/v1/sync/*）不依赖它。测试注入 InMemorySyncTransport（零网络）。
    */
   syncTransport?: SyncTransport;
+  /**
+   * 配对时钟注入 seam（M3-T2 / Issue #31）：配对码 5 分钟 TTL 与撤销时间可被测试
+   * 拨快，避免真实等待。缺省系统时间。
+   */
+  pairingNow?: () => Date;
 }
 
 export interface RuntimeHandle {
   host: string;
   port: number;
   ledger: EventLedger;
-  /** Device 记录注册表（票 #3 最小实现；库形态可直用） */
+  /** Device 记录注册表（票 #3 最小实现；M3-T2 扩展为设备注册表） */
   devices: DeviceRegistry;
+  /** 设备配对服务（M3-T2 / Issue #31：码生成/claim/撤销/token 校验，库形态可直用） */
+  pairing: PairingService;
   /** 会话管理器（库形态可直用：abort / 订阅等测试与宿主 seam） */
   sessions: SessionManager;
   /** 记忆服务（票 M1-T1 / Issue #13：候选写入 + FTS 检索，库形态可直用） */
@@ -233,6 +246,9 @@ export interface RuntimeHandle {
 const routes: Route[] = [
   { method: "GET", re: /^\/v1\/health$/, handler: handleHealth },
   { method: "GET", re: /^\/v1\/devices$/, handler: handleListDevices },
+  // M3-T2 配对与设备管理（POST /v1/pairing/codes、POST /v1/pairing/claim、
+  // DELETE /v1/devices/:id）——鉴权中间层见 routeRequest + ADR-0008。
+  ...pairingRoutes,
   { method: "GET", re: /^\/v1\/events$/, handler: handleEvents },
   { method: "GET", re: /^\/v1\/providers$/, handler: handleListProviders },
   { method: "POST", re: /^\/v1\/providers$/, handler: handleRegisterProvider },
@@ -286,8 +302,8 @@ const routes: Route[] = [
 
 export async function startRuntime(config: RuntimeConfig, options: RuntimeOptions = {}): Promise<RuntimeHandle> {
   const ledger = EventLedger.open(config.dataDir);
-  // Device 记录（票 #3 的 M0 最小实现）：启动时从 replica-id 演化出的 config.replicaId 种子；
-  // 不做配对/撤销（M3 范围）
+  // Device 记录（票 #3 的 M0 最小实现 → M3-T2 设备注册表）：启动时从 replica-id
+  // 演化出的 config.replicaId 种子本机行；配对/撤销见下 pairing。
   const devices = DeviceRegistry.open(config.dataDir);
   devices.touch(config.replicaId);
   // 同步引擎（M3-T1 / Issue #30）：游标表与账本同库；出站传输可经 RuntimeOptions 注入
@@ -298,6 +314,23 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     replicaId: config.replicaId,
     cursors: syncCursors,
     ...(options.syncTransport === undefined ? {} : { transport: options.syncTransport }),
+  });
+  // 设备身份与配对（M3-T2 / Issue #31）：私钥惰性生成进 OS 凭据库（service
+  // com.morrow.device + replica_id）——纯本地回环部署不触碰钥匙串；首次配对才供给。
+  const secretStore = options.secretStore ?? detectSecretStore().store;
+  const deviceIdentity = new DeviceIdentity({
+    replicaId: config.replicaId,
+    secretStore,
+    devices,
+    ...(options.pairingNow !== undefined ? { now: options.pairingNow } : {}),
+  });
+  const pairing = new PairingService({
+    dataDir: config.dataDir,
+    replicaId: config.replicaId,
+    devices,
+    identity: deviceIdentity,
+    ledger,
+    ...(options.pairingNow !== undefined ? { now: options.pairingNow } : {}),
   });
   // 能力注册表（票 M2-T1 / Issue #22）：会话工具注入改查注册表（disable 即不再注入）；
   // builtin 工具的 ensure-registered 在 runtime.started 之后执行（审计顺序：进程启动 →
@@ -314,7 +347,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
   });
   const providers = new ProviderRegistry({
     dataDir: config.dataDir,
-    secretStore: options.secretStore ?? detectSecretStore().store,
+    secretStore,
     envFallback: config.provider,
   });
   // 记忆存储（票 M1-T1 / Issue #13）：与账本同库；候选即时写入 + FTS5 检索。
@@ -553,7 +586,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     memorySearch: (query) => memory.search(query).map((hit) => ({ content: hit.content, entry_kind: hit.stage })),
     workspaceRoot,
   });
-  const ctx: RequestContext = { ledger, replicaId: config.replicaId, sessions, providers, devices, tasks, scheduler, checkpoints, memory, projector, capabilities, sandbox, factory, skills, sync };
+  const ctx: RequestContext = { ledger, replicaId: config.replicaId, sessions, providers, devices, pairing, tasks, scheduler, checkpoints, memory, projector, capabilities, sandbox, factory, skills, sync };
   const server = createServer((req, res) => {
     routeRequest(req, res, ctx);
   });
@@ -569,6 +602,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     capabilities.close();
     memoryStore.close();
     syncCursors.close();
+    pairing.close();
     devices.close();
     ledger.close();
     throw err;
@@ -606,6 +640,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     sessions,
     providers,
     devices,
+    pairing,
     tasks,
     checkpoints,
     memory,
@@ -643,6 +678,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
       } catch (err) {
         console.error("[morrow] failed to append runtime.stopped:", err);
       }
+      pairing.close();
       devices.close();
       memoryStore.close();
       syncCursors.close();
@@ -732,7 +768,7 @@ function routeRequest(req: IncomingMessage, res: ServerResponse, ctx: RequestCon
   if (typeof origin === "string" && isLocalOrigin(origin)) {
     res.setHeader("access-control-allow-origin", origin);
     res.setHeader("vary", "origin");
-    res.setHeader("access-control-allow-headers", "content-type, last-event-id");
+    res.setHeader("access-control-allow-headers", "content-type, last-event-id, authorization");
     // PUT/DELETE：设置 UI 的 Provider 编辑/删除（票 T7 / Issue #8）——跨源 WebView 需在白名单内
     res.setHeader("access-control-allow-methods", "GET, POST, PUT, DELETE, OPTIONS");
   }
@@ -751,6 +787,23 @@ function routeRequest(req: IncomingMessage, res: ServerResponse, ctx: RequestCon
   }
   const pathname = url.pathname.replace(/\/+$/, "") || "/";
   const method = (req.method ?? "GET").toUpperCase();
+
+  // 请求鉴权（M3-T2 / Issue #31，ADR-0008）：回环豁免；非回环必须 bearer token，
+  // 唯一例外是 POST /v1/pairing/claim（新设备尚无令牌，配对码本身是凭据）。
+  // 鉴权先于路由匹配——未认证请求不会因 404/405 泄露路由面。
+  const authorization = authorizeRequest(
+    {
+      remoteAddress: req.socket.remoteAddress,
+      method,
+      pathname,
+      authorization: typeof req.headers.authorization === "string" ? req.headers.authorization : undefined,
+    },
+    ctx.pairing,
+  );
+  if (authorization.kind === "deny") {
+    sendError(res, authorization.status, authorization.code, authorization.message);
+    return;
+  }
 
   const pathMatches = routes.filter((route) => route.re.test(pathname));
   if (pathMatches.length === 0) {
