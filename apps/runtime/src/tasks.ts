@@ -16,6 +16,11 @@ import { DB_FILE_NAME, type EventLedger, type LedgerPage } from "./ledger.ts";
 import type { ProviderResolver } from "./providers.ts";
 import { ensureTaskTables } from "./task-migrations.ts";
 import { openSqlite, type SqliteDatabase, type SqliteStatement } from "./db.ts";
+import {
+  rebuildTaskProjection,
+  type TaskProjectionSnapshot,
+  type TaskRebuildResult,
+} from "./task-rebuild.ts";
 import { uuidv7 } from "./uuid-v7.ts";
 
 /**
@@ -650,6 +655,10 @@ export class TaskStore {
   #maxNodeSeqStmt;
   #insertEdgeStmt;
   #edgesOfStmt;
+  // 投影重建（M3 修复批 / #32 #36）：整体替换三张投影表（事务内）
+  #replaceDeleteTasksStmt;
+  #replaceInsertTaskStmt;
+  #replaceInsertNodeStmt;
 
   constructor(db: SqliteDatabase) {
     this.#db = db;
@@ -703,6 +712,15 @@ export class TaskStore {
       "INSERT INTO task_edges (edge_id, task_id, from_node, to_node) VALUES (?, ?, ?, ?)",
     );
     this.#edgesOfStmt = db.prepare("SELECT * FROM task_edges WHERE task_id = ? ORDER BY rowid");
+    this.#replaceDeleteTasksStmt = db.prepare("DELETE FROM tasks");
+    this.#replaceInsertTaskStmt = db.prepare(
+      "INSERT INTO tasks (task_id, goal, status, task_version, session_id, error, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    );
+    this.#replaceInsertNodeStmt = db.prepare(
+      `INSERT INTO task_nodes
+        (node_id, task_id, node_key, title, goal, agent_role, model, retriable, side_effect, status, actor, resources, attempts, result, error, node_seq, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    );
   }
 
   insertTask(row: { taskId: string; goal: string; sessionId?: string; now: string }): void {
@@ -839,6 +857,64 @@ export class TaskStore {
 
   edgesOf(taskId: string): EdgeRow[] {
     return this.#edgesOfStmt.all(taskId) as unknown as EdgeRow[];
+  }
+
+  /**
+   * 任务投影整体替换（M3 修复批 / #32 #36）：rebuildTaskProjection 的唯一落库接缝。
+   * 单事务内清空 tasks/task_nodes/task_edges 后按快照重写——投影是账本的纯派生物，
+   * 整体替换保证「重建幂等」（同一账本重复重建得到同一行集）。
+   */
+  replaceTaskProjection(snapshot: TaskProjectionSnapshot): void {
+    const insertEdge = this.#db.prepare(
+      "INSERT INTO task_edges (edge_id, task_id, from_node, to_node) VALUES (?, ?, ?, ?)",
+    );
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      this.#db.exec("DELETE FROM task_edges");
+      this.#db.exec("DELETE FROM task_nodes");
+      this.#replaceDeleteTasksStmt.run();
+      for (const task of snapshot.tasks) {
+        this.#replaceInsertTaskStmt.run(
+          task.task_id,
+          task.goal,
+          task.status,
+          task.task_version,
+          task.session_id,
+          task.error,
+          task.created_at,
+          task.updated_at,
+        );
+      }
+      for (const node of snapshot.nodes) {
+        this.#replaceInsertNodeStmt.run(
+          node.node_id,
+          node.task_id,
+          node.node_key,
+          node.title,
+          node.goal,
+          node.agent_role,
+          node.model,
+          node.retriable,
+          node.side_effect,
+          node.status,
+          node.actor,
+          node.resources,
+          node.attempts,
+          node.result,
+          node.error,
+          node.node_seq,
+          node.created_at,
+          node.updated_at,
+        );
+      }
+      for (const edge of snapshot.edges) {
+        insertEdge.run(edge.edge_id, edge.task_id, edge.from_node, edge.to_node);
+      }
+      this.#db.exec("COMMIT");
+    } catch (err) {
+      this.#db.exec("ROLLBACK");
+      throw err;
+    }
   }
 
   /** 节点行更新（调度器窄接缝：认领 = running+attempts；收尾 = 终态+结果/错误） */
@@ -1048,6 +1124,20 @@ export class TaskService {
 
   listTasks(sessionId?: string): TaskSummary[] {
     return this.#store.listTasks(sessionId).map((row) => this.#summaryOf(row));
+  }
+
+  /**
+   * 任务投影重建（M3 修复批 / #32 #36）：从账本按序重放 task.* 事件，整体替换
+   * tasks/task_nodes/task_edges。同步导入批次末尾与「空表 + 账本有任务事件」的启动
+   * 补建都走这里；只写投影，不触发调度器（不自动接管同步来的未完成任务）。
+   */
+  rebuildProjection(): TaskRebuildResult {
+    return rebuildTaskProjection({ store: this.#store, ledger: this.ledger });
+  }
+
+  /** 投影是否为空（启动补建判定；不扫描账本） */
+  get projectionEmpty(): boolean {
+    return this.#store.listTasks().length === 0;
   }
 
   /**
@@ -1290,10 +1380,15 @@ export class TaskService {
       added_keys: plan.add.map((a) => a.key),
       removed_keys: plan.removedKeys,
     };
+    // 修订后的 DAG 全量投影入 payload（M3 修复批）：投影重建不再需要猜测新增节点
+    // 的 node_id / node_seq——事件本身携带权威快照。
+    const revisedNodeRows = this.#store.nodesOf(taskId);
+    const revisedEdgeRows = this.#store.edgesOf(taskId);
     const revised = this.#appendTaskEvent(taskId, TASK_EVENT_TYPES.taskRevised, "owner", {
       task_version: taskVersion,
       summary,
       changes: { update: plan.update, add: plan.add, remove: plan.removedKeys },
+      nodes: revisedNodeRows.map((node) => this.#nodeProjection(node, revisedNodeRows, revisedEdgeRows)),
     }, null);
 
     let rolledBack = false;
@@ -1570,11 +1665,15 @@ export class TaskService {
     this.#store.updateTaskStatus(taskId, to, options.error ?? null, new Date().toISOString());
     const eventType =
       to === "running" && from !== "planned" ? TASK_EVENT_TYPES.taskResumed : STATUS_EVENT_TYPES[to];
+    // 失败原因同时进事件 payload（error 列可经账本重建；旧账本缺省回退 message）
+    const payload = options.error === undefined
+      ? options.payload ?? {}
+      : { ...(options.payload ?? {}), error: options.error };
     const envelope = this.#appendTaskEvent(
       taskId,
       eventType,
       options.actorId ?? "agent:runtime",
-      options.payload ?? {},
+      payload,
       options.causeEventId ?? null,
     );
     const updated = this.#store.getTask(taskId) as TaskRow;

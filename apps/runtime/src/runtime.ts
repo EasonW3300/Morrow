@@ -38,6 +38,7 @@ import { SyncConflictStore } from "./sync/conflict-store.ts";
 import { MemorySyncService } from "./sync/memory-sync.ts";
 import { SyncFileMerger } from "./sync/files.ts";
 import { MemoryProjectionRebuilder } from "./memory/rebuild.ts";
+import { TaskProjectionRebuilder } from "./task-rebuild.ts";
 import { ProviderRegistry, ProviderRegistryError, ENV_PROVIDER_ID, type ProviderResolver, type ResolvedProvider } from "./providers.ts";
 import { SessionManager, type AgentRuntimeExtras, type SessionFrame } from "./sessions.ts";
 import { TaskScheduler, type NodeAgentFactory, type TaskNodeExecInput } from "./scheduler.ts";
@@ -268,6 +269,8 @@ export interface RuntimeHandle {
   syncFiles: SyncFileMerger;
   /** 记忆投影重建器（M3-T3：rebuild / check） */
   memoryRebuilder: MemoryProjectionRebuilder;
+  /** 任务投影重建器（M3 修复批 / #32 #36：从账本重放 task.* 事件；只写投影） */
+  taskRebuilder: TaskProjectionRebuilder;
   /** 执行租约（M3-T4 / Issue #33：acquire/renew/release/validate/current，库形态可直用） */
   leases: LeaseStore;
   /**
@@ -444,7 +447,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
   // 记忆同步语义层（M3-T3 / Issue #32）：三方合并 + 冲突入 M1 队列 + 投影重建。
   // 晚绑定到 sync.afterImport：T1 引擎在每批导入落账后调用。
   const syncConflicts = SyncConflictStore.open(config.dataDir);
-  const memoryRebuilder = new MemoryProjectionRebuilder({ store: memoryStore, ledger });
+  const memoryRebuilder = new MemoryProjectionRebuilder({ store: memoryStore, ledger, replicaId: config.replicaId });
   const syncMemory = new MemorySyncService({
     store: memoryStore,
     ledger,
@@ -454,6 +457,15 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
   const syncFiles = new SyncFileMerger({ dataDir: config.dataDir, ledger, replicaId: config.replicaId });
   afterSyncImport = (envelopes, peerReplicaId) => {
     syncMemory.handleImported(envelopes, peerReplicaId);
+    // 任务投影随同步重建（M3 修复批 / #32 #36）：只重建可见投影，不触发调度器——
+    // 对端任务只读可见，执行权仍由本地租约与 needs_reconcile 语义决定。
+    if (envelopes.some((envelope) => envelope.event_type.startsWith("task."))) {
+      try {
+        taskRebuilder.rebuild();
+      } catch (err) {
+        console.error("[morrow] task projection rebuild after sync import failed:", err);
+      }
+    }
   };
   // 新副本首次启动（账本已从 peer 导入事实事件、记忆表尚空）→ 重建一次投影。
   // 取舍：不无条件全量重建（O(账本) 且重置 FTS）；只在明确的「空表 + 有事实事件」下补建。
@@ -617,6 +629,20 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     providers,
     providerRequired: !taskPlannerInjected,
   });
+  const taskRebuilder = new TaskProjectionRebuilder(() => tasks.rebuildProjection());
+  // 任务投影补建（M3 修复批 / #32 #36）：新副本首次启动时账本已从 peer 导入 task.* 事件
+  // 但投影表尚空 → 重放一次。取舍同记忆投影：不做无条件全量重建（O(账本)），只在
+  // 「空表 + 有任务事件」时补建。重建不触发调度，同步来的未完成任务不会自动执行。
+  try {
+    if (
+      tasks.projectionEmpty &&
+      ledger.scan({ eventType: "task.created" }).length > 0
+    ) {
+      taskRebuilder.rebuild();
+    }
+  } catch (err) {
+    console.error("[morrow] task projection rebuild on startup failed:", err);
+  }
   // Checkpoint 域（M1-T5 / Issue #17）：FR-TASK-5 快照 + 恢复落地；执行配置采集注入
   // runtime 版本、默认 Provider 投影（绝不含密钥）与工具版本表（M1 code-review 填实：
   // pi-adapter 版本可证；逐工具版本无来源——任务执行无工具通道，留空待后续票交付）。
@@ -777,6 +803,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     syncMemory,
     syncFiles,
     memoryRebuilder,
+    taskRebuilder,
     leases,
     async close(signal?: string): Promise<void> {
       if (closing) return;

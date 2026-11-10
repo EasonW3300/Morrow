@@ -62,20 +62,26 @@ export interface ReplayState {
 }
 
 /** 收集 sync.conflict 明确判定为「不采纳」的远端事件 id（重放时跳过） */
-function collectConflictedEvents(entries: LedgerEntry[]): Set<string> {
+function collectConflictedEvents(entries: LedgerEntry[], localReplicaId: string | undefined): Set<string> {
+  // 事件作者表：冲突记录里的 id 可能是「对端冲突事件把本机原创修订记为 remote」的情形
+  // （两端同时竞争时双方各写一条 sync.conflict，互为 remote）。重放的可见值必须按
+  // **事件作者归属**过滤——本副本创作的修订永远不被对端冲突记录压下去（AC-05 修复）。
+  const authorOf = new Map<string, string>();
+  for (const entry of entries) authorOf.set(entry.envelope.event_id, entry.envelope.replica_id);
+
   const ids = new Set<string>();
+  const add = (value: unknown): void => {
+    if (typeof value !== "string" || value.length === 0) return;
+    if (localReplicaId !== undefined && authorOf.get(value) === localReplicaId) return;
+    ids.add(value);
+  };
   for (const entry of entries) {
     if (entry.envelope.event_type !== "sync.conflict") continue;
     const payload = entry.envelope.payload;
-    for (const key of ["remote_event_id", "incoming_event_id"]) {
-      const value = payload[key];
-      if (typeof value === "string" && value.length > 0) ids.add(value);
-    }
+    for (const key of ["remote_event_id", "incoming_event_id"]) add(payload[key]);
     const list = payload.remote_event_ids;
     if (Array.isArray(list)) {
-      for (const value of list) {
-        if (typeof value === "string" && value.length > 0) ids.add(value);
-      }
+      for (const value of list) add(value);
     }
   }
   return ids;
@@ -103,8 +109,16 @@ function linkSource(state: ReplayState, factId: string, sourceId: string | null)
   state.factSources.set(`${factId}\u0000${sourceId}`, { fact_id: factId, source_id: sourceId });
 }
 
+export interface MemoryReplayOptions {
+  /**
+   * 本副本 replica_id（AC-05 修复）：sync.conflict 只压制**非本副本**创作的修订。
+   * 缺省 undefined = 旧行为（不按作者归属过滤，供离线纯重放/兼容测试）。
+   */
+  localReplicaId?: string;
+}
+
 /** 纯重放：不触库，便于单测与一致性校验 */
-export function replayMemoryEvents(entries: LedgerEntry[]): ReplayState {
+export function replayMemoryEvents(entries: LedgerEntry[], options: MemoryReplayOptions = {}): ReplayState {
   const state: ReplayState = {
     facts: new Map(),
     revisions: new Map(),
@@ -112,7 +126,7 @@ export function replayMemoryEvents(entries: LedgerEntry[]): ReplayState {
     candidateSources: new Map(),
     factSources: new Map(),
     deleted: new Set(),
-    conflictedEvents: collectConflictedEvents(entries),
+    conflictedEvents: collectConflictedEvents(entries, options.localReplicaId),
     ignored: 0,
   };
 
@@ -258,8 +272,12 @@ export interface RebuildResult {
 }
 
 /** 从账本按序重放 memory.* 事件并整体替换记忆投影（facts / revisions / FTS） */
-export function rebuildMemoryProjection(deps: { store: MemoryStore; ledger: EventLedger }): RebuildResult {
-  const state = replayMemoryEvents(deps.ledger.scan());
+export function rebuildMemoryProjection(deps: {
+  store: MemoryStore;
+  ledger: EventLedger;
+  replicaId?: string;
+}): RebuildResult {
+  const state = replayMemoryEvents(deps.ledger.scan(), { localReplicaId: deps.replicaId });
   const snapshot = snapshotFromReplay(state);
   deps.store.replaceMemoryProjection(snapshot);
   return {
@@ -275,11 +293,13 @@ export function rebuildMemoryProjection(deps: { store: MemoryStore; ledger: Even
 export class MemoryProjectionRebuilder {
   readonly #store: MemoryStore;
   readonly #ledger: EventLedger;
+  readonly #replicaId: string | undefined;
   #lastResult: RebuildResult | null = null;
 
-  constructor(deps: { store: MemoryStore; ledger: EventLedger }) {
+  constructor(deps: { store: MemoryStore; ledger: EventLedger; replicaId?: string }) {
     this.#store = deps.store;
     this.#ledger = deps.ledger;
+    this.#replicaId = deps.replicaId;
   }
 
   get lastResult(): RebuildResult | null {
@@ -287,13 +307,21 @@ export class MemoryProjectionRebuilder {
   }
 
   rebuild(): RebuildResult {
-    const result = rebuildMemoryProjection({ store: this.#store, ledger: this.#ledger });
+    const result = rebuildMemoryProjection({
+      store: this.#store,
+      ledger: this.#ledger,
+      ...(this.#replicaId === undefined ? {} : { replicaId: this.#replicaId }),
+    });
     this.#lastResult = result;
     return result;
   }
 
   check(): ConsistencyReport {
-    return checkMemoryProjectionConsistency({ store: this.#store, ledger: this.#ledger });
+    return checkMemoryProjectionConsistency({
+      store: this.#store,
+      ledger: this.#ledger,
+      ...(this.#replicaId === undefined ? {} : { replicaId: this.#replicaId }),
+    });
   }
 }
 
@@ -304,8 +332,14 @@ export interface ConsistencyReport {
 }
 
 /** 投影 vs 事件重放快照的一致性校验（只读；不做修复） */
-export function checkMemoryProjectionConsistency(deps: { store: MemoryStore; ledger: EventLedger }): ConsistencyReport {
-  const snapshot = snapshotFromReplay(replayMemoryEvents(deps.ledger.scan()));
+export function checkMemoryProjectionConsistency(deps: {
+  store: MemoryStore;
+  ledger: EventLedger;
+  replicaId?: string;
+}): ConsistencyReport {
+  const snapshot = snapshotFromReplay(
+    replayMemoryEvents(deps.ledger.scan(), { localReplicaId: deps.replicaId }),
+  );
   const expectedFacts = new Map(snapshot.facts.map((fact) => [fact.fact_id, fact]));
   const actualFacts = new Map(deps.store.listAllFacts().map((fact) => [fact.fact_id, fact]));
   const factMismatch: ConsistencyReport["facts"] = { missing: [], extra: [], mismatched: [] };

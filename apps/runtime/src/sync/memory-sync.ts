@@ -58,7 +58,11 @@ export class MemorySyncService {
     this.#ledger = options.ledger;
     this.#replicaId = options.replicaId;
     this.#conflicts = options.conflicts;
-    this.#rebuilder = new MemoryProjectionRebuilder({ store: options.store, ledger: options.ledger });
+    this.#rebuilder = new MemoryProjectionRebuilder({
+      store: options.store,
+      ledger: options.ledger,
+      replicaId: options.replicaId,
+    });
   }
 
   /** 同步导入批次落账后的语义处理（引擎 afterImport 回调） */
@@ -85,6 +89,21 @@ export class MemorySyncService {
       if (latest.event_type === "memory.fact_created") continue; // 已有同 id 事实：不重放创建
       if (this.#conflicts.hasRemoteEvent(latest.event_id)) continue;
 
+      // 版本膨胀防护（M3 修复批 / #32 #36）：本地版本已越过远端修订时不再二次分类。
+      // 典型场景：两端并发 preference 在 A 自动合并出 v3 后，同批/后批到达的陈旧 v2
+      // （批次边界上的重复修订）又被判 auto_merge → 3->2=4 的重复递增。远端版本
+      // 不高于本地版本才可能推进可见值；陈旧修订只记 suppressed（不产生合并/冲突审计）。
+      const remoteVersion = versionOf(latest, local.version);
+      if (remoteVersion < local.version) {
+        suppressed += 1;
+        continue;
+      }
+
+      // 权威裁决结果（sync_merge / conflict_resolved / conflict_merged）由重放直接采纳：
+      // 即使本副本还有未裁决冲突，也不能把对端的裁决/合并事件继续压制（否则 keep_new /
+      // merge 的版本链永远传不到对端——AC-05 裁决后可见值不符合裁决）。
+      if (isAuthoritative(latest)) continue;
+
       // 已有一条未裁决的跨设备冲突：该事实后续远端修订继续被压制（记录事件 id 供重放跳过），
       // 不再制造第二条冲突——Owner 裁决前不扩大战线。
       const open = this.#openConflictMeta(factId);
@@ -97,7 +116,7 @@ export class MemorySyncService {
           peerReplicaId,
           localReplicaId: this.#replicaId,
           localVersion: local.version,
-          remoteVersion: versionOf(latest, local.version),
+          remoteVersion,
           baseVersion: open.base_version,
         });
         suppressed += 1;
@@ -316,7 +335,13 @@ export class MemorySyncService {
     });
   }
 
-  /** sync.conflict 审计：remote_event_ids 是重放时跳过的「未采纳远端修订」全集 */
+  /**
+   * sync.conflict 审计：remote_event_ids 是重放时跳过的「未采纳远端修订」全集。
+   * M3 修复批（#32 #36）：冲突记录同时保留**本地版本引用**（local_version +
+   * local_revision_id + local_event_id）与远端事件引用（remote_event_ids）——
+   * 重放按事件作者归属只压制远端修订，本地已合并的可见值不会回落到基线。
+   * 防御性过滤：本副本创作的事件绝不进 remote_event_ids（两端互为 remote 的场景）。
+   */
   #appendConflictEvent(input: {
     conflictId: string;
     factId: string;
@@ -328,7 +353,11 @@ export class MemorySyncService {
     remoteVersion: number;
     baseVersion: number | null;
   }): void {
-    const ids = input.remoteEvents.map((event) => event.event_id);
+    const ids = input.remoteEvents
+      .filter((event) => event.replica_id !== this.#replicaId)
+      .map((event) => event.event_id);
+    const localRevisionId = this.#store.getRevision(input.factId, input.localVersion)?.revision_id ?? null;
+    const localEventId = this.#localEventId(input.factId, input.localVersion);
     this.#ledger.append(
       buildEventEnvelope({
         replicaId: this.#replicaId,
@@ -341,6 +370,8 @@ export class MemorySyncService {
           local_replica_id: input.localReplicaId,
           remote_replica_id: input.peerReplicaId,
           local_version: input.localVersion,
+          local_revision_id: localRevisionId,
+          local_event_id: localEventId,
           remote_version: input.remoteVersion,
           base_version: input.baseVersion,
           remote_event_id: ids[ids.length - 1] ?? null,
@@ -349,6 +380,22 @@ export class MemorySyncService {
         causationId: ids[ids.length - 1] ?? null,
       }),
     );
+  }
+
+  /** 本地可见版本的账本事件 id（冲突记录里的 local 版本引用；找不到返回 null） */
+  #localEventId(factId: string, version: number): string | null {
+    const candidates = [
+      ...this.#ledger.scan({ eventType: MEMORY_EVENT_TYPES.factCreated }),
+      ...this.#ledger.scan({ eventType: MEMORY_EVENT_TYPES.factUpdated }),
+    ];
+    let found: string | null = null;
+    for (const entry of candidates) {
+      if (entry.envelope.replica_id !== this.#replicaId) continue;
+      if (entry.envelope.payload.fact_id !== factId) continue;
+      if (entry.envelope.payload.version !== version) continue;
+      found = entry.envelope.event_id;
+    }
+    return found;
   }
 
   #appendCandidateCreated(
@@ -379,6 +426,12 @@ export class MemorySyncService {
       }),
     );
   }
+}
+
+/** 权威结果标记（重放直接采纳，不再二次分类/压制） */
+function isAuthoritative(envelope: EventEnvelope): boolean {
+  const reason = envelope.payload.reason;
+  return typeof reason === "string" && AUTHORITATIVE_REASONS.has(reason);
 }
 
 /** 只有事实状态或冲突判定变化才需要重建投影（避免每批 sync.* 事件都全账本重放） */
