@@ -13,12 +13,16 @@ import {
   type CapabilityStatus,
   type CapabilityUseRequest,
   type CapabilityVersionRecord,
+  type ContactCapabilityCategory,
   type PermissionGrant,
   type PermissionViolation,
+  type SensitivityLevel,
   type ShellCommandCategory,
 } from "@morrow/protocol";
 import { buildEventEnvelope } from "../envelope.ts";
 import type { EventLedger } from "../ledger.ts";
+import { CONTACT_EVENT_TYPES } from "../contacts/events.ts";
+import { ContactStore } from "../contacts/store.ts";
 import {
   CapabilityStore,
   type CapabilityRow,
@@ -528,8 +532,34 @@ export interface RuntimeUseDecision {
   version: string;
 }
 
+// --- 可信联系人授权（M4-T6 / Issue #43） -------------------------------------
+
+/**
+ * 联系人越权请求的五类（AC-13 前置，全部阻断并留痕）：
+ *   memory_read  读记忆（仅 memory_reference 类别 + sensitivity=public）
+ *   filesystem   读文件（联系人默认不可访问）
+ *   shell        开发工具/命令（联系人默认不可访问）
+ *   capability   执行未授权能力（scope 未声明的能力名 → 拒绝；再走全局运行时复核）
+ *   session      读他人会话（只允许该联系人自己经渠道建立的会话）
+ */
+export type ContactAccessRequest =
+  | { contact_id: string; action: "memory_read"; sensitivity?: SensitivityLevel }
+  | { contact_id: string; action: "filesystem"; path: string }
+  | { contact_id: string; action: "shell"; category: string }
+  | { contact_id: string; action: "capability"; capability: string }
+  | { contact_id: string; action: "session"; session_id: string };
+
+export interface ContactAccessDecision {
+  allowed: boolean;
+  /** 拒绝原因（allowed=false 时存在；同时已落 contact.permission_denied 审计） */
+  reason?: string;
+  /** 拒绝审计事件 id */
+  event_id?: string;
+}
+
 export class PermissionEngine {
   readonly #store: CapabilityStore;
+  readonly #contacts: ContactStore;
   readonly #ledger: EventLedger;
   readonly #replicaId: string;
   readonly #onLifecycle: ((event: CapabilityLifecycleEvent) => void) | undefined;
@@ -537,6 +567,7 @@ export class PermissionEngine {
 
   constructor(options: PermissionEngineOptions) {
     this.#store = CapabilityStore.open(options.dataDir);
+    this.#contacts = ContactStore.open(options.dataDir);
     this.#ledger = options.ledger;
     this.#replicaId = options.replicaId;
     this.#onLifecycle = options.onLifecycle;
@@ -774,6 +805,88 @@ export class PermissionEngine {
     return { allowed: true, name: row.name, version: row.version };
   }
 
+  /**
+   * 联系人授权类别（联系人 → 类别 → 能力集）。未登记的联系人返回 null（调用方回退
+   * 旧的身份快照）；已登记但无显式授权行时按 FR-NOT-3 默认仅 query。
+   */
+  contactCategories(contactId: string): ContactCapabilityCategory[] | null {
+    this.#assertOpen();
+    if (this.#contacts.getContact(contactId) === null) return null;
+    const categories = this.#contacts.listGrants(contactId).map((grant) => grant.category);
+    return categories.length === 0 ? ["query"] : [...new Set(categories)];
+  }
+
+  /**
+   * 联系人会话可用的能力名（scope 并集）。返回值语义：
+   *   null  该会话不是联系人会话（Owner/普通会话）→ 不施加联系人收窄
+   *   []    联系人会话但没有能力 scope → 不注入任何能力工具
+   * 这是「执行未授权能力」在 Agent 工具注入面的落点：会话拿不到未授权工具。
+   */
+  contactCapabilitiesForSession(sessionId: string): string[] | null {
+    this.#assertOpen();
+    const contactId = this.#contacts.findContactBySession(sessionId);
+    if (contactId === null) return null;
+    const scopes = this.#contacts
+      .listGrants(contactId)
+      .flatMap((grant) => grant.scope);
+    return [...new Set(scopes)];
+  }
+
+  /**
+   * 联系人越权判定（单一入口，AC-13 前置）：五类请求逐类判定；拒绝时落
+   * contact.permission_denied 审计并返回原因。**没有第二条判定路径**——渠道入站、
+   * 记忆引用、能力调用都从这里出结论。
+   */
+  authorizeContactUse(request: ContactAccessRequest): ContactAccessDecision {
+    this.#assertOpen();
+    const contact = this.#contacts.getContact(request.contact_id);
+    if (contact === null || contact.status !== "active") {
+      return this.#denyContact(request, "contact_not_found");
+    }
+    const grants = this.#contacts.listGrants(request.contact_id);
+    const categories = new Set(grants.map((grant) => grant.category));
+
+    switch (request.action) {
+      case "memory_read": {
+        if (!categories.has("memory_reference")) {
+          return this.#denyContact(request, "memory_reference_not_granted");
+        }
+        if (request.sensitivity !== "public") {
+          return this.#denyContact(request, "private_memory_denied");
+        }
+        return { allowed: true };
+      }
+      case "filesystem":
+        // 联系人默认不可访问 Owner 文件（FR-NOT-3）；授权模型不提供文件维度开口子
+        return this.#denyContact(request, "filesystem_denied");
+      case "shell":
+        // 联系人不得使用开发工具/命令
+        return this.#denyContact(request, "dev_tools_denied");
+      case "capability": {
+        const scoped = grants.some((grant) => grant.scope.includes(request.capability));
+        if (!scoped) {
+          return this.#denyContact(request, "capability_not_granted");
+        }
+        try {
+          // 联系人 scope 只是第一道闸；全局运行时复核（enabled + 五维）仍必须通过
+          this.assertRuntimeUse(request.capability);
+        } catch (err) {
+          return this.#denyContact(
+            request,
+            err instanceof CapabilityError ? `capability_${err.code}` : "capability_unavailable",
+          );
+        }
+        return { allowed: true };
+      }
+      case "session": {
+        if (!this.#contacts.hasContactSession(request.contact_id, request.session_id)) {
+          return this.#denyContact(request, "session_not_owned");
+        }
+        return { allowed: true };
+      }
+    }
+  }
+
   /** 当前五维授权（未设置过 = 全空默认） */
   getGrants(): PermissionGrant {
     this.#assertOpen();
@@ -826,10 +939,31 @@ export class PermissionEngine {
   close(): void {
     if (this.#closed) return;
     this.#closed = true;
+    this.#contacts.close();
     this.#store.close();
   }
 
   // --- 内部 ------------------------------------------------------------------
+
+  /** 联系人越权拒绝：原因落 contact.permission_denied（actor = contact:<id>） */
+  #denyContact(request: ContactAccessRequest, reason: string): ContactAccessDecision {
+    const payload: Record<string, unknown> = {
+      contact_id: request.contact_id,
+      action: request.action,
+      reason,
+    };
+    if (request.action === "memory_read") payload.sensitivity = request.sensitivity ?? "private";
+    if (request.action === "filesystem") payload.path = request.path;
+    if (request.action === "shell") payload.category = request.category;
+    if (request.action === "capability") payload.capability = request.capability;
+    if (request.action === "session") payload.session_id = request.session_id;
+    const eventId = this.#append(
+      CONTACT_EVENT_TYPES.permissionDenied,
+      `contact:${request.contact_id}`,
+      payload,
+    );
+    return { allowed: false, reason, event_id: eventId };
+  }
 
   #setStatusTransition(
     name: string,

@@ -1038,10 +1038,13 @@ export class MemoryStore {
   }
 
   /**
-   * FTS5 关键词检索：候选与事实统一索引（本票只有候选有数据），按相关度（rank）
-   * 返回、上限 50；命中条目回链全部来源事件 id。
+   * FTS5 关键词检索：候选与事实统一索引，按相关度（rank）返回、上限 50；命中条目
+   * 回链全部来源事件 id。
+   *
+   * options.sensitivity 在**检索层**过滤（M4-T6 / Issue #43）：可信联系人记忆引用
+   * 只允许 sensitivity=public，private/locked 不进入结果集（不是返回后再由 UI 筛）。
    */
-  search(q: string): MemorySearchHit[] {
+  search(q: string, options: { sensitivity?: SensitivityLevel } = {}): MemorySearchHit[] {
     this.#assertOpen();
     const query = buildFtsQuery(q);
     const rows = this.#ftsScanStmt.all(query) as unknown as FtsRow[];
@@ -1049,10 +1052,10 @@ export class MemoryStore {
     for (const row of rows) {
       if (row.entry_kind === "candidate") {
         const hit = this.#candidateHit(row.entry_id);
-        if (hit !== null) hits.push(hit);
+        if (hit !== null && (options.sensitivity === undefined || hit.sensitivity === options.sensitivity)) hits.push(hit);
       } else if (row.entry_kind === "fact") {
         const hit = this.#factHit(row.entry_id);
-        if (hit !== null) hits.push(hit);
+        if (hit !== null && (options.sensitivity === undefined || hit.sensitivity === options.sensitivity)) hits.push(hit);
       }
     }
     return hits;
