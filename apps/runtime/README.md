@@ -42,6 +42,7 @@ FTS5 模块——更老的小版本（如 22.12）起服务/跑测试会在建�
 | `MORROW_PORT` | `0`（随机空闲） | 实际端口经 stdout 的 ready 行（单行 JSON）告知父进程，sidecar 场景无端口冲突 |
 | `MORROW_DATA_DIR` | `~/.morrow/data` | 账本等落盘数据目录（根 .gitignore 已忽略 data/） |
 | `MORROW_REPLICA_ID` | 按 dataDir 持久化 | 副本 uuid；未显式配置时写入 `<dataDir>/replica-id`，重启后身份稳定（同步按 replica 去重依赖它） |
+| `MORROW_PUBLIC_BASE_URL` | 按 host:port 推导 | 本机对外地址（join 时随 claim 告知对端）；跨网络部署必须显式配置 Tailscale/LAN 地址 |
 | `MORROW_PROVIDER_BASE_URL` | 缺省（无 Provider） | OpenAI Chat Completions 兼容端点（ADR-0002）；三个 PROVIDER 变量都缺省 = 未配置 |
 | `MORROW_PROVIDER_API_KEY` | `""` | 静态 key；vLLM/Ollama 等本地端点可留空 |
 | `MORROW_PROVIDER_MODEL` | 与 BASE_URL 同必需 | 模型 id |
@@ -479,8 +480,24 @@ upsert 种子；`GET /v1/devices` 只读。
 **接缝 `SyncTransport`**（`src/sync/transport.ts`）：`push(peerId, envelopes) →
 { accepted, duplicates }`、`pull(peerId, sinceSeq, limit) → { envelopes, nextSeq, hasMore }`。
 内存实现（`InMemorySyncTransport`）服务双副本契约测试；HTTP 实现（`HttpSyncTransport`）
-打对端 `/v1/sync/{push,pull}`，同一契约。引擎出站编排（`pullFromPeer` / `pushToPeer`）
-经 `RuntimeOptions.syncTransport` 注入。
+打对端 `/v1/sync/{push,pull}`，同一契约。
+
+**启动接线（M3 同步接线修复 / Issue #34）**：`startRuntime` 缺省构建
+`DeviceSyncTransport`（`src/sync/device-transport.ts`）注入引擎，不再依赖宿主注入
+——独立进程调 `POST /v1/sync/run` 直接可用。每 peer 的传输按需解析：
+- `base_url` 读 `devices.base_url`（join 写对端地址；claim 的 `device_base_url` 写加入方
+  地址，使服务端也能反向出站）；
+- token 读 `SecretStore` 的 `token:<peer replica_id>`（配对 join 写入），所有请求带
+  `Authorization: Bearer`；无 token 不带头（回环豁免），401/403 时错误 details 带
+  `auth: "none" | "bearer"` 与 `reason: "missing_token"`；
+- 设备撤销/未信任/无地址分别以 `device_revoked` / `device_untrusted` / `no_base_url`
+  明确不可达；`GET /v1/sync/status` 的 `peers[].unreachable_reason` 暴露原因。
+- 生命周期：**读路径惰性重建 + 配对/撤销回调主动失效**（不监听设备表；设备变更都在
+  本进程配对路径上，外部改库/重启由惰性解析覆盖）。
+- 本机对外地址：`MORROW_PUBLIC_BASE_URL` 优先，否则按 listen 的 host:port 推导；
+  通配监听退化为 127.0.0.1（跨网络部署必须显式配置）。
+- 边界：join 只为**加入方**发放 token，服务端→加入方的反向同步在回环豁免下可用；
+  非回环需要部署方另行提供该方向凭据。
 
 **游标**（`sync_cursors`，与账本同库、迁移幂等）：每对 peer 一行，两个方向独立：
 - `last_pulled_sequence`：从 peer 拉取并导入的最高 **peer 账本** sequence（`since` 缺省值）；
@@ -706,6 +723,27 @@ ToolInvoker 同一接缝注册 + 调用（`test/sandbox.go-worker.test.ts`：本
 - 双端独立执行检测：同一 task 的账本出现 ≥2 个 replica 的执行证据（或被授权转移之外
   的执行），或 ≥2 个 replica 各自推进过 task_version → `needs_reconcile` +
   `task.needs_reconcile`（payload 带两侧 replica/事件/转移记录），**不静默合并**。
+
+**跨设备事前互斥（M3 同步接线修复 / Issue #34）**：租约表仍按 dataDir 私有，跨设备
+可见的是账本事件。`task.lease_acquired / task.lease_renewed / task.lease_released`
+与既有 `task.lease_denied / task.lease_lost / task.execution_transferred` 一起随同步
+传播；`src/lease/view.ts` 按 task 重放出每个 holder 的当前租约（acquire 覆盖、renew
+刷新 expires_at、release/lost/transfer 清空）。`LeaseCoordinator`
+（`src/lease/coordinator.ts`）在调度器 acquire 前：
+
+1. 向全部已配对 peer 做一次增量拉取（**只 pull 不 push**；同任务 500ms 内复用结果，
+   避免调度重试放大网络与审计）；
+2. 重放远端租约：其他 replica 持有未过期租约 → **不写本地租约行**，记
+   `task.lease_denied`（`source: "remote_lease"` + 持有者/token/到期/来源事件），任务
+   保持 planned / waiting_input；
+3. 本地 acquire 成功后落 `task.lease_acquired`，再**强制二次拉取**：若双方都持有未
+   过期租约（近同时 acquire）→ 释放本地租约、落 `task.needs_reconcile`
+   （evidence.reasons 含 `dual_lease_hold`），不启动心跳、不执行节点。
+
+**残余窗口（诚实边界）**：拉取与 acquire 之间没有共识协议，两端仍可能各自认为对方
+未持有；二次采样只能缩小窗口。最终护栏是 fencing token（副作用提交前校验）与
+`needs_reconcile` 的 Owner 显式裁决；跨设备时钟偏差同理（远端 renew 事件是刷新依据）。
+离线优先语义下，peer 不可达不阻断本地 acquire（拉取错误只记录，状态页显示原因）。
 
 ### 测试与 CI
 

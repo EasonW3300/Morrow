@@ -85,6 +85,12 @@ export interface SyncPeerStatus {
   pending_download: number | null;
   /** 本次状态查询未能从对端取得账本上界（pending_download 因此为 null） */
   unreachable: boolean;
+  /**
+   * 不可达原因（M3 同步接线修复 / Issue #34）：`no_base_url`（设备记录缺地址）、
+   * `device_revoked`、`missing_token` 401、`invalid_token`、网络错误等。
+   * 可达时为 null。
+   */
+  unreachable_reason: string | null;
   /** 对端账本最大 sequence（取到才给；诊断用） */
   remote_max_sequence: number | null;
 }

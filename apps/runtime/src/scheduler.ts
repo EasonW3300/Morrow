@@ -13,6 +13,7 @@ import { SESSION_EVENT_TYPES } from "./sessions.ts";
 import type { LockTable } from "./locks.ts";
 import type { WorktreeManager, WorktreeRecord } from "./worktree.ts";
 import { detectDualExecution } from "./lease/reconcile.ts";
+import type { LeaseCoordinator } from "./lease/coordinator.ts";
 import type { ExecutionLeaseRecord, LeaseStore } from "./lease/store.ts";
 
 /**
@@ -140,6 +141,12 @@ export interface TaskSchedulerOptions {
   leaseTtlMs?: number;
   /** 心跳续租间隔（毫秒，默认 ttl/3） */
   leaseHeartbeatMs?: number;
+  /**
+   * 跨设备执行权协调器（M3 同步接线修复 / Issue #34）：acquire 前向全部已配对 peer
+   * 增量拉取并重放远端租约；acquire 后二次采样检测近同时 acquire。缺省 null = 纯本地
+   * 互斥（旧行为，直接建 TaskScheduler 的单测）。
+   */
+  leaseCoordinator?: LeaseCoordinator | null;
 }
 
 interface NodeOutcome {
@@ -188,6 +195,7 @@ export class TaskScheduler {
   readonly #leases: LeaseStore | null;
   readonly #leaseTtlMs: number;
   readonly #leaseHeartbeatMs: number;
+  readonly #leaseCoordinator: LeaseCoordinator | null;
   readonly #active = new Set<AgentRuntime>();
   /** 任务 → 在跑 AgentRuntime（租约丢失/执行权转移时按任务中止） */
   readonly #activeByTask = new Map<string, Set<AgentRuntime>>();
@@ -223,6 +231,7 @@ export class TaskScheduler {
       1,
       Math.floor(options.leaseHeartbeatMs ?? Math.max(1, Math.floor(this.#leaseTtlMs / 3))),
     );
+    this.#leaseCoordinator = options.leaseCoordinator ?? null;
   }
 
   /**
@@ -332,7 +341,7 @@ export class TaskScheduler {
       this.#tasks.flagNeedsReconcile(taskId, evidence);
       return this.#tasks.getTask(taskId) ?? task;
     }
-    const acquired = this.#acquireLease(taskId, null);
+    const acquired = await this.#acquireLease(taskId, null);
     if (!acquired.ok) {
       throw new TaskError(
         "lease_denied",
@@ -449,10 +458,10 @@ export class TaskScheduler {
    * reconcile（checkpoint 可空）→ task.restored → 迁回 running / 恢复标记 → 入队驱动。
    * #driving 在同步段即登记（并发双 resume 的第二个在入队前就被 409），驱动收尾时注销。
    */
-  #resumeFrom(
+  async #resumeFrom(
     task: NonNullable<ReturnType<TaskService["getTask"]>>,
     checkpointId: string | null,
-  ): ResumeResult {
+  ): Promise<ResumeResult> {
     const taskId = task.task_id;
     this.#driving.add(taskId);
     try {
@@ -469,7 +478,7 @@ export class TaskScheduler {
           drive: Promise.resolve(),
         };
       }
-      const acquired = this.#acquireLease(taskId, null);
+      const acquired = await this.#acquireLease(taskId, null);
       if (!acquired.ok) {
         throw new TaskError(
           "lease_denied",
@@ -588,7 +597,7 @@ export class TaskScheduler {
       }
       // 执行权单点化（FR-DEP-4）：planned→running 前必须持租约；失败保持 planned
       // 并记 task.lease_denied（payload 带持有者），不把任务标成失败。
-      const acquired = this.#acquireLease(taskId, plannedEventId);
+      const acquired = await this.#acquireLease(taskId, plannedEventId);
       if (!acquired.ok) return;
       try {
         const started = this.#tasks.transition(taskId, "running", {
@@ -930,14 +939,53 @@ export class TaskScheduler {
   // --- 执行租约（M3-T4 / Issue #33，FR-DEP-4）----------------------------------
 
   /**
-   * 申请执行租约；失败时记 task.lease_denied（payload 带持有者/到期/token）并返回
-   * 失败结果——任务保持 planned/waiting_input，不执行，也不标 failed。
+   * 申请执行租约；失败时记 task.lease_denied（payload 带持有者/到期/token/来源）并
+   * 返回失败结果——任务保持 planned/waiting_input，不执行，也不标 failed。
+   *
+   * 跨设备事前互斥（M3 同步接线修复 / Issue #34）：注入 LeaseCoordinator 时
+   *   1. acquire 前向全部已配对 peer 增量拉取（只 pull），重放远端租约；远端持有
+   *      未过期租约 → 直接拒绝，不写本地租约行；
+   *   2. 本地 acquire 成功后落 task.lease_acquired，再强制二次拉取——若两端都持有
+   *      未过期租约（近同时 acquire）→ 立即释放本地租约、冻结 needs_reconcile，
+   *      不启动心跳、不执行节点。
    */
-  #acquireLease(taskId: string, causeEventId: string | null): { ok: true } | { ok: false; heldBy: string; expiresAt: string } {
+  async #acquireLease(
+    taskId: string,
+    causeEventId: string | null,
+  ): Promise<{ ok: true } | { ok: false; heldBy: string; expiresAt: string }> {
     if (this.#leases === null) return { ok: true };
     if (this.#leaseLost.has(taskId) || this.#detached.has(taskId)) {
       return { ok: false, heldBy: "<detached>", expiresAt: new Date(0).toISOString() };
     }
+    const existing = this.#leaseHandles.get(taskId);
+
+    // 1) 事前检查：已持有（幂等路径）不再拉取；否则拉取并重放远端租约。
+    if (existing === undefined && this.#leaseCoordinator !== null) {
+      const gate = await this.#leaseCoordinator.beforeAcquire(taskId);
+      if (!gate.ok && gate.holder !== null) {
+        this.#appendTaskEvent(
+          taskId,
+          TASK_EVENT_TYPES.taskLeaseDenied,
+          {
+            replica_id: this.#replicaId,
+            holder_replica_id: gate.holder.holder_replica_id,
+            fencing_token: gate.holder.fencing_token,
+            expires_at: gate.holder.expires_at,
+            source: "remote_lease",
+            remote_peer_replica_id: gate.holder.source_replica_id,
+            remote_lease_event_id: gate.holder.event_id,
+            pull_errors: gate.pull.errors,
+          },
+          causeEventId,
+        );
+        return {
+          ok: false,
+          heldBy: gate.holder.holder_replica_id,
+          expiresAt: gate.holder.expires_at,
+        };
+      }
+    }
+
     const outcome = this.#leases.acquire(taskId, this.#replicaId, this.#leaseTtlMs);
     if ("heldBy" in outcome) {
       this.#appendTaskEvent(taskId, TASK_EVENT_TYPES.taskLeaseDenied, {
@@ -945,15 +993,47 @@ export class TaskScheduler {
         holder_replica_id: outcome.heldBy,
         expires_at: outcome.expires_at,
         fencing_token: outcome.fencing_token,
+        source: "local_lease_table",
       }, causeEventId);
       return { ok: false, heldBy: outcome.heldBy, expiresAt: outcome.expires_at };
     }
-    const existing = this.#leaseHandles.get(taskId);
     if (existing !== undefined && existing.token === outcome.token) {
-      // 幂等 acquire（同一 holder 未过期）：沿用既有心跳，不重复起计时器
+      // 幂等 acquire（同一 holder 未过期）：沿用既有心跳，不重复起计时器/不重复落事件
       return { ok: true };
     }
     if (existing !== undefined) this.#clearLeaseTimer(taskId);
+
+    // 2) 本地持有已生效：落租约生命周期事件（随同步传播，供对端事前判断）。
+    this.#appendTaskEvent(taskId, TASK_EVENT_TYPES.taskLeaseAcquired, {
+      replica_id: this.#replicaId,
+      holder_replica_id: this.#replicaId,
+      fencing_token: outcome.token,
+      expires_at: outcome.expires_at,
+      acquired_at: outcome.acquired_at,
+    }, causeEventId);
+
+    // 3) 二次采样：近同时 acquire 的对方事件可能刚到。双持有 → 释放并冻结，不执行。
+    if (this.#leaseCoordinator !== null) {
+      const verify = await this.#leaseCoordinator.afterAcquire(taskId);
+      if (!verify.ok && verify.dual_hold) {
+        this.#leases.release(taskId, this.#replicaId, outcome.token);
+        this.#appendTaskEvent(taskId, TASK_EVENT_TYPES.taskLeaseReleased, {
+          replica_id: this.#replicaId,
+          holder_replica_id: this.#replicaId,
+          fencing_token: outcome.token,
+          reason: "dual_hold_reconcile",
+        }, causeEventId);
+        if (verify.evidence !== null) {
+          this.#tasks.flagNeedsReconcile(taskId, verify.evidence, causeEventId);
+        }
+        return {
+          ok: false,
+          heldBy: verify.holder?.holder_replica_id ?? "<dual_hold>",
+          expiresAt: verify.holder?.expires_at ?? outcome.expires_at,
+        };
+      }
+    }
+
     this.#leaseHandles.set(taskId, { token: outcome.token, timer: null });
     this.#startLeaseHeartbeat(taskId, outcome.token);
     return { ok: true };
@@ -969,6 +1049,18 @@ export class TaskScheduler {
       if (this.#leases === null) return;
       if (!this.#leases.renew(taskId, this.#replicaId, token)) {
         this.#handleLeaseLost(taskId, token, "renew_failed");
+        return;
+      }
+      // 续租事件让远端看到新的 expires_at；否则对端只能看到 acquire 时的 TTL，
+      // 会把仍在续租的持有者误判为过期（事前互斥的数据源必须含心跳）。
+      const current = this.#leases.current(taskId);
+      if (current !== null) {
+        this.#appendTaskEvent(taskId, TASK_EVENT_TYPES.taskLeaseRenewed, {
+          replica_id: this.#replicaId,
+          holder_replica_id: this.#replicaId,
+          fencing_token: token,
+          expires_at: current.expires_at,
+        }, null);
       }
     }, this.#leaseHeartbeatMs);
     if (typeof timer.unref === "function") timer.unref();
@@ -1036,7 +1128,15 @@ export class TaskScheduler {
     this.#clearLeaseTimer(taskId);
     if (this.#leases !== null) {
       try {
-        this.#leases.release(taskId, this.#replicaId, handle.token);
+        if (this.#leases.release(taskId, this.#replicaId, handle.token)) {
+          // 释放也要随同步传播：否则对端会把本机残留的 acquire 事件当成仍持有。
+          this.#appendTaskEvent(taskId, TASK_EVENT_TYPES.taskLeaseReleased, {
+            replica_id: this.#replicaId,
+            holder_replica_id: this.#replicaId,
+            fencing_token: handle.token,
+            reason: "released",
+          }, null);
+        }
       } catch (err) {
         // 关闭竞态（库已 finalize）不影响进程退出；崩溃/正常退出后的租约由 TTL 兜底
         if (!this.#disposed) console.error("[morrow] lease release failed:", err);

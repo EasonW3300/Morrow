@@ -32,6 +32,12 @@ export interface RuntimeConfig {
    * 库形态/测试可经 RuntimeOptions.memoryExtractor 注入任意实现，优先于本配置）。
    */
   memoryExtractor?: "heuristic" | "llm";
+  /**
+   * 本机对外可达的 HTTP 基地址（M3 同步接线修复 / Issue #34，MORROW_PUBLIC_BASE_URL）：
+   * join 时随 claim 告知对端，使对端能反向出站同步。缺省按 host:port 推导（通配监听
+   * 地址退化为 127.0.0.1，仅本机可用）——跨网络部署必须显式配置 Tailscale/LAN 地址。
+   */
+  publicBaseUrl?: string | null;
 }
 
 /** OpenAI Chat Completions 兼容端点配置（GLOSSARY: Provider） */
@@ -60,7 +66,37 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   if (!UUID_RE.test(replicaId)) {
     throw new Error(`invalid MORROW_REPLICA_ID: "${replicaId}" (lowercase uuid expected)`);
   }
-  return { host, port, dataDir, replicaId, provider: parseProviderConfig(env), memoryExtractor: parseMemoryExtractor(env) };
+  return {
+    host,
+    port,
+    dataDir,
+    replicaId,
+    provider: parseProviderConfig(env),
+    memoryExtractor: parseMemoryExtractor(env),
+    publicBaseUrl: parsePublicBaseUrl(env),
+  };
+}
+
+/**
+ * MORROW_PUBLIC_BASE_URL：显式对外地址（http/https，无 query/hash）；缺省 null =
+ * 按实际监听 host:port 推导。非法值启动即失败（错误的地址会让配对写入不可达 peer）。
+ */
+function parsePublicBaseUrl(env: Record<string, string | undefined>): string | null {
+  const raw = env.MORROW_PUBLIC_BASE_URL;
+  if (raw === undefined || raw.trim() === "") return null;
+  let url: URL;
+  try {
+    url = new URL(raw.trim());
+  } catch {
+    throw new Error(`invalid MORROW_PUBLIC_BASE_URL: "${raw}" (absolute http(s) URL expected)`);
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new Error(`invalid MORROW_PUBLIC_BASE_URL: "${raw}" (http or https expected)`);
+  }
+  if (url.search.length > 0 || url.hash.length > 0) {
+    throw new Error(`invalid MORROW_PUBLIC_BASE_URL: "${raw}" (must not contain query or fragment)`);
+  }
+  return `${url.origin}${url.pathname}`.replace(/\/+$/, "");
 }
 
 /**

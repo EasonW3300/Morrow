@@ -135,6 +135,12 @@ export interface PairingClaimRequest {
    */
   device_replica_id?: string;
   /**
+   * 新设备自身的 HTTP 基地址（M3 同步接线修复 / Issue #34）：服务端把它写进 devices
+   * 表的 base_url，使服务端也能作为发起方向该设备出站同步（对端地址不能被猜）。
+   * 浏览器 claim 无法可靠提供时缺省；该方向的同步会以 `no_base_url` 明确不可达。
+   */
+  device_base_url?: string;
+  /**
    * 可选：客户端从配对方（已信任设备）离线获得的指纹。服务端比对自身指纹，
    * 不一致立即 409 fingerprint_mismatch 且不消耗配对码——双端指纹不一致的
    * 明确失败路径（而不是静默建立信任）。

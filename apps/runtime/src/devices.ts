@@ -40,6 +40,7 @@ interface DeviceRow {
   last_sync_at: string | null;
   revoked_at: string | null;
   token_hash: string | null;
+  base_url: string | null;
 }
 
 const CREATE_SQL = `
@@ -55,7 +56,8 @@ CREATE TABLE IF NOT EXISTS devices (
   paired_at    TEXT,
   last_sync_at TEXT,
   revoked_at   TEXT,
-  token_hash   TEXT
+  token_hash   TEXT,
+  base_url     TEXT
 );
 `;
 
@@ -72,10 +74,11 @@ const MIGRATION_COLUMNS: Array<{ name: string; ddl: string }> = [
   { name: "last_sync_at", ddl: "ALTER TABLE devices ADD COLUMN last_sync_at TEXT" },
   { name: "revoked_at", ddl: "ALTER TABLE devices ADD COLUMN revoked_at TEXT" },
   { name: "token_hash", ddl: "ALTER TABLE devices ADD COLUMN token_hash TEXT" },
+  { name: "base_url", ddl: "ALTER TABLE devices ADD COLUMN base_url TEXT" },
 ];
 
 const SELECT_COLUMNS =
-  "replica_id, label, created_at, last_seen_at, public_key, fingerprint, trusted, revoked, paired_at, last_sync_at, revoked_at";
+  "replica_id, label, created_at, last_seen_at, public_key, fingerprint, trusted, revoked, paired_at, last_sync_at, revoked_at, base_url";
 
 export interface MarkPairedInput {
   replicaId: string;
@@ -83,6 +86,8 @@ export interface MarkPairedInput {
   publicKey: string;
   fingerprint: string;
   tokenHash: string;
+  /** 对端自身的 HTTP 基地址（M3 同步接线修复 / Issue #34）；浏览器 claim 可为空 */
+  baseUrl?: string | null;
   now: Date;
 }
 
@@ -135,8 +140,8 @@ export class DeviceRegistry {
     );
     this.#markPairedStmt = db.prepare(
       `INSERT INTO devices
-         (replica_id, label, created_at, last_seen_at, public_key, fingerprint, trusted, revoked, paired_at, revoked_at, token_hash)
-       VALUES (?, ?, ?, ?, ?, ?, 1, 0, ?, NULL, ?)
+         (replica_id, label, created_at, last_seen_at, public_key, fingerprint, trusted, revoked, paired_at, revoked_at, token_hash, base_url)
+       VALUES (?, ?, ?, ?, ?, ?, 1, 0, ?, NULL, ?, ?)
        ON CONFLICT(replica_id) DO UPDATE SET
          label = excluded.label,
          last_seen_at = excluded.last_seen_at,
@@ -146,12 +151,13 @@ export class DeviceRegistry {
          revoked = 0,
          paired_at = excluded.paired_at,
          revoked_at = NULL,
-         token_hash = excluded.token_hash`,
+         token_hash = excluded.token_hash,
+         base_url = COALESCE(excluded.base_url, devices.base_url)`,
     );
     this.#markJoinedPeerStmt = db.prepare(
       `INSERT INTO devices
-         (replica_id, label, created_at, last_seen_at, public_key, fingerprint, trusted, revoked, paired_at, revoked_at, token_hash)
-       VALUES (?, ?, ?, ?, ?, ?, 1, 0, ?, NULL, NULL)
+         (replica_id, label, created_at, last_seen_at, public_key, fingerprint, trusted, revoked, paired_at, revoked_at, token_hash, base_url)
+       VALUES (?, ?, ?, ?, ?, ?, 1, 0, ?, NULL, NULL, ?)
        ON CONFLICT(replica_id) DO UPDATE SET
          label = excluded.label,
          last_seen_at = excluded.last_seen_at,
@@ -160,7 +166,8 @@ export class DeviceRegistry {
          trusted = 1,
          revoked = 0,
          paired_at = excluded.paired_at,
-         revoked_at = NULL`,
+         revoked_at = NULL,
+         base_url = COALESCE(excluded.base_url, devices.base_url)`,
     );
     this.#markSyncedStmt = db.prepare("UPDATE devices SET last_sync_at = ? WHERE replica_id = ?");
     this.#revokeStmt = db.prepare(
@@ -211,6 +218,7 @@ export class DeviceRegistry {
       input.fingerprint,
       iso,
       input.tokenHash,
+      input.baseUrl ?? null,
     );
   }
 
@@ -219,9 +227,35 @@ export class DeviceRegistry {
    * 把对端（服务端）记为本机 devices 中的可信远端设备。token 不落本表——只存本机
    * OS 凭据库（见 PairingService.join），本表只保存公开身份。
    */
-  markJoinedPeer(input: { replicaId: string; label: string | null; publicKey: string; fingerprint: string; now: Date }): void {
+  markJoinedPeer(input: {
+    replicaId: string;
+    label: string | null;
+    publicKey: string;
+    fingerprint: string;
+    /** 对端的 HTTP 基地址（join 的 base_url）——服务端也要能反向出站同步 */
+    baseUrl?: string | null;
+    now: Date;
+  }): void {
     const iso = input.now.toISOString();
-    this.#markJoinedPeerStmt.run(input.replicaId, input.label, iso, iso, input.publicKey, input.fingerprint, iso);
+    this.#markJoinedPeerStmt.run(
+      input.replicaId,
+      input.label,
+      iso,
+      iso,
+      input.publicKey,
+      input.fingerprint,
+      iso,
+      input.baseUrl ?? null,
+    );
+  }
+
+  /**
+   * 对端 HTTP 基地址（M3 同步接线修复 / Issue #34）：设备投影（DeviceInfo）不暴露该
+   * 内部字段，同步传输按需查询。不存在/未记录返回 null。
+   */
+  baseUrl(replicaId: string): string | null {
+    const row = this.#getStmt.get(replicaId) as DeviceRow | undefined;
+    return row?.base_url ?? null;
   }
 
   /**

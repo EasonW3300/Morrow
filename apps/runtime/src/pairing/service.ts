@@ -96,6 +96,17 @@ export interface PairingServiceOptions {
   fetchImpl?: typeof fetch;
   /** join 出站请求超时（毫秒，默认 15s） */
   joinTimeoutMs?: number;
+  /**
+   * 本机对外可达的 HTTP 基地址（M3 同步接线修复 / Issue #34）：join 时随 claim 以
+   * `device_base_url` 告知对端，使对端也能反向出站同步。运行端口在 listen 后才确定，
+   * 因此传函数而非值；未知返回 null（对端该方向以 no_base_url 明确不可达）。
+   */
+  selfBaseUrl?: () => string | null;
+  /**
+   * 设备表变更回调（配对成功 / join / 撤销）：runtime 用它让同步传输注册表立即失效
+   * 该 peer 的缓存，避免继续使用旧 base_url/token（读路径本身也会按设备表惰性重建）。
+   */
+  onDeviceChanged?: (replicaId: string) => void;
 }
 
 export interface ClaimInput {
@@ -103,6 +114,8 @@ export interface ClaimInput {
   devicePublicKey: string;
   deviceLabel?: string | undefined;
   deviceReplicaId?: string | undefined;
+  /** 新设备自身的 HTTP 基地址（join 的调用方提供；浏览器 claim 可缺省） */
+  deviceBaseUrl?: string | undefined;
   expectedServerFingerprint?: string | undefined;
   /** 来源标识（HTTP 层传 socket 远端地址）；缺省不做限速 */
   remoteKey?: string | undefined;
@@ -140,6 +153,8 @@ export class PairingService {
   readonly #attemptWindowMs: number;
   readonly #fetch: typeof fetch;
   readonly #joinTimeoutMs: number;
+  readonly #selfBaseUrl: (() => string | null) | undefined;
+  readonly #onDeviceChanged: ((replicaId: string) => void) | undefined;
   #attempts = new Map<string, { count: number; windowStart: number }>();
   #closed = false;
 
@@ -156,6 +171,8 @@ export class PairingService {
     this.#attemptWindowMs = options.claimAttemptWindowMs ?? DEFAULT_ATTEMPT_WINDOW_MS;
     this.#fetch = options.fetchImpl ?? fetch;
     this.#joinTimeoutMs = options.joinTimeoutMs ?? DEFAULT_JOIN_TIMEOUT_MS;
+    this.#selfBaseUrl = options.selfBaseUrl;
+    this.#onDeviceChanged = options.onDeviceChanged;
   }
 
   /** 已信任设备生成一次性配对码（调用方须先通过鉴权；本方法再校验 issuer 信任态） */
@@ -240,6 +257,10 @@ export class PairingService {
       );
     }
 
+    // 新设备自报的基地址（可选）：仅当是本 Runtime 宿主发起 join 时提供。非法值在
+    // **消耗配对码之前**拒绝（与指纹校验同一原则：不把可修正的错误变成烧码）。
+    const deviceBaseUrl = input.deviceBaseUrl === undefined ? null : normalizeBaseUrl(input.deviceBaseUrl);
+
     const consumed = this.#store.consume(hashPairingCode(input.code), now, deviceReplicaId);
     if (consumed.status === "used") {
       throw new PairingError("code_already_used", 409, "pairing code has already been used");
@@ -259,8 +280,10 @@ export class PairingService {
       publicKey: input.devicePublicKey,
       fingerprint: parsedKey.fingerprint,
       tokenHash: hashToken(token),
+      baseUrl: deviceBaseUrl,
       now,
     });
+    this.#onDeviceChanged?.(deviceReplicaId);
 
     const device: DeviceIdentityInfo & { label: string | null } = {
       replica_id: deviceReplicaId,
@@ -315,10 +338,13 @@ export class PairingService {
     }
     const label = normalizeLabel(input.deviceLabel);
     const self = await this.#ensureIdentity();
+    // 自报基地址（M3 同步接线修复）：对端据此把本机记为可出站同步的 peer。
+    const selfBaseUrl = this.#selfBaseUrl?.() ?? null;
     const claim = await this.#claimRemote(baseUrl, {
       code: input.code,
       device_public_key: self.public_key,
       device_replica_id: this.#replicaId,
+      ...(selfBaseUrl === null ? {} : { device_base_url: selfBaseUrl }),
       ...(label === null ? {} : { device_label: label }),
     });
 
@@ -389,6 +415,8 @@ export class PairingService {
         label: null,
         publicKey: claim.server.public_key,
         fingerprint: normalizeFingerprint(claim.server.fingerprint),
+        // 对端地址来自本次 join 的目标 base_url：入站 claim 场景没有这条信息。
+        baseUrl,
         now: this.#now(),
       });
     } catch (err) {
@@ -396,6 +424,7 @@ export class PairingService {
       await this.#rollbackJoin(baseUrl, claim);
       throw err;
     }
+    this.#onDeviceChanged?.(claim.server.replica_id);
 
     const device = this.#devices.get(claim.server.replica_id);
     if (device === null) {
@@ -438,6 +467,8 @@ export class PairingService {
           },
         }),
       );
+      // 同步传输注册表立即丢掉该 peer 的缓存与 transport（撤销后不再尝试）。
+      this.#onDeviceChanged?.(deviceId);
     }
     const after = this.#devices.get(deviceId);
     return after === null ? null : { device: after, changed };

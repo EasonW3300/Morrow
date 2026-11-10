@@ -33,6 +33,7 @@ import { SyncCursorStore } from "./sync/cursors.ts";
 import { SyncEngine } from "./sync/engine.ts";
 import { syncRoutes } from "./sync/routes.ts";
 import type { SyncTransport } from "./sync/transport.ts";
+import { DeviceSyncTransport } from "./sync/device-transport.ts";
 import { TombstoneStore } from "./sync/tombstones.ts";
 import { SyncConflictStore } from "./sync/conflict-store.ts";
 import { MemorySyncService } from "./sync/memory-sync.ts";
@@ -52,6 +53,7 @@ import { LockTable } from "./locks.ts";
 import { LeaseStore } from "./lease/store.ts";
 import { FencingGuard } from "./lease/fencing.ts";
 import { detectDualExecution } from "./lease/reconcile.ts";
+import { LeaseCoordinator } from "./lease/coordinator.ts";
 import { WorktreeManager } from "./worktree.ts";
 import { DockerRunner } from "./sandbox/docker-runner.ts";
 import { ToolInvoker, type InvocationResult } from "./sandbox/invoker.ts";
@@ -206,8 +208,9 @@ export interface RuntimeOptions {
   /** Skill 自动晋升阈值：同组合连续成功 ≥ N 产生提案（默认 2，最小 1） */
   skillPromotionThreshold?: number;
   /**
-   * 同步出站传输注入 seam（M3-T1 / Issue #30）：pullFromPeer / pushToPeer 经此与 peer
-   * 交换事件。HTTP 端点（/v1/sync/*）不依赖它。测试注入 InMemorySyncTransport（零网络）。
+   * 同步出站传输注入 seam（M3-T1 / Issue #30；M3 同步接线修复 / Issue #34 起缺省已接线）：
+   * 缺省按 devices 表 + SecretStore 构建 DeviceSyncTransport（启动即可同步）；注入
+   * InMemorySyncTransport 服务零网络契约测试，注入自定义实现覆盖真机夹具。
    */
   syncTransport?: SyncTransport;
   /**
@@ -226,6 +229,13 @@ export interface RuntimeOptions {
   leaseTtlMs?: number;
   /** 心跳续租间隔（毫秒，默认 ttl/3） */
   leaseHeartbeatMs?: number;
+  /**
+   * 跨设备事前互斥（M3 同步接线修复 / Issue #34）：缺省 true = acquire 前向已配对
+   * peer 增量拉取并按事件重放远端租约。false 仅供需要纯本地语义的宿主/测试关闭。
+   */
+  leaseCoordination?: boolean;
+  /** 同任务租约前拉取结果复用窗口（毫秒，默认 500；0 = 不节流） */
+  leasePullThrottleMs?: number;
 }
 
 export interface RuntimeHandle {
@@ -248,6 +258,8 @@ export interface RuntimeHandle {
   providers: ProviderRegistry;
   /** 任务服务（库形态可直用：createTask / 详情 / 状态机迁移；调度经 HTTP 自动触发） */
   tasks: TaskService;
+  /** 任务调度器（库形态可直用：schedule/kick/pause/resume/transferExecution） */
+  scheduler: TaskScheduler;
   /** Checkpoint 服务（库形态可直用：createCheckpoint / 列表 / restore 落地；M1-T5） */
   checkpoints: CheckpointService;
   /** 沙箱工具调用接缝（M2-T2 / Issue #23：sandboxed 与 builtin Go Worker 的统一注册/调用） */
@@ -270,6 +282,8 @@ export interface RuntimeHandle {
   memoryRebuilder: MemoryProjectionRebuilder;
   /** 执行租约（M3-T4 / Issue #33：acquire/renew/release/validate/current，库形态可直用） */
   leases: LeaseStore;
+  /** 跨设备执行权协调器（Issue #34：pre-acquire 拉取/远端租约重放；测试与运维可直用） */
+  leaseCoordinator: LeaseCoordinator;
   /**
    * 优雅停止：停止接收请求 → 中止并释放会话运行时与在跑任务节点 → 记账 runtime.stopped
    * → 关闭任务投影库与账本（WAL checkpoint）。signal 传入收到的 POSIX 信号名，
@@ -353,10 +367,26 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
   // 演化出的 config.replicaId 种子本机行；配对/撤销见下 pairing。
   const devices = DeviceRegistry.open(config.dataDir);
   devices.touch(config.replicaId);
-  // 同步引擎（M3-T1 / Issue #30）：游标表与账本同库；出站传输可经 RuntimeOptions 注入
-  // （缺省无传输——HTTP 端点只负责对端驱动的事件导出/导入，出站编排由宿主接线）。
-  // M3-T3：删除集合随引擎启动从账本重建；导入批次末尾回调记忆语义层（晚绑定——
-  // MemoryStore/MemorySyncService 在下方构建）。
+  // 设备身份与配对（M3-T2 / Issue #31）：私钥惰性生成进 OS 凭据库（service
+  // com.morrow.device + replica_id）——纯本地回环部署不触碰钥匙串；首次配对才供给。
+  // 同步传输在下面构建时要用同一个凭据库（读 token:<peer>），故提前到引擎之前。
+  const secretStore = options.secretStore ?? detectSecretStore().store;
+  // 出站同步传输（M3 同步接线修复 / Issue #34）：启动即按 devices 表接线——
+  // base_url 从设备记录读、bearer token 从 SecretStore 读 `token:<peer>`。运行时
+  // 设备增删由 DeviceSyncTransport 的读路径惰性重建 + PairingService 变更回调失效。
+  // 宿主显式注入 syncTransport 时仍以注入为准（契约测试/真机夹具）。
+  const deviceSyncTransport =
+    options.syncTransport === undefined
+      ? new DeviceSyncTransport({
+          selfReplicaId: config.replicaId,
+          devices,
+          secretStore,
+        })
+      : undefined;
+  const outboundTransport: SyncTransport = options.syncTransport ?? deviceSyncTransport!;
+  // 同步引擎（M3-T1 / Issue #30）：游标表与账本同库。M3-T3：删除集合随引擎启动从
+  // 账本重建；导入批次末尾回调记忆语义层（晚绑定——MemoryStore/MemorySyncService 在
+  // 下方构建）。
   const syncCursors = SyncCursorStore.open(config.dataDir);
   const tombstones = TombstoneStore.open(config.dataDir);
   let afterSyncImport: ((envelopes: EventEnvelope[], peerReplicaId: string) => void) | undefined;
@@ -375,11 +405,20 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
         .map((device) => device.replica_id),
     onSynced: (peerReplicaId, at) => devices.markSynced(peerReplicaId, at),
     afterImport: (envelopes, peerReplicaId) => afterSyncImport?.(envelopes, peerReplicaId),
-    ...(options.syncTransport === undefined ? {} : { transport: options.syncTransport }),
+    transport: outboundTransport,
   });
-  // 设备身份与配对（M3-T2 / Issue #31）：私钥惰性生成进 OS 凭据库（service
-  // com.morrow.device + replica_id）——纯本地回环部署不触碰钥匙串；首次配对才供给。
-  const secretStore = options.secretStore ?? detectSecretStore().store;
+  // 跨设备执行权协调（Issue #34）：acquire 前拉取 + 重放远端租约（只 pull 不 push，
+  // 同任务 500ms 节流）；纯本地部署 peer 集为空，等价于无网络操作。
+  const leaseCoordinator = new LeaseCoordinator({
+    ledger,
+    replicaId: config.replicaId,
+    sync,
+    now: options.leaseNow ?? (() => new Date()),
+    ...(options.leasePullThrottleMs === undefined ? {} : { pullThrottleMs: options.leasePullThrottleMs }),
+  });
+  // 本机对外基地址在 listen 后才确定；PairingService 通过闭包读取（join 时随 claim
+  // 告知对端，对端据此反向出站同步）。
+  let selfBaseUrl: string | null = null;
   const deviceIdentity = new DeviceIdentity({
     replicaId: config.replicaId,
     secretStore,
@@ -394,6 +433,10 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     ledger,
     // join 拿到的对端 bearer token 只写本机 OS 凭据库（浏览器 WebView 无法安全持久化）
     secretStore,
+    // 本机对外地址（listen 后赋值）：随 join 的 claim 告知对端，供反向出站同步。
+    selfBaseUrl: () => selfBaseUrl,
+    // 配对/撤销后立刻失效设备传输缓存（读路径也会惰性重建；这里是确定性的即时收回）。
+    onDeviceChanged: (replicaId) => deviceSyncTransport?.invalidate(replicaId),
     ...(options.pairingNow !== undefined ? { now: options.pairingNow } : {}),
   });
   // 能力注册表（票 M2-T1 / Issue #22）：会话工具注入改查注册表（disable 即不再注入）；
@@ -664,6 +707,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     ...(options.leaseTtlMs === undefined ? {} : { leaseTtlMs: options.leaseTtlMs }),
     ...(options.leaseHeartbeatMs === undefined ? {} : { leaseHeartbeatMs: options.leaseHeartbeatMs }),
     ...(options.taskConcurrency === undefined ? {} : { concurrency: options.taskConcurrency }),
+    leaseCoordinator: options.leaseCoordination === false ? null : leaseCoordinator,
   });
   // 启动清扫（M2-T4）：崩溃残留的 worktree/分支/孤儿锁；pending_review 节点的冲突
   // worktree 是 Owner 调解证据，清扫保留。清扫失败不阻塞启动（下次启动再清）。
@@ -713,6 +757,9 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
   let port: number;
   try {
     port = await listen(server, config.host, config.port);
+    // listen 之后才能确定实际端口：显式 MORROW_PUBLIC_BASE_URL 优先，否则按监听地址
+    // 推导（通配地址对别的设备不可达，退化为 127.0.0.1 并只在本机有意义）。
+    selfBaseUrl = resolveSelfBaseUrl(config, port);
   } catch (err) {
     skills.close();
     factory.close();
@@ -764,6 +811,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     devices,
     pairing,
     tasks,
+    scheduler,
     checkpoints,
     memory,
     projector,
@@ -778,6 +826,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     syncFiles,
     memoryRebuilder,
     leases,
+    leaseCoordinator,
     async close(signal?: string): Promise<void> {
       if (closing) return;
       closing = true;
@@ -816,6 +865,21 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
       ledger.close();
     },
   };
+}
+
+/**
+ * 本机对外基地址：显式配置优先；否则按实际监听地址 + 端口推导。
+ * 通配监听（0.0.0.0 / ::）对其它设备不可达，退化为 127.0.0.1——这只在本机回环有意义；
+ * 跨网络部署必须设 MORROW_PUBLIC_BASE_URL（Tailscale/LAN 地址），否则对端无法反向同步。
+ */
+export function resolveSelfBaseUrl(config: RuntimeConfig, port: number): string {
+  if (config.publicBaseUrl !== undefined && config.publicBaseUrl !== null && config.publicBaseUrl.length > 0) {
+    return config.publicBaseUrl;
+  }
+  const host =
+    config.host === "0.0.0.0" || config.host === "::" || config.host === "[::]" ? "127.0.0.1" : config.host;
+  const bracketed = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
+  return `http://${bracketed}:${port}`;
 }
 
 /** 生产默认工厂：按会话解析的 Provider → createPiAdapter（OpenAI 兼容协议，ADR-0002）。
