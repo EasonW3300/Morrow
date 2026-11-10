@@ -8,9 +8,13 @@ import type { TaskNodeRecord, TaskStatus } from "@morrow/protocol/browser";
 import type { TaskEventEnvelope } from "./api.ts";
 import {
   dagLayers,
+  describeReconcileEvidence,
   eventPageState,
   looksLikeDiff,
+  NEEDS_RECONCILE_MESSAGE,
   projectTaskEvents,
+  reconcileControls,
+  taskNeedsReconcile,
   taskNodeStatusLabel,
   taskStatusLabel,
   taskStatusTone,
@@ -220,4 +224,69 @@ test("validateReviseForm builds the API body from form fields and rejects invali
     nodes,
   );
   assert.equal(cycle.ok, false);
+});
+
+// --- needs_reconcile（票 M3-T6 / Issue #35：双端独立执行的 Owner 裁决）----------------
+
+test("needs_reconcile 状态有专属标签/警示色调，且判定函数只认该状态", () => {
+  assert.equal(taskStatusLabel("needs_reconcile"), "待人工裁决");
+  assert.equal(taskStatusTone("needs_reconcile"), "warn");
+  assert.equal(taskNeedsReconcile("needs_reconcile"), true);
+  for (const status of ["created", "planned", "running", "paused", "waiting_input", "failed", "completed", "cancelled"] as TaskStatus[]) {
+    assert.equal(taskNeedsReconcile(status), false, `${status} 不应触发裁决入口`);
+  }
+});
+
+test("裁决说明文案明确「两设备独立执行过此任务，需你裁决」", () => {
+  assert.equal(NEEDS_RECONCILE_MESSAGE, "两设备独立执行过此任务，需你裁决");
+});
+
+test("reconcileControls：待裁决且空闲时两个裁决按钮可用，附注记输入", () => {
+  const controls = reconcileControls("needs_reconcile", false);
+  assert.equal(controls.visible, true);
+  assert.equal(controls.canSubmit, true);
+  assert.equal(controls.noteEnabled, true);
+  assert.equal(controls.hint, null);
+  assert.deepEqual(
+    controls.options.map((o) => [o.resolution, o.disabled]),
+    [
+      ["completed", false],
+      ["failed", false],
+    ],
+  );
+  assert.match(controls.options[0].label, /已完成/);
+  assert.match(controls.options[1].label, /失败/);
+  // 明确「不自动合并一侧结果」的语义提示
+  assert.match(controls.options[0].hint, /不自动合并/);
+});
+
+test("reconcileControls：提交中禁用两个按钮（防重复裁决）", () => {
+  const controls = reconcileControls("needs_reconcile", true);
+  assert.equal(controls.canSubmit, false);
+  assert.ok(controls.options.every((o) => o.disabled));
+});
+
+test("reconcileControls：非待裁决状态不显示入口，hint 说明当前状态", () => {
+  const controls = reconcileControls("completed", false);
+  assert.equal(controls.visible, false);
+  assert.equal(controls.canSubmit, false);
+  assert.ok(controls.options.every((o) => o.disabled));
+  assert.match(controls.hint ?? "", /已完成/);
+  assert.match(controls.hint ?? "", /无需裁决/);
+});
+
+test("describeReconcileEvidence：复述双端执行证据（副本短 id + 原因中文），无证据返回 null", () => {
+  const text = describeReconcileEvidence({
+    task_id: "t1",
+    replicas: ["11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222"],
+    independent_replicas: ["11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222"],
+    sources: [],
+    transfers: [],
+    reasons: ["dual_execution"],
+  });
+  assert.ok(text !== null);
+  assert.match(text, /11111111/);
+  assert.match(text, /22222222/);
+  assert.match(text, /各自独立执行/);
+  assert.equal(describeReconcileEvidence(null), null);
 });

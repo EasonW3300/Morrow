@@ -70,7 +70,7 @@ export function CapabilitiesView({
   }, [initialCapabilityName]);
 
   return (
-    <div className="page">
+    <div className="settings-section">
       <div className="settings-subnav">
         {(
           [

@@ -1524,3 +1524,455 @@ body {
 .capability-ref-chip:hover {
   background: color-mix(in srgb, var(--accent) 12%, transparent);
 }
+
+/* --- 设备与同步（票 M3-T6 / Issue #35）--------------------------------------------- */
+
+.devices-page {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.device-section {
+  gap: 10px;
+}
+
+.section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.section-head h4 {
+  margin: 0;
+  font-size: 13px;
+  opacity: 0.85;
+}
+
+/* 设备列表 */
+.device-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.device-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 12px;
+  flex-wrap: wrap;
+}
+
+.device-row.device-revoked {
+  opacity: 0.62;
+  background: #fafafa;
+}
+
+.device-main {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.device-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.device-meta {
+  display: flex;
+  gap: 14px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.device-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+/* 配对 */
+.pairing-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 12px;
+}
+
+.pairing-card {
+  border: 1px dashed var(--border);
+  border-radius: 10px;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+
+.pairing-card h5 {
+  margin: 0;
+  font-size: 13px;
+}
+
+.pairing-code-box {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  align-items: flex-start;
+}
+
+.pairing-code {
+  font-size: 30px;
+  letter-spacing: 0.28em;
+  font-weight: 700;
+  padding: 6px 12px;
+  border-radius: 8px;
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.pairing-countdown {
+  font-size: 13px;
+}
+
+.pairing-countdown.tone-ok {
+  color: #2e7d32;
+}
+
+.pairing-countdown.tone-warn {
+  color: #c77700;
+}
+
+.pairing-countdown.tone-error {
+  color: var(--error);
+  font-weight: 600;
+}
+
+.pairing-expires-at {
+  font-size: 11.5px;
+  opacity: 0.7;
+}
+
+.pairing-fingerprint {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  flex-wrap: wrap;
+  font-size: 12.5px;
+}
+
+.fingerprint {
+  font-size: 15px;
+  letter-spacing: 0.06em;
+  font-weight: 600;
+  background: #f0f2f5;
+  border-radius: 6px;
+  padding: 2px 8px;
+}
+
+.pairing-code-input {
+  font-size: 20px;
+  letter-spacing: 0.24em;
+}
+
+.join-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* 加入设备：双端指纹核对 */
+.claim-review,
+.claim-done,
+.claim-mismatch {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  background: #fbfcfe;
+}
+
+.claim-review h6 {
+  margin: 0;
+  font-size: 13px;
+}
+
+.fingerprint-pair {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 10px;
+}
+
+.fingerprint-pair > div {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.claim-check {
+  margin: 0;
+  font-weight: 600;
+}
+
+.claim-check.tone-ok {
+  color: #2e7d32;
+}
+
+.claim-check.tone-warn {
+  color: #c77700;
+}
+
+.claim-check.tone-error {
+  color: var(--error);
+}
+
+/* 同步状态面板 */
+.sync-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.sync-notice {
+  border-radius: 8px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.sync-notice p {
+  margin: 0;
+  font-size: 12.5px;
+}
+
+.sync-notice.tone-error {
+  background: var(--error-soft);
+  border: 1px solid #f3c1bd;
+  color: var(--error);
+}
+
+.sync-notice.tone-warn {
+  background: #fff5e6;
+  border: 1px solid #f0d3a5;
+  color: #8a5a00;
+}
+
+.sync-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.sync-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 8px;
+}
+
+.sync-card {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 13px;
+}
+
+.cursor-table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 12.5px;
+}
+
+.cursor-table th,
+.cursor-table td {
+  border-bottom: 1px solid var(--border);
+  padding: 6px 8px;
+  text-align: left;
+}
+
+.cursor-table th {
+  color: var(--text-dim);
+  font-weight: 600;
+}
+
+/* 冲突审核 */
+.conflict-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.conflict-card {
+  border: 1px solid var(--border);
+  border-left: 3px solid #c77700;
+  border-radius: 8px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.conflict-card.conflict-resolved {
+  border-left-color: #2e7d32;
+  opacity: 0.8;
+}
+
+.conflict-head {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+  font-size: 12.5px;
+}
+
+.conflict-reason {
+  font-weight: 600;
+}
+
+.conflict-sides {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.conflict-diff {
+  margin: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #fbfbfc;
+  padding: 6px 8px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 220px;
+  overflow: auto;
+}
+
+.diff-line {
+  display: flex;
+  gap: 6px;
+}
+
+.diff-line.diff-add {
+  background: #e7f7ea;
+  color: #1d5b28;
+}
+
+.diff-line.diff-remove {
+  background: #fdecea;
+  color: #8f1d17;
+}
+
+.diff-line.diff-same {
+  color: var(--text-dim);
+}
+
+.diff-marker {
+  flex: none;
+  width: 10px;
+  opacity: 0.7;
+}
+
+.conflict-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: flex-start;
+}
+
+.merge-box {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex-basis: 100%;
+}
+
+.merge-box textarea {
+  width: 100%;
+  font-family: inherit;
+  font-size: 13px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 8px;
+}
+
+/* needs_reconcile 显著呈现（Task 视图） */
+.needs-reconcile-strip {
+  margin: 10px 16px 0;
+  padding: 8px 12px;
+  border-radius: 8px;
+  background: #fff5e6;
+  border: 1px solid #f0d3a5;
+  color: #8a5a00;
+  font-size: 13px;
+}
+
+.task-row.task-row-reconcile {
+  border-left: 3px solid #c77700;
+  background: #fffaf2;
+}
+
+.task-row-alert {
+  color: #c77700;
+}
+
+.needs-reconcile-panel {
+  border: 1px solid #f0d3a5;
+  border-left: 4px solid #c77700;
+  background: #fffaf2;
+  border-radius: 10px;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.needs-reconcile-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.needs-reconcile-badge {
+  background: #c77700;
+  color: #fff;
+  border-radius: 999px;
+  padding: 2px 10px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.needs-reconcile-evidence {
+  margin: 0;
+  font-size: 12.5px;
+  color: #8a5a00;
+}
+
+/* 设置页外壳：子页签与内容同属一个居中列（.main 是 row flex，不能把子页签留成兄弟节点） */
+.settings-section {
+  display: block;
+}
