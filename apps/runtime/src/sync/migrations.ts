@@ -19,6 +19,36 @@ CREATE TABLE IF NOT EXISTS sync_cursors (
   last_acked_sequence  INTEGER NOT NULL DEFAULT 0,
   updated_at           TEXT NOT NULL
 );
+
+-- 删除集合（票 M3-T3 / Issue #32，FR-DEP-5 / FR-MEM-8）：kind=fact 是事实 tombstone
+-- （version 记录删除时的事实版本），kind=event 是该事实相关事件 id 的删除集合——
+-- 导入时命中即跳过，离线副本不得复活已删数据。
+CREATE TABLE IF NOT EXISTS sync_tombstones (
+  kind       TEXT NOT NULL CHECK (kind IN ('event', 'fact')),
+  target_id  TEXT NOT NULL,
+  replica_id TEXT,
+  version    INTEGER,
+  deleted_at TEXT NOT NULL,
+  PRIMARY KEY (kind, target_id)
+);
+CREATE INDEX IF NOT EXISTS sync_tombstones_kind_idx ON sync_tombstones (kind, deleted_at);
+
+-- 跨设备冲突元数据（票 M3-T3）：冲突本体仍在 M1 memory_conflicts 队列，这里只补
+-- 来源副本与三方版本号，供 GET /v1/sync/conflicts 汇总与 resolve 后标记。
+CREATE TABLE IF NOT EXISTS sync_conflict_meta (
+  conflict_id       TEXT PRIMARY KEY,
+  fact_id           TEXT NOT NULL,
+  local_replica_id  TEXT NOT NULL,
+  remote_replica_id TEXT NOT NULL,
+  local_version     INTEGER NOT NULL,
+  remote_version    INTEGER NOT NULL,
+  base_version      INTEGER,
+  reason            TEXT NOT NULL,
+  remote_event_id   TEXT NOT NULL,
+  created_at        TEXT NOT NULL,
+  resolved_at       TEXT
+);
+CREATE INDEX IF NOT EXISTS sync_conflict_meta_status_idx ON sync_conflict_meta (resolved_at, created_at);
 `;
 
 const SYNC_CURSOR_COLUMNS: Array<{ column: string; ddl: string }> = [

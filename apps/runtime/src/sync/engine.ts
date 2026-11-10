@@ -1,5 +1,6 @@
 import {
   computeIntegrityHash,
+  type EventEnvelope,
   type SyncEnvelope,
   type SyncPullBatch,
   type SyncPushOutcome,
@@ -10,6 +11,7 @@ import { LedgerError, type EventLedger } from "../ledger.ts";
 import type { SyncCursorStore } from "./cursors.ts";
 import { SyncError } from "./errors.ts";
 import type { SyncTransport } from "./transport.ts";
+import type { TombstoneStore } from "./tombstones.ts";
 
 /**
  * 同步引擎核心（M3-T1 / Issue #30，PRD §4.6 FR-DEP-3）。
@@ -29,6 +31,10 @@ export const SYNC_EVENT_TYPES = {
   pulled: "sync.pulled",
   pushed: "sync.pushed",
   gapDetected: "sync.gap_detected",
+  tombstoneSkipped: "sync.tombstone_skipped",
+  merged: "sync.merged",
+  conflict: "sync.conflict",
+  fileConflict: "sync.file_conflict",
 } as const;
 
 export const SYNC_PULL_DEFAULT_LIMIT = 100;
@@ -40,6 +46,16 @@ export interface SyncEngineOptions {
   cursors: SyncCursorStore;
   /** 出站编排（pullFromPeer / pushToPeer）用的传输；HTTP 端点本身不需要它 */
   transport?: SyncTransport;
+  /**
+   * 删除集合（票 M3-T3 / Issue #32）：导入路径命中 fact/event tombstone 时跳过并落
+   * sync.tombstone_skipped 审计。缺省（T1 单测）不启用删除语义。
+   */
+  tombstones?: TombstoneStore;
+  /**
+   * 导入批次落账后的语义回调（票 M3-T3）：参数 = 本批真正新增的事件 + peer replica id。
+   * runtime 注入 MemorySyncService.handleImported 做三方合并/投影重建。缺省不触发。
+   */
+  afterImport?: (envelopes: EventEnvelope[], peerReplicaId: string) => void;
 }
 
 export interface PullOptions {
@@ -60,6 +76,8 @@ export class SyncEngine {
   readonly replicaId: string;
   readonly #ledger: EventLedger;
   readonly #cursors: SyncCursorStore;
+  readonly #tombstones: TombstoneStore | undefined;
+  readonly #afterImport: ((envelopes: EventEnvelope[], peerReplicaId: string) => void) | undefined;
   #transport: SyncTransport | undefined;
 
   constructor(options: SyncEngineOptions) {
@@ -67,6 +85,10 @@ export class SyncEngine {
     this.replicaId = options.replicaId;
     this.#cursors = options.cursors;
     this.#transport = options.transport;
+    this.#tombstones = options.tombstones;
+    this.#afterImport = options.afterImport;
+    // 启动时从账本重建删除集合（本机历史删除 + 上次会话已导入的删除）
+    this.#tombstones?.reconcileFromLedger(this.#ledger);
   }
 
   /** 注入/替换出站传输（宿主接线或契约测试用它把两个副本连起来） */
@@ -214,8 +236,10 @@ export class SyncEngine {
 
     // 3) 逐条幂等导入（账本 append-only；event_id 唯一约束是最终防线）
     const seen = new Set<string>();
+    const acceptedEnvelopes: EventEnvelope[] = [];
     let accepted = 0;
     let duplicates = 0;
+    let skipped = 0;
     for (const item of envelopes) {
       const eventId = item.envelope.event_id;
       if (seen.has(eventId) || this.#ledger.hasEvent(eventId)) {
@@ -223,9 +247,29 @@ export class SyncEngine {
         continue;
       }
       seen.add(eventId);
+      // 删除集合（M3-T3）：已删事实的陈旧修订 / 已删事件不得复活。跳过但仍是「本批
+      // 已到达的事件」——游标照常推进，审计单独留痕。
+      const tombstone = this.#tombstones?.shouldSkip(item.envelope);
+      if (tombstone !== undefined && tombstone.skip) {
+        skipped += 1;
+        this.#audit(SYNC_EVENT_TYPES.tombstoneSkipped, {
+          peer_replica_id: peerReplicaId,
+          direction,
+          event_id: eventId,
+          event_type: item.envelope.event_type,
+          reason: tombstone.reason,
+          ...(tombstone.fact_id !== undefined ? { fact_id: tombstone.fact_id } : {}),
+        });
+        continue;
+      }
       try {
         this.#ledger.append(item.envelope);
         accepted += 1;
+        acceptedEnvelopes.push(item.envelope);
+        if (item.envelope.event_type === "memory.fact_deleted") {
+          // 导入的 tombstone 立即生效：同批后续/下一批的旧修订都会被拦下
+          this.#tombstones?.recordFactDeletion(item.envelope, this.#ledger);
+        }
       } catch (err) {
         if (err instanceof LedgerError && err.code === "duplicate_event_id") {
           duplicates += 1;
@@ -257,10 +301,20 @@ export class SyncEngine {
         direction: "inbound",
         accepted,
         duplicates,
+        skipped,
         next_seq: Math.max(cursor, lastSequence),
       });
     }
-    return { accepted, duplicates, next_seq: lastSequence };
+    // 4) 语义层（记忆三方合并 / 投影重建）；只处理本批真正新增的事件
+    if (acceptedEnvelopes.length > 0) {
+      this.#afterImport?.(acceptedEnvelopes, peerReplicaId);
+    }
+    return {
+      accepted,
+      duplicates,
+      next_seq: lastSequence,
+      ...(skipped > 0 ? { skipped } : {}),
+    };
   }
 
   #gap(

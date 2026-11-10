@@ -115,6 +115,18 @@ export interface MemoryRevisionRow {
   created_at: string;
 }
 
+/**
+ * 记忆投影快照（票 M3-T3 / Issue #32）：facts / revisions / sources / fact_sources
+ * 的事件重放结果。MemoryStore 负责在一个事务里把这份快照落成可检索的投影
+ * （replaceMemoryProjection），重放规则在 memory/rebuild.ts（纯函数，可单测）。
+ */
+export interface MemoryProjectionSnapshot {
+  facts: MemoryFactRow[];
+  revisions: MemoryRevisionRow[];
+  sources: MemorySourceRow[];
+  factSources: Array<{ fact_id: string; source_id: string }>;
+}
+
 /** 冲突待确认条目（FR-MEM-5：不静默覆盖，等 Owner 裁决） */
 export interface MemoryConflictRow {
   conflict_id: string;
@@ -337,6 +349,10 @@ export class MemoryStore {
   #updateFactStmt;
   #insertRevisionStmt;
   #listFactsStmt;
+  #listAllFactsStmt;
+  #revisionByVersionStmt;
+  #listRevisionsStmt;
+  #listAllRevisionsStmt;
   #deleteFactStmt;
   #deleteFtsEntryStmt;
   #insertConflictStmt;
@@ -419,6 +435,22 @@ export class MemoryStore {
     this.#listFactsStmt = db.prepare(
       `SELECT fact_id, content, kind, sensitivity, version, valid_from, valid_until, created_at, updated_at, deleted_at
        FROM memory_facts WHERE valid_until IS NULL AND deleted_at IS NULL ORDER BY created_at, fact_id`,
+    );
+    this.#listAllFactsStmt = db.prepare(
+      `SELECT fact_id, content, kind, sensitivity, version, valid_from, valid_until, created_at, updated_at, deleted_at
+       FROM memory_facts ORDER BY created_at, fact_id`,
+    );
+    this.#revisionByVersionStmt = db.prepare(
+      `SELECT revision_id, fact_id, version, content, sensitivity, reason, source_id, created_at
+       FROM memory_revisions WHERE fact_id = ? AND version = ?`,
+    );
+    this.#listRevisionsStmt = db.prepare(
+      `SELECT revision_id, fact_id, version, content, sensitivity, reason, source_id, created_at
+       FROM memory_revisions WHERE fact_id = ? ORDER BY version, revision_id`,
+    );
+    this.#listAllRevisionsStmt = db.prepare(
+      `SELECT revision_id, fact_id, version, content, sensitivity, reason, source_id, created_at
+       FROM memory_revisions ORDER BY fact_id, version, revision_id`,
     );
     this.#deleteFactStmt = db.prepare(
       "UPDATE memory_facts SET deleted_at = ? WHERE fact_id = ? AND deleted_at IS NULL",
@@ -589,6 +621,31 @@ export class MemoryStore {
     return this.#listFactsStmt.all() as unknown as MemoryFactRow[];
   }
 
+  /** 全部事实行（含已删/已过期）：投影重建快照与一致性校验用 */
+  listAllFacts(): MemoryFactRow[] {
+    this.#assertOpen();
+    return this.#listAllFactsStmt.all() as unknown as MemoryFactRow[];
+  }
+
+  /** 指定版本的修订（三方合并的基线查找）；不存在返回 null */
+  getRevision(factId: string, version: number): MemoryRevisionRow | null {
+    this.#assertOpen();
+    const row = this.#revisionByVersionStmt.get(factId, version) as unknown as MemoryRevisionRow | undefined;
+    return row ?? null;
+  }
+
+  /** 单事实版本历史（version 升序） */
+  listRevisions(factId: string): MemoryRevisionRow[] {
+    this.#assertOpen();
+    return this.#listRevisionsStmt.all(factId) as unknown as MemoryRevisionRow[];
+  }
+
+  /** 全部修订行（投影重建一致性校验用） */
+  listAllRevisions(): MemoryRevisionRow[] {
+    this.#assertOpen();
+    return this.#listAllRevisionsStmt.all() as unknown as MemoryRevisionRow[];
+  }
+
   /**
    * 删除标记（票 M1-T3，FR-MEM-8 的单机前置）：软删——deleted_at 落值 + FTS 索引移除
    * （检索面立即退出），行/修订/来源多对多保留（回链审计）。单事务；重复删除或未知
@@ -676,6 +733,136 @@ export class MemoryStore {
     this.#tx(() => {
       this.#insertFactSourceStmt.run(input.factId, input.sourceId);
       this.#setCandidateStatusInTx(input.candidateId, "consolidated");
+    });
+  }
+
+  /**
+   * 同步合并落版本（票 M3-T3 / Issue #32）：与巩固 updateFact 的唯一差别是**版本号由
+   * 调用方显式给出**（三方合并结果 = max(本地, 远端) + 1）。版本必须严格前进——
+   * 否则说明另一端已经推进过，拒绝写回（合并结果收敛靠这个单调性）。
+   */
+  applyFactRevision(input: {
+    factId: string;
+    version: number;
+    content: string;
+    sensitivity: SensitivityLevel;
+    reason: string;
+    candidateId: string;
+    sourceId: string;
+  }): { fact: MemoryFactRow; revision: MemoryRevisionRow } {
+    this.#assertOpen();
+    if (!Number.isInteger(input.version) || input.version < 2) {
+      throw new Error(`merge version must be an integer >= 2, got ${input.version}`);
+    }
+    const now = new Date().toISOString();
+    return this.#tx(() => {
+      const current = this.#getFactInTx(input.factId);
+      if (current.deleted_at !== null) throw new Error(`fact ${input.factId} is deleted`);
+      if (input.version <= current.version) {
+        throw new Error(`merge version ${input.version} must advance fact ${input.factId} (current ${current.version})`);
+      }
+      this.#db
+        .prepare(
+          "UPDATE memory_facts SET content = ?, sensitivity = ?, version = ?, updated_at = ? WHERE fact_id = ?",
+        )
+        .run(input.content, input.sensitivity, input.version, now, input.factId);
+      const fact = this.#getFactInTx(input.factId);
+      const revision: MemoryRevisionRow = {
+        revision_id: uuidv7(),
+        fact_id: input.factId,
+        version: input.version,
+        content: input.content,
+        sensitivity: input.sensitivity,
+        reason: input.reason,
+        source_id: input.sourceId,
+        created_at: now,
+      };
+      this.#insertRevisionStmt.run(
+        revision.revision_id,
+        revision.fact_id,
+        revision.version,
+        revision.content,
+        revision.sensitivity,
+        revision.reason,
+        revision.source_id,
+        revision.created_at,
+      );
+      this.#deleteFtsEntryStmt.run(input.factId, "fact");
+      this.#insertFtsStmt.run(normalizeForFts(fact.content), input.factId, "fact");
+      this.#insertFactSourceStmt.run(input.factId, input.sourceId);
+      this.#setCandidateStatusInTx(input.candidateId, "consolidated");
+      return { fact, revision };
+    });
+  }
+
+  /**
+   * 投影重建落库（票 M3-T3 / Issue #32）：用事件重放快照整体替换 facts / revisions /
+   * fact_sources / 事实 FTS。单事务；候选与冲突队列表不动（它们是工作流状态，不是
+   * 记忆可见视图）。外键在 node:sqlite 缺省未开启，先删后插不会波及冲突行的 fact_id。
+   */
+  replaceMemoryProjection(snapshot: MemoryProjectionSnapshot): void {
+    this.#assertOpen();
+    this.#tx(() => {
+      // memory_conflicts 仍引用这些 fact_id（冲突未裁决时事实必须保持存在）。SQLite 的
+      // 外键约束在 node:sqlite 下是开启的；先删后插同一主键需把校验推迟到 COMMIT。
+      this.#db.exec("PRAGMA defer_foreign_keys = ON");
+      this.#db.exec("DELETE FROM memory_fts WHERE entry_kind = 'fact'");
+      this.#db.exec("DELETE FROM memory_fact_sources");
+      this.#db.exec("DELETE FROM memory_revisions");
+      this.#db.exec("DELETE FROM memory_facts");
+
+      const insertSource = this.#db.prepare(
+        `INSERT OR IGNORE INTO memory_sources (source_id, kind, event_id, session_id, created_at) VALUES (?, ?, ?, ?, ?)`,
+      );
+      for (const source of snapshot.sources) {
+        insertSource.run(source.source_id, source.kind, source.event_id, source.session_id, source.created_at);
+      }
+      const insertFact = this.#db.prepare(
+        `INSERT INTO memory_facts
+           (fact_id, content, kind, sensitivity, version, valid_from, valid_until, created_at, updated_at, deleted_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      );
+      for (const fact of snapshot.facts) {
+        insertFact.run(
+          fact.fact_id,
+          fact.content,
+          fact.kind,
+          fact.sensitivity,
+          fact.version,
+          fact.valid_from,
+          fact.valid_until,
+          fact.created_at,
+          fact.updated_at,
+          fact.deleted_at,
+        );
+      }
+      const insertRevision = this.#db.prepare(
+        `INSERT INTO memory_revisions (revision_id, fact_id, version, content, sensitivity, reason, source_id, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      );
+      for (const revision of snapshot.revisions) {
+        insertRevision.run(
+          revision.revision_id,
+          revision.fact_id,
+          revision.version,
+          revision.content,
+          revision.sensitivity,
+          revision.reason,
+          revision.source_id,
+          revision.created_at,
+        );
+      }
+      const insertFactSource = this.#db.prepare(
+        "INSERT OR IGNORE INTO memory_fact_sources (fact_id, source_id) VALUES (?, ?)",
+      );
+      for (const link of snapshot.factSources) {
+        insertFactSource.run(link.fact_id, link.source_id);
+      }
+      // 检索面与 listFacts 同口径：已删 / 已过期事实不索引
+      for (const fact of snapshot.facts) {
+        if (fact.deleted_at !== null || fact.valid_until !== null) continue;
+        this.#insertFtsStmt.run(normalizeForFts(fact.content), fact.fact_id, "fact");
+      }
     });
   }
 
