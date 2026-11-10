@@ -300,6 +300,19 @@ export class QqChannelAdapter implements ChannelAdapter {
     const record = event as Record<string, unknown>;
     const classified = classifyQqEvent(record);
     if (classified.kind === "message") {
+      // 学会话形态（group / direct）：`send()` 据此选择 /v2/groups/* 还是 /v2/users/*，
+      // 未学过就会以 unknown_conversation 拒发。Webhook 路径由调用的 parseInbound 学习，
+      // WS 路径没有经过那里——真实联调中就是这里漏掉，导致"收到消息但回不出去"。
+      const parsed = this.parseInbound(record);
+      if (isParseError(parsed)) {
+        this.#lastError = `${parsed.code}: ${parsed.message}`;
+        this.#onInboundRejected?.({
+          code: parsed.code,
+          message: parsed.message,
+          raw: record,
+        });
+        return { ok: true };
+      }
       this.#connected = true;
       this.#degraded = false;
       this.#lastError = null;

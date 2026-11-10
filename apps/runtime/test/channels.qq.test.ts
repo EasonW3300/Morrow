@@ -401,3 +401,46 @@ test("health：连接状态、token 到期时间与最近错误可诊断", async
   assert.equal(unhealthy.healthy, true, "单次显式失败不降级，仅记录最近错误");
   assert.match(unhealthy.last_error ?? "", /permission_denied/);
 });
+
+// 回归（QQ 真实联调发现）：WS 可信入口收到消息后必须"学会话形态"，否则 send() 以
+// unknown_conversation 拒发——表现为"能收到 @ 消息但回不出去"。修复前 handleTrustedEvent
+// 只做 classify 不调 parseInbound，`#conversationKinds` 永远为空。
+test("regression: handleTrustedEvent 学会话形态，入站后可立即回复（不再 unknown_conversation）", async () => {
+  const h = await setup();
+  try {
+    // WS Dispatch 帧形态：op=0 + t + d（与真实网关一致）
+    const event = {
+      op: 0,
+      t: "GROUP_AT_MESSAGE_CREATE",
+      d: {
+        id: "qq_ws_in_1",
+        content: " 你好",
+        timestamp: new Date().toISOString(),
+        group_openid: "qq_group_ws",
+        author: { id: "u1", member_openid: "u1" },
+      },
+      s: 1,
+    };
+    const result = h.adapter.handleTrustedEvent(event);
+    assert.deepEqual(result, { ok: true });
+    assert.equal(h.inbound.length, 1);
+
+    // 关键断言：无需显式 parseInbound，直接能回（此前会抛 unknown_conversation）
+    const receipt = await h.adapter.send(
+      groupOutbound({
+        native_conversation_id: "qq_group_ws",
+        reply_to_native_message_id: "qq_ws_in_1",
+        idempotency_key: "regression:ws:reply",
+      }),
+    );
+    assert.ok(receipt.remote_message_id);
+    // 回复必须打到群消息端点（桩以 "custom" kind 注册，按 URL 断言更直接）
+    const sends = h.server.requests.filter((r) =>
+      r.url.pathname === "/v2/groups/qq_group_ws/messages",
+    );
+    assert.equal(sends.length, 1, "回复必须打到群消息端点");
+    assert.equal(sends[0]!.method, "POST");
+  } finally {
+    await h.dispose();
+  }
+});
