@@ -128,6 +128,13 @@ export interface ChannelAdapter {
    * 路由层据此对私聊也做 fail-closed 白名单校验（群聊始终校验）。
    */
   readonly requiresConversationAllowlist?: boolean;
+  /**
+   * 凭据是否齐备（未配置占位适配器返回 false）。
+   *
+   * 为什么需要：已知渠道即使未配置也要出现在清单里，否则 `PUT /channels/:id/secrets`
+   * 会 404、新渠道永远无法通过 UI 首次配置（死循环）。但未配置的条目不能被 start()。
+   */
+  readonly isConfigured?: () => boolean;
   /** 实验适配器是否已由 Owner 显式启用（缺省视为已启用，兼容稳定适配器） */
   isEnabled?(): boolean;
   /**

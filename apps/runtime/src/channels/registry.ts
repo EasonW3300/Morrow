@@ -429,6 +429,13 @@ export class ChannelRegistry {
         entry.detail = "channel is configured but disabled; enable it with POST /v1/channels/:id/enable";
         continue;
       }
+      // 未配置占位（Issue #37 A5）：出现在清单里但绝不 start——等 Owner 写凭据后再 enable。
+      // 必须放在 experimental 分支之前：实验渠道会跳过上面的 disabled 短路。
+      if (entry.adapter.isConfigured !== undefined && !entry.adapter.isConfigured()) {
+        entry.state = "stopped";
+        entry.detail = "channel_not_configured: 尚未配置凭据（PUT /v1/channels/:id/secrets）";
+        continue;
+      }
       // 实验适配器（M4-T5）：出厂 disabled，必须经 enableChannel(confirmRisk=true)
       if (entry.adapter.isEnabled !== undefined && !entry.adapter.isEnabled()) {
         entry.state = "stopped";

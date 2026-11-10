@@ -133,11 +133,23 @@ test("渠道凭据端点：投影只报 configured、写入不回显、必填/�
   const clearRequired = await putJson(base, "/v1/channels/feishu/secrets", { secrets: { app_id: "" } });
   assert.equal(clearRequired.status, 400);
 
-  // echo 已注册但无凭据概念 → 400；未知渠道 → 404
+  // echo 已注册但无凭据概念 → 400 channel_not_configurable（不是 404：404 是"未注册"）
   const echo = await putJson(base, "/v1/channels/echo/secrets", { secrets: { app_id: "x" } });
-  assert.equal(echo.status, 404);
+  assert.equal(echo.status, 404, "本用例未注册 echo → unknown_channel");
+  // A5：已知渠道即使未配置也注册为 pending → 凭据投影可读（configured=false），不再是 404
   const wechat = await fetch(`${base}/v1/channels/wechat/secrets`);
-  assert.equal(wechat.status, 404);
+  assert.equal(wechat.status, 200);
+  const projection = (await wechat.json()) as {
+    channel_id: string;
+    fields: Array<{ field: string; required: boolean; configured: boolean }>;
+  };
+  assert.equal(projection.channel_id, "wechat");
+  const bridgeFields = projection.fields.filter((field) => field.field.startsWith("bridge_"));
+  assert.equal(bridgeFields.length, 2, "微信桥两个字段可配置（此前完全没有规格）");
+  assert.ok(bridgeFields.every((field) => field.configured === false));
+  // 真正未知渠道仍是 404
+  const unknownChannel = await fetch(`${base}/v1/channels/telegram/secrets`);
+  assert.equal(unknownChannel.status, 404);
 });
 
 test("渠道凭据端点：echo 适配器注册后明确 400 channel_not_configurable", async (t) => {

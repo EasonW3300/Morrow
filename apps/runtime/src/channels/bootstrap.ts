@@ -115,6 +115,97 @@ class UnavailableChannelAdapter implements ChannelAdapter {
   }
 }
 
+/**
+ * 未配置凭据的已知渠道占位（Issue #37 修复批 A5）。
+ *
+ * 为什么需要：凭据端点 `/v1/channels/:id/secrets` 只对「已注册」适配器开放，
+ * 而注册条件又是"凭据已存在"——形成死循环：新渠道无法通过 UI 首次配置，只能
+ * 手工写钥匙串。现在三个已知渠道**始终**出现在清单里（capabilities 用真实矩阵，
+ * health 明确"未配置"），UI 可先写凭据、再 enable；未配置时 registry 因
+ * managed+enabled=false 不会 start，不会产生任何收发。
+ */
+class PendingChannelAdapter implements ChannelAdapter {
+  readonly channelId: string;
+  readonly experimental: boolean;
+  /** 未配置：registry 据 this 保持 stopped，不尝试 start */
+  readonly isConfigured = () => false;
+  readonly #capabilities: ChannelCapabilities;
+
+  constructor(
+    channelId: string,
+    capabilities: ChannelCapabilities,
+    options: { experimental?: boolean } = {},
+  ) {
+    this.channelId = channelId;
+    this.#capabilities = capabilities;
+    this.experimental = options.experimental === true;
+  }
+
+  start(): never {
+    throw new ChannelNotConfiguredError(this.channelId);
+  }
+
+  async stop(): Promise<void> {}
+
+  send(_outbound: OutboundMessage): never {
+    throw new ChannelSendError(
+      "explicit",
+      `channel "${this.channelId}" is not configured yet (put credentials via PUT /v1/channels/${this.channelId}/secrets)`,
+      { code: "channel_not_configured", retryable: false },
+    );
+  }
+
+  health(): ChannelAdapterHealth {
+    return {
+      healthy: false,
+      detail: "channel_not_configured: 尚未配置凭据",
+      connection: "disconnected",
+      last_error: null,
+      ...(this.experimental ? { experimental: true } : {}),
+    };
+  }
+
+  parseInbound(_raw: unknown): ParseInboundResult {
+    return {
+      ok: false,
+      code: "channel_not_configured",
+      message: `channel "${this.channelId}" is not configured`,
+    };
+  }
+
+  capabilities(): ChannelCapabilities {
+    return { ...this.#capabilities };
+  }
+}
+
+/** enable 一个未配置渠道时抛出，供 registry 映射为 409 channel_not_configured */
+export class ChannelNotConfiguredError extends Error {
+  readonly code = "channel_not_configured";
+  constructor(channelId: string) {
+    super(
+      `channel "${channelId}" is not configured: PUT /v1/channels/${channelId}/secrets first, then enable`,
+    );
+    this.name = "ChannelNotConfiguredError";
+  }
+}
+
+/** 各渠道的真实能力矩阵（未配置时也如实展示，避免 UI 误标"不支持"） */
+const FEISHU_CAPABILITIES: ChannelCapabilities = {
+  direct_message: "supported",
+  group_mention: "supported",
+  group_proactive: "limited",
+  attachments: "limited",
+  edit: "unsupported",
+};
+const QQ_CAPABILITIES: ChannelCapabilities = { ...FEISHU_CAPABILITIES };
+const WECHAT_CAPABILITIES: ChannelCapabilities = {
+  direct_message: "supported",
+  group_mention: "supported",
+  group_proactive: "limited",
+  attachments: "limited",
+  edit: "unsupported",
+};
+
 /** 真实微信本地桥未接线时的占位（适配器保持 disabled，不产生收发） */
 class UnavailableLocalBridge implements LocalBridge {
   readonly #error: string;
@@ -200,6 +291,12 @@ export async function buildConfiguredChannels(
       account: accountFor("feishu", feishuAppId, "Morrow Feishu", ownerNativeIds.feishu),
       experimental: false,
     });
+  } else {
+    registrations.push({
+      adapter: new PendingChannelAdapter("feishu", FEISHU_CAPABILITIES),
+      account: accountFor("feishu", "feishu-unconfigured", "Morrow Feishu", ownerNativeIds.feishu),
+      experimental: false,
+    });
   }
 
   const qqAppId = await readSecret(options.secretStore, QQ_SECRET_SERVICE, "app_id");
@@ -221,6 +318,12 @@ export async function buildConfiguredChannels(
     registrations.push({
       adapter,
       account: accountFor("qq", qqAppId, "Morrow QQ", ownerNativeIds.qq),
+      experimental: false,
+    });
+  } else {
+    registrations.push({
+      adapter: new PendingChannelAdapter("qq", QQ_CAPABILITIES),
+      account: accountFor("qq", "qq-unconfigured", "Morrow QQ", ownerNativeIds.qq),
       experimental: false,
     });
   }
@@ -249,6 +352,12 @@ export async function buildConfiguredChannels(
         "Morrow WeChat",
         ownerNativeIds.wechat,
       ),
+      experimental: true,
+    });
+  } else {
+    registrations.push({
+      adapter: new PendingChannelAdapter("wechat", WECHAT_CAPABILITIES, { experimental: true }),
+      account: accountFor("wechat", "wechat-unconfigured", "Morrow WeChat", ownerNativeIds.wechat),
       experimental: true,
     });
   }

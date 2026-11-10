@@ -105,12 +105,24 @@ test("startRuntime 自动装配飞书+QQ：未配置不出现，缺省 disabled 
   const base = `http://127.0.0.1:${runtime.port}`;
   const initial = await listChannels(base);
   const initialIds = initial.map((channel) => channel.channel_id).sort();
-  assert.deepEqual(initialIds, ["feishu", "qq"], "只出现已配置凭据的渠道（echo/微信不隐式出现）");
+  // A5：三个已知渠道始终出现（未配置者以 pending 占位，health 明确 channel_not_configured），
+  // 这样 UI 才能"先写凭据再启用"——否则凭据端点只对已注册渠道开放，形成死循环。
+  assert.deepEqual(initialIds, ["feishu", "qq", "wechat"], "三个已知渠道始终出现在清单里");
   for (const channel of initial) {
     assert.equal(channel.state, "stopped", `${channel.channel_id} 缺省未启用`);
     assert.equal(channel.enabled, false);
     assert.ok((channel.account ?? "").length > 0, `${channel.channel_id} 账号已登记`);
   }
+  // 未配置的微信：能力矩阵如实、health 明确未配置
+  const wechatHealth = await health(base, "wechat");
+  assert.match(String(wechatHealth.detail ?? ""), /channel_not_configured/);
+  // 配置入口可用（死循环修复的关键断言）：未配置渠道也能写凭据
+  const put = await fetch(`${base}/v1/channels/wechat/secrets`, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ bridge_endpoint: "http://127.0.0.1:1" }),
+  });
+  assert.notEqual(put.status, 404, "未配置的已知渠道必须允许写凭据（此前 404 unknown_channel）");
 
   const disabledHealth = await health(base, "feishu");
   assert.equal(disabledHealth.state, "stopped");
@@ -125,6 +137,12 @@ test("startRuntime 自动装配飞书+QQ：未配置不出现，缺省 disabled 
 
   const running = await listChannels(base);
   for (const channel of running) {
+    // 微信尚未配置凭据 → 仍是 pending 占位（stopped），不应被隐式启动
+    if (channel.channel_id === "wechat") {
+      assert.equal(channel.state, "stopped", "未配置的微信不得随他人 enable 被启动");
+      assert.equal(channel.enabled, false);
+      continue;
+    }
     assert.equal(channel.state, "running", `${channel.channel_id} 启用后运行`);
     assert.equal(channel.enabled, true);
   }
@@ -149,12 +167,17 @@ test("startRuntime 自动装配飞书+QQ：未配置不出现，缺省 disabled 
   });
   const restarted = await listChannels(`http://127.0.0.1:${runtime.port}`);
   assert.deepEqual(
-    restarted.map((channel) => [channel.channel_id, channel.state, channel.enabled]).sort(),
+    restarted
+      .filter((channel) => channel.channel_id !== "wechat") // 微信未配置：pending 占位不影响
+      .map((channel) => [channel.channel_id, channel.state, channel.enabled])
+      .sort(),
     [
       ["feishu", "running", true],
       ["qq", "running", true],
     ],
   );
+  const restartedWechat = restarted.find((channel) => channel.channel_id === "wechat");
+  assert.equal(restartedWechat?.state, "stopped", "未配置渠道跨重启仍是 pending");
 });
 
 test("微信标记凭据 → 实验适配器出厂 disabled；注入本地桥后 confirm_risk 方可启用", async (t) => {

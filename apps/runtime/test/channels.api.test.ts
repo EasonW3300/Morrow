@@ -49,8 +49,11 @@ test("GET /v1/channels lists adapters with capabilities and state; health is que
   const list = await json<{ channels: ChannelSummary[] }>(
     await fetch(`http://127.0.0.1:${runtime.port}/v1/channels`),
   );
-  assert.equal(list.channels.length, 1);
-  const echo = list.channels[0];
+  // 已知渠道（feishu/qq/wechat）以 pending 占位常驻清单（Issue #37 A5：否则无法首次配置凭据），
+  // 这里只断言注入的 echo 本身。
+  const echo = list.channels.find((channel) => channel.channel_id === "echo");
+  assert.ok(echo, "echo 适配器应在清单中");
+  assert.equal(list.channels.filter((channel) => channel.state === "running").length, 1);
   assert.equal(echo.channel_id, "echo");
   assert.equal(echo.account, "echo-default");
   assert.equal(echo.state, "running");

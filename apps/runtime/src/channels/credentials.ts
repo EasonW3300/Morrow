@@ -5,6 +5,7 @@ import {
   FEISHU_SECRET_SERVICE,
 } from "./adapters/feishu/config.ts";
 import { QQ_SECRET_FIELDS, QQ_SECRET_SERVICE } from "./adapters/qq/config.ts";
+import { WECHAT_SECRET_FIELDS, WECHAT_SECRET_SERVICE } from "./bootstrap.ts";
 
 /**
  * 渠道凭据配置投影（M4-T8 / Issue #45：渠道管理 UI 的凭据表单）。
@@ -50,7 +51,18 @@ const QQ_SPEC: ChannelCredentialSpec = {
   })),
 };
 
-const SPECS: readonly ChannelCredentialSpec[] = [FEISHU_SPEC, QQ_SPEC];
+/**
+ * 微信实验适配器没有平台凭据，但有一个可配置项：本地桥（`bridge_command` 或
+ * `bridge_endpoint`，二选一）。此前不在规格内 → UI 无法配置微信桥，与实际能力不符。
+ * 两个字段都非必填（任一即可），由启动装配判定。
+ */
+const WECHAT_SPEC: ChannelCredentialSpec = {
+  channelId: "wechat",
+  service: WECHAT_SECRET_SERVICE,
+  fields: WECHAT_SECRET_FIELDS.map((field) => ({ field, required: false })),
+};
+
+const SPECS: readonly ChannelCredentialSpec[] = [FEISHU_SPEC, QQ_SPEC, WECHAT_SPEC];
 
 /** channel_id → 凭据字段规格；无凭据概念的渠道返回 null */
 export function channelCredentialSpec(channelId: string): ChannelCredentialSpec | null {
