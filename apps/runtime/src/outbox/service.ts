@@ -85,7 +85,16 @@ export interface OutboxSendRequest {
  */
 export type OutboxSendOutcome =
   | { kind: "sent"; receipt?: OutboxReceipt }
-  | { kind: "failed"; error: string };
+  | {
+      kind: "failed";
+      error: string;
+      /**
+       * 平台明确拒收是否值得自动重试（默认 true）。M4-T4 起用于 QQ 主动消息被平台
+       * 拒绝：这类拒绝是策略/额度限制，重试无意义且可能持续触发风控，故标记 false →
+       * 立即转 needs_review（不自动重发，仍落 outbound.failed/reviewed 审计）。
+       */
+      retryable?: boolean;
+    };
 
 /** 适配器抛出的已分类错误；未分类异常一律按 network 语义（结果未知）处理 */
 export class OutboxChannelError extends Error {
@@ -497,10 +506,31 @@ export class OutboxService {
 
     const detail =
       outcome instanceof OutboxChannelError
-        ? { message: outcome.message, errorKind: outcome.kind }
-        : { message: outcome.error, errorKind: "explicit" };
+        ? { message: outcome.message, errorKind: outcome.kind, retryable: outcome.kind === "explicit" }
+        : { message: outcome.error, errorKind: "explicit" as const, retryable: outcome.retryable !== false };
 
     if (detail.errorKind === "explicit") {
+      // 平台明确拒收但标注不可重试（如 QQ 主动消息被平台策略拒绝）：
+      // 不进入退避队列，直接 failed → needs_review，人工核对/改场景后手动 retry。
+      if (!detail.retryable) {
+        const reason = `${detail.message} (non-retryable rejection)`;
+        this.#store.markFailed(row.id, reason, null, doneIso, "needs_review");
+        this.#emit(OUTBOX_EVENT_TYPES.failed, row, {
+          status: "failed",
+          attempts: attempt,
+          error: detail.message,
+          will_retry: false,
+          retryable: false,
+        });
+        this.#emit(OUTBOX_EVENT_TYPES.reviewed, row, {
+          status: "needs_review",
+          review_reason: "non_retryable_rejection",
+          previous_status: "failed",
+          attempts: attempt,
+          error: detail.message,
+        });
+        return "needs_review";
+      }
       // 平台明确拒收/4xx：幂等安全，可退避重试；达到上限后转人工核对。
       if (attempt >= this.#maxAttempts) {
         const reason = `${detail.message} (max attempts ${this.#maxAttempts} exhausted)`;

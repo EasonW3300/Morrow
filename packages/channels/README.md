@@ -2,7 +2,7 @@
 
 渠道适配器把平台协议转换为统一的 `InboundMessage` / `OutboundMessage`；入站经 T1 的统一
 路由（账号/身份/白名单/权限全部由本地记录决定），助手回复先入 **Outbox** 再投递，所有外发
-留 `outbound.*` 审计。首批稳定基线：飞书 Bot（已实现协议层）、QQ 官方 Bot（T4）；微信个人
+留 `outbound.*` 审计。首批稳定基线：飞书 Bot 与 QQ 官方 Bot（均已实现协议层）；微信个人
 号为实验适配器（T5）。
 
 本目录的 README 是渠道域的操作/复用手册；代码位于 `apps/runtime/src/channels/`。
@@ -105,6 +105,137 @@ await startRuntime(config, {
 - 错误分类 → Outbox：429/403/主动消息拒绝/平台业务码 = `explicit`（failed，指数退避）；
   超时/网络中断 = `timeout|network`（delivery_unknown，不自动重发）。
 
+## QQ 官方 Bot 适配器
+
+代码：`apps/runtime/src/channels/adapters/qq/`（M4-T4 / Issue #41，stable baseline channel）。
+它与飞书适配器共用 T1 契约、Outbox 桥、事件传输与 ChannelTestServer，只替换平台协议。
+
+### 能力矩阵（`capabilities()`）
+
+| 维度 | 声明 | 说明 |
+|---|---|---|
+| `direct_message` | `supported` | 单聊消息收发（`/v2/users/{openid}/messages`） |
+| `group_mention` | `supported` | 群内仅在被 @ 时处理（`GROUP_AT_MESSAGE_CREATE`） |
+| `group_proactive` | `limited` | 主动消息受平台场景/额度限制；**不承诺无限推送** |
+| `attachments` | `limited` | 入站只保留平台 URL 引用；出站富媒体需先上传（未实现） |
+| `edit` | `unsupported` | QQ 消息编辑不纳入首版 |
+
+**主动消息限制（必须如实告知 Owner）**：QQ 官方对主动消息有明确上限（例如单聊约
+10 qps / 20 qpm / 每用户 1000 条/天，群聊约 60 qpm / 每群 1000 条/天，未认证主体更低；
+用户还可以关闭「允许主动发送」）。具体数值以官方文档为准，适配器只在
+`capabilities().group_proactive = "limited"` 中声明受限，不在 UI/文档中暗示无限推送。
+
+### 配置（SecretStore，`channel:qq:<field>`）
+
+| service | account | 必填 | 说明 |
+|---|---|---|---|
+| `channel:qq` | `app_id` | 是 | 机器人 AppID（开放平台「机器人 ID」） |
+| `channel:qq` | `app_secret` | 是 | 机器人 AppSecret（换 access token 的 clientSecret） |
+| `channel:qq` | `bot_secret` | Webhook 时必填 | 回调 Ed25519 签名密钥；配置后事件必须带有效签名 |
+| `channel:qq` | `token_endpoint` | 否 | access token 端点覆盖（内网/联调）；默认官方地址 |
+
+Access Token **不落 SecretStore**，只在进程内缓存并按 `expires_in` 提前刷新（默认提前
+5 分钟）；平台仍报 token 失效时强制刷新**一次**并重试，二次失败 → `health()` 降级
+（`healthy=false`、`connection="degraded"`、`last_error` 可查）。旧的 `Bot Token` 鉴权
+已被 QQ 官方废弃，适配器不实现它。
+
+非机密项由 `QqChannelAdapterOptions` 注入：`apiBaseUrl`（默认
+`https://api.sgroup.qq.com`）、`tokenEndpoint`（默认
+`https://api.bot.qq.com/app/getAppAccessToken`；旧文档/SDK 常用
+`https://bots.qq.com/app/getAppAccessToken`，可用此选项覆盖；`config.tokenEndpoint` 优先）、
+`requestTimeoutMs`、`tokenRefreshSkewMs`、事件传输等。
+
+生产接线：
+
+```ts
+const config = await loadQqConfig(secretStore); // channel:qq:app_id / app_secret
+const adapter = new QqChannelAdapter({ accountId: "qq-default", config });
+await startRuntime(startConfig, {
+  channelAdapters: [{
+    adapter,
+    account: {
+      account_id: "qq-default",
+      channel_id: "qq",
+      native_account_id: config.appId,
+      owner_native_ids: ["<owner 的 QQ member_openid / user_openid>"],
+    },
+  }],
+});
+```
+
+### 事件入站（Webhook / 长连接）
+
+| 平台事件 | 归一化 |
+|---|---|
+| `GROUP_AT_MESSAGE_CREATE` | `conversation_kind=group`，会话 id=`group_openid`，`mention.agent=true`（只在 @ 机器人时投递） |
+| `C2C_MESSAGE_CREATE` | `conversation_kind=direct`，会话 id=`author.user_openid` |
+
+- 文本会去掉 `<@!bot_appid>` 占位符；附件保留 `url` 引用（`native_id` = url）。
+- **签名**：配置 `bot_secret` 后按官方语义校验 Ed25519——种子为 BotSecret 补齐/截断到
+  32 字节，签名内容为 `X-Signature-Timestamp + rawBody`；失败不进入会话链路，落
+  `channel.inbound_rejected`（`signature_invalid` / `signature_missing` /
+  `timestamp_stale`）。
+- **回调校验 op 13**：`answerQqValidation(event, botSecret)` 返回
+  `{ plain_token, signature }`（签名内容 `event_ts + plain_token`），供宿主 Webhook
+  层应答。
+- 默认事件传输仍是与 ChannelTestServer 对齐的 HTTP 长轮询桥接（`EventTransport` 接缝，
+  QQ 复用 T3 实现）；真实平台由官方长连接/SDK 或本地 sidecar 适配后注入。
+
+### 发送与错误分类
+
+- 被动回复（带 `reply_to_native_message_id`）：群 `POST /v2/groups/{group_openid}/messages`、
+  私聊 `POST /v2/users/{user_openid}/messages`，body `{content, msg_type: 0, msg_id, msg_seq}`。
+  `msg_seq` 对同一 `msg_id` 递增（QQ 以 `msg_id+msg_seq` 判重；被动回复窗口/次数由平台限制）。
+- 主动消息（无 `reply_to_native_message_id`）：同一端点省略 `msg_id`，受平台额度/场景限制。
+- **会话形态**：两条 API 需要知道目标是群还是私聊。适配器从入站事件自动学习；
+  对从未入站的目标（如通知主动推送）必须显式登记
+  `conversationKinds: { "<openid>": "group" | "direct" }` 或调用
+  `rememberConversationKind()`。未知形态**显式失败**（`unknown_conversation`，不猜测）。
+- 鉴权头：`Authorization: QQBot <access_token>`（与飞书的 `Bearer` 不同）。
+
+| 平台结果 | 分类 | Outbox 语义 |
+|---|---|---|
+| HTTP 401 / 11241-11243 | `token_invalid` | 强制刷新一次后重试；仍失败 → 健康降级 |
+| HTTP 429 / 20028 / 504xxx / 1100100 / 1100308 | `rate_limited` | `failed`，按 Retry-After 指数退避 |
+| 主动消息被拒（304021/304022/304035/304045..304052 等） | `proactive_rejected` | **不可重试** → 直接 `needs_review` + 审计（`outbound.failed` `will_retry=false`、`outbound.reviewed` `non_retryable_rejection`） |
+| HTTP 403 / 权限码 | `permission_denied` | `failed`（可退避） |
+| 其它 4xx/业务码 | `bad_request` | `failed`（可退避） |
+| 超时 / 网络中断 | `timeout` / `network` | `delivery_unknown` → `needs_review`，**不自动重发** |
+
+> 为实现「主动消息被拒不重试」，T2 的 `OutboxSendOutcome.failed` 增加了可选
+> `retryable?: boolean`；`ChannelSendError.retryable=false` 会原样传到这里。默认行为
+> 不变（缺省按可重试处理）。
+
+### QQ 协议桩（`registerQqTestStub`）
+
+`apps/runtime/src/channels/testing/qq-stub.ts` 在共享 `ChannelTestServer` 上用 `route()`
+注册 QQ 端点，**没有 fork 服务器**：
+
+```ts
+const server = new ChannelTestServer();
+await server.start();
+const stub = registerQqTestStub(server, { appId, appSecret, botSecret });
+const adapter = new QqChannelAdapter({
+  config,
+  apiBaseUrl: server.baseUrl,
+  tokenEndpoint: `${server.baseUrl}/app/getAppAccessToken`,
+});
+
+stub.pushMessage({ type: "group", text: "hi", senderId: "owner" }); // 签名后入事件队列
+stub.rejectProactive = true;   // 主动消息被拒（群 304046 / 单聊 304050）
+stub.rejectAllTokens = true;   // 刷新后仍 401
+stub.failTokenEndpoint = true; // token 端点 500
+stub.rateLimit = { remaining: 1, retryAfterSeconds: 2 };
+stub.mode = "hang" | "forbidden" | "ok";
+stub.expireAccessToken();
+stub.groupMessages; stub.c2cMessages; stub.rejectedProactive; stub.count("group");
+```
+
+共享服务器新增的通用能力（M4-T4 最小扩展）：`ChannelTestServer.pushFrame(frame)`——
+允许非飞书签名形态（QQ Ed25519）把预构造帧投入同一事件队列；`pushEvent` 行为不变。
+
+T4 测试文件：`test/channels.qq.test.ts`、`test/channels.qq.e2e.test.ts`。
+
 ## ChannelTestServer（T4/T5 复用）
 
 代码：`apps/runtime/src/channels/testing/channel-test-server.ts`（runtime 公共出口已导出）。
@@ -164,19 +295,20 @@ server.buildMessageEvent(...);                    // 只构造不投递
 server.buildEventFrame(event);                    // 签名/加密后的 {body, headers}
 ```
 
-自定义平台端点（T4 QQ/T5 微信）：
+自定义平台端点（T4 QQ 已由 `registerQqTestStub` 封装；T5 微信可直接 `route()`）：
 
 ```ts
-server.route("POST", /^\/qq\/token$/, (ctx) => {
+server.route("POST", /^\/custom\/token$/, (ctx) => {
   ctx.respond(200, { access_token: "..." }, { "retry-after": "1" });
 }, "token");
 // 需要延迟响应时返回 "deferred" 并稍后 ctx.respond(...)；ctx.hang() 模拟不响应
 ```
 
 覆盖的验收路径：正常收发、签名失败、429 退避、重复投递、超时 → `delivery_unknown`、
-主动消息受限、token 过期/刷新失败。T3 的测试文件：
+主动消息受限、token 过期/刷新失败。飞书测试文件：
 `test/channels.test-server.test.ts`、`test/channels.feishu.test.ts`、
-`test/channels.feishu.e2e.test.ts`、`test/channels.feishu.runtime.test.ts`。
+`test/channels.feishu.e2e.test.ts`、`test/channels.feishu.runtime.test.ts`；
+QQ 测试文件：`test/channels.qq.test.ts`、`test/channels.qq.e2e.test.ts`。
 
 ## 真实飞书联调（未做，外部依赖阻塞）
 
@@ -196,6 +328,29 @@ server.route("POST", /^\/qq\/token$/, (ctx) => {
 6. 私聊发消息验证回复引用原消息；群聊把 Bot 拉群、@ 一次验证响应，未 @ 不响应；在
    `GET /v1/outbox` 与事件账本核对 `outbound.queued/sent` 与平台回执。
 7. 记录 20 次真实收发证据到门禁报告；主动消息限制、附件限制如实登记。
+
+## 真实 QQ 联调（未做，外部依赖阻塞）
+
+**状态：未执行。** 原因：QQ 机器人开发者资质/机器人账号尚未注册（ADR-0005 前置清单）。
+协议层已由 `ChannelTestServer` + `registerQqTestStub` 全链路覆盖；以下步骤在资质就绪后
+执行，**不得以桩测试冒充平台验收**。
+
+1. 在 QQ 开放平台注册机器人开发者并创建机器人，记录 AppID 与 AppSecret。
+2. 配置沙箱/正式环境的事件订阅：填写回调 HTTPS 地址（只允许 80/443/8080/8443），
+   订阅群 @ 与单聊消息事件；记录 BotSecret 用于 Ed25519 校验。
+3. 提交所需权限/场景：群聊消息、单聊消息；主动消息需按平台申请场景与额度（多数个人
+   开发者默认额度很低或不可用）。
+4. 把 `app_id`、`app_secret`、`bot_secret` 写入本机 SecretStore（service `channel:qq`，
+   account 为字段名）；如需内网 token 代理，写 `token_endpoint`。
+5. 以 `channelAdapters` 注入 `QqChannelAdapter` 启动 Runtime；确认
+   `GET /v1/channels/qq/health` 为 healthy、`connection=connected`、
+   `token_expires_at` 合理；`GET /v1/channels` 中 `group_proactive=limited`。
+6. 私聊发消息验证回复引用原消息；把机器人拉群、@ 一次验证响应，未 @ 不响应；在
+   `GET /v1/outbox` 与事件账本核对 `outbound.queued/sent` 与平台回执。
+7. 主动消息：先确认平台额度与「允许主动发送」开关；若平台拒绝，核对 Outbox 是否进入
+   `needs_review` 且**没有**自动重发，并检查 `outbound.failed` 的
+   `retryable=false`/`outbound.reviewed` 审计。
+8. 记录 20 次真实收发证据到门禁报告；主动消息限制、附件限制如实登记为平台约束。
 
 ## 测试命令
 
