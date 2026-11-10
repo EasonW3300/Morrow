@@ -130,8 +130,10 @@ async function main(): Promise<void> {
     if (finished) return;
     finished = true;
     try {
-      await adapter.stop();
+      // 先读 health 再 stop：stop 会把 connected 置 false，导致退出摘要永远显示
+      // "disconnected"，看起来像故障（实际只是已优雅停止）。
       const health = await adapter.health();
+      await adapter.stop();
       console.log(`[qq] exit (${reason}) events=${events} rejected=${rejected} replies=${replies}`);
       console.log(JSON.stringify({ events, rejected, replies, health }, null, 2));
     } finally {
@@ -154,12 +156,14 @@ async function main(): Promise<void> {
         return;
       }
       console.log(
-        `[event #${events}] type=${parsed.conversation_kind === "group" ? "group_mention" : "direct"}` +
+        `[${new Date().toISOString()}] [event #${events}] type=${parsed.conversation_kind === "group" ? "group_mention" : "direct"}` +
           ` conv=${parsed.native_conversation_id} sender=${parsed.sender.native_id}` +
           ` msg=${parsed.native_message_id} text="${summarize(parsed.text)}"`,
       );
 
-      if (replyText === null || parsed.conversation_kind !== "group") return;
+      // 两条路径都回：群 @（/v2/groups/*）与私聊 C2C（/v2/users/*）。
+      // 适配器按入站学到的会话形态自动选端点——此前这里只回群消息，导致"私聊没反应"。
+      if (replyText === null) return;
       replies += 1;
       void adapter
         .send({
@@ -171,7 +175,9 @@ async function main(): Promise<void> {
           idempotency_key: `qq-live:${parsed.native_message_id}:reply`,
         })
         .then((receipt) => {
-          console.log(`[qq] replied to ${parsed.native_message_id}: id=${receipt.remote_message_id ?? "?"}`);
+          console.log(
+            `[${new Date().toISOString()}] [qq] replied (${parsed.conversation_kind}) to ${parsed.native_message_id}: id=${receipt.remote_message_id ?? "?"}`,
+          );
         })
         .catch((err: unknown) => {
           console.error(
