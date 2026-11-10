@@ -14,14 +14,18 @@ import { classifyFactMerge, type FactMergeDecision, type FactVersionView } from 
  * 记忆同步语义层（票 M3-T3 / Issue #32，PRD §4.2「冲突合并」/ FR-DEP-5 / AC-05）。
  *
  * T1 引擎负责「事件到齐」；本层负责「到齐之后记忆该怎么变」：
- *   1. 三方合并：对每个远端修订，找共同基线（min(local,remote) - 1 的修订），交给
- *      merge.ts（内部复用 M1 DefaultConsolidator）分类；
- *   2. 自动合并（同主题 preference / fast-forward）→ 追加 memory.fact_updated
- *      （reason=sync_merge，显式版本 = max+1）+ sync.merged 审计；
- *   3. 待审核（locked / sensitivity_change / fact_conflict）→ 远端修订写成候选 +
- *      冲突进 M1 memory_conflicts 队列 + sync.conflict 审计（含两侧 replica 与
- *      三方版本），绝不覆盖本地值；
- *   4. 重放：处理完本批后从账本重建 facts/revisions/FTS（memory/rebuild.ts），
+ *   1. 版本关系判定（M3 code-review B1）：远端版本更高 → fast-forward；同版本且内容
+ *      不同 → 并发（交给 merge.ts，内部复用 M1 DefaultConsolidator）；远端版本更低 →
+ *      陈旧跳过。**不再用 `min(local,remote)-1` 伪造共同基线**（它会让 fast-forward
+ *      成为死分支、把普通新版本误判冲突、并放大 preference 版本）。
+ *   2. 有效期参与合并（M3 code-review B2 / FR-DEP-5）：过期事实不作为冲突源——远端
+ *      过期跳过（双方过期留 skip 审计），仅本地过期则有效远端胜出；
+ *   3. 自动合并（同版本 preference）→ 追加 memory.fact_updated（reason=sync_merge，
+ *      显式版本 = max+1）+ sync.merged 审计；
+ *   4. 待审核（locked / sensitivity_change / fact_conflict）→ 远端修订写成候选 +
+ *      冲突进 M1 memory_conflicts 队列 + sync.conflict 审计（含两侧 replica 与版本），
+ *      绝不覆盖本地值；
+ *   5. 重放：处理完本批后从账本重建 facts/revisions/FTS（memory/rebuild.ts），
  *      保证「记忆视图 = 账本事件 + 本副本冲突判定」。
  *
  * 幂等：远端事件 id 已进 sync_conflict_meta / 已被 sync.conflict 记录时不再处理；
@@ -30,6 +34,8 @@ import { classifyFactMerge, type FactMergeDecision, type FactVersionView } from 
  */
 
 const AUTHORITATIVE_REASONS = new Set(["sync_merge", "conflict_resolved", "conflict_merged"]);
+/** 合并跳过审计（B2：双方/远端过期；不产生冲突也不改可见值） */
+const MERGE_SKIPPED_EVENT_TYPE = "sync.merge_skipped";
 
 export interface MemorySyncStats {
   merged: number;
@@ -44,6 +50,8 @@ export interface MemorySyncOptions {
   ledger: EventLedger;
   replicaId: string;
   conflicts: SyncConflictStore;
+  /** 注入时钟（valid_until 过期判定；测试零真实等待）；缺省系统时间 */
+  now?: () => Date;
 }
 
 export class MemorySyncService {
@@ -52,12 +60,14 @@ export class MemorySyncService {
   readonly #replicaId: string;
   readonly #conflicts: SyncConflictStore;
   readonly #rebuilder: MemoryProjectionRebuilder;
+  readonly #now: () => Date;
 
   constructor(options: MemorySyncOptions) {
     this.#store = options.store;
     this.#ledger = options.ledger;
     this.#replicaId = options.replicaId;
     this.#conflicts = options.conflicts;
+    this.#now = options.now ?? (() => new Date());
     this.#rebuilder = new MemoryProjectionRebuilder({
       store: options.store,
       ledger: options.ledger,
@@ -89,20 +99,49 @@ export class MemorySyncService {
       if (latest.event_type === "memory.fact_created") continue; // 已有同 id 事实：不重放创建
       if (this.#conflicts.hasRemoteEvent(latest.event_id)) continue;
 
-      // 版本膨胀防护（M3 修复批 / #32 #36）：本地版本已越过远端修订时不再二次分类。
-      // 典型场景：两端并发 preference 在 A 自动合并出 v3 后，同批/后批到达的陈旧 v2
-      // （批次边界上的重复修订）又被判 auto_merge → 3->2=4 的重复递增。远端版本
-      // 不高于本地版本才可能推进可见值；陈旧修订只记 suppressed（不产生合并/冲突审计）。
-      const remoteVersion = versionOf(latest, local.version);
-      if (remoteVersion < local.version) {
-        suppressed += 1;
-        continue;
-      }
-
       // 权威裁决结果（sync_merge / conflict_resolved / conflict_merged）由重放直接采纳：
       // 即使本副本还有未裁决冲突，也不能把对端的裁决/合并事件继续压制（否则 keep_new /
       // merge 的版本链永远传不到对端——AC-05 裁决后可见值不符合裁决）。
       if (isAuthoritative(latest)) continue;
+
+      const remote = viewFromEnvelope(latest, local);
+      if (remote === null) continue;
+
+      // 有效期参与合并（M3 code-review B2 / FR-DEP-5）：过期事实不得作为冲突源。
+      // - 远端过期（含双方都过期）→ 跳过；双方都过期留 sync.merge_skipped 审计；
+      // - 仅本地过期 → 有效远端胜出（本地不再是可竞争的当前值）。
+      const nowMs = this.#now().getTime();
+      const localExpired = isExpired(local.valid_until, nowMs);
+      const remoteExpired = isExpired(remote.validUntil, nowMs);
+      if (remoteExpired) {
+        this.#auditMergeSkipped(factId, latest, peerReplicaId, localExpired ? "both_expired" : "remote_expired", local.version, remote.version);
+        suppressed += 1;
+        continue;
+      }
+      if (localExpired) {
+        if (remote.version > local.version) {
+          // 远端事件已在账本里且版本更高，重放会直接采纳；只留审计。
+          this.#appendMergedEvent(local, remote, latest, "expired_local_fast_forward", peerReplicaId, remote.version, null);
+          merged += 1;
+        } else if (
+          this.#applyMergeRevision(
+            local,
+            remote,
+            latest,
+            {
+              content: remote.content,
+              sensitivity: remote.sensitivity,
+              resultVersion: Math.max(local.version, remote.version) + 1,
+              mergedReason: "expired_local",
+            },
+            peerReplicaId,
+          )
+        ) {
+          // 远端版本不高于本地：重放会跳过它，显式写一条权威修订覆盖过期本地值。
+          merged += 1;
+        }
+        continue;
+      }
 
       // 已有一条未裁决的跨设备冲突：该事实后续远端修订继续被压制（记录事件 id 供重放跳过），
       // 不再制造第二条冲突——Owner 裁决前不扩大战线。
@@ -116,17 +155,16 @@ export class MemorySyncService {
           peerReplicaId,
           localReplicaId: this.#replicaId,
           localVersion: local.version,
-          remoteVersion,
+          remoteVersion: remote.version,
           baseVersion: open.base_version,
         });
         suppressed += 1;
         continue;
       }
 
-      const remote = viewFromEnvelope(latest, local);
-      if (remote === null) continue;
-      const base = this.#baseView(factId, local, remote);
-      const decision = classifyFactMerge({ base, local: viewOfFact(local), remote });
+      // 版本关系由 classifyFactMerge 直接按 local/remote 的 version 判定（B1）：
+      // 不再从 min(version)-1 伪造共同基线（那会让 fast_forward 成为死分支）。
+      const decision = classifyFactMerge({ base: null, local: viewOfFact(local), remote });
 
       if (decision.action === "auto_merge") {
         if (this.#applyAutoMerge(local, remote, latest, decision, peerReplicaId)) merged += 1;
@@ -141,8 +179,13 @@ export class MemorySyncService {
       if (decision.action === "escalate") {
         this.#raiseConflict(local, remote, events, decision, peerReplicaId);
         conflicts += 1;
+        continue;
       }
-      // identical / remote_is_base / no_local：无需动作
+      if (decision.action === "remote_is_base") {
+        // 远端版本低于本地：陈旧修订，重放会跳过；不产生任何修订/冲突审计。
+        suppressed += 1;
+      }
+      // identical / no_local：无需动作
     }
 
     const rebuilt = needsRebuild(envelopes) ? this.#rebuilder.rebuild() : null;
@@ -154,19 +197,32 @@ export class MemorySyncService {
     return this.#rebuilder.rebuild();
   }
 
-  #baseView(factId: string, local: MemoryFactRow, remote: FactVersionView): FactVersionView | null {
-    const version = Math.min(local.version, remote.version) - 1;
-    if (version < 1) return null;
-    const revision = this.#store.getRevision(factId, version);
-    if (revision === null) return null;
-    return {
-      factId,
-      content: revision.content,
-      kind: local.kind,
-      sensitivity: revision.sensitivity,
-      version: revision.version,
-      updatedAt: revision.created_at,
-    };
+  /** 合并跳过审计（B2）：过期事实不参与冲突，留痕供运维核对（不影响可见值） */
+  #auditMergeSkipped(
+    factId: string,
+    remoteEnvelope: EventEnvelope,
+    peerReplicaId: string,
+    reason: "both_expired" | "remote_expired",
+    localVersion: number,
+    remoteVersion: number,
+  ): void {
+    this.#ledger.append(
+      buildEventEnvelope({
+        replicaId: this.#replicaId,
+        actorId: "agent:runtime",
+        eventType: MERGE_SKIPPED_EVENT_TYPE,
+        payload: {
+          fact_id: factId,
+          reason,
+          local_version: localVersion,
+          remote_version: remoteVersion,
+          local_replica_id: this.#replicaId,
+          remote_replica_id: peerReplicaId,
+          remote_event_id: remoteEnvelope.event_id,
+        },
+        causationId: remoteEnvelope.event_id,
+      }),
+    );
   }
 
   #openConflictMeta(factId: string): SyncConflictMeta | null {
@@ -185,11 +241,41 @@ export class MemorySyncService {
     decision: Extract<FactMergeDecision, { action: "auto_merge" }>,
     peerReplicaId: string,
   ): boolean {
+    return this.#applyMergeRevision(
+      local,
+      remote,
+      remoteEnvelope,
+      {
+        content: decision.content,
+        sensitivity: decision.sensitivity,
+        resultVersion: decision.resultVersion,
+        mergedReason: "preference_update",
+      },
+      peerReplicaId,
+    );
+  }
+
+  /**
+   * 写一条 reason=sync_merge 的权威修订 + 审计（自动合并 / 本地过期让位给有效远端）。
+   * 版本已由另一端推进时收敛为 no-op（返回 false）。
+   */
+  #applyMergeRevision(
+    local: MemoryFactRow,
+    remote: FactVersionView,
+    remoteEnvelope: EventEnvelope,
+    input: {
+      content: string;
+      sensitivity: MemoryFactRow["sensitivity"];
+      resultVersion: number;
+      mergedReason: string;
+    },
+    peerReplicaId: string,
+  ): boolean {
     const { source, candidate } = this.#store.createCandidate({
-      content: decision.content,
+      content: input.content,
       kind: remote.kind,
       confidence: 1,
-      sensitivity: decision.sensitivity,
+      sensitivity: input.sensitivity,
       occurredAt: remoteEnvelope.occurred_at,
       source: { kind: "sync", eventId: remoteEnvelope.event_id, sessionId: null },
     });
@@ -197,9 +283,9 @@ export class MemorySyncService {
     try {
       const { revision } = this.#store.applyFactRevision({
         factId: local.fact_id,
-        version: decision.resultVersion,
-        content: decision.content,
-        sensitivity: decision.sensitivity,
+        version: input.resultVersion,
+        content: input.content,
+        sensitivity: input.sensitivity,
         reason: "sync_merge",
         candidateId: candidate.candidate_id,
         sourceId: source.source_id,
@@ -211,10 +297,10 @@ export class MemorySyncService {
           eventType: MEMORY_EVENT_TYPES.factUpdated,
           payload: {
             fact_id: local.fact_id,
-            version: decision.resultVersion,
-            content: decision.content,
+            version: input.resultVersion,
+            content: input.content,
             kind: local.kind,
-            sensitivity: decision.sensitivity,
+            sensitivity: input.sensitivity,
             revision_id: revision.revision_id,
             reason: "sync_merge",
             candidate_id: candidate.candidate_id,
@@ -231,7 +317,7 @@ export class MemorySyncService {
       if (err instanceof Error && err.message.includes("must advance")) return false;
       throw err;
     }
-    this.#appendMergedEvent(local, remote, remoteEnvelope, "preference_update", peerReplicaId, decision.resultVersion, decision.baseVersion);
+    this.#appendMergedEvent(local, remote, remoteEnvelope, input.mergedReason, peerReplicaId, input.resultVersion, null);
     return true;
   }
 
@@ -453,12 +539,15 @@ function viewOfFact(fact: MemoryFactRow): FactVersionView {
     sensitivity: fact.sensitivity,
     version: fact.version,
     updatedAt: fact.updated_at,
+    validUntil: fact.valid_until,
   };
 }
 
-function versionOf(envelope: EventEnvelope, fallback: number): number {
-  const version = envelope.payload.version;
-  return typeof version === "number" && Number.isInteger(version) && version >= 1 ? version : fallback;
+/** valid_until 非空且已到期（解析失败按「未过期」处理，避免误删有效事实） */
+function isExpired(validUntil: string | null | undefined, nowMs: number): boolean {
+  if (validUntil === null || validUntil === undefined) return false;
+  const at = Date.parse(validUntil);
+  return Number.isFinite(at) && at <= nowMs;
 }
 
 function viewFromEnvelope(envelope: EventEnvelope, local: MemoryFactRow): FactVersionView | null {
@@ -472,6 +561,7 @@ function viewFromEnvelope(envelope: EventEnvelope, local: MemoryFactRow): FactVe
   const content = envelope.payload.content;
   if (typeof content !== "string") return null;
   const kind = envelope.payload.kind;
+  const validUntil = envelope.payload.valid_until;
   return {
     factId: local.fact_id,
     content,
@@ -484,6 +574,8 @@ function viewFromEnvelope(envelope: EventEnvelope, local: MemoryFactRow): FactVe
         : local.sensitivity,
     version,
     updatedAt: envelope.occurred_at,
+    // 缺省沿用本地有效期（与 rebuild 的合并口径一致：payload 未携带时不清空）。
+    validUntil: typeof validUntil === "string" ? validUntil : (validUntil === null ? null : local.valid_until),
   };
 }
 

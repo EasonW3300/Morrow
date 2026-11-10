@@ -66,12 +66,4 @@ export class DeviceIdentity {
     };
     return this.#cached;
   }
-
-  /**
-   * 已有的公开身份（不触碰凭据库）：本机配对过则返回，否则 null。
-   * GET /v1/devices 走 devices 表，不用本方法；预留给 UI 展示。
-   */
-  peek(): DeviceIdentityInfo | null {
-    return this.#cached;
-  }
 }

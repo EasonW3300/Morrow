@@ -112,7 +112,12 @@ function offlineFactUpdate(
   factId: string,
   version: number,
   content: string,
-  options: { sensitivity?: SensitivityLevel; kind?: "fact" | "preference" | "profile" | "procedural"; reason?: string } = {},
+  options: {
+    sensitivity?: SensitivityLevel;
+    kind?: "fact" | "preference" | "profile" | "procedural";
+    reason?: string;
+    validUntil?: string | null;
+  } = {},
 ): EventEnvelope {
   const envelope = buildEventEnvelope({
     replicaId,
@@ -126,9 +131,13 @@ function offlineFactUpdate(
       sensitivity: options.sensitivity ?? "private",
       revision_id: uuidv7(),
       reason: options.reason ?? "offline_edit",
+      ...(options.validUntil === undefined ? {} : { valid_until: options.validUntil }),
     },
   });
   runtime.ledger.append(envelope);
+  // 真实离线编辑会立即反映到本机投影；只落账本会让「并发 v2」测试实际停在 v1
+  // （B1 起 v1→v2 被正确视为 fast-forward，而不是并发）。
+  runtime.memoryRebuilder.rebuild();
   return envelope;
 }
 
@@ -279,11 +288,107 @@ test("两端并发修改同一 preference：自动合并，两端收敛到同一
     assert.ok(eventIds(pair.a, "sync.merged").length >= 1);
     const merged = pair.a.ledger.scan({ eventType: "sync.merged" }).at(-1)!;
     const payload = merged.envelope.payload as Record<string, unknown>;
-    assert.equal(payload.local_version, 1);
+    assert.equal(payload.local_version, 2);
     assert.equal(payload.remote_version, 2);
     assert.equal(payload.result_version, 3);
     assert.equal(pair.a.memoryRebuilder.check().ok, true);
     assert.equal(pair.b.memoryRebuilder.check().ok, true);
+  } finally {
+    await closePair(pair);
+  }
+});
+
+test("B1：普通 fact 远端版本更高 → fast-forward 采纳且不建冲突；同版本不同值 → 巩固器判定；低版本 → 跳过", async () => {
+  const pair = await startPair();
+  try {
+    connect(pair);
+    const factId = await seedFact(pair.a, pair.sensitivityA, "服务监听端口 8787。");
+    await syncAll(pair);
+
+    // 1) 远端 v2 > 本地 v1：fast-forward，不产生冲突/待审核
+    const ff = offlineFactUpdate(pair.b, REPLICA_B, factId, 2, "服务监听端口 9000。");
+    await syncAll(pair);
+    assert.equal(pair.a.memory.getFact(factId)?.content, "服务监听端口 9000。", "A 采纳远端更高版本");
+    assert.equal(pair.a.memory.getFact(factId)?.version, 2);
+    assert.equal(pair.a.memory.listConflicts({ status: "open" }).length, 0, "fast-forward 不进待审核");
+    const ffMerged = pair.a.ledger
+      .scan({ eventType: "sync.merged" })
+      .filter((entry) => entry.envelope.payload.remote_event_id === ff.event_id);
+    assert.equal(ffMerged.length, 1, "留 fast-forward 合并审计");
+    assert.equal(ffMerged[0].envelope.payload.reason, "fast_forward");
+    assert.equal(ffMerged[0].envelope.payload.local_version, 1);
+    assert.equal(ffMerged[0].envelope.payload.remote_version, 2);
+
+    // 2) 同版本不同值（普通 fact）→ 巩固器判 fact_conflict（不静默覆盖）
+    offlineFactUpdate(pair.a, REPLICA_A, factId, 3, "服务监听端口 8787。");
+    const conflictRemote = offlineFactUpdate(pair.b, REPLICA_B, factId, 3, "服务监听端口 9100。");
+    await syncAll(pair);
+    const open = pair.a.memory.listConflicts({ status: "open" });
+    assert.ok(open.some((row) => row.fact_id === factId && row.reason === "fact_conflict"), "同版本并发进待审核");
+    assert.equal(pair.a.memory.getFact(factId)?.content, "服务监听端口 8787。", "待审核期间本地值不被静默覆盖");
+    assert.equal(pair.b.memory.getFact(factId)?.content, "服务监听端口 9100。");
+    assert.ok(
+      pair.a.ledger
+        .scan({ eventType: "sync.conflict" })
+        .some((entry) => (entry.envelope.payload.remote_event_ids as string[]).includes(conflictRemote.event_id)),
+      "远端修订被记录为待审核来源",
+    );
+
+    // 3) 远端版本更低 → 陈旧跳过：可见值/版本不变、不新增冲突
+    const conflictsBefore = pair.a.memory.listConflicts({ status: "open" }).length;
+    const stale = offlineFactUpdate(pair.b, REPLICA_B, factId, 2, "服务监听端口 1。");
+    await syncAll(pair);
+    assert.equal(pair.a.ledger.hasEvent(stale.event_id), true, "陈旧修订仍入账本（审计）");
+    assert.equal(pair.a.memory.getFact(factId)?.content, "服务监听端口 8787。", "陈旧修订不覆盖本地");
+    assert.equal(pair.a.memory.getFact(factId)?.version, 3, "本地版本不前进");
+    assert.equal(pair.a.memory.listConflicts({ status: "open" }).length, conflictsBefore, "陈旧修订不制造新冲突");
+  } finally {
+    await closePair(pair);
+  }
+});
+
+test("B2：本地已过期 + 远端有效 → 采用远端且不冲突；双方都过期 → 跳过并记 skip 审计", async () => {
+  const pair = await startPair();
+  try {
+    connect(pair);
+    const factId = await seedFact(pair.a, pair.sensitivityA, "部署目标是 Ubuntu 24.04。");
+    await syncAll(pair);
+
+    // 1) A 本地事实过期（v2），B 有效（v3，有效期至未来）→ 过期本地不作为冲突源
+    const past = "2020-01-01T00:00:00.000Z";
+    const future = "2999-01-01T00:00:00.000Z";
+    offlineFactUpdate(pair.a, REPLICA_A, factId, 2, "部署目标是 Debian 12（已过期）。", { validUntil: past });
+    const validRemote = offlineFactUpdate(pair.b, REPLICA_B, factId, 3, "部署目标是 Ubuntu 26.04。", { validUntil: future });
+    await syncAll(pair);
+
+    assert.equal(pair.a.memory.getFact(factId)?.content, "部署目标是 Ubuntu 26.04。", "有效远端胜出");
+    assert.equal(pair.a.memory.getFact(factId)?.version, 3);
+    assert.equal(pair.a.memory.getFact(factId)?.valid_until, future);
+    assert.equal(pair.a.memory.listConflicts({ status: "open" }).length, 0, "过期本地不制造冲突");
+    assert.ok(
+      pair.a.ledger
+        .scan({ eventType: "sync.merged" })
+        .some(
+          (entry) =>
+            entry.envelope.payload.remote_event_id === validRemote.event_id &&
+            entry.envelope.payload.reason === "expired_local_fast_forward",
+        ),
+      "采用远端留同步合并审计",
+    );
+
+    // 2) 双方都过期且同版本不同值 → 无冲突，仅 skip 审计
+    const skipsBefore = pair.a.ledger.scan({ eventType: "sync.merge_skipped" }).length;
+    offlineFactUpdate(pair.a, REPLICA_A, factId, 4, "旧记录 A（已过期）。", { validUntil: past });
+    offlineFactUpdate(pair.b, REPLICA_B, factId, 4, "旧记录 B（已过期）。", { validUntil: past });
+    await syncAll(pair);
+
+    assert.equal(pair.a.memory.listConflicts({ status: "open" }).length, 0, "双方过期不产生冲突");
+    const skips = pair.a.ledger.scan({ eventType: "sync.merge_skipped" });
+    assert.ok(skips.length > skipsBefore, "留 skip 审计");
+    assert.ok(
+      skips.some((entry) => entry.envelope.payload.reason === "both_expired"),
+      "skip 原因为 both_expired",
+    );
   } finally {
     await closePair(pair);
   }

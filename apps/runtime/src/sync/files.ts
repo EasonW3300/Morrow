@@ -167,13 +167,3 @@ export function replicaShort(replicaId: string): string {
 function sha256(content: Buffer): string {
   return createHash("sha256").update(content).digest("hex");
 }
-
-/** 供外部确认路径是否落在 baseDir 内（附件传输入口的防御性检查） */
-export function isInsideBase(baseDir: string, relativePath: string): boolean {
-  try {
-    assertInside(baseDir, join(baseDir, normalizeRelative(relativePath)));
-    return true;
-  } catch {
-    return false;
-  }
-}

@@ -21,7 +21,8 @@
 | 10 | 执行权单点：needs_reconcile 期间与裁决后均无有效执行租约（不并行重放） | PASS | lease=active=false |
 
 注记：
-- needs_reconcile 的异地证据以直接入账本方式模拟：任务投影（tasks 表）不随同步事件重建，见门禁报告 §6。
+- needs_reconcile 的异地证据以直接入账本方式模拟；任务投影已随同步重建（`51ecc64`，门禁报告 §6-4），此处仅为构造证据。
+- 第 7 行 `B.token=1` 是本归档生成时的旧行为（各副本 token 独立起号）；A1 修复后 B 应采用转移声明的 `next=2`（见 `apps/runtime/test/lease.fencing-sync.test.ts`）。
 
 **轮次小结**：PASS=10 FAIL=0
 
@@ -43,7 +44,8 @@
 | 10 | 执行权单点：needs_reconcile 期间与裁决后均无有效执行租约（不并行重放） | PASS | lease=active=false |
 
 注记：
-- needs_reconcile 的异地证据以直接入账本方式模拟：任务投影（tasks 表）不随同步事件重建，见门禁报告 §6。
+- needs_reconcile 的异地证据以直接入账本方式模拟；任务投影已随同步重建（`51ecc64`，门禁报告 §6-4），此处仅为构造证据。
+- 第 7 行 `B.token=1` 是本归档生成时的旧行为（各副本 token 独立起号）；A1 修复后 B 应采用转移声明的 `next=2`（见 `apps/runtime/test/lease.fencing-sync.test.ts`）。
 
 **轮次小结**：PASS=10 FAIL=0
 

@@ -7,18 +7,33 @@ import { ensureLeaseTable } from "./migrations.ts";
  * LeaseStore（M3-T4 / Issue #33，FR-DEP-4「执行权单点化」）。
  *
  * 语义（全部由注入时钟判定，测试零 sleep）：
- * - acquire：首次 token=1；同一 holder 未过期重复 acquire 幂等返回同 token；他人
+ * - acquire：token = max(本地行当前 token, 账本观察到的 granted 最大 token) + 1；
+ *   首次无观察值时为 1。同一 holder 未过期重复 acquire 幂等返回同 token；他人
  *   持有且未过期 → `{ heldBy }`（调用方据此不执行并说明持有者）；租约过期（含已
  *   release）可抢占，token 严格 +1，旧 token 从此 validate=false；
  * - renew：只延长 expires_at/heartbeat_at，不换 token；过期后 renew 返回 false；
  * - release：holder+token 匹配才成功；holder 置 NULL、expires_at 提前到当前时刻，
  *   token 计数保留（下一位持有者 token+1）；
- * - validate：token 匹配且当前有效（holder 非空、未过期）。
+ * - validate：token 匹配且当前有效（holder 非空、未过期），且 token 不低于账本
+ *   观察到的跨副本最大 token（旧设备的旧 token 不能在新设备接管后继续提交）。
+ *
+ * 跨副本计数：execution_fencing_tokens 保存从账本重放出的 granted/reserved 最大值
+ * （reserved = task.execution_transferred 的 next_fencing_token）。租约表本身是副本
+ * 私有态，只靠它会让每个副本各自从 1 起号；观察值由 LeaseCoordinator/调度器在
+ * acquire 前与转移时写入。
  *
  * 原子性：acquire 在 BEGIN IMMEDIATE 事务内完成「读当前行 → 判定 → 写入」，SQLite
  * 写事务串行化使跨连接的两副本同时抢租约只有一个成功（另一个读到新 holder）。
  * 连接与任务投影同库（events.sqlite，WAL + busy_timeout）。
  */
+
+/** 账本观察到的跨副本 fencing 最大 token（0 = 未观察） */
+export interface ObservedFencingTokens {
+  /** 实际发放过（acquire/renew/release 携带的 fencing_token）的最大值 */
+  granted: number;
+  /** task.execution_transferred 声明的 next_fencing_token 最大值 */
+  reserved: number;
+}
 
 /** 租约当前投影（current 返回；active 由注入时钟判定） */
 export interface ExecutionLeaseRecord {
@@ -70,6 +85,9 @@ export class LeaseStore {
   #updateRenewStmt;
   #updateReleaseStmt;
   #listStmt;
+  #getObservedStmt;
+  #observeGrantedStmt;
+  #observeReservedStmt;
 
   constructor(options: LeaseStoreOptions) {
     if (options.db !== undefined) {
@@ -98,6 +116,17 @@ export class LeaseStore {
       "UPDATE execution_leases SET holder_replica_id = NULL, expires_at = ?, heartbeat_at = ? WHERE task_id = ?",
     );
     this.#listStmt = this.#db.prepare("SELECT * FROM execution_leases ORDER BY acquired_at, task_id");
+    this.#getObservedStmt = this.#db.prepare(
+      "SELECT granted_token, reserved_token FROM execution_fencing_tokens WHERE task_id = ?",
+    );
+    this.#observeGrantedStmt = this.#db.prepare(
+      `INSERT INTO execution_fencing_tokens (task_id, granted_token, reserved_token) VALUES (?, ?, 0)
+       ON CONFLICT(task_id) DO UPDATE SET granted_token = MAX(granted_token, excluded.granted_token)`,
+    );
+    this.#observeReservedStmt = this.#db.prepare(
+      `INSERT INTO execution_fencing_tokens (task_id, granted_token, reserved_token) VALUES (?, 0, ?)
+       ON CONFLICT(task_id) DO UPDATE SET reserved_token = MAX(reserved_token, excluded.reserved_token)`,
+    );
   }
 
   /**
@@ -117,10 +146,18 @@ export class LeaseStore {
     this.#db.exec("BEGIN IMMEDIATE");
     try {
       const existing = this.#getStmt.get(taskId) as LeaseRow | undefined;
+      // 跨副本计数：本机行可能从 1 起，但账本里别的副本已发过更大的号/转移预留了
+      // 下一个号——取号必须越过它，否则转移后旧设备的旧 token 仍可提交。
+      // 转移预留的号是「目标副本应当拿到的下一个号」：取 max(本地/远端已发放)+1 后，
+      // 若预留值更大则直接采用预留值（不浪费号，也不产生低于校验下限的 token）。
+      const observed = this.#observed(taskId);
+      const nextToken = (localToken: number): number =>
+        Math.max(localToken + 1, observed.granted + 1, observed.reserved);
       let outcome: LeaseAcquireOutcome;
       if (existing === undefined) {
-        this.#insertStmt.run(taskId, replicaId, 1, expiresIso, nowIso, nowIso);
-        outcome = { token: 1, expires_at: expiresIso, acquired_at: nowIso, heartbeat_at: nowIso };
+        const token = nextToken(0);
+        this.#insertStmt.run(taskId, replicaId, token, expiresIso, nowIso, nowIso);
+        outcome = { token, expires_at: expiresIso, acquired_at: nowIso, heartbeat_at: nowIso };
       } else {
         const heldBy = existing.holder_replica_id;
         const active = heldBy !== null && nowMs < Date.parse(existing.expires_at);
@@ -135,8 +172,8 @@ export class LeaseStore {
         } else if (active && heldBy !== null) {
           outcome = { heldBy, expires_at: existing.expires_at, fencing_token: existing.fencing_token };
         } else {
-          // 首次 / 过期抢占 / release 后重新持有：token 严格 +1
-          const token = existing.fencing_token + 1;
+          // 首次 / 过期抢占 / release 后重新持有：token 越过本地行与远端观察值
+          const token = nextToken(existing.fencing_token);
           this.#updateGrantStmt.run(replicaId, token, expiresIso, nowIso, nowIso, taskId);
           outcome = { token, expires_at: expiresIso, acquired_at: nowIso, heartbeat_at: nowIso };
         }
@@ -186,14 +223,48 @@ export class LeaseStore {
     return true;
   }
 
-  /** 副作用提交前的 fencing 校验：token 匹配且租约当前有效。 */
+  /**
+   * 副作用提交前的 fencing 校验：token 匹配且租约当前有效，且不低于跨副本观察到的
+   * 最大 token（granted 或转移预留）。后者保证旧设备持有的旧 token 在新设备接管后
+   * 立即失效——即使本机租约行还残留着旧的 holder/token。
+   */
   validate(taskId: string, token: number): boolean {
     this.#assertOpen();
+    const observed = this.#observed(taskId);
+    const floor = Math.max(observed.granted, observed.reserved);
+    if (token < floor) return false;
     const existing = this.#getStmt.get(taskId) as LeaseRow | undefined;
     if (existing === undefined) return false;
     if (existing.holder_replica_id === null) return false;
     if (existing.fencing_token !== token) return false;
     return this.#now().getTime() < Date.parse(existing.expires_at);
+  }
+
+  /**
+   * 记录账本中观察到的「实际发放过」的最大 fencing token（幂等取 max）。
+   * 由同步租约协调器在 pull 后调用；本机自身 acquire 也会推进本地行，无需调用。
+   */
+  observeGrantedToken(taskId: string, token: number): void {
+    this.#assertOpen();
+    if (!Number.isInteger(token) || token <= 0) return;
+    this.#observeGrantedStmt.run(taskId, token);
+  }
+
+  /**
+   * 记录 task.execution_transferred 声明的 next_fencing_token（幂等取 max）。
+   * 转移方/接收方都应记录：接收方 acquire 越过它取号，转移方用旧 token 提交会被
+   * validate 拒绝。
+   */
+  observeReservedToken(taskId: string, token: number): void {
+    this.#assertOpen();
+    if (!Number.isInteger(token) || token <= 0) return;
+    this.#observeReservedStmt.run(taskId, token);
+  }
+
+  /** 当前观察值（0 = 未观察；诊断/测试用） */
+  fencingObservation(taskId: string): ObservedFencingTokens {
+    this.#assertOpen();
+    return this.#observed(taskId);
   }
 
   /** 当前租约（含释放后的行；无行 → null）；active 由注入时钟判定。 */
@@ -215,6 +286,14 @@ export class LeaseStore {
     if (this.#closed) return;
     this.#closed = true;
     if (this.#ownsDb) this.#db.close();
+  }
+
+  #observed(taskId: string): ObservedFencingTokens {
+    const row = this.#getObservedStmt.get(taskId) as
+      | { granted_token: number | bigint; reserved_token: number | bigint }
+      | undefined;
+    if (row === undefined) return { granted: 0, reserved: 0 };
+    return { granted: Number(row.granted_token), reserved: Number(row.reserved_token) };
   }
 
   #project(row: LeaseRow, nowMs: number): ExecutionLeaseRecord {

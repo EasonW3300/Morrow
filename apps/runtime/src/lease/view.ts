@@ -49,17 +49,49 @@ interface HolderState {
 }
 
 /**
- * 按 task 重放租约事件，返回**当前持有**（holder 非 null）的记录，按账本 sequence
- * 排序。已释放/丢失的 holder 不出现在结果里。
+ * 租约重放视图：
+ * - `leases`：当前持有者（已释放/丢失的 holder 不在其中）；
+ * - `max_granted_token`：账本中**实际发放过**的最大 fencing token；
+ * - `max_reserved_token`：`task.execution_transferred.next_fencing_token` 声明的最大
+ *   预留 token（转移目标应当拿到的下一个号）。
+ *
+ * 跨副本计数（M3 修复批 / #33）：租约表是副本私有态，各副本各自从 1 起号会让
+ * 旧设备的旧 token 在新设备接管后仍然有效。调用方把这两个值喂给 LeaseStore
+ * （observeGranted/ReservedToken）：取号用 max(本地 token, granted)+1，校验拒绝
+ * 任何 < max(granted, reserved) 的 token。
  */
-export function replayLeases(ledger: EventLedger, taskId: string): ReplayedLease[] {
+export interface LeaseView {
+  leases: ReplayedLease[];
+  max_granted_token: number;
+  max_reserved_token: number;
+}
+
+/**
+ * 按 task 重放租约事件，返回**当前持有**（holder 非 null）的记录与观察到的最大
+ * token（见 LeaseView）。记录按账本 sequence 排序。
+ */
+export function replayLeaseView(ledger: EventLedger, taskId: string): LeaseView {
   const entries = ledger.scan({ taskId });
   const holders = new Map<string, HolderState>();
-  let order = 0;
+  let maxGranted = 0;
+  let maxReserved = 0;
   for (const entry of entries) {
-    order += 1;
     const type = entry.envelope.event_type;
     const payload = entry.envelope.payload;
+    if (
+      type === LEASE_EVENT_TYPES.acquired ||
+      type === LEASE_EVENT_TYPES.renewed ||
+      type === LEASE_EVENT_TYPES.released ||
+      type === LEASE_EVENT_TYPES.lost ||
+      type === LEASE_EVENT_TYPES.transferred
+    ) {
+      const observed = asNumber(payload.fencing_token);
+      if (observed !== null && observed > maxGranted) maxGranted = observed;
+      if (type === LEASE_EVENT_TYPES.transferred) {
+        const reserved = asNumber(payload.next_fencing_token);
+        if (reserved !== null && reserved > maxReserved) maxReserved = reserved;
+      }
+    }
     if (type === LEASE_EVENT_TYPES.acquired) {
       const holder = asString(payload.holder_replica_id) ?? entry.envelope.replica_id;
       const token = asNumber(payload.fencing_token);
@@ -106,9 +138,21 @@ export function replayLeases(ledger: EventLedger, taskId: string): ReplayedLease
       holders.delete(holder);
     }
   }
-  return [...holders.values()]
-    .map((state) => state.lease)
-    .sort((left, right) => left.sequence - right.sequence || left.holder_replica_id.localeCompare(right.holder_replica_id));
+  return {
+    leases: [...holders.values()]
+      .map((state) => state.lease)
+      .sort(
+        (left, right) =>
+          left.sequence - right.sequence || left.holder_replica_id.localeCompare(right.holder_replica_id),
+      ),
+    max_granted_token: maxGranted,
+    max_reserved_token: maxReserved,
+  };
+}
+
+/** 只取当前持有记录（replayLeaseView 的便捷包装） */
+export function replayLeases(ledger: EventLedger, taskId: string): ReplayedLease[] {
+  return replayLeaseView(ledger, taskId).leases;
 }
 
 /** 仅返回未过期（expires_at > now）的持有记录 */

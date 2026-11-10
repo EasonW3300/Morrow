@@ -962,6 +962,8 @@ export class TaskScheduler {
     // 1) 事前检查：已持有（幂等路径）不再拉取；否则拉取并重放远端租约。
     if (existing === undefined && this.#leaseCoordinator !== null) {
       const gate = await this.#leaseCoordinator.beforeAcquire(taskId);
+      // 跨副本 fencing 观察值（M3 修复批 / #33）：取号越过它，validate 拒绝旧 token。
+      this.#observeLeaseTokens(taskId, gate.observed);
       if (!gate.ok && gate.holder !== null) {
         this.#appendTaskEvent(
           taskId,
@@ -1015,6 +1017,7 @@ export class TaskScheduler {
     // 3) 二次采样：近同时 acquire 的对方事件可能刚到。双持有 → 释放并冻结，不执行。
     if (this.#leaseCoordinator !== null) {
       const verify = await this.#leaseCoordinator.afterAcquire(taskId);
+      this.#observeLeaseTokens(taskId, verify.observed);
       if (!verify.ok && verify.dual_hold) {
         this.#leases.release(taskId, this.#replicaId, outcome.token);
         this.#appendTaskEvent(taskId, TASK_EVENT_TYPES.taskLeaseReleased, {
@@ -1037,6 +1040,13 @@ export class TaskScheduler {
     this.#leaseHandles.set(taskId, { token: outcome.token, timer: null });
     this.#startLeaseHeartbeat(taskId, outcome.token);
     return { ok: true };
+  }
+
+  /** 把租约视图观察到的跨副本最大 token 写入 LeaseStore（幂等取 max） */
+  #observeLeaseTokens(taskId: string, observed: { granted: number; reserved: number }): void {
+    if (this.#leases === null) return;
+    if (observed.granted > 0) this.#leases.observeGrantedToken(taskId, observed.granted);
+    if (observed.reserved > 0) this.#leases.observeReservedToken(taskId, observed.reserved);
   }
 
   /** 心跳续租（默认 ttl/3）；renew 失败 = token 已被抢占/过期 → 中止并记 task.lease_lost。 */
@@ -1277,6 +1287,10 @@ export class TaskScheduler {
       had_inflight_execution: hadInflight,
       ...(checkpointId === undefined ? {} : { checkpoint_id: checkpointId }),
     });
+    // 转移声明的下一个号即刻成为本机校验下限：若本进程还残留旧 token 的提交路径，
+    // validate 会拒绝（跨副本单调，M3 修复批 / #33）。
+    this.#leases.observeGrantedToken(taskId, token);
+    this.#leases.observeReservedToken(taskId, token + 1);
     return {
       task: this.#tasks.getTask(taskId) ?? task,
       lease: this.#leases.current(taskId),

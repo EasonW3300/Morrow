@@ -46,13 +46,14 @@ export interface SyncPushOutcome {
   skipped?: number;
 }
 
-/** 每对 peer 的同步游标 */
+/** 每对 peer 的同步游标（两个方向各用独立存储列，M3 code-review A2） */
 export interface SyncCursorRecord {
   peer_replica_id: string;
-  /** 已从 peer 账本拉取并导入的最高 sequence（peer 的命名空间） */
+  /** inbound：已从 peer 拉取/接收并导入的最高 **peer** 账本 sequence
+   *  （pull 与 receivePush 共用这一列） */
   last_pulled_sequence: number;
-  /** 已获 peer 确认的对端推送方向最高 sequence（发送方是本副本时为本地命名空间；
-   *  接收方是 peer 推送时存 peer 的命名空间）——见 README 同步章节口径 */
+  /** outbound：已获 peer 确认的最高 **本地** sequence（只由 push 回执推进；
+   *  接收对端 push 不会改变它，否则反向推送会从错误序号起跳） */
   last_acked_sequence: number;
   /**
    * 最近一次成功同步（任一方向的 pull / push / 接收 push）时间；从未成功过为 null。
@@ -69,9 +70,7 @@ export interface SyncCursorRecord {
  *
  * 待同步量口径：
  *   pending_upload   = max(0, 本副本账本最大 sequence − last_acked_sequence)。
- *                      last_acked_sequence 的方向命名空间见 SyncCursorRecord：当本副本是
- *                      发送方时它就是本地命名空间；当本 peer 曾向本副本推送时该游标
- *                      记录的是 peer 命名空间（此时该差值是保守估值，注释在案）。
+ *                      last_acked_sequence 是 outbound 游标（本地命名空间，已获 peer 确认）。
  *   pending_download = max(0, 对端账本最大 sequence − last_pulled_sequence)。对端上界必须
  *                      实时查询（GET /v1/sync/status?probe=local）；对端不可达时为 null
  *                      且 unreachable=true——不伪造 0。

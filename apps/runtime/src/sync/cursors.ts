@@ -5,13 +5,18 @@ import { DB_FILE_NAME } from "../ledger.ts";
 import { ensureSyncTables } from "./migrations.ts";
 
 /**
- * 同步游标存储（M3-T1 / Issue #30）。每对 peer 一行，记录两个方向独立的进度：
- * 拉取方向（last_pulled_sequence）与 push 方向已确认（last_acked_sequence）。
- * 游标只前进不后退（advance 单调取 max），缺口检测失败时不调用 advance。
+ * 同步游标存储（M3-T1 / Issue #30）。每对 peer 一行，两个方向各用独立列
+ * （M3 code-review A2）：
+ *   - inbound：`last_pulled_remote_sequence`——已从 peer 拉取/接收并导入的最高
+ *     **peer** sequence（pullFromPeer 与 receivePush 共用）；
+ *   - outbound：`last_acked_local_sequence`——已获 peer 确认的最高 **本地**
+ *     sequence（只由 pushToPeer 推进）。
+ * 对外投影仍用 `last_pulled_sequence` / `last_acked_sequence` 字段名（API 兼容），
+ * 但语义已分离：收到 push 只推进 inbound，绝不影响下一轮反向 push 的起点。
  *
- * M3 修复批（Issue #35）：新增 last_synced_at——每次**成功**的 pull/push（含空批成功、
- * 游标无需推进的重复同步）都刷新；updated_at 只在游标实际前进时变化，不能用它表达
- * 「刚刚同步过但没有新事件」。
+ * 游标只前进不后退（advance 单调取 max），缺口检测失败时不调用 advance。
+ * M3 修复批（Issue #35）：last_synced_at——每次**成功**的 pull/push（含空批成功、
+ * 游标无需推进的重复同步）都刷新；updated_at 只在游标实际前进时变化。
  */
 export class SyncCursorStore {
   readonly #db: SqliteDatabase;
@@ -19,35 +24,43 @@ export class SyncCursorStore {
 
   #getStmt;
   #listStmt;
-  #advancePulledStmt;
-  #advanceAckedStmt;
+  #advancePulledRemoteStmt;
+  #advanceAckedLocalStmt;
   #markSyncedStmt;
 
   private constructor(db: SqliteDatabase) {
     this.#db = db;
     ensureSyncTables(db);
     this.#getStmt = db.prepare(
-      "SELECT peer_replica_id, last_pulled_sequence, last_acked_sequence, last_synced_at, updated_at FROM sync_cursors WHERE peer_replica_id = ?",
+      `SELECT peer_replica_id,
+              last_pulled_remote_sequence AS last_pulled_sequence,
+              last_acked_local_sequence   AS last_acked_sequence,
+              last_synced_at, updated_at
+         FROM sync_cursors WHERE peer_replica_id = ?`,
     );
     this.#listStmt = db.prepare(
-      "SELECT peer_replica_id, last_pulled_sequence, last_acked_sequence, last_synced_at, updated_at FROM sync_cursors ORDER BY peer_replica_id",
+      `SELECT peer_replica_id,
+              last_pulled_remote_sequence AS last_pulled_sequence,
+              last_acked_local_sequence   AS last_acked_sequence,
+              last_synced_at, updated_at
+         FROM sync_cursors ORDER BY peer_replica_id`,
     );
-    this.#advancePulledStmt = db.prepare(
-      `INSERT INTO sync_cursors (peer_replica_id, last_pulled_sequence, last_acked_sequence, updated_at)
+    this.#advancePulledRemoteStmt = db.prepare(
+      `INSERT INTO sync_cursors (peer_replica_id, last_pulled_remote_sequence, last_acked_local_sequence, updated_at)
        VALUES (?, ?, 0, ?)
        ON CONFLICT(peer_replica_id) DO UPDATE SET
-         last_pulled_sequence = excluded.last_pulled_sequence,
+         last_pulled_remote_sequence = excluded.last_pulled_remote_sequence,
          updated_at = excluded.updated_at`,
     );
-    this.#advanceAckedStmt = db.prepare(
-      `INSERT INTO sync_cursors (peer_replica_id, last_pulled_sequence, last_acked_sequence, updated_at)
+    this.#advanceAckedLocalStmt = db.prepare(
+      `INSERT INTO sync_cursors (peer_replica_id, last_pulled_remote_sequence, last_acked_local_sequence, updated_at)
        VALUES (?, 0, ?, ?)
        ON CONFLICT(peer_replica_id) DO UPDATE SET
-         last_acked_sequence = excluded.last_acked_sequence,
+         last_acked_local_sequence = excluded.last_acked_local_sequence,
          updated_at = excluded.updated_at`,
     );
     this.#markSyncedStmt = db.prepare(
-      `INSERT INTO sync_cursors (peer_replica_id, last_pulled_sequence, last_acked_sequence, last_synced_at, updated_at)
+      `INSERT INTO sync_cursors (peer_replica_id, last_pulled_remote_sequence, last_acked_local_sequence, last_synced_at, updated_at)
        VALUES (?, 0, 0, ?, ?)
        ON CONFLICT(peer_replica_id) DO UPDATE SET
          last_synced_at = excluded.last_synced_at,
@@ -100,22 +113,22 @@ export class SyncCursorStore {
     return rows.map(normalizeRow);
   }
 
-  /** 拉取方向推进（只前进）；sequence <= 当前值时 no-op */
-  advancePulled(peerReplicaId: string, sequence: number, now: Date = new Date()): void {
+  /** inbound 推进（只前进）；sequence <= 当前值时 no-op */
+  advancePulledRemote(peerReplicaId: string, sequence: number, now: Date = new Date()): void {
     this.#assertOpen();
     if (!Number.isInteger(sequence) || sequence <= 0) return;
     const current = this.getOrZero(peerReplicaId).last_pulled_sequence;
     if (sequence <= current) return;
-    this.#advancePulledStmt.run(peerReplicaId, sequence, now.toISOString());
+    this.#advancePulledRemoteStmt.run(peerReplicaId, sequence, now.toISOString());
   }
 
-  /** push 方向已确认推进（只前进）；sequence <= 当前值时 no-op */
-  advanceAcked(peerReplicaId: string, sequence: number, now: Date = new Date()): void {
+  /** outbound 已确认推进（只前进）；sequence <= 当前值时 no-op */
+  advanceAckedLocal(peerReplicaId: string, sequence: number, now: Date = new Date()): void {
     this.#assertOpen();
     if (!Number.isInteger(sequence) || sequence <= 0) return;
     const current = this.getOrZero(peerReplicaId).last_acked_sequence;
     if (sequence <= current) return;
-    this.#advanceAckedStmt.run(peerReplicaId, sequence, now.toISOString());
+    this.#advanceAckedLocalStmt.run(peerReplicaId, sequence, now.toISOString());
   }
 
   /**

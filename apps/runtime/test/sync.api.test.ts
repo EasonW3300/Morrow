@@ -134,8 +134,8 @@ test("POST /v1/sync/push 幂等导入：同批重推 accepted=0/duplicates=N，�
     const status = await json<SyncStatus>(await fetch(url(runtime, "/v1/sync/status")));
     const cursor = status.cursors.find((row) => row.peer_replica_id === REPLICA_B);
     assert.ok(cursor);
-    assert.equal(cursor.last_acked_sequence, 3);
-    assert.equal(cursor.last_pulled_sequence, 0);
+    assert.equal(cursor.last_pulled_sequence, 3, "接收 push 推进 inbound 游标");
+    assert.equal(cursor.last_acked_sequence, 0, "outbound 不被收到的 push 污染");
 
     const pushed = runtime.ledger.scan({ eventType: "sync.pushed" });
     assert.equal(pushed.length, 2);

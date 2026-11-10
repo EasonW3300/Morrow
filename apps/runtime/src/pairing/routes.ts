@@ -13,7 +13,8 @@ import { PairingError, type PairingService } from "./service.ts";
  *   POST   /v1/pairing/join      **本机作为新设备**加入对端 Runtime（M3 修复批 / Issue #35）：
  *                                宿主侧 claim + 本地指纹校验 + token 写 OS 凭据库 +
  *                                对端公钥写设备表；响应绝不含 token 明文
- *   DELETE /v1/devices/:id       撤销设备（revoked=1 + 清 token_hash + 审计）
+ *   DELETE /v1/devices/:id       撤销设备（revoked=1 + **保留 token_hash 作吊销墓碑** +
+ *                                审计；摘要不构成访问权，鉴权必查 revoked → 403）
  *
  * GET /v1/devices 仍由 runtime.ts 的极简路由承载（M0 起就在那里；本票只扩展了
  * DeviceRegistry.list 的投影字段）。错误信封与全局约定一致
