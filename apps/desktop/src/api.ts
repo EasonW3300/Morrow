@@ -22,6 +22,7 @@ import type {
   DeviceInfo,
   NotificationRule,
   NotificationRuleInput,
+  NotificationRecord,
   OutboxListPage,
   OutboxMessageRecord,
   OutboxStatus,
@@ -56,6 +57,7 @@ export type {
   DeviceInfo,
   NotificationRule,
   NotificationRuleInput,
+  NotificationRecord,
   OutboxListPage,
   OutboxMessageRecord,
   OutboxStatus,
@@ -795,6 +797,22 @@ export const api = {
       headers: JSON_HEADERS,
       body: JSON.stringify({ rules }),
     }).then((r) => r.rules);
+  },
+
+  /** GET /v1/notifications/pending：桌面待拉取（服务端已放行到点的免打扰延迟行） */
+  listPendingNotifications(base: string): Promise<NotificationRecord[]> {
+    return request<{ notifications: NotificationRecord[] }>(base, "/v1/notifications/pending").then(
+      (r) => r.notifications,
+    );
+  },
+
+  /** POST /v1/notifications/:id/ack：桌面已展示/已读确认（pending → sent） */
+  ackNotification(base: string, notificationId: string): Promise<NotificationRecord> {
+    return request<{ notification: NotificationRecord }>(
+      base,
+      `/v1/notifications/${encodeURIComponent(notificationId)}/ack`,
+      { method: "POST", headers: JSON_HEADERS },
+    ).then((r) => r.notification);
   },
 
   /** GET /v1/outbox?status=&limit=&offset=：外发审计列表（人工核对入口） */

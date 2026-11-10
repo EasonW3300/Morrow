@@ -9,6 +9,8 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = [] }
+# 系统通知（Issue #47 / PRD §4.8 FR-NOT-2）：Tauri v2 官方插件，权限态由 OS 管理
+tauri-plugin-notification = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

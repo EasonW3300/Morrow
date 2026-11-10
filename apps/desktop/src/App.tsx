@@ -6,6 +6,7 @@ import { SessionList } from "./SessionList.tsx";
 import { SettingsView } from "./SettingsView.tsx";
 import { HealthView } from "./HealthView.tsx";
 import { TaskView } from "./TaskView.tsx";
+import { NotificationCenter } from "./NotificationCenter.tsx";
 
 /**
  * 桌面壳根组件：解析控制面地址（sidecar ready）→ 顶栏导航（会话 / 任务 / 设置 / 健康）。
@@ -117,6 +118,7 @@ export default function App() {
             </button>
           ))}
         </nav>
+        <NotificationCenter base={base} onOpenTask={openTask} />
       </header>
       {view === "chat" && (
         <div className="chat-layout">

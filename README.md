@@ -2,7 +2,7 @@
 
 单主人、长期记忆、可自主生成能力的个人 Agent。
 
-**当前状态**：M4 收官（渠道与通知域**协议层达成**：飞书/QQ 适配器、Outbox 外发审计、可信联系人、群聊白名单、通知规则、微信实验适配；**真实平台层未达成**——QQ 真实平台累计群 @ 15/20 + 私聊 1 次、飞书资质未注册、微信需 Owner Windows，见 [M4 门禁报告](docs/gates/m4-gate-report.md) 的双层结论）。M3 收官（三种部署形态、同步引擎、设备配对、离线回放、执行租约交付，见 [M3 门禁报告](docs/gates/m3-gate-report.md)；M2「缺能力→造工具→安全验证→重用」演示达成，见 [M2 门禁报告](docs/gates/m2-gate-report.md)；M1 两项主线门槛达成，见 [M1 门禁报告](docs/gates/m1-gate-report.md)；M0 冒烟门全绿，见 [M0 门禁报告](docs/gates/m0-gate-report.md)）。
+**当前状态**：M4 收官（渠道与通知域**协议层达成**：飞书/QQ 适配器、Outbox 外发审计、可信联系人、群聊白名单、通知规则、微信实验适配；桌面通知投递已端到端达成——`tauri-plugin-notification` 系统通知 + 应用内通知中心，权限被拒时自动降级；**真实平台层未达成**——QQ 真实平台累计群 @ 15/20 + 私聊 1 次、飞书资质未注册、微信需 Owner Windows，见 [M4 门禁报告](docs/gates/m4-gate-report.md) 的双层结论）。M3 收官（三种部署形态、同步引擎、设备配对、离线回放、执行租约交付，见 [M3 门禁报告](docs/gates/m3-gate-report.md)；M2「缺能力→造工具→安全验证→重用」演示达成，见 [M2 门禁报告](docs/gates/m2-gate-report.md)；M1 两项主线门槛达成，见 [M1 门禁报告](docs/gates/m1-gate-report.md)；M0 冒烟门全绿，见 [M0 门禁报告](docs/gates/m0-gate-report.md)）。
 
 ## 文档导航
 
