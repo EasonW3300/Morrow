@@ -112,7 +112,7 @@ test("receivePush 导入事件并按 event_id 幂等：同批重推无副作用�
     assert.equal(first.duplicates, 0);
     assert.equal(first.next_seq, 3);
     assert.equal(dataEvents(b), 3, "全部导入");
-    assert.equal(b.cursors.getOrZero(REPLICA_A).last_acked_sequence, 3);
+    assert.equal(b.cursors.getOrZero(REPLICA_A).last_pulled_sequence, 3);
 
     const countBefore = b.ledger.count();
     const second = b.engine.receivePush(REPLICA_A, fromA.envelopes);
@@ -121,7 +121,7 @@ test("receivePush 导入事件并按 event_id 幂等：同批重推无副作用�
     assert.equal(second.next_seq, 3);
     assert.equal(dataEvents(b), 3, "重复导入不产生新数据事件");
     assert.equal(b.ledger.count(), countBefore + 1, "只追加一条审计事件");
-    assert.equal(b.cursors.getOrZero(REPLICA_A).last_acked_sequence, 3, "游标不后退也不虚增");
+    assert.equal(b.cursors.getOrZero(REPLICA_A).last_pulled_sequence, 3, "游标不后退也不虚增");
 
     const pushed = b.ledger.scan({ eventType: "sync.pushed" });
     assert.equal(pushed.length, 2, "每次导入动作都留审计（含全重复批）");
@@ -156,7 +156,7 @@ test("receivePush 批内 sequence 不连续 → sync_gap（expected/actual），
       },
     );
     assert.equal(dataEvents(b), 0, "整批预校验失败，不落任何事件");
-    assert.equal(b.cursors.getOrZero(REPLICA_A).last_acked_sequence, 0, "游标不推进");
+    assert.equal(b.cursors.getOrZero(REPLICA_A).last_pulled_sequence, 0, "游标不推进");
 
     const gaps = b.ledger.scan({ eventType: "sync.gap_detected" });
     assert.equal(gaps.length, 1);
@@ -177,7 +177,7 @@ test("receivePush 起始 sequence 与游标不衔接 → sync_gap；游标已有
     const batch = a.engine.exportBatch(0, 100).envelopes;
 
     b.engine.receivePush(REPLICA_A, batch.slice(0, 2)); // 游标 = 2
-    assert.equal(b.cursors.getOrZero(REPLICA_A).last_acked_sequence, 2);
+    assert.equal(b.cursors.getOrZero(REPLICA_A).last_pulled_sequence, 2);
 
     assert.throws(
       () => b.engine.receivePush(REPLICA_A, [batch[3], batch[4]]), // 从 4 开始，缺 3
@@ -189,7 +189,7 @@ test("receivePush 起始 sequence 与游标不衔接 → sync_gap；游标已有
         return true;
       },
     );
-    assert.equal(b.cursors.getOrZero(REPLICA_A).last_acked_sequence, 2);
+    assert.equal(b.cursors.getOrZero(REPLICA_A).last_pulled_sequence, 2);
     assert.equal(dataEvents(b), 2);
   } finally {
     closeReplica(a);
@@ -217,7 +217,7 @@ test("receivePush 完整 integrity_hash 不符 → 拒绝整批，已合法的�
       },
     );
     assert.equal(dataEvents(b), 0, "整批拒绝：合法的前置事件也不落库");
-    assert.equal(b.cursors.getOrZero(REPLICA_A).last_acked_sequence, 0);
+    assert.equal(b.cursors.getOrZero(REPLICA_A).last_pulled_sequence, 0);
     assert.equal(b.ledger.scan({ eventType: "sync.gap_detected" }).length, 0, "integrity 失败不是 gap");
   } finally {
     closeReplica(a);
@@ -276,12 +276,55 @@ test("pushToPeer 从 last_acked_sequence 增量推送，对端导入并推进两
     assert.equal(first.next_seq, 3);
     assert.equal(dataEvents(b), 3);
     assert.equal(a.cursors.getOrZero(REPLICA_B).last_acked_sequence, 3, "发送侧记住已 ack 的自身 sequence");
-    assert.equal(b.cursors.getOrZero(REPLICA_A).last_acked_sequence, 3, "接收侧 ack 到来源 sequence");
+    assert.equal(b.cursors.getOrZero(REPLICA_A).last_pulled_sequence, 3, "接收侧 ack 到来源 sequence");
 
     const second = await a.engine.pushToPeer(REPLICA_B);
     assert.equal(second.accepted, 0);
     assert.equal(second.duplicates, 0, "无新事件时不发送");
     assert.equal(second.next_seq, 3);
+  } finally {
+    closeReplica(a);
+    closeReplica(b);
+  }
+});
+
+test("A push 到 B 后 B 反向 push：从 B 自己账本最早的未确认处起，B 推送前的旧事件全部到达 A", async () => {
+  const a = openReplica(REPLICA_A);
+  const b = openReplica(REPLICA_B);
+  try {
+    connect([a, b]);
+    // B 在收到 A 的 push **之前**已有自己的本地事件（旧事件）。
+    writeEvents(b, REPLICA_B, 2, "b-old");
+    const bLocalBefore = b.ledger.count();
+
+    writeEvents(a, REPLICA_A, 3, "a");
+    const pushedToB = await a.engine.pushToPeer(REPLICA_B);
+    assert.equal(pushedToB.accepted, 3);
+
+    // 收到 push 后：B 的 inbound 游标记录 A 的 sequence；outbound 游标仍是 0
+    // （旧实现把二者混在同一列，反向推送会从 3 起跳，跳过 B 的 1..2）。
+    const cursorAfterReceive = b.cursors.getOrZero(REPLICA_A);
+    assert.equal(cursorAfterReceive.last_pulled_sequence, 3, "inbound 记录已拉到 A 的 sequence");
+    assert.equal(cursorAfterReceive.last_acked_sequence, 0, "outbound 不被收到的 push 污染");
+
+    const reverse = await b.engine.pushToPeer(REPLICA_A);
+    assert.ok(reverse.accepted >= bLocalBefore, "B 收到 A 的 push 前的旧事件也全部推送");
+    // 反向批次也携带 B 刚导入的 A 事件（回显），A 按 event_id 幂等去重。
+    assert.equal(reverse.duplicates, 3, "A 的 3 条事件回显为重复");
+    const bEventsOnA = a.ledger
+      .scan({ eventType: "test.sync_offline" })
+      .filter((entry) => entry.envelope.replica_id === REPLICA_B);
+    assert.equal(bEventsOnA.length, bLocalBefore, "A 收到了 B 的全部业务事件");
+    assert.deepEqual(
+      bEventsOnA.map((entry) => entry.envelope.payload.index),
+      [0, 1],
+      "B 的两条旧事件按原顺序到达 A",
+    );
+    assert.equal(
+      b.cursors.getOrZero(REPLICA_A).last_acked_sequence,
+      b.ledger.sequenceRange().max,
+      "outbound 推进到本地账本最大 sequence（含导入事件）",
+    );
   } finally {
     closeReplica(a);
     closeReplica(b);
@@ -341,7 +384,9 @@ test("sync_cursors 迁移幂等：旧表缺列经 ensureSyncTables 补齐，重�
       (column) => column.name,
     );
     assert.deepEqual(columns.sort(), [
+      "last_acked_local_sequence",
       "last_acked_sequence",
+      "last_pulled_remote_sequence",
       "last_pulled_sequence",
       "last_synced_at",
       "peer_replica_id",
@@ -349,7 +394,7 @@ test("sync_cursors 迁移幂等：旧表缺列经 ensureSyncTables 补齐，重�
     ]);
     // 迁移后可正常写入/读取游标（默认值 0）
     db.prepare(
-      "INSERT INTO sync_cursors (peer_replica_id, last_pulled_sequence, last_acked_sequence, updated_at) VALUES (?, 0, 0, ?)",
+      "INSERT INTO sync_cursors (peer_replica_id, last_pulled_remote_sequence, last_acked_local_sequence, updated_at) VALUES (?, 0, 0, ?)",
     ).run(REPLICA_B, new Date().toISOString());
     assert.equal((db.prepare("SELECT COUNT(*) AS n FROM sync_cursors").get() as { n: number }).n, 1);
   } finally {

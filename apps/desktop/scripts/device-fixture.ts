@@ -173,10 +173,10 @@ const localMax = sequenceRange.max ?? 1;
 const cursors = SyncCursorStore.open(config.dataDir);
 try {
   // peerA：已拉到 12；推送方向确认到「本地上界 − 3」（待上传估算 = 3 条）
-  cursors.advancePulled(pairedA, 12, ago(70 * 60_000));
-  cursors.advanceAcked(pairedA, Math.max(1, localMax - 3), ago(35 * 60_000));
+  cursors.advancePulledRemote(pairedA, 12, ago(70 * 60_000));
+  cursors.advanceAckedLocal(pairedA, Math.max(1, localMax - 3), ago(35 * 60_000));
   // peerB：只拉过一批、从未确认过本机推送（待上传估算 = 本地全部）
-  cursors.advancePulled(pairedB, 4, ago(11 * HOUR));
+  cursors.advancePulledRemote(pairedB, 4, ago(11 * HOUR));
 } finally {
   cursors.close();
 }

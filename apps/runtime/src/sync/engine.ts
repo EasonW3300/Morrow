@@ -115,7 +115,11 @@ export class SyncEngine {
     this.#tombstones?.reconcileFromLedger(this.#ledger);
   }
 
-  /** 注入/替换出站传输（宿主接线或契约测试用它把两个副本连起来） */
+  /**
+   * 注入/替换出站传输。当前无生产调用者（runtime 构造时经 SyncEngineOptions.transport
+   * 注入，配对变更走 DeviceSyncTransport.invalidate）；保留给契约测试把两个副本连起来
+   * 以及宿主测试接线。
+   */
   setTransport(transport: SyncTransport | null): void {
     this.#transport = transport ?? undefined;
   }
@@ -160,7 +164,7 @@ export class SyncEngine {
     const outcome = this.#importEnvelopes(peerReplicaId, result.envelopes, "pulled");
     // 正常推进游标：以批内最后一条实际 sequence 为准（不盲信对端 nextSeq，避免跳过空洞）
     const lastSequence = result.envelopes.length > 0 ? result.envelopes[result.envelopes.length - 1].sequence : since;
-    this.#cursors.advancePulled(peerReplicaId, lastSequence);
+    this.#cursors.advancePulledRemote(peerReplicaId, lastSequence);
     this.#markSynced(peerReplicaId);
     return {
       envelopes: result.envelopes,
@@ -171,9 +175,11 @@ export class SyncEngine {
     };
   }
 
-  /** 把本地新事件推给 peer（从 last_acked_sequence 之后的本地 sequence 起） */
+  /** 把本地新事件推给 peer（从本地已确认的 outbound 游标之后起） */
   async pushToPeer(peerReplicaId: string, options: PushOptions = {}): Promise<SyncPushOutcome> {
     const transport = this.#requireTransport();
+    // outbound 游标只由 push 回执推进（A2）：接收 push 只写 inbound，不会把这里
+    // 的起点推到对端命名空间的序号上。
     const acked = this.#cursors.getOrZero(peerReplicaId).last_acked_sequence;
     const batch = this.exportBatch(acked, normalizeLimit(options.limit));
     if (batch.envelopes.length === 0) {
@@ -181,7 +187,7 @@ export class SyncEngine {
       return { accepted: 0, duplicates: 0, next_seq: acked };
     }
     const receipt = await transport.push(peerReplicaId, batch.envelopes);
-    this.#cursors.advanceAcked(peerReplicaId, batch.next_seq);
+    this.#cursors.advanceAckedLocal(peerReplicaId, batch.next_seq);
     this.#markSynced(peerReplicaId);
     // 出站侧不另落 sync.pushed：对端接收时必落一条（同一次动作的单侧审计），
     // 避免发送方审计事件反过来被下一次推送携带、形成审计自增殖。
@@ -400,10 +406,7 @@ export class SyncEngine {
       return { accepted: 0, duplicates: 0, next_seq: null };
     }
 
-    const cursor =
-      direction === "pulled"
-        ? this.#cursors.getOrZero(peerReplicaId).last_pulled_sequence
-        : this.#cursors.getOrZero(peerReplicaId).last_acked_sequence;
+    const cursor = this.#cursors.getOrZero(peerReplicaId).last_pulled_sequence;
 
     // 1) 形状 + sequence 连续性/游标衔接（缺口 → sync_gap；整批未写库）
     let expected = cursor + 1;
@@ -509,11 +512,9 @@ export class SyncEngine {
     }
 
     const lastSequence = envelopes[envelopes.length - 1].sequence;
-    if (direction === "pulled") {
-      this.#cursors.advancePulled(peerReplicaId, lastSequence);
-    } else {
-      this.#cursors.advanceAcked(peerReplicaId, lastSequence);
-    }
+    // 两个入口（pull / 接收 push）都是 inbound：推进同一个 remote-sequence 游标。
+    // outbound 的 last_acked_sequence 只由 pushToPeer 回执推进（A2：不再混用）。
+    this.#cursors.advancePulledRemote(peerReplicaId, lastSequence);
     // 只含 sync.* 元事件的导入不落新审计：审计事件本身会随账本传播，若每次导入
     // 元事件都再审一遍，两台副本会围绕审计事件互相触发（自增殖）。携带真实数据
     // 的导入（含全重复批）仍留痕。

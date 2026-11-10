@@ -158,7 +158,7 @@ test("双副本各离线 50 条 → 重连双向同步 → 逐项对账（无丢
     const cursorBOnA = a.sync
       .status()
       .cursors.find((cursor) => cursor.peer_replica_id === REPLICA_B);
-    assert.equal(cursorBOnA?.last_acked_sequence, b.ledger.sequenceRange().max);
+    assert.equal(cursorBOnA?.last_pulled_sequence, b.ledger.sequenceRange().max);
 
     // 再推一次：游标已到对端末尾，无新事件可发
     const again = await b.sync.pushToPeer(REPLICA_A);
@@ -167,7 +167,7 @@ test("双副本各离线 50 条 → 重连双向同步 → 逐项对账（无丢
     // 缺口：伪造带洞的新 sequence → sync_gap，游标不推进、事件不落库
     const ackedBefore = a.sync
       .status()
-      .cursors.find((cursor) => cursor.peer_replica_id === REPLICA_B)?.last_acked_sequence;
+      .cursors.find((cursor) => cursor.peer_replica_id === REPLICA_B)?.last_pulled_sequence;
     const nextExpected = (ackedBefore ?? 0) + 1;
     const beforeCount = a.ledger.count();
     const gapBatch: SyncEnvelope[] = [
@@ -186,7 +186,7 @@ test("双副本各离线 50 条 → 重连双向同步 → 逐项对账（无丢
     );
     assert.equal(a.ledger.count(), beforeCount + 1, "只追加一条 sync.gap_detected 审计");
     assert.equal(
-      a.sync.status().cursors.find((cursor) => cursor.peer_replica_id === REPLICA_B)?.last_acked_sequence,
+      a.sync.status().cursors.find((cursor) => cursor.peer_replica_id === REPLICA_B)?.last_pulled_sequence,
       ackedBefore,
       "缺口时游标不推进",
     );
@@ -196,7 +196,7 @@ test("双副本各离线 50 条 → 重连双向同步 → 逐项对账（无丢
     tamperSource[1].envelope.payload = { tampered: true };
     const cursorBeforeTamper = a.sync
       .status()
-      .cursors.find((cursor) => cursor.peer_replica_id === REPLICA_B)?.last_acked_sequence;
+      .cursors.find((cursor) => cursor.peer_replica_id === REPLICA_B)?.last_pulled_sequence;
     assert.throws(
       () => a.sync.receivePush(REPLICA_B, tamperSource),
       (err: unknown) => {
@@ -206,7 +206,7 @@ test("双副本各离线 50 条 → 重连双向同步 → 逐项对账（无丢
       },
     );
     assert.equal(
-      a.sync.status().cursors.find((cursor) => cursor.peer_replica_id === REPLICA_B)?.last_acked_sequence,
+      a.sync.status().cursors.find((cursor) => cursor.peer_replica_id === REPLICA_B)?.last_pulled_sequence,
       cursorBeforeTamper,
       "integrity 失败不推进游标",
     );
