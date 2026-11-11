@@ -140,6 +140,50 @@ jobs:
           path: ${{ matrix.bundle-dir }}/
           if-no-files-found: error
 
+  # 类型与单测门禁（2026-11-11 新增）。
+  #
+  # 为什么补这一 job：在此之前 CI 只跑 `pack:runtime`（esbuild，不做类型检查）、
+  # `tauri build`（只覆盖 desktop 的 tsc）与沙箱测试——runtime 的 `tsc --noEmit` 与
+  # 733 个单测从未进过 CI。M4-T9 就是带着一个 runtime typecheck 回归通过了 CI，
+  # 靠本地才发现。本地跑得再全，不进门禁等于没有。
+  #
+  # 边界：
+  #   - 只跑不需要真实容器的套件（容器两条由 `sandbox tests (ubuntu, real containers)`
+  #     单独负责，避免重复拉镜像）；
+  #   - desktop 只跑 node:test（cargo 由 build job 的 tauri build 覆盖）。
+  checks:
+    name: typecheck + unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1 # 仓库历史 blob 较大（~600MB），门禁无需历史
+
+      - uses: pnpm/action-setup@v4 # 版本取 package.json packageManager（pnpm@9.12.0）
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22 # 解析到最新 22.x（含 FTS5，需 >=22.16）
+          cache: pnpm
+
+      - name: Install workspace dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck all packages
+        run: pnpm -r typecheck
+
+      # desktop 的 node:test 有前置：tauri build script 要求 runtime dist 存在
+      - name: Build runtime dist (desktop test prerequisite)
+        run: pnpm --filter @morrow/runtime build
+
+      - name: Runtime unit tests (excludes real-container suites)
+        run: pnpm --filter @morrow/runtime test:unit
+
+      - name: Desktop UI/logic tests (no cargo)
+        run: pnpm --filter @morrow/desktop test:ui
+
+
   gate:
     name: gate (${{ matrix.name }})
     needs: build

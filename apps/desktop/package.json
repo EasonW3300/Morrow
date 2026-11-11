@@ -11,7 +11,8 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "typecheck": "tsc --noEmit",
-    "test": "pnpm run typecheck && node --experimental-strip-types --test \"src/*.test.ts\" && cargo test --manifest-path src-tauri/Cargo.toml"
+    "test": "pnpm run typecheck && node --experimental-strip-types --test \"src/*.test.ts\" && cargo test --manifest-path src-tauri/Cargo.toml",
+    "test:ui": "tsc --noEmit && node --experimental-strip-types --test \"src/*.test.ts\""
   },
   "dependencies": {
     "@morrow/protocol": "workspace:*",

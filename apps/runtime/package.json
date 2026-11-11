@@ -17,7 +17,8 @@
     "test:sandbox": "node --experimental-sqlite --test --experimental-strip-types \"test/sandbox.*.test.ts\"",
     "memory:ac03": "node --experimental-sqlite --experimental-strip-types scripts/memory-ac03.ts",
     "factory:ac06": "node --experimental-sqlite --experimental-strip-types scripts/factory-ac06.ts",
-    "factory:harness:container": "node --experimental-sqlite --test --experimental-strip-types \"test/capability-factory.harness.container.test.ts\""
+    "factory:harness:container": "node --experimental-sqlite --test --experimental-strip-types \"test/capability-factory.harness.container.test.ts\"",
+    "test:unit": "node --experimental-sqlite --test --experimental-strip-types $(find test -maxdepth 1 -name \"*.test.ts\" ! -name \"sandbox.docker.test.ts\" ! -name \"capability-factory.harness.container.test.ts\")"
   },
   "dependencies": {
     "@morrow/pi-adapter": "workspace:*",
