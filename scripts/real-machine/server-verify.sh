@@ -127,7 +127,8 @@ check "服务 enabled"       'systemctl is-enabled --quiet morrow'
 check "health 200"         'curl -fsS --max-time 5 http://127.0.0.1:8787/v1/health | grep -q "\"status\":\"ok\""'
 check "数据目录归属 morrow" 'test "$(stat -c %U /var/lib/morrow)" = "morrow"'
 check "账本已落盘"          'sudo -n test -s /var/lib/morrow/events.sqlite'
-check "审计事件含 started"  'sudo -n sqlite3 /var/lib/morrow/events.sqlite "select count(*) from events where envelope like '"'"'%runtime.started%'"'"'" 2>/dev/null | grep -qv "^0$" || sudo -n grep -c "runtime.started" /var/lib/morrow/*.jsonl 2>/dev/null | grep -qv "^0$"'
+# 走控制面 API 查账本（服务器不保证装 sqlite3；API 是权威读路径）
+check "审计事件含 runtime.started" 'curl -fsS --max-time 5 "http://127.0.0.1:8787/v1/events?limit=20" | grep -q "runtime.started"'
 
 echo "  -- 重启后仍健康 --"
 rssh 'sudo -n systemctl restart morrow'
@@ -135,14 +136,43 @@ sleep 4
 check "重启后 health 200" 'curl -fsS --max-time 8 http://127.0.0.1:8787/v1/health | grep -q "\"status\":\"ok\""'
 check "重启后账本完整"     'sudo -n test -s /var/lib/morrow/events.sqlite'
 
-echo "  -- 单二进制自检（--probe：health + sqlite + 真实 PiAdapter 对话，内置 mock，无需密钥）--"
-if rssh 'sudo -n -u morrow env MORROW_PORT=0 MORROW_DATA_DIR=/tmp/morrow-probe /usr/local/bin/morrow --probe' 2>&1 | tail -12 | tee /tmp/morrow-probe.out | grep -q "PASS"; then
-  echo "  PASS  --probe 自检"
+echo "  -- 单二进制自检（--probe：health + sqlite + 真实 PiAdapter 对话）--"
+# 探针的对话段要求 MORROW_PROBE_LLM_BASE_URL（打包流程里由本地 mock 提供）。服务器上临时
+# 起一个最小 SSE mock（python3 标准库，零安装），跑完即清理——这样在 Linux 上验证的是
+# 完整 PiAdapter 链路，而不是只验 health。
+rssh 'cat > /tmp/morrow-mock-openai.py <<"MOCKPY"
+import json, time
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+class H(BaseHTTPRequestHandler):
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("content-length", 0)))
+        self.send_response(200)
+        self.send_header("content-type", "text/event-stream")
+        self.end_headers()
+        def chunk(delta, finish=None):
+            body = {"id":"mock","object":"chat.completion.chunk","created":int(time.time()),
+                    "model":"mock-model","choices":[{"index":0,"delta":delta,"finish_reason":finish}]}
+            self.wfile.write(b"data: " + json.dumps(body).encode() + b"\n\n")
+            self.wfile.flush()
+        chunk({"role":"assistant","content":"探针正常"})
+        chunk({}, "stop")
+        self.wfile.write(b"data: [DONE]\n\n")
+        self.wfile.flush()
+    def log_message(self, *a):
+        pass
+
+HTTPServer(("127.0.0.1", 18080), H).serve_forever()
+MOCKPY
+nohup python3 /tmp/morrow-mock-openai.py >/tmp/morrow-mock.log 2>&1 &
+sleep 1'
+if rssh 'cd /tmp && sudo -n -u morrow env MORROW_PORT=0 MORROW_DATA_DIR=/tmp/morrow-probe MORROW_PROBE_LLM_BASE_URL=http://127.0.0.1:18080/v1 /usr/local/bin/morrow --probe' 2>&1 | tee /tmp/morrow-probe.out | grep -q '"probe":"pass"'; then
+  echo "  PASS  --probe 自检（health + sqlite + 真实 PiAdapter 对话）"
 else
   echo "  FAIL  --probe 自检（输出见 /tmp/morrow-probe.out）"
   FAILED=1
 fi
-rssh 'sudo -n rm -rf /tmp/morrow-probe' || true
+rssh 'pkill -f morrow-mock-openai.py 2>/dev/null || true; rm -f /tmp/morrow-mock-openai.py /tmp/morrow-mock.log; sudo -n rm -rf /tmp/morrow-probe /tmp/morrow-probe2' || true
 
 echo "  -- 日志（最近 8 行）--"
 rssh 'sudo -n journalctl -u morrow --no-pager -n 8' || true
