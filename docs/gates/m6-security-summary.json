@@ -1,0 +1,141 @@
+{
+  "generated_at": "2026-11-11T06:31:18.288Z",
+  "node": "v24.22.1",
+  "platform": "darwin-arm64",
+  "boundary": "zero external network (loopback only); zero real secrets (in-memory SecretStore / stubs / FakePi)",
+  "domains": [
+    {
+      "id": "authorization",
+      "title": "越权（可信联系人五类 + 能力注册五维）",
+      "assertions": 41,
+      "passed": 41,
+      "failed": 0,
+      "skipped": 0,
+      "status": "PASS",
+      "duration_ms": 4650,
+      "files": [
+        "test/contacts.permissions.test.ts",
+        "test/channels.contact-authorization.test.ts",
+        "test/capabilities.engine.test.ts",
+        "test/capabilities.api.test.ts",
+        "test/capabilities.invoke.test.ts"
+      ],
+      "evidence": "contacts.permissions.test.ts「all five unauthorized contact actions…」；capabilities.engine.test.ts「checkPermissionsWithinGrants：五维…」；capabilities.api.test.ts「注册越权：五维…」",
+      "failures": [],
+      "checks": [],
+      "error": null
+    },
+    {
+      "id": "secret-leak",
+      "title": "密钥泄漏（配置 / API / 账本 / 日志）",
+      "assertions": 61,
+      "passed": 61,
+      "failed": 0,
+      "skipped": 0,
+      "status": "PASS",
+      "duration_ms": 869,
+      "files": [
+        "test/providers.test.ts",
+        "test/providers.api.test.ts",
+        "test/keyring.test.ts",
+        "test/channels.secrets.api.test.ts",
+        "test/notifications.service.test.ts"
+      ],
+      "evidence": "providers.test.ts「providers.json 不得含密钥」；providers.api.test.ts「密钥全链路不泄漏…」；channels.secrets.api.test.ts「写入不回显」；notifications.service.test.ts「内容裁剪…凭据被裁剪」",
+      "failures": [],
+      "checks": [
+        {
+          "name": "运行期日志字节扫描（console 捕获，与测试同进程）",
+          "passed": true,
+          "detail": "捕获 0 行 / 0 字节，密钥命中 0"
+        }
+      ],
+      "error": null
+    },
+    {
+      "id": "csrf-origin",
+      "title": "CSRF / 来源（415、CORS、回环精确豁免）",
+      "assertions": 20,
+      "passed": 20,
+      "failed": 0,
+      "skipped": 0,
+      "status": "PASS",
+      "duration_ms": 2233,
+      "files": [
+        "test/cors.test.ts",
+        "test/pairing.test.ts"
+      ],
+      "evidence": "cors.test.ts「simple POST with text/plain (CSRF vector) is rejected 415…」「non-local origins get no CORS grant」；pairing.test.ts「鉴权策略：回环豁免；非回环无令牌 401…撤销后 403」",
+      "failures": [],
+      "checks": [],
+      "error": null
+    },
+    {
+      "id": "sandbox",
+      "title": "沙箱（不可用拒绝 + 权限不越界）",
+      "assertions": 75,
+      "passed": 75,
+      "failed": 0,
+      "skipped": 0,
+      "status": "PASS",
+      "duration_ms": 2227,
+      "files": [
+        "test/sandbox.contract.test.ts",
+        "test/sandbox.detect.test.ts",
+        "test/sandbox.permission.test.ts",
+        "test/sandbox.invoker.test.ts",
+        "test/sandbox.runner-units.test.ts",
+        "test/sandbox.docker-runner.test.ts",
+        "test/sandbox.wiring.test.ts",
+        "test/invocation-errors.test.ts",
+        "test/capabilities.invoke.test.ts"
+      ],
+      "evidence": "sandbox.docker-runner.test.ts「无容器运行时 → sandbox_unavailable 且带 install-hint」；sandbox.permission.test.ts「越界路径一律拒绝」；sandbox.invoker.test.ts「先权限后执行，fail-closed」；capabilities.invoke.test.ts 错误码表 503+install-hint",
+      "failures": [],
+      "checks": [],
+      "error": null
+    },
+    {
+      "id": "sync-security",
+      "title": "同步安全（tombstone / 撤销设备 / 通知裁剪）",
+      "assertions": 44,
+      "passed": 44,
+      "failed": 0,
+      "skipped": 0,
+      "status": "PASS",
+      "duration_ms": 3486,
+      "files": [
+        "test/sync.memory.test.ts",
+        "test/sync.engine.test.ts",
+        "test/sync.api.test.ts",
+        "test/pairing.test.ts",
+        "test/notifications.service.test.ts"
+      ],
+      "evidence": "sync.memory.test.ts「删除跨副本传播且不复活…反向同理」；sync.api.test.ts「integrity_hash 不符 → 400 拒绝整批」；pairing.test.ts 撤销后 403 device_revoked；notifications.service.test.ts「渠道接收者正文不含 private…凭据」",
+      "failures": [],
+      "checks": [],
+      "error": null
+    },
+    {
+      "id": "lease",
+      "title": "租约（fencing token / 双持有冻结）",
+      "assertions": 23,
+      "passed": 23,
+      "failed": 0,
+      "skipped": 0,
+      "status": "PASS",
+      "duration_ms": 2879,
+      "files": [
+        "test/lease.test.ts",
+        "test/lease.api.test.ts",
+        "test/lease.scheduler.test.ts",
+        "test/lease.fencing-sync.test.ts",
+        "test/lease.preacquire.test.ts"
+      ],
+      "evidence": "lease.test.ts「fencing guard 在租约被抢占后拒绝旧 token 的副作用提交」；lease.fencing-sync.test.ts「B.validate(1)=false，A 旧 token=1 被拒」；lease.preacquire.test.ts「近同时 acquire（双持有）→ 立即 needs_reconcile」",
+      "failures": [],
+      "checks": [],
+      "error": null
+    }
+  ]
+}

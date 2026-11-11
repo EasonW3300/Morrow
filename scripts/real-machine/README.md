@@ -2,6 +2,20 @@
 
 CI runner 无音频设备与 GUI 会话，冒烟门清单 #4 的真机项在本机执行；本目录放可重复执行的探针。
 
+## M6 安全与故障注入汇总（Issue #52）
+
+```bash
+export PATH="/opt/homebrew/bin:$PATH"
+node --experimental-strip-types scripts/real-machine/security-suite.ts
+# 可选：机器可读证据
+node --experimental-strip-types scripts/real-machine/security-suite.ts --json docs/gates/m6-security-summary.json
+```
+
+- 一个命令跑六个安全域（越权 / 密钥泄漏 / CSRF 来源 / 沙箱 / 同步安全 / 租约），输出 PASS/FAIL 总表，退出码 0/1；
+- 聚合调用既有 `apps/runtime/test/*` 断言，不重写断言；唯一补充检查是运行期日志字节扫描；
+- 零真实网络（仅 127.0.0.1 回环）、零真实密钥（内存 SecretStore / 平台桩 / FakePi）；
+- 域→断言映射与未覆盖项：`docs/security/README.md`、`docs/gates/m6-security-summary.md`。
+
 ## M4 门禁脚本（Issue #46）
 
 全部为**平台协议桩**口径（真实适配器 + `ChannelTestServer` / `registerQqTestStub` / `StubLocalBridge`，零真实网络）；真实平台层证据单列在 `docs/gates/m4-qq-live-evidence.md`，未达项见 `docs/gates/m4-gate-report.md` §3/§6。
