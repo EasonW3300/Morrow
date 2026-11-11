@@ -59,8 +59,10 @@ check "unit 已移除"    '[ ! -e /etc/systemd/system/morrow.service ]'
 check "服务已停止"     '! systemctl is-active --quiet morrow'
 check "数据目录仍保留" '[ -d /var/lib/morrow ]'
 check "账本仍在"       'sudo -n test -s /var/lib/morrow/events.sqlite'
-check "副本身份仍在"   '[ -s /var/lib/morrow/replica-id ]'
-check "env 仍保留"     '[ -e /etc/morrow/morrow.env ]'
+# 这两个文件对 ubuntu 用户不可读（/var/lib/morrow 0750 morrow、/etc/morrow/morrow.env 0640 root:morrow），
+# 检查必须走 sudo；否则报的是权限不足，会被误读成"数据丢了"（首次演练就是这样误报的）。
+check "副本身份仍在"   'sudo -n test -s /var/lib/morrow/replica-id'
+check "env 仍保留"     'sudo -n test -e /etc/morrow/morrow.env'
 
 say "4/6 重新安装并校验数据完好"
 rssh "sudo -n bash ~/${REMOTE_DIR}/scripts/deploy/install-ubuntu.sh --binary ~/${REMOTE_DIR}/morrow" | tail -3

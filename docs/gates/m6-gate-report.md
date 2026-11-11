@@ -12,7 +12,7 @@
 | 部分 | AC-10（QQ 真实平台 15/20，差 5，Owner 明确不补）、AC-14（除语音段外达成） |
 | 未达成 | AC-11（语音，M5 延后 —— Owner 指示） |
 | 外部依赖 | AC-02（真实双 Provider 密钥）、AC-09（飞书资质）、AC-15（微信 Windows + 真实桥） |
-| PRD §9 M6 门槛 | 6 项中 **5 达成（含真机 systemd 部署，证据已归档）、1 部分（回滚：流程文档齐备，无回滚演练）**——三 OS 打包 / 故障注入 / 安全测试 / 同步冲突 / 文档与自动化验收达成；**「§8 全部强制项达标」字面未满足**，按 Owner 确认的 M0–M4 范围口径发布 |
+| PRD §9 M6 门槛 | **6 项全部达成**（含真机 systemd 部署与回滚演练，证据均已归档）——三 OS 打包 / 故障注入 / 安全测试 / 同步冲突 / 文档与自动化验收达成；**「§8 全部强制项达标」字面未满足**，按 Owner 确认的 M0–M4 范围口径发布 |
 | **release blocker（阻塞 v0.1.0 发布的工程项）** | **0 项**；语音按「本版功能范围不含语音，发布说明必须写明」处理，**不是 blocker** |
 | 外部依赖 | **4 条**（飞书资质 / 微信 Windows+真实桥 / AC-02 双 Provider 密钥 / Tailscale 双机） |
 | **发布建议** | **`v0.1.0` 可发布**（按 Owner 确认的 M0–M4 功能范围口径），发布说明必须逐条写全 §6 的 8 条已知限制并与 `CHANGELOG.md` 措辞一致 |
@@ -60,10 +60,10 @@ PRD §9 M6 行：**「三 OS 打包、故障注入、安全测试、同步冲突
 | 2 | 故障注入 | **达成** | Checkpoint 25 点（m1 §2.2）；安全汇总域 4/6：沙箱不可用 fail-closed、越界拒绝、租约双持有冻结（`docs/gates/m6-security-summary.md` §3-4/§3-6）；渠道层：QQ 主动消息真实 `40034105` → `proactive_rejected` 不重试（m4-qq-live-evidence §2b）、微信桥崩溃 → `healthy=false/degraded` 并恢复（m4-gate §2.4） |
 | 3 | 安全测试 | **达成** | `docs/gates/m6-security-summary.md` §2：**六域 264/264 PASS**；单入口 `pnpm security:suite`（退出码 0/1）；域→断言映射 `docs/security/README.md` |
 | 4 | 同步冲突 | **达成** | AC-05：20 竞争事实分类 20/20、双向删除不复活、`needs_reconcile` 冻结交 Owner 裁决（m3 §2.2/§4；`docs/gates/m3-ac05-conflicts.md`） |
-| 5 | 回滚 | **部分** | 流程与命令齐备：`deploy/README.md` §「升级与回滚」+ §「数据备份与恢复」（二进制回滚、停服备份 dataDir、恢复步骤）；发布回滚 `docs/release/m6-checklist.md` §8（revert / tag 删除）。**未做真实回滚演练**：无升级→回滚→校验的实跑记录，无代码级回滚测试 → 不计「达成」（§10-V2） |
+| 5 | 回滚 | **达成** | 真机演练通过：`docs/gates/m6-rollback-drill.md`（安装 v1 → `--uninstall` 保留数据 → 校验二进制/unit 移除而数据/身份/env 仍在 → 重装 → **`replica_id` 前后一致**、账本事件 2→4、health 200 → `--purge` 清场无残留）；流程文档 `deploy/README.md` §升级与回滚、发布回滚 `docs/release/m6-checklist.md` §8；复跑 `scripts/real-machine/server-rollback-drill.sh`。未覆盖：跨版本回滚（当前仅一版）与 schema 降级迁移 |
 | 6 | 文档与自动化验收 | **达成** | CI 新增 `typecheck + unit tests` job（run `42975490317` success，不再是「CI 只 build 不测」）；文档一致性自检 `docs/release/m6-checklist.md` §4 命令；本报告 §6/§7；README/CHANGELOG/检查表/deploy README 已由 T3 对齐 |
 
-**M6 门槛总判定**：**条件性通过（按 Owner 确认的发布范围口径）**。工程侧五项（三 OS 打包、故障注入、安全测试、同步冲突、文档与自动化）达成；**回滚为部分**；**PRD §9「§8 全部强制项达标」字面未满足**（AC-10/11/14 部分或未达、AC-02/09/15 外部依赖）。若 Owner 要求严格按「§8 全部强制项达标」才可发布，则本版**不可发布**；本报告的发布建议基于 M6 #51 已确认的「M0–M4 功能集 + 已知限制明示」基调。
+**M6 门槛总判定**：**六项全部达成（按 Owner 确认的发布范围口径）**——三 OS 打包、故障注入、安全测试、同步冲突、**回滚（真机演练）**、文档与自动化验收；**PRD §9「§8 全部强制项达标」字面未满足**（AC-10/11/14 部分或未达、AC-02/09/15 外部依赖）。若 Owner 要求严格按「§8 全部强制项达标」才可发布，则本版**不可发布**；本报告的发布建议基于 M6 #51 已确认的「M0–M4 功能集 + 已知限制明示」基调。
 
 ## 4. release blocker 清单
 
@@ -146,6 +146,7 @@ M6 前置工程门（版本统一、全 workspace typecheck、单测、打包产
 | AC-08 并行 | 6/6 | m2-gate §2.2 |
 | AC-09/10/13/15 协议层 | 20/20×5、20/20×2、100/100 + 160/160、20/20 | m4-gate §2.1–§2.4 与各归档 JSON |
 | 演示脚本 | m2-demo 10/10 × 2；m3-demo 两轮 20/20；m4-demo 两轮 20/20 | `docs/gates/m2-demo-output.md`、`m3-demo-output.md`、`m4-demo-output.md` |
+| **真机：回滚演练** | **达成** | `docs/gates/m6-rollback-drill.md`：安装→卸载(保留数据)→重装，`replica_id` 一致、事件 2→4、清场无残留 |
 | **真机：Ubuntu systemd** | **达成** | 证据归档 `docs/gates/m6-ubuntu-systemd-evidence.md`：Ubuntu 22.04.5 / systemd 249，9 项检查全 PASS（active/enabled/health 就绪轮询/数据目录归属/账本落盘/`runtime.started`/重启后健康与账本/`--probe` 含 node:sqlite 3.53.4 与真实 PiAdapter 对话）；清理后各路径为空、端口无残留、磁盘回到验证前水位。复跑：`scripts/real-machine/server-verify.sh` |
 
 ## 8. 发布建议
@@ -177,7 +178,7 @@ M6 前置工程门（版本统一、全 workspace typecheck、单测、打包产
 | ID | 未验证项 | 为什么不计「达成」 | 关闭方式 |
 |---|---|---|---|
 | V1 | Windows/Linux 桌面安装向导（.nsis/.deb）人工实装与 GUI 走查 | CI 只验证产物存在 + 单二进制/探针；无 Owner 真机人工安装记录 | Owner 在 Windows/Linux 机器安装并走查；命令见 m6-checklist §3 |
-| V2 | 升级→回滚→数据恢复演练 | 只有文档与命令，无实跑记录 | 在 Ubuntu 上按 deploy/README §升级与回滚 实跑一次并归档 |
+| V2 | ~~升级→回滚→数据恢复演练~~ | **已闭合**（2026-11-11）：真机全流程 PASS，证据 `docs/gates/m6-rollback-drill.md` | — |
 | V3 | ~~Ubuntu systemd 真机部署~~ | **已闭合**（2026-11-11）：真机 9 项全 PASS，证据 `docs/gates/m6-ubuntu-systemd-evidence.md` | — |
 | V4 | Tailscale/Wi-Fi 真实双机同步 | 全部证据为 127.0.0.1 回环 | E4 |
 | V5 | 飞书真实平台 / 微信真实环境 / 真实双 Provider | 外部条件未满足 | E1/E2/E3 |
