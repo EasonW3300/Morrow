@@ -177,6 +177,7 @@ M6 前置工程门（版本统一、全 workspace typecheck、单测、打包产
 
 | ID | 未验证项 | 为什么不计「达成」 | 关闭方式 |
 |---|---|---|---|
+| V4 | 安全汇总套件对机器负载敏感（观察项） | 2026-11-11 发布前验证时，在与 typecheck/单测**并发**执行的情况下出现过 1 次 sandbox 域单断言失败（263/264）；随后沙箱域单跑 5 轮、全量套件 3 轮**均 264/264 PASS**。失败输出未保留，未定位到具体断言 | 已在 CI 以独立 job 运行（无并发干扰）；后续如复现，先保留 `/tmp` 完整输出再定位 |
 | V1 | Windows/Linux 桌面安装向导（.nsis/.deb）人工实装与 GUI 走查 | CI 只验证产物存在 + 单二进制/探针；无 Owner 真机人工安装记录 | Owner 在 Windows/Linux 机器安装并走查；命令见 m6-checklist §3 |
 | V2 | ~~升级→回滚→数据恢复演练~~ | **已闭合**（2026-11-11）：真机全流程 PASS，证据 `docs/gates/m6-rollback-drill.md` | — |
 | V3 | ~~Ubuntu systemd 真机部署~~ | **已闭合**（2026-11-11）：真机 9 项全 PASS，证据 `docs/gates/m6-ubuntu-systemd-evidence.md` | — |
