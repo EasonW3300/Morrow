@@ -115,6 +115,11 @@ export class WeChatChannelAdapter implements ChannelAdapter {
     return this.#enabled;
   }
 
+  /** 构造 WeChatChannelAdapter 即代表本地桥凭据已就绪（bootstrap 只在凭据存在时构造） */
+  isConfigured(): boolean {
+    return true;
+  }
+
   /** 显式启用：未 confirm_risk=true 一律拒绝（API 层再强制一次）。 */
   enable(options: { confirmRisk?: boolean }): void {
     if (options.confirmRisk !== true) throw new WeChatRiskConfirmationRequiredError();

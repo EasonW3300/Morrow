@@ -129,6 +129,8 @@ class PendingChannelAdapter implements ChannelAdapter {
   readonly experimental: boolean;
   /** 未配置：registry 据 this 保持 stopped，不尝试 start */
   readonly isConfigured = () => false;
+  /** 占位适配器永不可启用；isConfigured=false 会先短路，仅满足 ConfigurableChannel 接口 */
+  readonly isEnabled = () => false;
   readonly #capabilities: ChannelCapabilities;
 
   constructor(
