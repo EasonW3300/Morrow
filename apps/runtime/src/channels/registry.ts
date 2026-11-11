@@ -24,7 +24,12 @@ import {
 } from "./credentials.ts";
 import { ChannelInboundRouter, type InboundRouteOptions, type InboundRouteResult } from "./inbound.ts";
 import { ChannelStore, type ChannelAccountInput, type ChannelAccountRecord, type ChannelIdentityInput, type ChannelMessageRecord, type ConversationAllowInput, type ConversationAllowRow, type ConversationRecord } from "./store.ts";
-import { isParseError, type ChannelAdapter } from "./types.ts";
+import {
+  isConfigurable,
+  isExperimental,
+  isParseError,
+  type ChannelAdapter,
+} from "./types.ts";
 
 /**
  * 适配器注册表（M4-T1 / Issue #38）：
@@ -196,7 +201,7 @@ export class ChannelRegistry {
     this.#adapters.set(adapter.channelId, {
       adapter,
       state: configuredEnabled ? "registered" : "stopped",
-      experimental: options.experimental ?? adapter.experimental === true,
+      experimental: options.experimental ?? (isExperimental(adapter) && adapter.experimental === true),
       detail: configuredEnabled
         ? null
         : "channel is configured but disabled; enable it with POST /v1/channels/:id/enable",
@@ -352,17 +357,17 @@ export class ChannelRegistry {
     const out: ChannelSummary[] = [];
     for (const [channelId, entry] of this.#adapters) {
       const account = this.#store.findAccountByChannel(channelId);
+      const adapter = entry.adapter;
+      const experimental = isExperimental(adapter);
       out.push({
         channel_id: channelId,
         account: account?.account_id ?? null,
         state: entry.state,
-        capabilities: entry.adapter.capabilities(),
+        capabilities: adapter.capabilities(),
         enabled: entry.state === "running" && account?.enabled === true,
         experimental: entry.experimental,
-        ...(entry.adapter.environment === undefined
-          ? {}
-          : { environment: entry.adapter.environment }),
-        ...(entry.adapter.riskNotice === undefined ? {} : { risk_notice: entry.adapter.riskNotice }),
+        ...(experimental && adapter.environment !== undefined ? { environment: adapter.environment } : {}),
+        ...(experimental && adapter.riskNotice !== undefined ? { risk_notice: adapter.riskNotice } : {}),
       });
     }
     return out;
@@ -431,13 +436,13 @@ export class ChannelRegistry {
       }
       // 未配置占位（Issue #37 A5）：出现在清单里但绝不 start——等 Owner 写凭据后再 enable。
       // 必须放在 experimental 分支之前：实验渠道会跳过上面的 disabled 短路。
-      if (entry.adapter.isConfigured !== undefined && !entry.adapter.isConfigured()) {
+      if (isConfigurable(entry.adapter) && !entry.adapter.isConfigured()) {
         entry.state = "stopped";
         entry.detail = "channel_not_configured: 尚未配置凭据（PUT /v1/channels/:id/secrets）";
         continue;
       }
       // 实验适配器（M4-T5）：出厂 disabled，必须经 enableChannel(confirmRisk=true)
-      if (entry.adapter.isEnabled !== undefined && !entry.adapter.isEnabled()) {
+      if (isConfigurable(entry.adapter) && !entry.adapter.isEnabled()) {
         entry.state = "stopped";
         entry.detail = "experimental adapter disabled (explicit risk confirmation required)";
         continue;
@@ -460,6 +465,7 @@ export class ChannelRegistry {
     if (entry === undefined) {
       return { ok: false, code: "unknown_channel", message: `no channel adapter registered for "${channelId}"` };
     }
+    const adapter = entry.adapter;
     if (!entry.experimental) {
       // 稳定适配器（A1 修复批）：自动装配的 managed 渠道可由 Owner 显式启用并持久化；
       // 手动注入的稳定适配器保持既有语义（注册即启动，不存在 not_experimental 的启用路径）。
@@ -483,14 +489,15 @@ export class ChannelRegistry {
       });
       return { ok: true, channel_id: channelId, enabled: true, risk_notice: null };
     }
-    if (entry.adapter.enable === undefined) {
+    if (!isConfigurable(adapter) || adapter.enable === undefined) {
       return {
         ok: false,
         code: "not_experimental",
         message: `channel "${channelId}" is not an experimental adapter`,
       };
     }
-    const riskNotice = entry.adapter.riskNotice ?? null;
+    const experimentalAdapter = isExperimental(adapter) ? adapter : null;
+    const riskNotice = experimentalAdapter?.riskNotice ?? null;
     if (options.confirmRisk !== true) {
       return {
         ok: false,
@@ -500,8 +507,8 @@ export class ChannelRegistry {
       };
     }
 
-    const wasEnabled = entry.adapter.isEnabled?.() ?? false;
-    await entry.adapter.enable({ confirmRisk: true });
+    const wasEnabled = isConfigurable(adapter) && adapter.isEnabled();
+    await adapter.enable({ confirmRisk: true });
     entry.configuredEnabled = true;
     if (entry.managed) this.#store.setChannelEnabled(channelId, true, this.#now());
     if (entry.state !== "running" && entry.state !== "starting") {
@@ -514,7 +521,7 @@ export class ChannelRegistry {
         experimental: true,
         confirm_risk: true,
         risk_notice: riskNotice,
-        environment: entry.adapter.environment ?? null,
+        environment: experimentalAdapter?.environment ?? null,
       });
     }
     return { ok: true, channel_id: channelId, enabled: true, risk_notice: riskNotice };
@@ -535,7 +542,7 @@ export class ChannelRegistry {
         account_id: account?.account_id ?? null,
       });
     }
-    await entry.adapter.disable?.();
+    if (isConfigurable(entry.adapter)) await entry.adapter.disable?.();
     if (entry.state === "running" || entry.state === "starting") {
       try {
         await entry.adapter.stop();

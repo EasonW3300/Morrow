@@ -112,38 +112,74 @@ export function isParseError(value: ParseInboundResult): value is ChannelParseEr
   return (value as ChannelParseError).ok === false;
 }
 
-export interface ChannelAdapter {
-  readonly channelId: string;
-  /** 实验适配器标记（微信个人号等）；echo 参考适配器为 true，清单如实呈现 */
-  readonly experimental?: boolean;
-  /**
-   * 实验适配器环境声明（M4-T5）：清单/health 原样暴露给 UI。
-   * 稳定适配器不提供。
-   */
-  readonly environment?: ChannelEnvironment;
-  /** 实验适配器风险声明（M4-T5）：API/UI 双处呈现；稳定适配器不提供 */
-  readonly riskNotice?: string;
-  /**
-   * 该渠道是否只处理 channel_allowlist 中的会话（M4-T5 微信个人号 = true）。
-   * 路由层据此对私聊也做 fail-closed 白名单校验（群聊始终校验）。
-   */
-  readonly requiresConversationAllowlist?: boolean;
+/**
+ * 生命周期语义（M4-T5 微信个人号、Issue #37 A5 未配置占位）：
+ * 只有需要「配置/显式启停」的适配器实现；飞书/QQ 官方 Bot 不实现。
+ *
+ * 为什么不放在 ChannelAdapter：协议转换接缝（start/send/parseInbound…）对所有
+ * 适配器都成立，而 isConfigured/enable/disable 是可选的生命周期能力。混在一起
+ * 会迫使稳定适配器空实现（Refused Bequest），registry 也只能散落判断
+ * 「字段是否 undefined」——改为接口存在性判定（`isConfigurable`）。
+ */
+export interface ConfigurableChannel {
   /**
    * 凭据是否齐备（未配置占位适配器返回 false）。
    *
    * 为什么需要：已知渠道即使未配置也要出现在清单里，否则 `PUT /channels/:id/secrets`
    * 会 404、新渠道永远无法通过 UI 首次配置（死循环）。但未配置的条目不能被 start()。
    */
-  readonly isConfigured?: () => boolean;
-  /** 实验适配器是否已由 Owner 显式启用（缺省视为已启用，兼容稳定适配器） */
-  isEnabled?(): boolean;
+  isConfigured(): boolean;
+  /** 实验适配器是否已由 Owner 显式启用（稳定适配器恒 true） */
+  isEnabled(): boolean;
   /**
    * 显式启用实验适配器（M4-T5）：必须 confirmRisk=true；否则抛错拒绝。
-   * 稳定适配器不实现。
+   * 稳定适配器可不实现（其启用走 managed 配置）。
    */
   enable?(options: { confirmRisk?: boolean }): void | Promise<void>;
-  /** 禁用实验适配器：立即停止收发（幂等）；稳定适配器不实现 */
+  /** 禁用适配器：立即停止收发（幂等）；稳定适配器可不实现 */
   disable?(): void | Promise<void>;
+}
+
+/**
+ * 实验性语义（M4-T5 微信个人号）：环境声明、风险声明与实验标记。
+ * registry/UI 据此呈现「实验」徽标、风险声明与启用门；稳定适配器不实现。
+ */
+export interface ExperimentalChannel {
+  /** 实验适配器标记（微信个人号等）；echo 参考适配器为 true，清单如实呈现 */
+  readonly experimental: boolean;
+  /** 实验适配器环境声明（M4-T5）：清单/health 原样暴露给 UI */
+  readonly environment?: ChannelEnvironment;
+  /** 实验适配器风险声明（M4-T5）：API/UI 双处呈现 */
+  readonly riskNotice?: string;
+}
+
+/** 接口存在性判定：替代分散的 `adapter.isConfigured !== undefined` 判断 */
+export function isConfigurable(
+  adapter: ChannelAdapter,
+): adapter is ChannelAdapter & ConfigurableChannel {
+  return typeof (adapter as Partial<ConfigurableChannel>).isConfigured === "function";
+}
+
+/** 接口存在性判定：至少声明了一项实验性语义（标记/环境/风险） */
+export function isExperimental(
+  adapter: ChannelAdapter,
+): adapter is ChannelAdapter & ExperimentalChannel {
+  const candidate = adapter as ChannelAdapter & Partial<ExperimentalChannel>;
+  return (
+    candidate.experimental === true ||
+    candidate.environment !== undefined ||
+    candidate.riskNotice !== undefined
+  );
+}
+
+/** 适配器协议转换接缝：只含对所有渠道都成立的收发/解析/能力声明。 */
+export interface ChannelAdapter {
+  readonly channelId: string;
+  /**
+   * 该渠道是否只处理 channel_allowlist 中的会话（M4-T5 微信个人号 = true）。
+   * 路由层据此对私聊也做 fail-closed 白名单校验（群聊始终校验）。
+   */
+  readonly requiresConversationAllowlist?: boolean;
   start(context: ChannelAdapterContext): void | Promise<void>;
   stop(): void | Promise<void>;
   send(outbound: OutboundMessage): ChannelSendReceipt | Promise<ChannelSendReceipt>;
