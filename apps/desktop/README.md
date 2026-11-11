@@ -159,8 +159,9 @@ node --experimental-sqlite --experimental-strip-types apps/desktop/scripts/devic
    填写错误指纹时服务端 409 fingerprint_mismatch 且**不消耗配对码**（改值重试可成功）。
 4. 同步状态面板：本副本 seq 范围/条数、各 peer 游标（已拉取/已确认/更新时间）、最后
    同步时间、待上传估算（本地上界 − 已确认，钳到 0）；「待下载」显示未知并注明
-   `GET /v1/sync/status` 不含对端账本上界。「刷新同步状态」只做查询——M3 尚无「立即
-   同步一轮」控制端点，按钮旁明确标注。
+   `GET /v1/sync/status` 不含对端账本上界。「刷新同步状态」只做查询；面板同时提供
+   「立即同步一轮」，调用 Runtime 的 `POST /v1/sync/run`（缺省全部已配对 peer，失败单 peer
+   不中断其他 peer）。
 5. 冲突审核：来源副本 + 本地/远端/基线三方版本 + 行级 diff；保留本地（keep_old）/
    采用远端（keep_new）/ 合并（必填合并文本）→ 真实裁决写入账本，勾「显示已裁决」可回看。
 6. 任务页：需要裁决的任务有橙色警示条与「⚠ 待人工裁决」徽标；详情页横幅展示
