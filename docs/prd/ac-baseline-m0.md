@@ -132,3 +132,34 @@ CI 侧：node 22（runner 托管）、bun 1.4.4（oven-sh setup-bun pin）、Rus
 - **测试规模（M4 合并态 56ca2d2 实测）**：runtime **726**（M3 收官 603 → 726，排除两个真实容器套件）、desktop 116（95 → 116）+ sidecar Rust 9、protocol 40、pi-adapter 31、packaging 56；全 workspace node:test 合计 **969**（M3 收官 831 → 969），全部绿（exit 0）。真实容器套件由 CI ubuntu 腿独立判定（最新 run [42789125967](https://github.com/EasonW3300/Morrow/actions/runs/42789125967) success）。
 - **合并态 typecheck 基线缺陷（登记，未修复）**：56ca2d2 起 `QqTestStubOptions` 缺六个注入选项字段（`rejectProactive`/`rejectAllTokens`/`failTokenEndpoint`/`rateLimit`/`mode`/`signatureMode`），`tsc --noEmit` 7 处失败；CI 不跑 typecheck/单测故未暴露。node:test 969 仍绿；严格口径「全 workspace 测试绿」不成立，待后续修复票。详见 `docs/gates/m4-gate-report.md` §6-13/§7。
 - **仍未校准/未达成**：飞书真实平台（资质未注册，0 次）；QQ 真实平台群 @ 20 次门线（15/20）与私聊 20 次（1 次）；微信真实环境（Owner Windows + 真实桥未实现）；附件文件传输；QQ 频道 `AT_MESSAGE_CREATE`；真实 Tailscale/Wi-Fi 双机；真实 LLM 生成；桌面 UI 人工走查（M6）。详见 `docs/gates/m4-gate-report.md` §3/§6。
+
+## 11. M6 最终注记（2026-11-11，M6-T4 / Issue #55 合并态实测）
+
+M6 是 PRD §8 验收的**最终裁决**，不是又一次里程碑校准。逐项裁决全文见
+[`docs/gates/m6-gate-report.md`](../gates/m6-gate-report.md)；本节只锁定最终规模、判定环境与 Owner 范围决定。
+
+- **最终测试规模（本工作树 `m6/t4` = `integration/m0` @ `dde03f1` + T4 文档实测，node v24.22.1）**：runtime **738**（排除两个真实容器套件）、desktop **139**、protocol **40**、pi-adapter **31**、packaging **56** —— node:test 合计 **1004/1004**；desktop sidecar Rust **9/9**；**总计 1013**。`pnpm -r typecheck` 5 包全绿。安全汇总单入口 **264/264**（六域非去重计数，见 `docs/gates/m6-security-summary.md` §1）。与 M4 门禁 993（`m4-gate-report.md` §7）相比 +11（TECH-DEBT #49/#50 + M6-T2 UI 修复补测 6 例）。
+- **裁决统计（AC-01..AC-15）**：达成 **9**（AC-01/03/04/05/06/07/08/12/13）、部分 **2**（AC-10、AC-14）、未达成 **1**（AC-11）、外部依赖 **3**（AC-02/09/15）；AC-10a 按 PRD 原文不设验收承诺、不入统计。
+- **各 AC 判定环境（固定分母的口径）**：
+
+| AC | 判定 | 判定环境 |
+|---|---|---|
+| AC-01 | 达成 | CI runner：macOS arm64 / linux x64 / windows x64（build+gate 实跑产物与探针）；本机 macOS 真机 GUI 启动/退出/重启。Windows/Linux 桌面安装向导未人工实装（验证边界） |
+| AC-02 | 外部依赖 | **未在真实端点执行**；切换机制证据走本地 mock OpenAI |
+| AC-03 | 达成 | 本机 macOS + 确定性启发式抽取（100 条数据集） |
+| AC-04 | 达成（回环基线） | 127.0.0.1 单机双 Runtime；p95 2.43–2.54 ms |
+| AC-05 | 达成（回环基线） | 127.0.0.1 单机双 Runtime；20 竞争事实 |
+| AC-06 | 达成 | 本机 `LocalNodeRunner` 桩 + 本机 Docker 真容器 1/1 + CI ubuntu 容器腿 |
+| AC-07 | 达成 | 本机进程级 kill -9 + 进程内注入（25 点） |
+| AC-08 | 达成 | 本机真实 git worktree 夹具（6 例） |
+| AC-09 | 外部依赖 | 平台协议桩（`ChannelTestServer`）+ 本机 Runtime；真实飞书平台 **0 次** |
+| AC-10 | 部分 | 协议桩 20/20 × 2；真实 QQ 平台群 @ 15 + 私聊 1（0 拒绝） |
+| AC-11 | 未达成 | **无运行时**（`packages/voice` 仅 README；桌面 Voice 视图占位） |
+| AC-12 | 达成 | 本机测试（五类 ≥5）+ M6 真实浏览器逐操作点击 |
+| AC-13 | 达成 | 本机回环 20 轮（越权 100/100、去重 160/160）+ 桌面通知中心浏览器走查 |
+| AC-14 | 部分 | 本机回环双 Runtime + 飞书协议桩；两轮 20/20；**语音段未达成** |
+| AC-15 | 外部依赖 | `StubLocalBridge` 桩；真实微信环境 **0 次** |
+
+- **M5 语音延后（Owner 决定，2026-11-11 确认口径）**：`0.1.0` 的功能范围是 M0–M4，**不含语音**。AC-11 判定**未达成**、AC-14 标注**语音段未达成**；发布说明必须写明「本版不含语音」，不得暗示已具备。`docs/gates/m6-gate-report.md` §4.1 明确：语音**不是 release blocker**，是范围外项。
+- **AC-02 与 QQ 真实层的 Owner 决定**：AC-02 的真实双 Provider 验收**待 Owner 配置密钥**（外部依赖，不计达成）；AC-10 真实平台停在群 @ 15/20 + 私聊 1，**Owner 明确不再补测**，按「部分」登记。
+- **验证边界（不影响上述判定，但不得宣称已验证）**：真实 Ubuntu systemd 部署（脚本 `scripts/real-machine/server-verify.sh` 已交付并经真机迭代，但**无归档 PASS 日志**）、升级回滚演练、Tailscale 双机、飞书/微信真实层、Windows/Linux 真机桌面安装与凭据库 —— 逐条见门禁报告 §10。

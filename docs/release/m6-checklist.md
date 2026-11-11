@@ -6,7 +6,9 @@
 
 - 发布版本：`0.1.0`
 - 发布分支：`integration/m0`
-- 发布提交：`0236012`（`merge: TECH-DEBT ChannelsView 拆分 + 通道生命周期语义下沉（#50）`）
+- 发布准备基线：`0236012`（`merge: TECH-DEBT ChannelsView 拆分 + 通道生命周期语义下沉（#50）`）
+  —— M6-T1/T2/T4 合并后 tip 会前移，**发布提交一律以 §0 `git rev-parse --short HEAD` 为准**，
+  并在该 tip 上确认 §5 的 CI 证据
 - 文档基线：[CHANGELOG.md](../../CHANGELOG.md)、[M4 门禁报告](../gates/m4-gate-report.md)、[威胁模型](../security/threat-model.md)
 - 参考环境：macOS（Apple M4 Pro，Node 24.22.1 / pnpm 9.12.0 / bun 1.4.4）；CI 见 `.github/workflows/m0.yml`
 
