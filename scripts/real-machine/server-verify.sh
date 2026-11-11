@@ -173,11 +173,9 @@ else
   echo "  FAIL  --probe 自检（输出见 /tmp/morrow-probe.out）"
   FAILED=1
 fi
-# 注意：pkill 的模式不能直接写 "mock-openai.py"——远端命令行里含有该字符串，pkill 会
-# 连同执行它的 shell 一起杀掉（实测过，表现为 ssh 无声退出 255）。方括号技巧让模式
-# 匹配 "mock-openai.py" 而不匹配命令行里的字面量。
-# mock 可能以 root 身份启动（手工排障时），因此清理走 sudo
-rssh 'sudo -n pkill -f "mock-openai[.]py" 2>/dev/null || true; sudo -n rm -f /tmp/morrow-mock-openai.py /tmp/morrow-mock.log; sudo -n rm -rf /tmp/morrow-probe /tmp/morrow-probe2' || true
+# 按端口杀 mock 进程，而不是 pkill -f <模式>：远端命令行里同时出现 mock 的路径与模式
+# 字面量时，pkill 会把执行它的 shell 一起杀掉（实测两次，表现为 ssh 无声退出 255）。
+rssh 'PID=$(sudo -n ss -ltnpH "sport = :18080" 2>/dev/null | grep -o "pid=[0-9]*" | head -1 | cut -d= -f2); [ -n "$PID" ] && sudo -n kill "$PID" 2>/dev/null; sudo -n rm -f /tmp/morrow-mock-openai.py /tmp/morrow-mock.log; sudo -n rm -rf /tmp/morrow-probe /tmp/morrow-probe2' || true
 
 echo "  -- 日志（最近 8 行）--"
 rssh 'sudo -n journalctl -u morrow --no-pager -n 8' || true
