@@ -172,7 +172,10 @@ else
   echo "  FAIL  --probe 自检（输出见 /tmp/morrow-probe.out）"
   FAILED=1
 fi
-rssh 'pkill -f morrow-mock-openai.py 2>/dev/null || true; rm -f /tmp/morrow-mock-openai.py /tmp/morrow-mock.log; sudo -n rm -rf /tmp/morrow-probe /tmp/morrow-probe2' || true
+# 注意：pkill 的模式不能直接写 "mock-openai.py"——远端命令行里含有该字符串，pkill 会
+# 连同执行它的 shell 一起杀掉（实测过，表现为 ssh 无声退出 255）。方括号技巧让模式
+# 匹配 "mock-openai.py" 而不匹配命令行里的字面量。
+rssh 'pkill -f "mock-openai[.]py" 2>/dev/null || true; rm -f /tmp/morrow-mock-openai.py /tmp/morrow-mock.log; sudo -n rm -rf /tmp/morrow-probe /tmp/morrow-probe2' || true
 
 echo "  -- 日志（最近 8 行）--"
 rssh 'sudo -n journalctl -u morrow --no-pager -n 8' || true
