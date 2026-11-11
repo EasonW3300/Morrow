@@ -33,6 +33,21 @@ const GIT_IDENTITY = [
   "-c", "commit.gpgsign=false",
 ];
 
+/**
+ * 身份同时经环境变量注入（2026-11-11 CI 门禁暴露）。
+ *
+ * 只用 `-c` 时，任何**由 git 自身派生的提交**（如 merge 在特定分支拓扑下自行创建
+ * 提交、子模块/钩子路径）都拿不到身份——本地因宿主有全局 user.email 而通过，
+ * Linux CI 直接 `Committer identity unknown`。环境变量会被所有 git 进程继承，
+ * 与调用形式无关，因此这是唯一不依赖"每个调用点都记得加 -c"的写法。
+ */
+const GIT_IDENTITY_ENV: NodeJS.ProcessEnv = {
+  GIT_AUTHOR_NAME: "Morrow Runtime",
+  GIT_AUTHOR_EMAIL: "morrow@runtime.local",
+  GIT_COMMITTER_NAME: "Morrow Runtime",
+  GIT_COMMITTER_EMAIL: "morrow@runtime.local",
+};
+
 interface GitResult {
   code: number;
   stdout: string;
@@ -41,7 +56,11 @@ interface GitResult {
 
 async function git(args: string[], cwd?: string): Promise<GitResult> {
   try {
-    const { stdout, stderr } = await execFileP("git", args, { cwd, maxBuffer: 64 * 1024 * 1024 });
+    const { stdout, stderr } = await execFileP("git", args, {
+      cwd,
+      maxBuffer: 64 * 1024 * 1024,
+      env: { ...process.env, ...GIT_IDENTITY_ENV },
+    });
     return { code: 0, stdout, stderr };
   } catch (err) {
     const e = err as NodeJS.ErrnoException & { code?: number | string; stdout?: string; stderr?: string };

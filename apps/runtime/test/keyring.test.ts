@@ -62,18 +62,33 @@ function secretStoreContract(name: string, make: () => SecretStore, cleanup?: (s
 // --- 真实 macOS Keychain（本机实测） -----------------------------------------
 
 const MACOS_SERVICE = `com.morrow.t5-test-${randomUUID()}`;
-secretStoreContract(
-  "macOS Keychain（security CLI，真实）",
-  () => createKeychainStore(),
-  async (store) => {
-    // 清理本套件写入的所有钥匙串项（幂等）
-    for (const account of ["provider-alpha", "provider-beta"]) {
-      await store.deleteSecret(MACOS_SERVICE, account);
-    }
-  },
-);
+/**
+ * macOS 钥匙串真实套件只在 darwin 上跑（2026-11-11 CI 门禁暴露）。
+ *
+ * 此前无条件执行：Linux CI 没有 `/usr/bin/security`，`deleteSecret` 返回 exit 1，
+ * 整个契约 hook 失败 → 新加的 checks job 红。跳过是诚实的（其余平台的后端本就
+ * 只有注入桩测试，README 已标注未实测），而不是让 Linux 假装通过。
+ */
+const MACOS_KEYCHAIN_AVAILABLE = process.platform === "darwin";
+if (MACOS_KEYCHAIN_AVAILABLE) {
+  secretStoreContract(
+    "macOS Keychain（security CLI，真实）",
+    () => createKeychainStore(),
+    async (store) => {
+      // 清理本套件写入的所有钥匙串项（幂等）
+      for (const account of ["provider-alpha", "provider-beta"]) {
+        await store.deleteSecret(MACOS_SERVICE, account);
+      }
+    },
+  );
+} else {
+  it("macOS Keychain 真实套件（非 darwin 跳过：无 /usr/bin/security）", { skip: "requires darwin" }, () => {});
+}
 
-it("macOS 后端真实往返：写 → 读 → 删（独立于契约套件的显式冒烟）", async () => {
+it(
+  "macOS 后端真实往返：写 → 读 → 删（独立于契约套件的显式冒烟）",
+  { skip: MACOS_KEYCHAIN_AVAILABLE ? false : "requires darwin" },
+  async () => {
   const store = createKeychainStore();
   const service = `com.morrow.t5-test-${randomUUID()}`;
   try {
@@ -83,7 +98,8 @@ it("macOS 后端真实往返：写 → 读 → 删（独立于契约套件的显
     await store.deleteSecret(service, "smoke");
     assert.equal(await store.getSecret(service, "smoke"), null);
   }
-});
+  },
+);
 
 // --- 内存桩（测试与无 OS 凭据库环境的回退） -----------------------------------
 
