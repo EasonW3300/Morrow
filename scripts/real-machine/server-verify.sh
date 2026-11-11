@@ -124,7 +124,8 @@ check() { # check <描述> <命令>
 
 check "服务 active"        'systemctl is-active --quiet morrow'
 check "服务 enabled"       'systemctl is-enabled --quiet morrow'
-check "health 200"         'curl -fsS --max-time 5 http://127.0.0.1:8787/v1/health | grep -q "\"status\":\"ok\""'
+# 就绪轮询：systemd is-active 之后进程可能还没 listen（实测竞态：首跑 PASS、二跑 FAIL）
+check "health 200（就绪轮询 ≤15s）" 'for i in $(seq 1 15); do curl -fsS --max-time 2 http://127.0.0.1:8787/v1/health | grep -q "\"status\":\"ok\"" && exit 0; sleep 1; done; exit 1'
 check "数据目录归属 morrow" 'test "$(stat -c %U /var/lib/morrow)" = "morrow"'
 check "账本已落盘"          'sudo -n test -s /var/lib/morrow/events.sqlite'
 # 走控制面 API 查账本（服务器不保证装 sqlite3；API 是权威读路径）
@@ -133,7 +134,7 @@ check "审计事件含 runtime.started" 'curl -fsS --max-time 5 "http://127.0.0.
 echo "  -- 重启后仍健康 --"
 rssh 'sudo -n systemctl restart morrow'
 sleep 4
-check "重启后 health 200" 'curl -fsS --max-time 8 http://127.0.0.1:8787/v1/health | grep -q "\"status\":\"ok\""'
+check "重启后 health 200（就绪轮询 ≤15s）" 'for i in $(seq 1 15); do curl -fsS --max-time 2 http://127.0.0.1:8787/v1/health | grep -q "\"status\":\"ok\"" && exit 0; sleep 1; done; exit 1'
 check "重启后账本完整"     'sudo -n test -s /var/lib/morrow/events.sqlite'
 
 echo "  -- 单二进制自检（--probe：health + sqlite + 真实 PiAdapter 对话）--"
@@ -175,7 +176,8 @@ fi
 # 注意：pkill 的模式不能直接写 "mock-openai.py"——远端命令行里含有该字符串，pkill 会
 # 连同执行它的 shell 一起杀掉（实测过，表现为 ssh 无声退出 255）。方括号技巧让模式
 # 匹配 "mock-openai.py" 而不匹配命令行里的字面量。
-rssh 'pkill -f "mock-openai[.]py" 2>/dev/null || true; rm -f /tmp/morrow-mock-openai.py /tmp/morrow-mock.log; sudo -n rm -rf /tmp/morrow-probe /tmp/morrow-probe2' || true
+# mock 可能以 root 身份启动（手工排障时），因此清理走 sudo
+rssh 'sudo -n pkill -f "mock-openai[.]py" 2>/dev/null || true; sudo -n rm -f /tmp/morrow-mock-openai.py /tmp/morrow-mock.log; sudo -n rm -rf /tmp/morrow-probe /tmp/morrow-probe2' || true
 
 echo "  -- 日志（最近 8 行）--"
 rssh 'sudo -n journalctl -u morrow --no-pager -n 8' || true
