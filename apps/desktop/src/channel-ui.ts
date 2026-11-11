@@ -537,6 +537,18 @@ export function targetLabel(target: string): string {
   return target;
 }
 
+/**
+ * 默认通知会话输入校验（channel:<id> 通知规则的前置条件）：
+ * 必填、去首尾空白。服务端还会校验会话已存在/已白名单（fail-closed），
+ * 前端只挡住空输入，避免无意义请求。
+ */
+export function validateNotifyTargetInput(value: string): string | null {
+  const trimmed = value.trim();
+  if (trimmed.length === 0) return "请填写默认通知会话 id（该渠道已存在或已加入白名单的会话）。";
+  if (/\s/.test(trimmed)) return "会话 id 不能包含空白字符。";
+  return null;
+}
+
 export interface NotificationRuleDraft {
   /** 既有规则的 id（新行 null）；仅用于 UI key */
   rule_id: string | null;

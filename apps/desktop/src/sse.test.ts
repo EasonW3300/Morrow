@@ -149,18 +149,37 @@ test("done 关轮：清残留易失文本（工厂失败轮没有 assistant 收�
   assert.equal(state.streaming, "");
 });
 
-test("stateFromHistory 以 GET messages 投影播种：items 顺序与 lastSeq 正确，重放去重生效", () => {
+test("stateFromHistory 以 GET messages 投影播种：lastSeq 不阻塞首帧重放重建", () => {
   const state = stateFromHistory([
     { message_id: "m1", role: "user", text: "你好", sequence: 5, occurred_at: "2026-10-29T10:00:00Z" },
     { message_id: "m2", role: "assistant", text: "你好！有什么可以帮你？", stop_reason: "stop", sequence: 6, occurred_at: "2026-10-29T10:00:01Z" },
   ]);
   assert.equal(state.items.length, 2);
   assert.equal(state.lastSeq, 6);
-  // 重启后 SSE 从 0 重放：<= lastSeq 的 durable 帧全部去重
+  assert.equal(state.seededFromHistory, true);
+  // 首帧（账本重放）到达后按全量重放重建：历史消息不重复、游标回到账本序
   const replayed = applyFrame(state, eventFrame("message.user", { message_id: "m1", text: "你好" }, { sequence: 5 }));
-  assert.equal(replayed.items.length, 2);
-  // 新一轮（seq 更大）正常渲染
+  assert.equal(replayed.items.length, 1);
+  assert.equal(replayed.lastSeq, 5);
+  assert.equal(replayed.seededFromHistory, false);
   const next = applyFrame(replayed, eventFrame("message.user", { message_id: "m3", text: "再来一条" }, { sequence: 9 }));
-  assert.equal(next.items.length, 3);
+  assert.equal(next.items.length, 2);
   assert.equal(next.turnActive, true);
+});
+
+test("历史回看：工具事件与 agent.error 在重放后保留（不只消息）", () => {
+  // GET /messages 只返回消息：user(seq 1) 与 assistant(seq 4)；工具/错误在账本中间。
+  const seeded = stateFromHistory([
+    { message_id: "m1", role: "user", text: "现在几点", sequence: 1, occurred_at: "2026-10-29T10:00:00Z" },
+    { message_id: "m2", role: "assistant", text: "12:00", stop_reason: "stop", sequence: 4, occurred_at: "2026-10-29T10:00:03Z" },
+  ]);
+  let state = applyFrame(seeded, eventFrame("message.user", { message_id: "m1", text: "现在几点" }, { sequence: 1 }));
+  state = applyFrame(state, eventFrame("tool.started", { tool_call_id: "t1", tool_name: "lookup_time", args: { tz: "UTC" } }, { sequence: 2 }));
+  state = applyFrame(state, eventFrame("tool.finished", { tool_call_id: "t1", tool_name: "lookup_time", text: "12:00", is_error: false }, { sequence: 3 }));
+  state = applyFrame(state, eventFrame("message.assistant", { message_id: "m2", text: "12:00", stop_reason: "stop" }, { sequence: 4 }));
+  state = applyFrame(state, eventFrame("agent.error", { message: "后续轮失败" }, { sequence: 5 }));
+  assert.deepEqual(
+    state.items.map((item) => item.kind),
+    ["message", "tool", "message", "error"],
+  );
 });

@@ -1,6 +1,7 @@
 import { Button } from "./design-system/primitives/Button.tsx";
 import { ChannelAllowlistSection } from "./channels/ChannelAllowlistSection.tsx";
 import { ChannelListSection } from "./channels/ChannelListSection.tsx";
+import { ChannelNotifyTargetSection } from "./channels/ChannelNotifyTargetSection.tsx";
 import { ContactsSection } from "./channels/ContactsSection.tsx";
 import { NotificationRulesSection } from "./channels/NotificationRulesSection.tsx";
 import { OutboxReviewSection } from "./channels/OutboxReviewSection.tsx";
@@ -46,6 +47,7 @@ export function ChannelsView({ base }: { base: string }) {
       />
       <ChannelAllowlistSection base={base} channels={channels} />
       <ContactsSection base={base} nowMs={nowMs} />
+      <ChannelNotifyTargetSection base={base} channels={channels} />
       <NotificationRulesSection base={base} channels={channels} />
       <OutboxReviewSection base={base} nowMs={nowMs} />
     </div>

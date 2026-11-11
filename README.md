@@ -16,6 +16,7 @@
 - [M3 门禁报告](docs/gates/m3-gate-report.md) —— AC-04 双向同步 50×2 + p95 / AC-05 20 竞争事实 + 删除不复活 / 三部署与 needs_reconcile 证据、PRD §9 M3 门槛核对（[演示输出](docs/gates/m3-demo-output.md)、[AC-04](docs/gates/m3-ac04-sync.md)、[AC-05](docs/gates/m3-ac05-conflicts.md)）
 - [M4 门禁报告](docs/gates/m4-gate-report.md) —— 协议层：AC-09 飞书五面 20/20、AC-10 QQ 两路径 20/20、AC-13 越权 100/100 阻断、AC-15 微信实验 20/20、AC-14 两轮 20/20；**真实平台层如实登记为未达成/外部阻塞**（[AC-09](docs/gates/m4-ac09-feishu.md)、[AC-10](docs/gates/m4-ac10-qq.md)、[AC-13](docs/gates/m4-ac13-notifications-permissions.md)、[AC-15](docs/gates/m4-ac15-wechat.md)、[端到端演示](docs/gates/m4-demo-output.md)）
 - [QQ 真实平台联调证据](docs/gates/m4-qq-live-evidence.md) —— 真实 QQ 官方 Bot 群 @ 15 次 + 私聊 1 次、0 拒绝；`unknown_conversation` 缺陷发现与修复（未达 AC-10 的 20 次门线）
+- [M6 UI 人工走查](docs/gates/m6-ui-walkthrough.md) —— Liquid Glass 七视图浏览器实跑：会话/任务/Provider/渠道/设备与同步/健康/通知中心逐项结论、已修缺陷与遗留登记、关键 DOM 证据
 - [威胁模型](docs/security/threat-model.md) —— 四域威胁、对策与残余风险（PRD §7）
 - [M0 验收基线](docs/prd/ac-baseline-m0.md) —— 参考硬件/网络/模型/测试数据（PRD §8 校准基准；§7–§10 为 M1–M4 校准注记）
 - [决策稿 V0.6](docs/history/decision-baseline-v0.6.md) —— 归档的 PRD 输入基线

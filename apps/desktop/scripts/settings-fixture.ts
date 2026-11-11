@@ -36,7 +36,7 @@ const servers: Server[] = [
 
 const envDataDir = process.env.MORROW_DATA_DIR;
 const dataDir = envDataDir ?? mkdtempSync(join(tmpdir(), "morrow-settings-"));
-const config = { ...loadConfig(), dataDir };
+const config = loadConfig({ ...process.env, MORROW_DATA_DIR: dataDir });
 const runtime = await startRuntime(config, {
   secretStore: createInMemorySecretStore(),
   agentAdapterFactory: async () => createScriptedAgent(),

@@ -10,6 +10,7 @@ import {
   type Frame,
 } from "./sse.ts";
 import { taskStatusLabel, taskStatusTone } from "./task-ui.ts";
+import { describeSendError, type SendErrorView } from "./chat-ui.ts";
 import { Badge } from "./design-system/primitives/Badge.tsx";
 import { Button } from "./design-system/primitives/Button.tsx";
 import { GlassSurface } from "./design-system/primitives/GlassSurface.tsx";
@@ -45,13 +46,15 @@ export function ChatView({
   base,
   sessionId,
   onOpenTask,
+  onOpenSettings,
 }: {
   base: string;
   sessionId: string;
   onOpenTask?: (taskId: string) => void;
+  onOpenSettings?: () => void;
 }) {
   const [state, setState] = useState<ChatState>(emptyChatState());
-  const [streamError, setStreamError] = useState<string | null>(null);
+  const [streamError, setStreamError] = useState<SendErrorView | null>(null);
   const [connected, setConnected] = useState(false);
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
@@ -132,7 +135,9 @@ export function ChatView({
       await api.sendMessage(base, sessionId, text);
     } catch (err) {
       setStreamError(
-        err instanceof ApiError ? `${readableCode(err.code)}（${err.code}）：${err.message}` : String(err),
+        err instanceof ApiError
+          ? describeSendError(err.code, err.message)
+          : { title: "请求失败", detail: String(err), openSettings: false },
       );
       setDraft(text); // 发送失败把输入还回去
     } finally {
@@ -147,7 +152,13 @@ export function ChatView({
       </div>
       {streamError !== null && (
         <div className="banner-error" role="alert">
-          {streamError}
+          <strong>{streamError.title}</strong>
+          <span className="send-error-detail">{streamError.detail}</span>
+          {streamError.openSettings && onOpenSettings !== undefined && (
+            <Button size="sm" onClick={onOpenSettings}>
+              去设置 → Provider 与模型
+            </Button>
+          )}
         </div>
       )}
       {sessionTasks.length > 0 && (
@@ -262,21 +273,6 @@ function ItemRow({ item }: { item: ChatItem }) {
           {item.message}
         </div>
       );
-  }
-}
-
-function readableCode(code: string): string {
-  switch (code) {
-    case "provider_not_configured":
-      return "尚未配置模型 Provider";
-    case "invalid_body":
-      return "请求体非法";
-    case "not_found":
-      return "会话不存在";
-    case "http_503":
-      return "Runtime 拒绝服务";
-    default:
-      return "请求失败";
   }
 }
 

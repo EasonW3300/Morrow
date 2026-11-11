@@ -14,6 +14,8 @@ import {
   NEEDS_RECONCILE_MESSAGE,
   projectTaskEvents,
   reconcileControls,
+  taskEventsRefreshMode,
+  taskIsTerminal,
   taskNeedsReconcile,
   taskNodeStatusLabel,
   taskStatusLabel,
@@ -289,4 +291,23 @@ test("describeReconcileEvidence：复述双端执行证据（副本短 id + 原�
   assert.match(text, /22222222/);
   assert.match(text, /各自独立执行/);
   assert.equal(describeReconcileEvidence(null), null);
+});
+
+// --- 走查修复（M6-T2 / Issue #53）------------------------------------------------
+
+test("taskIsTerminal：completed/failed/cancelled 隐藏节点介入入口", () => {
+  assert.equal(taskIsTerminal("completed"), true);
+  assert.equal(taskIsTerminal("failed"), true);
+  assert.equal(taskIsTerminal("cancelled"), true);
+  assert.equal(taskIsTerminal("running"), false);
+  assert.equal(taskIsTerminal("paused"), false);
+  assert.equal(taskIsTerminal("waiting_input"), false);
+  assert.equal(taskIsTerminal("needs_reconcile"), false);
+});
+
+test("taskEventsRefreshMode：仅运行中自动轮询，其余靠动作刷新/手动刷新", () => {
+  assert.equal(taskEventsRefreshMode("running"), "poll");
+  for (const status of ["planned", "paused", "waiting_input", "completed", "failed", "needs_reconcile"] as TaskStatus[]) {
+    assert.equal(taskEventsRefreshMode(status), "manual");
+  }
 });

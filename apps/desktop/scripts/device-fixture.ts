@@ -40,7 +40,7 @@ import { detectDualExecution } from "../../runtime/src/lease/reconcile.ts";
 
 const envDataDir = process.env.MORROW_DATA_DIR;
 const dataDir = envDataDir ?? mkdtempSync(join(tmpdir(), "morrow-device-fixture-"));
-const config = { ...loadConfig(), dataDir };
+const config = loadConfig({ ...process.env, MORROW_DATA_DIR: dataDir });
 
 /** 规划器只需输出合法 DAG；任务创建后即被冻结为 needs_reconcile，不会真的执行节点。 */
 const PLAN = JSON.stringify({

@@ -38,6 +38,7 @@ import {
  * Issue #35），「加入设备」调用本机 POST /v1/pairing/join（token 由宿主写 OS 凭据库）。
  */
 export function DevicesView({ base }: { base: string }) {
+  const [devicesRefreshToken, setDevicesRefreshToken] = useState(0);
   return (
     <div className="settings-section devices-page">
       <div className="page-head">
@@ -48,8 +49,8 @@ export function DevicesView({ base }: { base: string }) {
         设备配对 = 一次性配对码 + 双端指纹人工核对。设备之间只同步事件账本（不复制数据库文件）；
         同一任务在两台设备各自执行过时会冻结为「待人工裁决」，由你在这里或任务页决定结论。
       </p>
-      <DeviceListSection base={base} />
-      <PairingSection base={base} />
+      <DeviceListSection base={base} refreshToken={devicesRefreshToken} />
+      <PairingSection base={base} onJoined={() => setDevicesRefreshToken((token) => token + 1)} />
       <SyncSection base={base} />
       <ConflictSection base={base} />
     </div>
@@ -81,7 +82,7 @@ function relative(iso: string | null): string {
 
 // --- 设备列表 ---------------------------------------------------------------------
 
-function DeviceListSection({ base }: { base: string }) {
+function DeviceListSection({ base, refreshToken }: { base: string; refreshToken: number }) {
   const [devices, setDevices] = useState<DeviceInfo[]>([]);
   const [localReplicaId, setLocalReplicaId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -101,7 +102,7 @@ function DeviceListSection({ base }: { base: string }) {
 
   useEffect(() => {
     void reload();
-  }, [reload]);
+  }, [reload, refreshToken]);
 
   const revoke = async (record: DeviceInfo) => {
     const name = record.label ?? record.fingerprint_short ?? record.replica_id.slice(0, 8);
@@ -191,7 +192,7 @@ function DeviceListSection({ base }: { base: string }) {
 
 // --- 配对 -------------------------------------------------------------------------
 
-function PairingSection({ base }: { base: string }) {
+function PairingSection({ base, onJoined }: { base: string; onJoined: () => void }) {
   const [code, setCode] = useState<PairingCodeResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
@@ -263,12 +264,14 @@ function PairingSection({ base }: { base: string }) {
           defaultBase={base}
           onJoined={() => {
             setJoined(true);
+            // 配对完成后设备表已新增对端行；通知外层刷新列表，避免停在旧快照。
+            onJoined();
           }}
         />
       </div>
       {joined && (
         <p className="hint-inline">
-          加入操作已完成一轮：请在上方设备列表点「刷新」确认新设备（撤销也在那里）。
+          加入操作已完成一轮：设备列表已自动刷新（撤销也在那里）。
         </p>
       )}
     </section>
@@ -449,7 +452,14 @@ function JoinDeviceCard({ defaultBase, onJoined }: { defaultBase: string; onJoin
             设备已作为「{review.deviceLabel}」加入对端。两端指纹一致才继续使用；不一致请选择「指纹不一致」并撤销。
           </p>
           <div className="form-actions">
-            <button className="btn primary" onClick={() => advance({ type: "confirm" })}>
+            <button
+              className="btn primary"
+              onClick={() => {
+                advance({ type: "confirm" });
+                // 对端已在 join 时写入设备表；完成核对后立即刷新列表与同步状态。
+                onJoined();
+              }}
+            >
               两端指纹一致，完成
             </button>
             <button className="btn danger" onClick={() => advance({ type: "reject" })}>

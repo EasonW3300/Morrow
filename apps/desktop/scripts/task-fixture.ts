@@ -38,7 +38,7 @@ const PLAN = JSON.stringify({
 
 const envDataDir = process.env.MORROW_DATA_DIR;
 const dataDir = envDataDir ?? mkdtempSync(join(tmpdir(), "morrow-task-fixture-"));
-const config = { ...loadConfig(), dataDir };
+const config = loadConfig({ ...process.env, MORROW_DATA_DIR: dataDir });
 const runtime = await startRuntime(config, {
   secretStore: createInMemorySecretStore(),
   // 会话 Agent：脚本化回声（Chat 可发消息，无网络）
