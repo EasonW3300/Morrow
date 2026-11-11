@@ -1,0 +1,272 @@
+{
+  "ticket": "M4-T9 / Issue #46 AC-13",
+  "generated_at": "2026-11-10T09:13:21.831Z",
+  "environment": {
+    "node": "v24.22.1",
+    "platform": "darwin-arm64"
+  },
+  "permissions": {
+    "contact_id": "01a1c4bb-c20c-7cd2-a913-ab70ae80049a",
+    "categories": [
+      {
+        "category": "private_memory",
+        "action": "memory_read",
+        "attempts": 20,
+        "blocked": 20,
+        "reason": "private_memory_denied"
+      },
+      {
+        "category": "filesystem",
+        "action": "filesystem",
+        "attempts": 20,
+        "blocked": 20,
+        "reason": "filesystem_denied"
+      },
+      {
+        "category": "dev_tools",
+        "action": "shell",
+        "attempts": 20,
+        "blocked": 20,
+        "reason": "dev_tools_denied"
+      },
+      {
+        "category": "unauthorized_capability",
+        "action": "capability",
+        "attempts": 20,
+        "blocked": 20,
+        "reason": "capability_not_granted"
+      },
+      {
+        "category": "other_session",
+        "action": "session",
+        "attempts": 20,
+        "blocked": 20,
+        "reason": "session_not_owned"
+      }
+    ],
+    "total_attempts": 100,
+    "total_blocked": 100,
+    "block_rate": "100.0%",
+    "public_control": {
+      "attempts": 20,
+      "allowed": 20
+    },
+    "denials_audited": 100,
+    "grants": [
+      {
+        "category": "memory_reference",
+        "scope": [],
+        "created_at": "2026-11-10T09:13:21.686Z",
+        "updated_at": "2026-11-10T09:13:21.686Z"
+      },
+      {
+        "category": "task_execute",
+        "scope": [
+          "allowed.capability"
+        ],
+        "created_at": "2026-11-10T09:13:21.686Z",
+        "updated_at": "2026-11-10T09:13:21.686Z"
+      }
+    ]
+  },
+  "notifications": {
+    "rules": 8,
+    "rounds": 20,
+    "delivered": 160,
+    "suppressed": 160,
+    "history_total": 160,
+    "desktop_pending": 80,
+    "channel_sent": 80,
+    "echo_sent": 80,
+    "dedupe_rate": "50.0%",
+    "by_event_type": {
+      "completed": 40,
+      "failed": 40,
+      "waiting_input": 40,
+      "milestone": 40
+    }
+  },
+  "rounds": [
+    {
+      "round": 1,
+      "permission_attempts": 5,
+      "permission_blocked": 5,
+      "public_control_allowed": 1,
+      "notifications_delivered": 8,
+      "notifications_suppressed": 8,
+      "errors": []
+    },
+    {
+      "round": 2,
+      "permission_attempts": 5,
+      "permission_blocked": 5,
+      "public_control_allowed": 1,
+      "notifications_delivered": 8,
+      "notifications_suppressed": 8,
+      "errors": []
+    },
+    {
+      "round": 3,
+      "permission_attempts": 5,
+      "permission_blocked": 5,
+      "public_control_allowed": 1,
+      "notifications_delivered": 8,
+      "notifications_suppressed": 8,
+      "errors": []
+    },
+    {
+      "round": 4,
+      "permission_attempts": 5,
+      "permission_blocked": 5,
+      "public_control_allowed": 1,
+      "notifications_delivered": 8,
+      "notifications_suppressed": 8,
+      "errors": []
+    },
+    {
+      "round": 5,
+      "permission_attempts": 5,
+      "permission_blocked": 5,
+      "public_control_allowed": 1,
+      "notifications_delivered": 8,
+      "notifications_suppressed": 8,
+      "errors": []
+    },
+    {
+      "round": 6,
+      "permission_attempts": 5,
+      "permission_blocked": 5,
+      "public_control_allowed": 1,
+      "notifications_delivered": 8,
+      "notifications_suppressed": 8,
+      "errors": []
+    },
+    {
+      "round": 7,
+      "permission_attempts": 5,
+      "permission_blocked": 5,
+      "public_control_allowed": 1,
+      "notifications_delivered": 8,
+      "notifications_suppressed": 8,
+      "errors": []
+    },
+    {
+      "round": 8,
+      "permission_attempts": 5,
+      "permission_blocked": 5,
+      "public_control_allowed": 1,
+      "notifications_delivered": 8,
+      "notifications_suppressed": 8,
+      "errors": []
+    },
+    {
+      "round": 9,
+      "permission_attempts": 5,
+      "permission_blocked": 5,
+      "public_control_allowed": 1,
+      "notifications_delivered": 8,
+      "notifications_suppressed": 8,
+      "errors": []
+    },
+    {
+      "round": 10,
+      "permission_attempts": 5,
+      "permission_blocked": 5,
+      "public_control_allowed": 1,
+      "notifications_delivered": 8,
+      "notifications_suppressed": 8,
+      "errors": []
+    },
+    {
+      "round": 11,
+      "permission_attempts": 5,
+      "permission_blocked": 5,
+      "public_control_allowed": 1,
+      "notifications_delivered": 8,
+      "notifications_suppressed": 8,
+      "errors": []
+    },
+    {
+      "round": 12,
+      "permission_attempts": 5,
+      "permission_blocked": 5,
+      "public_control_allowed": 1,
+      "notifications_delivered": 8,
+      "notifications_suppressed": 8,
+      "errors": []
+    },
+    {
+      "round": 13,
+      "permission_attempts": 5,
+      "permission_blocked": 5,
+      "public_control_allowed": 1,
+      "notifications_delivered": 8,
+      "notifications_suppressed": 8,
+      "errors": []
+    },
+    {
+      "round": 14,
+      "permission_attempts": 5,
+      "permission_blocked": 5,
+      "public_control_allowed": 1,
+      "notifications_delivered": 8,
+      "notifications_suppressed": 8,
+      "errors": []
+    },
+    {
+      "round": 15,
+      "permission_attempts": 5,
+      "permission_blocked": 5,
+      "public_control_allowed": 1,
+      "notifications_delivered": 8,
+      "notifications_suppressed": 8,
+      "errors": []
+    },
+    {
+      "round": 16,
+      "permission_attempts": 5,
+      "permission_blocked": 5,
+      "public_control_allowed": 1,
+      "notifications_delivered": 8,
+      "notifications_suppressed": 8,
+      "errors": []
+    },
+    {
+      "round": 17,
+      "permission_attempts": 5,
+      "permission_blocked": 5,
+      "public_control_allowed": 1,
+      "notifications_delivered": 8,
+      "notifications_suppressed": 8,
+      "errors": []
+    },
+    {
+      "round": 18,
+      "permission_attempts": 5,
+      "permission_blocked": 5,
+      "public_control_allowed": 1,
+      "notifications_delivered": 8,
+      "notifications_suppressed": 8,
+      "errors": []
+    },
+    {
+      "round": 19,
+      "permission_attempts": 5,
+      "permission_blocked": 5,
+      "public_control_allowed": 1,
+      "notifications_delivered": 8,
+      "notifications_suppressed": 8,
+      "errors": []
+    },
+    {
+      "round": 20,
+      "permission_attempts": 5,
+      "permission_blocked": 5,
+      "public_control_allowed": 1,
+      "notifications_delivered": 8,
+      "notifications_suppressed": 8,
+      "errors": []
+    }
+  ],
+  "pass": true
+}

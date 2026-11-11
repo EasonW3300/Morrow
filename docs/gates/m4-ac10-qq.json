@@ -1,0 +1,295 @@
+{
+  "ticket": "M4-T9 / Issue #46 AC-10",
+  "generated_at": "2026-11-10T09:21:49.505Z",
+  "environment": {
+    "node": "v24.22.1",
+    "platform": "darwin-arm64"
+  },
+  "channel": {
+    "config": {
+      "appId": "qq_m4_ac10",
+      "appSecret": "ac10_app_secret",
+      "botSecret": "ac10_bot_secret"
+    },
+    "capabilities": {
+      "direct_message": "supported",
+      "group_mention": "supported",
+      "group_proactive": "limited",
+      "attachments": "limited",
+      "edit": "unsupported"
+    }
+  },
+  "rounds_requested": 20,
+  "rounds_completed": 20,
+  "aspects": {
+    "group_mention": {
+      "passed": 20,
+      "total": 20
+    },
+    "direct_message": {
+      "passed": 20,
+      "total": 20
+    },
+    "outbound_audit": {
+      "passed": 20,
+      "total": 20,
+      "messages": 40
+    },
+    "proactive_limited": {
+      "declared": true,
+      "rejection_classified": true,
+      "evidence": "platform reject code=304046; outbox=needs_review; outbound.failed(will_retry=false)+outbound.reviewed; retry attempts after 10min=0"
+    },
+    "token_refresh": {
+      "passed": true,
+      "evidence": "expired token → refreshed (issued 1 → 2); reply sent once"
+    }
+  },
+  "totals": {
+    "outbound_messages": 40,
+    "platform_group_messages": 20,
+    "platform_direct_messages": 21,
+    "inbound_received": 41,
+    "outbound_queued": 42,
+    "outbound_sent": 41,
+    "signed_events": true
+  },
+  "real_platform_layer": {
+    "status": "partial",
+    "evidence_pointer": "docs/gates/m4-qq-live-evidence.md",
+    "completed": [
+      "真实 QQ 官方 Bot 群 @ 入站 → 回复：累计 15 次（首轮 1 + 第二轮 14；含 10 次仅 @ 不带正文），0 拒绝，Owner 侧确认收到",
+      "真实 QQ 官方 Bot 私聊（C2C）入站 → 回复：1 次（/v2/users/{openid}/messages，端点选择正确）",
+      "主动消息真实限制：群主动消息 HTTP 400 code=40034105（无权限）→ proactive_rejected；私聊主动消息 HTTP 200（额度内可发），证实分场景受限",
+      "真实平台发现并修复三处缺陷：unknown_conversation（73cf438）、40034105 未入不可重试码表、测试桩六个注入选项未生效（56ca2d2）"
+    ],
+    "not_completed": [
+      "AC-10 要求的群 @ 20 次门线：累计 15 次（差 5），不标完成",
+      "私聊 20 次门线：当前 1 次",
+      "真实链路 Outbox 幂等/未知状态与外发审计逐条落库核对"
+    ]
+  },
+  "rounds": [
+    {
+      "round": 1,
+      "group_mention_ok": true,
+      "direct_ok": true,
+      "outbound_ok": true,
+      "outbound_messages": 2,
+      "platform_group_messages": 1,
+      "platform_direct_messages": 1,
+      "inbound_events": 2,
+      "errors": []
+    },
+    {
+      "round": 2,
+      "group_mention_ok": true,
+      "direct_ok": true,
+      "outbound_ok": true,
+      "outbound_messages": 2,
+      "platform_group_messages": 1,
+      "platform_direct_messages": 1,
+      "inbound_events": 2,
+      "errors": []
+    },
+    {
+      "round": 3,
+      "group_mention_ok": true,
+      "direct_ok": true,
+      "outbound_ok": true,
+      "outbound_messages": 2,
+      "platform_group_messages": 1,
+      "platform_direct_messages": 1,
+      "inbound_events": 2,
+      "errors": []
+    },
+    {
+      "round": 4,
+      "group_mention_ok": true,
+      "direct_ok": true,
+      "outbound_ok": true,
+      "outbound_messages": 2,
+      "platform_group_messages": 1,
+      "platform_direct_messages": 1,
+      "inbound_events": 2,
+      "errors": []
+    },
+    {
+      "round": 5,
+      "group_mention_ok": true,
+      "direct_ok": true,
+      "outbound_ok": true,
+      "outbound_messages": 2,
+      "platform_group_messages": 1,
+      "platform_direct_messages": 1,
+      "inbound_events": 2,
+      "errors": []
+    },
+    {
+      "round": 6,
+      "group_mention_ok": true,
+      "direct_ok": true,
+      "outbound_ok": true,
+      "outbound_messages": 2,
+      "platform_group_messages": 1,
+      "platform_direct_messages": 1,
+      "inbound_events": 2,
+      "errors": []
+    },
+    {
+      "round": 7,
+      "group_mention_ok": true,
+      "direct_ok": true,
+      "outbound_ok": true,
+      "outbound_messages": 2,
+      "platform_group_messages": 1,
+      "platform_direct_messages": 1,
+      "inbound_events": 2,
+      "errors": []
+    },
+    {
+      "round": 8,
+      "group_mention_ok": true,
+      "direct_ok": true,
+      "outbound_ok": true,
+      "outbound_messages": 2,
+      "platform_group_messages": 1,
+      "platform_direct_messages": 1,
+      "inbound_events": 2,
+      "errors": []
+    },
+    {
+      "round": 9,
+      "group_mention_ok": true,
+      "direct_ok": true,
+      "outbound_ok": true,
+      "outbound_messages": 2,
+      "platform_group_messages": 1,
+      "platform_direct_messages": 1,
+      "inbound_events": 2,
+      "errors": []
+    },
+    {
+      "round": 10,
+      "group_mention_ok": true,
+      "direct_ok": true,
+      "outbound_ok": true,
+      "outbound_messages": 2,
+      "platform_group_messages": 1,
+      "platform_direct_messages": 1,
+      "inbound_events": 2,
+      "errors": []
+    },
+    {
+      "round": 11,
+      "group_mention_ok": true,
+      "direct_ok": true,
+      "outbound_ok": true,
+      "outbound_messages": 2,
+      "platform_group_messages": 1,
+      "platform_direct_messages": 1,
+      "inbound_events": 2,
+      "errors": []
+    },
+    {
+      "round": 12,
+      "group_mention_ok": true,
+      "direct_ok": true,
+      "outbound_ok": true,
+      "outbound_messages": 2,
+      "platform_group_messages": 1,
+      "platform_direct_messages": 1,
+      "inbound_events": 2,
+      "errors": []
+    },
+    {
+      "round": 13,
+      "group_mention_ok": true,
+      "direct_ok": true,
+      "outbound_ok": true,
+      "outbound_messages": 2,
+      "platform_group_messages": 1,
+      "platform_direct_messages": 1,
+      "inbound_events": 2,
+      "errors": []
+    },
+    {
+      "round": 14,
+      "group_mention_ok": true,
+      "direct_ok": true,
+      "outbound_ok": true,
+      "outbound_messages": 2,
+      "platform_group_messages": 1,
+      "platform_direct_messages": 1,
+      "inbound_events": 2,
+      "errors": []
+    },
+    {
+      "round": 15,
+      "group_mention_ok": true,
+      "direct_ok": true,
+      "outbound_ok": true,
+      "outbound_messages": 2,
+      "platform_group_messages": 1,
+      "platform_direct_messages": 1,
+      "inbound_events": 2,
+      "errors": []
+    },
+    {
+      "round": 16,
+      "group_mention_ok": true,
+      "direct_ok": true,
+      "outbound_ok": true,
+      "outbound_messages": 2,
+      "platform_group_messages": 1,
+      "platform_direct_messages": 1,
+      "inbound_events": 2,
+      "errors": []
+    },
+    {
+      "round": 17,
+      "group_mention_ok": true,
+      "direct_ok": true,
+      "outbound_ok": true,
+      "outbound_messages": 2,
+      "platform_group_messages": 1,
+      "platform_direct_messages": 1,
+      "inbound_events": 2,
+      "errors": []
+    },
+    {
+      "round": 18,
+      "group_mention_ok": true,
+      "direct_ok": true,
+      "outbound_ok": true,
+      "outbound_messages": 2,
+      "platform_group_messages": 1,
+      "platform_direct_messages": 1,
+      "inbound_events": 2,
+      "errors": []
+    },
+    {
+      "round": 19,
+      "group_mention_ok": true,
+      "direct_ok": true,
+      "outbound_ok": true,
+      "outbound_messages": 2,
+      "platform_group_messages": 1,
+      "platform_direct_messages": 1,
+      "inbound_events": 2,
+      "errors": []
+    },
+    {
+      "round": 20,
+      "group_mention_ok": true,
+      "direct_ok": true,
+      "outbound_ok": true,
+      "outbound_messages": 2,
+      "platform_group_messages": 1,
+      "platform_direct_messages": 1,
+      "inbound_events": 2,
+      "errors": []
+    }
+  ],
+  "pass": true
+}

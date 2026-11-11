@@ -1,0 +1,22 @@
+{
+  "name": "@morrow/pi-adapter",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Pi 内核适配层：冻结接口面 + 事件翻译 + FakePi 测试替身 + 契约测试（ADR-0001）",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "tsc --noEmit && node --test --experimental-strip-types \"test/*.test.ts\""
+  },
+  "dependencies": {
+    "@earendil-works/pi-agent-core": "1.4.0",
+    "@earendil-works/pi-ai": "1.4.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0"
+  }
+}

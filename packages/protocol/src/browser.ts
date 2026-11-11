@@ -1,0 +1,126 @@
+/**
+ * @morrow/protocol 浏览器安全入口（`@morrow/protocol/browser`）。
+ *
+ * 与默认出口（./index.ts）的差异：不导出 integrity.ts（node:crypto 依赖）与
+ * event-envelope JSON Schema——二者仅服务 Node 侧运行时；浏览器 bundle（desktop
+ * 的 vite build）只允许从本入口取类型与纯 JS 常量，避免 node 内置模块被拖进
+ * 浏览器构建（CI 三平台 build 腿回归的根因，见 Issue #27 / #24）。
+ *
+ * 演进规则：本文件只允许追加「无 node 内置模块、无副作用」的导出；任何
+ * node 依赖一律留在默认出口。
+ */
+export type {
+  ActorId,
+  ChannelReceipt,
+  EventEnvelope,
+  SchemaVersion,
+} from "./event-envelope.ts";
+export type {
+  ConnectivityResult,
+  DeviceIdentityInfo,
+  DeviceInfo,
+  PairingClaimRequest,
+  PairingClaimResponse,
+  PairingCodeResponse,
+  PairingJoinRequest,
+  PairingJoinResponse,
+  MemoryEntryKind,
+  MemoryWriteInput,
+  ProviderCompatConfig,
+  ProviderRecord,
+  SensitivityLevel,
+} from "./api-contracts.ts";
+export type {
+  ExecutionLease,
+  ExecutionReconcileEvidence,
+  ExecutionTransferRecord,
+  NodeGitRepoResource,
+  NodeResources,
+  ReconcileEvidenceSource,
+  SideEffectClass,
+  TaskDetail,
+  TaskExecutionState,
+  TaskNodeRecord,
+  TaskNodeStatus,
+  TaskStatus,
+  TaskSummary,
+  TransferExecutionRequest,
+  TransferExecutionResponse,
+} from "./task-contracts.ts";
+// 同步协议（M3-T6 / Issue #35：设置→设备与同步页的同步状态面板）
+// sync-contracts.ts 只依赖 EventEnvelope 类型，无 node 内置模块——浏览器安全。
+export type {
+  SyncCursorRecord,
+  SyncEnvelope,
+  SyncGapDetails,
+  SyncPeerRunResult,
+  SyncPeerStatus,
+  SyncPullBatch,
+  SyncPushOutcome,
+  SyncPushRequest,
+  SyncRunReport,
+  SyncRunRequest,
+  SyncStatus,
+} from "./sync-contracts.ts";
+export type {
+  CapabilityAuthor,
+  CapabilityChannel,
+  CapabilityManifest,
+  CapabilityPermissions,
+  CapabilityRecord,
+  CapabilityRuntimeKind,
+  CapabilitySandboxSpec,
+  CapabilityStatus,
+  CapabilityUseRequest,
+  CapabilityVersionRecord,
+  PermissionGrant,
+  PermissionViolation,
+  ShellCommandCategory,
+} from "./capability-contracts.ts";
+export {
+  CAPABILITY_CHANNELS,
+  SHELL_COMMAND_CATEGORIES,
+} from "./capability-contracts.ts";
+// 渠道 / 可信联系人 / 通知 / Outbox（M4-T8 / Issue #45：渠道与联系人 UI）。
+// 三类合约文件都只含纯类型与纯 JS 常量，无 node 内置模块依赖——浏览器安全。
+export type {
+  ChannelAdapterState,
+  ChannelCapabilities,
+  ChannelConversationKind,
+  ChannelEnvironment,
+  ChannelFeatureSupport,
+  ChannelHealth,
+  ChannelLocalBridgeHealth,
+  ChannelSecretFieldView,
+  ChannelSecretsView,
+  ChannelSummary,
+} from "./channel-contracts.ts";
+export type {
+  ChannelAllowMode,
+  ChannelAllowlistEntryView,
+  ContactAmbiguityView,
+  ContactCapabilityCategory,
+  ContactGrantView,
+  ContactIdentityView,
+  ContactInviteView,
+  ContactView,
+} from "./contact-contracts.ts";
+export { CONTACT_CAPABILITY_CATEGORIES } from "./contact-contracts.ts";
+export type {
+  NotificationDeliveryKind,
+  NotificationDeliveryStatus,
+  NotificationEventType,
+  NotificationQuietHours,
+  NotificationRecord,
+  NotificationRule,
+  NotificationRuleInput,
+} from "./notification-contracts.ts";
+export { NOTIFICATION_EVENT_TYPE_VALUES } from "./notification-contracts.ts";
+export type {
+  OutboxListPage,
+  OutboxMessageRecord,
+  OutboxReceipt,
+  OutboxStatus,
+  OutboxTarget,
+  OutboxTargetKind,
+} from "./outbox-contracts.ts";

@@ -1,0 +1,248 @@
+{
+  "ticket": "M4-T9 / Issue #46 AC-15",
+  "generated_at": "2026-11-10T09:12:09.063Z",
+  "environment": {
+    "node": "v24.22.1",
+    "platform": "darwin-arm64"
+  },
+  "config": {
+    "factory_disabled": true,
+    "experimental": true,
+    "environment_declared": {
+      "os": "Windows",
+      "client": "最新版微信 Windows 桌面客户端",
+      "bridge": "LocalBridge（M4 仅 StubLocalBridge；真实本地桥未实现）",
+      "real_integration": "not_done",
+      "notes": "真实微信联调未做，需 Owner Windows 机器；不承诺跨 OS 稳定，也不承诺账号安全。"
+    },
+    "risk_notice": "微信个人号适配器属于实验功能：基于非官方自动化，不稳定、可能随时失效，且可能违反微信平台服务条款，导致账号被限制或封禁；账号风险自担。出厂默认关闭，启用必须显式确认风险（confirm_risk=true）。真实微信联调尚未完成，需 Owner 的 Windows 机器。",
+    "expected_environment": {
+      "os": "Windows",
+      "client": "最新版微信 Windows 桌面客户端",
+      "bridge": "LocalBridge（M4 仅 StubLocalBridge；真实本地桥未实现）",
+      "real_integration": "not_done",
+      "notes": "真实微信联调未做，需 Owner Windows 机器；不承诺跨 OS 稳定，也不承诺账号安全。"
+    }
+  },
+  "risk_confirmation": {
+    "refused_status": 409,
+    "refused_code": "risk_confirmation_required",
+    "enabled_status": 200,
+    "audit_events": 1
+  },
+  "allowlist": {
+    "rounds_requested": 20,
+    "rounds_completed": 20,
+    "allowed_sent": {
+      "passed": 20,
+      "total": 20
+    },
+    "blocked_rejected": {
+      "passed": 20,
+      "total": 20
+    },
+    "bridge_sent_total": 20,
+    "inbound_received": 20,
+    "inbound_rejected": 20
+  },
+  "health": {
+    "initial": {
+      "healthy": false,
+      "state": "stopped",
+      "connection": "disconnected",
+      "bridge": {
+        "process": "stopped",
+        "login": "logged_out",
+        "window": "unavailable",
+        "last_error": null
+      }
+    },
+    "degraded": {
+      "healthy": false,
+      "connection": "degraded",
+      "last_error": "bridge crashed",
+      "bridge": {
+        "process": "error",
+        "login": "logged_out",
+        "window": "unavailable",
+        "last_error": "bridge crashed"
+      }
+    },
+    "restored_healthy": true
+  },
+  "logs": {
+    "event_types": {
+      "channel.adapter_started": 1,
+      "channel.experimental_enabled": 1,
+      "channel.inbound_received": 20,
+      "channel.inbound_rejected": 20
+    },
+    "all_expected_present": true,
+    "expected": [
+      "channel.adapter_started",
+      "channel.experimental_enabled",
+      "channel.inbound_received",
+      "channel.inbound_rejected"
+    ]
+  },
+  "disable": {
+    "status": 200,
+    "bridge_disconnected": true,
+    "channel_enabled": false,
+    "channel_state": "stopped",
+    "inbound_after_disable": 0,
+    "stopped_audited": 1
+  },
+  "real_wechat_layer": {
+    "status": "not_run_external_block",
+    "reason": "真实微信个人号联调需要 Owner 的 Windows 机器 + 最新版微信 + 真实本地自动化桥；M4 只交付可注入 LocalBridge 接缝与平台桩验证，真实桥未实现。",
+    "requires": [
+      "Windows 声明环境（最新版微信）",
+      "真实本地自动化桥实现",
+      "Owner 现场登录与白名单会话"
+    ]
+  },
+  "rounds": [
+    {
+      "round": 1,
+      "allowed_sent": true,
+      "blocked_rejected": true,
+      "blocked_sent_extra": 0,
+      "errors": []
+    },
+    {
+      "round": 2,
+      "allowed_sent": true,
+      "blocked_rejected": true,
+      "blocked_sent_extra": 0,
+      "errors": []
+    },
+    {
+      "round": 3,
+      "allowed_sent": true,
+      "blocked_rejected": true,
+      "blocked_sent_extra": 0,
+      "errors": []
+    },
+    {
+      "round": 4,
+      "allowed_sent": true,
+      "blocked_rejected": true,
+      "blocked_sent_extra": 0,
+      "errors": []
+    },
+    {
+      "round": 5,
+      "allowed_sent": true,
+      "blocked_rejected": true,
+      "blocked_sent_extra": 0,
+      "errors": []
+    },
+    {
+      "round": 6,
+      "allowed_sent": true,
+      "blocked_rejected": true,
+      "blocked_sent_extra": 0,
+      "errors": []
+    },
+    {
+      "round": 7,
+      "allowed_sent": true,
+      "blocked_rejected": true,
+      "blocked_sent_extra": 0,
+      "errors": []
+    },
+    {
+      "round": 8,
+      "allowed_sent": true,
+      "blocked_rejected": true,
+      "blocked_sent_extra": 0,
+      "errors": []
+    },
+    {
+      "round": 9,
+      "allowed_sent": true,
+      "blocked_rejected": true,
+      "blocked_sent_extra": 0,
+      "errors": []
+    },
+    {
+      "round": 10,
+      "allowed_sent": true,
+      "blocked_rejected": true,
+      "blocked_sent_extra": 0,
+      "errors": []
+    },
+    {
+      "round": 11,
+      "allowed_sent": true,
+      "blocked_rejected": true,
+      "blocked_sent_extra": 0,
+      "errors": []
+    },
+    {
+      "round": 12,
+      "allowed_sent": true,
+      "blocked_rejected": true,
+      "blocked_sent_extra": 0,
+      "errors": []
+    },
+    {
+      "round": 13,
+      "allowed_sent": true,
+      "blocked_rejected": true,
+      "blocked_sent_extra": 0,
+      "errors": []
+    },
+    {
+      "round": 14,
+      "allowed_sent": true,
+      "blocked_rejected": true,
+      "blocked_sent_extra": 0,
+      "errors": []
+    },
+    {
+      "round": 15,
+      "allowed_sent": true,
+      "blocked_rejected": true,
+      "blocked_sent_extra": 0,
+      "errors": []
+    },
+    {
+      "round": 16,
+      "allowed_sent": true,
+      "blocked_rejected": true,
+      "blocked_sent_extra": 0,
+      "errors": []
+    },
+    {
+      "round": 17,
+      "allowed_sent": true,
+      "blocked_rejected": true,
+      "blocked_sent_extra": 0,
+      "errors": []
+    },
+    {
+      "round": 18,
+      "allowed_sent": true,
+      "blocked_rejected": true,
+      "blocked_sent_extra": 0,
+      "errors": []
+    },
+    {
+      "round": 19,
+      "allowed_sent": true,
+      "blocked_rejected": true,
+      "blocked_sent_extra": 0,
+      "errors": []
+    },
+    {
+      "round": 20,
+      "allowed_sent": true,
+      "blocked_rejected": true,
+      "blocked_sent_extra": 0,
+      "errors": []
+    }
+  ],
+  "pass": true
+}
