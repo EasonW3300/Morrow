@@ -2,7 +2,7 @@
 
 单主人、长期记忆、可自主生成能力的个人 Agent。
 
-**当前状态**：M4 收官（渠道与通知域**协议层达成**：飞书/QQ 适配器、Outbox 外发审计、可信联系人、群聊白名单、通知规则、微信实验适配；桌面通知投递已端到端达成——`tauri-plugin-notification` 系统通知 + 应用内通知中心，权限被拒时自动降级；**真实平台层未达成**——QQ 真实平台累计群 @ 15/20 + 私聊 1 次、飞书资质未注册、微信需 Owner Windows，见 [M4 门禁报告](docs/gates/m4-gate-report.md) 的双层结论）。M3 收官（三种部署形态、同步引擎、设备配对、离线回放、执行租约交付，见 [M3 门禁报告](docs/gates/m3-gate-report.md)；M2「缺能力→造工具→安全验证→重用」演示达成，见 [M2 门禁报告](docs/gates/m2-gate-report.md)；M1 两项主线门槛达成，见 [M1 门禁报告](docs/gates/m1-gate-report.md)；M0 冒烟门全绿，见 [M0 门禁报告](docs/gates/m0-gate-report.md)）。
+**当前状态**：`0.1.0`（M0–M4 合并态）—— M0 事件账本/对话/Provider/桌面壳/单二进制与三平台冒烟门；M1 记忆与任务；M2 能力工厂；M3 同步、设备配对与三种部署形态；M4 渠道与通知（**协议层达成**：飞书/QQ 适配器、Outbox 外发审计、可信联系人、通知规则，桌面通知投递端到端；**真实平台层**仍受外部依赖阻塞，见 [M4 门禁报告](docs/gates/m4-gate-report.md) 的双层结论）。**已知限制**：语音（M5）未实现、附件文件传输仅引用语义未实现、飞书需自建应用资质、微信需 Windows + 最新客户端（实验）、AC-02 真实双 Provider 待 Owner 配置、Tailscale 双机未验证——逐条与残余风险见 [CHANGELOG 已知限制](CHANGELOG.md) 与 [M6 门禁报告](docs/gates/m6-gate-report.md)。
 
 ## 文档导航
 
@@ -10,6 +10,11 @@
 - [GLOSSARY](GLOSSARY.md) —— 领域统一语言
 - [ADR 目录](docs/adr/) —— 工程决策记录（含 0007 桌面壳裁决）
 - [部署指南](deploy/README.md) —— 三种部署形态（纯本地 / Ubuntu systemd / 本地+服务器混合）、私有网络（Tailscale/WireGuard）、安装升级回滚与备份、部署冒烟脚本
+- [版本变更日志](CHANGELOG.md) —— 0.1.0 的 M0–M4 功能清单与「已知限制」
+- [0.1.0 发布检查表](docs/release/m6-checklist.md) —— 版本/构建/测试/产物/CI/合并与 tag 的逐项命令（合并、tag、push **由 Owner 确认后执行**）
+- [M6 门禁报告](docs/gates/m6-gate-report.md) —— AC-01..AC-15 逐项裁决、M6 门槛核对、release blocker 与外部依赖、v0.1.0 发布建议
+- [M6 UI 走查](docs/gates/m6-ui-walkthrough.md) —— Liquid Glass 七个视图人工走查结论、已修问题与登记项
+- [安全与故障注入汇总](docs/security/README.md) —— 六域断言、可复跑入口与残余风险（[M6 安全摘要](docs/gates/m6-security-summary.md)）
 - [M0 门禁报告](docs/gates/m0-gate-report.md) —— CI 三平台 + 真机门禁证据、PRD §9 门槛核对
 - [M1 门禁报告](docs/gates/m1-gate-report.md) —— 记忆回链 / 故障注入 / 人工介入覆盖盘点、PRD §9 M1 门槛核对
 - [M2 门禁报告](docs/gates/m2-gate-report.md) —— 能力工厂 harness 双路径 / 并行隔离 / 完整演示脚本（[归档输出](docs/gates/m2-demo-output.md)）、PRD §9 M2 门槛核对
@@ -35,7 +40,7 @@ packages/capability 能力工厂：生成 / 沙箱验证 / 注册 / 演进
 packages/voice      语音管线：VAD / ASR / TTS / 打断
 workers/go          Go 组件（系统适配、性能敏感服务、CLI）
 docs/prd, docs/adr  PRD 与决策记录
-docs/gates          门禁报告归档（docs/security 威胁模型）
+docs/gates          门禁报告归档（docs/security 威胁模型与安全汇总、docs/release 发布检查表）
 docs/history        归档文档
 ```
 
@@ -50,6 +55,23 @@ docs/history        归档文档
 传输默认走私有网络（[ADR-0004](docs/adr/0004-private-network-first-transport.md)：Tailscale/WireGuard），
 Runtime 默认不监听公网；非回环访问必须持配对下发的 bearer token。发布前三形态冒烟：
 `scripts/deploy/smoke-{local,server,hybrid}.sh`。
+
+## 构建与发布（0.1.0）
+
+```bash
+pnpm install --frozen-lockfile
+pnpm -r typecheck                           # 全 workspace 类型检查
+pnpm --filter @morrow/runtime test:unit     # Runtime 单测（需 Node 22.16+ / 24 的 FTS5）
+pnpm --filter @morrow/desktop test:ui       # 桌面 UI/逻辑测试（不触发 cargo）
+
+pnpm pack:runtime                           # bun compile → scripts/packaging/dist/morrow-runtime-<platform>-<arch>
+pnpm probe:runtime                          # standalone + sidecar 探针（PASS 退出码 0）
+pnpm gate:runtime                           # 冒烟门（产物校验 + 双探针；本机无 bundle 时 bundle 项 skipped）
+```
+
+版本号唯一来源是各 workspace `package.json`（Runtime ready 行与 `/v1/health` 的 `version` 同源）。
+合并到 `main`、打 `v0.1.0` tag、push 的完整步骤见 [0.1.0 发布检查表](docs/release/m6-checklist.md)，
+**由 Owner 确认后执行**。
 
 ## Runtime HTTP API（能力域摘要）
 

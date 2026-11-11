@@ -523,11 +523,13 @@ QQ 测试文件：`test/channels.qq.test.ts`、`test/channels.qq.e2e.test.ts`、
    `GET /v1/outbox` 与事件账本核对 `outbound.queued/sent` 与平台回执。
 7. 记录 20 次真实收发证据到门禁报告；主动消息限制、附件限制如实登记。
 
-## 真实 QQ 联调（WS 传输已实现，真实收发证据待执行）
+## 真实 QQ 联调（WS 传输已实现，已有真实平台部分证据）
 
-**状态：真实 WebSocket 网关传输与联调脚本已实现；真实收发证据尚未执行**（需要机器人账号
-+ 人在 QQ 里 @ 机器人）。协议层已由 `ChannelTestServer` + `registerQqTestStub` 全链路覆盖，
-WS 传输由 `channels.qq.websocket.test.ts` 零网络覆盖；**不得以桩测试冒充平台验收**。
+**状态：真实 WebSocket 网关传输与联调脚本已实现，并已完成真实平台联调**——累计群 @ 15 次
++ 私聊 1 次、0 拒绝；`unknown_conversation` 等三处缺陷已修复并补回归（证据
+[`docs/gates/m4-qq-live-evidence.md`](../../docs/gates/m4-qq-live-evidence.md)）。**未达 AC-10 的
+20 次群 @ 门线**，真实平台层不得标完成。协议层已由 `ChannelTestServer` + `registerQqTestStub`
+全链路覆盖，WS 传输由 `channels.qq.websocket.test.ts` 零网络覆盖；**不得以桩测试冒充平台验收**。
 
 联调脚本：`scripts/real-machine/qq-live-smoke.ts`（只读 Keychain，不打印 token）：
 
@@ -545,7 +547,7 @@ node --experimental-strip-types scripts/real-machine/qq-live-smoke.ts --reply "�
 - `--seconds N` 超时退出（默认 60），退出打印事件/拒绝计数与 `health()`；
 - 前置：机器人已加入群，且有人 **@ 机器人**（未 @ 的群消息平台不投递）。
 
-以下步骤在资质就绪后执行：
+以下步骤为平台侧前置（机器人账号已注册，用于核对配置）：
 
 1. 在 QQ 开放平台注册机器人开发者并创建机器人，记录 AppID 与 AppSecret。
 2. 配置沙箱/正式环境的事件订阅：填写回调 HTTPS 地址（只允许 80/443/8080/8443），
