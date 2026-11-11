@@ -90,7 +90,7 @@ const LOG_ARCHIVE_V020: CapabilityManifest = {
 
 const envDataDir = process.env.MORROW_DATA_DIR;
 const dataDir = envDataDir ?? mkdtempSync(join(tmpdir(), "morrow-capability-"));
-const config = { ...loadConfig(), dataDir };
+const config = loadConfig({ ...process.env, MORROW_DATA_DIR: dataDir });
 
 // --- 工厂演示：脚本化生成器（真实管线，零 LLM）+ 本地桩沙箱 -----------------------------
 

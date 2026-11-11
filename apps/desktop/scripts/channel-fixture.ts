@@ -119,7 +119,7 @@ const wechatAdapter = new WeChatChannelAdapter({ accountId: "wechat-default", br
 
 const envDataDir = process.env.MORROW_DATA_DIR;
 const dataDir = envDataDir ?? mkdtempSync(join(tmpdir(), "morrow-channel-"));
-const config = { ...loadConfig(), dataDir };
+const config = loadConfig({ ...process.env, MORROW_DATA_DIR: dataDir });
 
 // 通知服务可注入时钟（Issue #47 走查）：先让免打扰行落 delayed，再前移 2 分钟放行到 pending。
 let notificationClock = new Date();
@@ -181,6 +181,9 @@ runtime.channels.setAllowlist("wechat", [
 runtime.channels.setAllowlist("feishu", [
   { native_conversation_id: "oc_feishu_group_demo", mode: "mention_only" },
 ]);
+runtime.channels.setAllowlist("qq", [
+  { native_conversation_id: "qq-group-1", mode: "mention_only" },
+]);
 
 // --- 可信联系人：真实邀请码 → 渠道回复绑定 → 授权类别 ----------------------------------
 
@@ -225,6 +228,16 @@ const contactZhou = await seedContact({
 const ambiguityId = runtime.contacts.recordAmbiguity("qq-default", "qq_uncertain_sender", [contactLin, contactZhou]);
 
 // --- 通知规则：四类事件 × 目标 × 免打扰（含跨天与停用行） ----------------------------
+
+// A3 修复批（Issue #37）后 channel:<id> 规则保存要求渠道已有默认通知会话（fail-closed）；
+// 夹具必须先指到已白名单的会话，否则 upsertRules 直接 400 notify_target_required。
+const feishuTarget = runtime.channels.setNotifyTarget("feishu", "oc_feishu_group_demo");
+const qqTarget = runtime.channels.setNotifyTarget("qq", "qq-group-1");
+if (!feishuTarget.ok || !qqTarget.ok) {
+  throw new Error(
+    `channel-fixture: failed to seed notify targets: ${feishuTarget.ok ? "" : feishuTarget.code} / ${qqTarget.ok ? "" : qqTarget.code}`,
+  );
+}
 
 runtime.notifications.upsertRules([
   { event_type: "completed", target: "desktop", quiet_hours: null, enabled: true },

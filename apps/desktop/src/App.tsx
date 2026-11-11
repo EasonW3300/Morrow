@@ -162,7 +162,13 @@ export default function App() {
                 <p>选择左侧会话，或新建一个开始对话。</p>
               </div>
             ) : (
-              <ChatView key={selectedId} base={base} sessionId={selectedId} onOpenTask={openTask} />
+              <ChatView
+                key={selectedId}
+                base={base}
+                sessionId={selectedId}
+                onOpenTask={openTask}
+                onOpenSettings={() => setView("settings")}
+              />
             )}
           </main>
         </div>

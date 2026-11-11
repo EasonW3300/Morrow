@@ -54,10 +54,16 @@ export interface ChatState {
   turnActive: boolean;
   /** 已应用的最大 durable seq（重连重放去重边界） */
   lastSeq: number;
+  /**
+   * items 仅来自 GET /messages 播种（SSE 尚未投递任何 durable 帧）。
+   * 首帧到达时以账本全量重放重建 items：历史接口只含消息，不带 tool.* / agent.error；
+   * 若直接沿用 lastSeq，这些事件会被当成「已应用」丢弃（历史回看丢工具事件）。
+   */
+  seededFromHistory: boolean;
 }
 
 export function emptyChatState(): ChatState {
-  return { items: [], streaming: "", turnActive: false, lastSeq: 0 };
+  return { items: [], streaming: "", turnActive: false, lastSeq: 0, seededFromHistory: false };
 }
 
 export function applyFrame(state: ChatState, frame: Frame): ChatState {
@@ -73,6 +79,11 @@ export function applyFrame(state: ChatState, frame: Frame): ChatState {
 }
 
 function applyEvent(state: ChatState, sequence: number, envelope: Envelope): ChatState {
+  if (state.seededFromHistory) {
+    // 历史播种只覆盖消息；首条 durable 帧到达后改用账本全量重放重建，避免
+    // tool.started/finished 与 agent.error 因 <= 历史最后消息 seq 被去重丢弃。
+    return applyEvent({ ...state, items: [], lastSeq: 0, seededFromHistory: false }, sequence, envelope);
+  }
   if (sequence <= state.lastSeq) {
     return state; // 重放/重连去重（durable 帧以账本 seq 为唯一序）
   }
@@ -212,5 +223,5 @@ export function stateFromHistory(messages: MessageRecord[]): ChatState {
       occurredAt: message.occurred_at,
     } satisfies ChatItem;
   });
-  return { items, streaming: "", turnActive: false, lastSeq };
+  return { items, streaming: "", turnActive: false, lastSeq, seededFromHistory: true };
 }

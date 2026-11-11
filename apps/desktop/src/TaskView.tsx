@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   api,
   ApiError,
@@ -17,6 +17,8 @@ import {
   projectTaskEvents,
   reconcileControls,
   taskNeedsReconcile,
+  taskEventsRefreshMode,
+  taskIsTerminal,
   taskNodeStatusLabel,
   taskNodeStatusTone,
   taskStatusLabel,
@@ -47,7 +49,6 @@ const POLL_INTERVAL_MS = 2000;
 const EVENT_PAGE_SIZE = 50;
 /** 能力引用卡的扫描窗口（账本单页上限 200；引用卡是辅助信息，不做全量回扫） */
 const CAPABILITY_REFS_EVENT_LIMIT = 200;
-const TERMINAL_STATUSES = new Set(["failed", "completed", "cancelled"]);
 
 export function TaskView({
   base,
@@ -236,7 +237,7 @@ function TaskDetailPanel({
   if (task === null) {
     return <p className="empty-note">正在读取任务…</p>;
   }
-  const terminal = TERMINAL_STATUSES.has(task.status);
+  const terminal = taskIsTerminal(task.status);
 
   return (
     <div className="task-detail-body">
@@ -320,8 +321,21 @@ function TaskDetailPanel({
           }}
         />
       )}
-      <NodeList base={base} task={task} busy={busy} run={run} capabilityRefs={capabilityRefs} onOpenCapability={onOpenCapability} />
-      <EventStream base={base} taskId={task.task_id} />
+      <NodeList
+        base={base}
+        task={task}
+        busy={busy}
+        interactive={!terminal}
+        run={run}
+        capabilityRefs={capabilityRefs}
+        onOpenCapability={onOpenCapability}
+      />
+      <EventStream
+        base={base}
+        taskId={task.task_id}
+        taskStatus={task.status}
+        refreshKey={`${task.status}:${task.task_version}:${task.updated_at}`}
+      />
       {checkpoints.length > 0 && (
         <CheckpointList
           base={base}
@@ -342,6 +356,7 @@ function NodeList({
   base,
   task,
   busy,
+  interactive,
   run,
   capabilityRefs,
   onOpenCapability,
@@ -349,6 +364,7 @@ function NodeList({
   base: string;
   task: TaskDetail;
   busy: boolean;
+  interactive: boolean;
   run: (what: string, action: () => Promise<unknown>) => Promise<void>;
   capabilityRefs: Map<string, CapabilityRef[]>;
   onOpenCapability?: (name: string) => void;
@@ -367,6 +383,7 @@ function NodeList({
               taskId={task.task_id}
               node={node}
               busy={busy}
+              interactive={interactive}
               run={run}
               capabilityRefs={capabilityRefs.get(node.node_id) ?? []}
               onOpenCapability={onOpenCapability}
@@ -386,6 +403,7 @@ function NodeRow({
   taskId,
   node,
   busy,
+  interactive,
   run,
   capabilityRefs,
   onOpenCapability,
@@ -394,6 +412,7 @@ function NodeRow({
   taskId: string;
   node: TaskNodeRecord;
   busy: boolean;
+  interactive: boolean;
   run: (what: string, action: () => Promise<unknown>) => Promise<void>;
   capabilityRefs: CapabilityRef[];
   onOpenCapability?: (name: string) => void;
@@ -436,7 +455,7 @@ function NodeRow({
         )
       )}
       {node.error !== undefined && <p className="node-error">错误：{node.error}</p>}
-      {owned && node.status === "pending" && (
+      {interactive && owned && node.status === "pending" && (
         <div className="node-actions">
           {completing ? (
             <>
@@ -473,7 +492,7 @@ function NodeRow({
           )}
         </div>
       )}
-      {!owned && node.status === "pending" && (
+      {interactive && !owned && node.status === "pending" && (
         <div className="node-actions">
           <Button
             disabled={busy}
@@ -625,11 +644,22 @@ function ReviseForm({
 
 // --- 执行事件流（分页 + 工具 I/O + diff 只读）---------------------------------------
 
-function EventStream({ base, taskId }: { base: string; taskId: string }) {
+function EventStream({
+  base,
+  taskId,
+  taskStatus,
+  refreshKey,
+}: {
+  base: string;
+  taskId: string;
+  taskStatus: TaskDetail["status"];
+  refreshKey: string;
+}) {
   const [events, setEvents] = useState<TaskEventEnvelope[]>([]);
   const [total, setTotal] = useState(0);
   const [offset, setOffset] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
 
   const load = useCallback(
     async (target: number | null) => {
@@ -653,11 +683,41 @@ function EventStream({ base, taskId }: { base: string; taskId: string }) {
     void load(null);
   }, [load]);
 
+  // 介入动作/状态变化（暂停、修订、裁决…）不改变当前窗口页码：刷新同一窗口即可。
+  // 首个渲染由上面的 mount effect 负责，这里跳过首次以免重复请求。
+  const firstRefresh = useRef(true);
+  useEffect(() => {
+    if (firstRefresh.current) {
+      firstRefresh.current = false;
+      return;
+    }
+    void load(offset);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- offset 仅作刷新锚点，不应触发重复刷新
+  }, [refreshKey]);
+
+  // 运行中节点事件持续追加（task_status/task_version 不变），按 2s 轮询当前窗口。
+  useEffect(() => {
+    if (taskEventsRefreshMode(taskStatus) !== "poll") return;
+    const timer = setInterval(() => void load(offset), 2000);
+    return () => clearInterval(timer);
+  }, [taskStatus, load, offset]);
+
+  const refresh = async () => {
+    setRefreshing(true);
+    await load(offset);
+    setRefreshing(false);
+  };
+
   const items: TaskEventItem[] = projectTaskEvents(events.map((e) => ({ sequence: 0, envelope: e })));
 
   return (
     <section className="task-section">
-      <h4>执行事件流（{total} 条，每页 {EVENT_PAGE_SIZE}）</h4>
+      <div className="section-head">
+        <h4>执行事件流（{total} 条，每页 {EVENT_PAGE_SIZE}）</h4>
+        <Button size="sm" onClick={() => void refresh()} disabled={refreshing}>
+          {refreshing ? "刷新中…" : "刷新事件"}
+        </Button>
+      </div>
       {error !== null && <div className="banner-error">{error}</div>}
       <div className="event-pages">
         <Button

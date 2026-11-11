@@ -51,6 +51,7 @@ import {
   validateGrantSelection,
   validateNotificationDrafts,
   validateNotificationRuleDraft,
+  validateNotifyTargetInput,
   validateQuietHours,
 } from "./channel-ui.ts";
 
@@ -444,4 +445,14 @@ test("credentialSummary：缺失必填项逐项列出，齐全时报配置数量
     }),
     "已配置 2/2 个字段",
   );
+});
+
+// --- 默认通知会话（M6-T2 / Issue #53 走查修复）------------------------------------
+
+test("validateNotifyTargetInput：空/纯空白与含空白字符被拒绝，正常会话 id 通过", () => {
+  assert.match(validateNotifyTargetInput("") ?? "", /请填写/);
+  assert.match(validateNotifyTargetInput("   ") ?? "", /请填写/);
+  assert.match(validateNotifyTargetInput("oc_feishu group") ?? "", /空白/);
+  assert.equal(validateNotifyTargetInput("oc_feishu_group_demo"), null);
+  assert.equal(validateNotifyTargetInput("  wx-group-family  "), null);
 });

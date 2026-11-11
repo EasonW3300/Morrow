@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { api, type ChannelSummary } from "../api.ts";
+import { api, ApiError, type ChannelSummary } from "../api.ts";
 import { NOTIFICATION_EVENT_TYPE_VALUES } from "@morrow/protocol/browser";
 import {
   notificationEventLabel,
@@ -59,7 +59,13 @@ export function NotificationRulesSection({ base, channels }: { base: string; cha
       setMessage("已按 (事件类型, 目标) 保存（notification.rule_upserted 审计已落账）。");
       await load();
     } catch (err) {
-      setError(readableError(err, "保存通知规则失败"));
+      if (err instanceof ApiError && err.code === "notify_target_required") {
+        setError(
+          `channel 目标还没有默认通知会话（notify_target_required）：请先在上方「默认通知会话」为对应渠道配置接收会话，再保存规则。`,
+        );
+      } else {
+        setError(readableError(err, "保存通知规则失败"));
+      }
     } finally {
       setSaving(false);
     }

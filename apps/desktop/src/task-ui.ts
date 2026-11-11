@@ -75,6 +75,22 @@ export function taskNodeStatusTone(status: TaskNodeStatus): Tone {
   return TASK_NODE_STATUS_TONES[status] ?? "idle";
 }
 
+/**
+ * 终态任务拒绝一切介入（Runtime #nodeForIntervention 409）。详情页据此隐藏
+ * 节点级「接管/完成/交还」，避免展示必然失败的按钮（M6-T2 走查发现）。
+ */
+export function taskIsTerminal(status: TaskStatus): boolean {
+  return status === "completed" || status === "failed" || status === "cancelled";
+}
+
+/**
+ * 执行事件流刷新策略：运行中自动轮询（节点开始/结束不改变 task_status/task_version），
+ * 其余状态由任务详情/介入动作触发刷新 + 手动按钮。
+ */
+export function taskEventsRefreshMode(status: TaskStatus): "poll" | "manual" {
+  return status === "running" ? "poll" : "manual";
+}
+
 // --- needs_reconcile 人工裁决（票 M3-T6 / Issue #35，FR-DEP-4）--------------------
 
 /** 详情页横幅与列表提示的统一文案（Owner 一眼知道为什么需要自己出手） */

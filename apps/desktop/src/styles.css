@@ -2671,6 +2671,62 @@ input[type="radio"] {
   color: var(--color-success-strong);
 }
 
+.tone-error-text {
+  color: var(--color-danger-strong);
+}
+
+/* Chat 发送错误：标题 + 服务端原文 + 设置页入口（M6-T2 / Issue #53） */
+.send-error-detail {
+  display: block;
+  margin-top: 2px;
+  font-size: var(--font-size-label);
+  opacity: 0.86;
+  word-break: break-word;
+}
+
+.banner-error .btn {
+  margin-top: var(--space-2);
+}
+
+/* 默认通知会话（M6-T2 / Issue #53）：渠道通知规则的前置配置 */
+.notify-target-list {
+  list-style: none;
+  margin: var(--space-2) 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.notify-target-row {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding: var(--space-2) var(--space-3);
+  background: var(--color-surface-secondary);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+}
+
+.notify-target-main {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+
+.notify-target-edit {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.notify-target-edit input {
+  flex: 1;
+  min-width: 0;
+}
+
+
 /* --- 加载态与动效偏好 --- */
 .btn-spinner {
   width: 14px;

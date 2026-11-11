@@ -160,6 +160,14 @@ export interface ProviderListResponse {
   default_provider_id: string | null;
 }
 
+/** GET/PUT /v1/channels/:id/notify-target：渠道默认通知会话（通知规则的前置条件） */
+export interface ChannelNotifyTargetView {
+  channel: string;
+  account_id: string | null;
+  native_conversation_id: string | null;
+  updated_at: string | null;
+}
+
 /** GET /v1/health 载荷（沙箱探针为四态状态机：not_configured|missing|daemon_down|ready，票 M2-T1） */
 export interface HealthPayload {
   status: string;
@@ -713,6 +721,27 @@ export const api = {
       method: "PUT",
       headers: JSON_HEADERS,
       body: JSON.stringify({ allowlist: entries }),
+    });
+  },
+
+  /** GET /v1/channels/:id/notify-target：默认通知会话（未配置 native_conversation_id=null） */
+  getChannelNotifyTarget(base: string, channelId: string): Promise<ChannelNotifyTargetView> {
+    return request<ChannelNotifyTargetView>(base, `/v1/channels/${encodeURIComponent(channelId)}/notify-target`);
+  },
+
+  /**
+   * PUT /v1/channels/:id/notify-target：channel:<id> 通知规则保存的前置条件。
+   * 会话必须已存在或已加入白名单，否则 400（conversation_not_found）。
+   */
+  putChannelNotifyTarget(
+    base: string,
+    channelId: string,
+    nativeConversationId: string,
+  ): Promise<ChannelNotifyTargetView> {
+    return request<ChannelNotifyTargetView>(base, `/v1/channels/${encodeURIComponent(channelId)}/notify-target`, {
+      method: "PUT",
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ native_conversation_id: nativeConversationId }),
     });
   },
 
