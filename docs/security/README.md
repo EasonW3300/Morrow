@@ -6,9 +6,9 @@
 
 ```bash
 export PATH="/opt/homebrew/bin:$PATH"
-node --experimental-strip-types scripts/real-machine/security-suite.ts
+pnpm security:suite
 # 可选：落一份机器可读证据
-node --experimental-strip-types scripts/real-machine/security-suite.ts --json docs/gates/m6-security-summary.json
+pnpm security:suite --json docs/gates/m6-security-summary.json
 ```
 
 - 退出码 `0` = 六域全 PASS；`1` = 任一域失败（或测试计数无法解析）。

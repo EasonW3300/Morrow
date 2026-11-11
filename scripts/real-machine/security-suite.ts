@@ -439,6 +439,39 @@ function writeJson(path: string, results: DomainResult[]): void {
   console.log(`JSON 证据已写入：${path}`);
 }
 
+
+/**
+ * 运行环境守卫（2026-11-11 修正）。
+ *
+ * 本套件经既有测试间接使用 `node:sqlite` 与 FTS5：
+ *   - Node >= 22.16：内建 SQLite 含 FTS5，无需任何 flag；
+ *   - Node 22.13–22.15：需 `--experimental-sqlite`，且内建 SQLite 无 FTS5（记忆相关域会红）；
+ *   - Node < 22.13：`node:sqlite` 根本不存在。
+ * 缺条件时失败点在深层测试里（ERR_UNKNOWN_BUILTIN_MODULE / no such module: fts5），
+ * 看不出是环境问题。这里前置判定并给出可执行指引。
+ *
+ * 只用版本判定、不做 require 探测：`require("node:sqlite")` 在不同小版本上的可用性
+ * 声明与运行期不一致，探测会误报（实测 Node 24 上被误判为不可用）。
+ */
+function assertRuntime(): void {
+  const [major, minor] = process.versions.node.split(".").map((part) => Number(part));
+  const ok = major > 22 || (major === 22 && minor >= 16);
+  if (ok) return;
+  const hasFlag = process.execArgv.includes("--experimental-sqlite");
+  console.error(
+    [
+      `[security-suite] 运行环境不满足要求：Node ${process.versions.node}`,
+      "  需要 Node >= 22.16（内建 SQLite 含 FTS5）。",
+      "  推荐（本机 homebrew node 24）：PATH=\"/opt/homebrew/bin:$PATH\" pnpm security:suite",
+      `  或：node${hasFlag ? "" : " --experimental-sqlite"} --experimental-strip-types scripts/real-machine/security-suite.ts`,
+      "  注意：22.13–22.15 即使带 flag 也无 FTS5，记忆相关域会失败，属环境不达标而非产品缺陷。",
+    ].join("\n"),
+  );
+  process.exit(2);
+}
+
+assertRuntime();
+
 async function main(): Promise<number> {
   const argv = process.argv.slice(2);
   const jsonIndex = argv.indexOf("--json");
