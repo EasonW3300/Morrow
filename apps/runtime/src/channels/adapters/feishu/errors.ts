@@ -1,8 +1,16 @@
-import { ChannelSendError } from "../../types.ts";
+import {
+  BotPlatformError,
+  isHttpSuccessStatus,
+  type BotPlatformErrorOptions,
+  type SendErrorRule,
+} from "../shared/error-catalog.ts";
 
 /**
  * 飞书 API 错误分类（M4-T3 / Issue #40）：统一映射到 Outbox 的
  * explicit（平台明确拒收/可重试退避）与 network/timeout（结果未知、不自动重发）。
+ *
+ * Issue #49 起错误模型与码表骨架在 `shared/`：本文件只保留飞书类别、文案前缀、
+ * 不可重试类别与**规则表**（顺序即优先级，与重构前 if 链逐条对应）。
  */
 export type FeishuErrorCategory =
   | "token_invalid"
@@ -15,48 +23,12 @@ export type FeishuErrorCategory =
   | "timeout"
   | "platform";
 
-export interface FeishuErrorOptions {
-  category: FeishuErrorCategory;
-  message: string;
-  httpStatus?: number;
-  /** 飞书业务 code（响应体的 code 字段） */
-  code?: number;
-  retryAfterSeconds?: number;
-  /** 平台是否可能已收到请求（超时/网络中断 = true） */
-  deliveryUnknown?: boolean;
-}
+export type FeishuErrorOptions = BotPlatformErrorOptions<FeishuErrorCategory>;
 
 /** 飞书平台错误（内部诊断 + 映射为 ChannelSendError 抛给 Outbox 桥） */
-export class FeishuError extends Error {
-  readonly category: FeishuErrorCategory;
-  readonly httpStatus: number | undefined;
-  readonly code: number | undefined;
-  readonly retryAfterSeconds: number | undefined;
-  readonly deliveryUnknown: boolean;
-
+export class FeishuError extends BotPlatformError<FeishuErrorCategory> {
   constructor(options: FeishuErrorOptions) {
-    super(options.message);
-    this.name = "FeishuError";
-    this.category = options.category;
-    this.httpStatus = options.httpStatus;
-    this.code = options.code;
-    this.retryAfterSeconds = options.retryAfterSeconds;
-    this.deliveryUnknown = options.deliveryUnknown ?? false;
-  }
-
-  /** 转成渠道层统一发送错误：explicit 可重试；network/timeout 结果未知 */
-  toSendError(): ChannelSendError {
-    const kind =
-      this.category === "network"
-        ? "network"
-        : this.category === "timeout"
-          ? "timeout"
-          : "explicit";
-    return new ChannelSendError(kind, `feishu ${this.category}: ${this.message}`, {
-      code: this.category,
-      retryable: kind === "explicit" && this.category !== "unsupported_attachment",
-      ...(this.retryAfterSeconds === undefined ? {} : { retry_after_seconds: this.retryAfterSeconds }),
-    });
+    super("FeishuError", options, FEISHU_ERROR_POLICY);
   }
 }
 
@@ -70,3 +42,48 @@ export const FEISHU_TOKEN_ERROR_CODES = new Set<number>([
 
 /** 主动消息被平台拒绝的业务错误码 */
 export const FEISHU_PROACTIVE_ERROR_CODES = new Set<number>([230001, 230002]);
+
+const FEISHU_ERROR_POLICY = {
+  label: "feishu",
+  nonRetryableCategories: new Set<FeishuErrorCategory>(["unsupported_attachment"]),
+} as const;
+
+/**
+ * 飞书响应 → 统一错误类别（表驱动；顺序与重构前 if 链一致）：
+ * 429 限流 → token 失效 → 403 权限 → 主动消息受限 → 其余非 2xx/非 0 业务码。
+ */
+export const FEISHU_SEND_ERROR_RULES: readonly SendErrorRule<FeishuErrorCategory>[] = [
+  {
+    category: "rate_limited",
+    when: ({ httpStatus }) => httpStatus === 429,
+    // 429 文案固定拼 retry-after（不采用平台文案），与重构前一致
+    preferPlatformMessage: false,
+    fallback: ({ retryAfterSeconds }) => `feishu rate limited (retry-after ${retryAfterSeconds ?? 1}s)`,
+    httpStatus: 429,
+    retryAfterSeconds: ({ retryAfterSeconds }) => retryAfterSeconds ?? 1,
+    includeCode: false,
+  },
+  {
+    category: "token_invalid",
+    when: ({ httpStatus, code }) =>
+      httpStatus === 401 || (code !== undefined && FEISHU_TOKEN_ERROR_CODES.has(code)),
+    fallback: () => "tenant_access_token is invalid or expired",
+  },
+  {
+    category: "permission_denied",
+    when: ({ httpStatus }) => httpStatus === 403,
+    fallback: () => "feishu permission denied",
+  },
+  {
+    category: "proactive_limited",
+    when: ({ proactive, code }) =>
+      proactive && code !== undefined && FEISHU_PROACTIVE_ERROR_CODES.has(code),
+    fallback: () => "feishu proactive message is limited in this scene",
+  },
+  {
+    category: "bad_request",
+    // 飞书以 code=0 表示成功；缺 code 也算失败（与重构前 `payload.code !== 0` 一致）
+    when: ({ httpStatus, code }) => !isHttpSuccessStatus(httpStatus) || code !== 0,
+    fallback: ({ httpStatus }) => `feishu responded ${httpStatus}`,
+  },
+];
