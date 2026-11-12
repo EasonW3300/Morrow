@@ -96,7 +96,16 @@ function handleMemoryFacts(_req: IncomingMessage, res: ServerResponse, url: URL,
     return;
   }
   const keyword = q.trim();
-  sendJson(res, 200, { q: keyword, facts: ctx.memory.search(keyword) });
+  // 语义修正（v0.1.1）：端点名为 facts，默认就只返回**已巩固的长期事实**。
+  // 底层 FTS 是「候选 + 事实」统一索引（M1-T1 的超集实现），直接把候选混进 facts
+  // 会让同一条记忆出现两次（stage=candidate 与 stage=fact），容易被误读成重复写入。
+  // 需要超集时显式 ?include=candidates=1。
+  // 允许 include=candidates 或 include=candidates=1（后者会被 URL 解析成 "candidates=1"）
+  const includeRaw = url.searchParams.get("include") ?? "";
+  const includeCandidates = includeRaw.split(",").some((part) => part.trim().startsWith("candidates"));
+  const hits = ctx.memory.search(keyword);
+  const facts = includeCandidates ? hits : hits.filter((hit) => hit.stage === "fact");
+  sendJson(res, 200, { q: keyword, facts });
 }
 
 function handleListCandidates(_req: IncomingMessage, res: ServerResponse, url: URL, ctx: MemoryRouteContext): void {

@@ -74,8 +74,12 @@ async function createSession(port: number): Promise<string> {
   return (await json<{ session_id: string }>(res)).session_id;
 }
 
-async function getFacts(port: number, q: string): Promise<{ status: number; body: MemoryFactsBody | ApiError }> {
-  const res = await fetch(`http://127.0.0.1:${port}/v1/memory/facts?q=${encodeURIComponent(q)}`);
+async function getFacts(
+  port: number,
+  q: string,
+  extraQuery = "",
+): Promise<{ status: number; body: MemoryFactsBody | ApiError }> {
+  const res = await fetch(`http://127.0.0.1:${port}/v1/memory/facts?q=${encodeURIComponent(q)}${extraQuery}`);
   return { status: res.status, body: (await res.json()) as MemoryFactsBody | ApiError };
 }
 
@@ -122,14 +126,19 @@ test("端到端：显式『请记住 X』→ 候选 → FTS 检索 → 回链原
     assert.equal(candidateEvent.payload.sensitivity, "private", "新记忆默认 private");
     assert.equal(candidateEvent.payload.rule, "explicit-remember");
 
-    // 检索命中并回链（M1-T2 巩固后：候选与事实统一索引，两条命中并存）
+    // 检索命中并回链（M1-T2 巩固后：底层仍是候选与事实统一索引）
+    // v0.1.1 语义修正：GET /v1/memory/facts 默认只返回已巩固的长期事实；候选需显式
+    // ?include=candidates=1（否则同一条记忆会出现两次，容易被误读成重复写入）。
     const { status, body } = await getFacts(runtime.port, "TypeScript");
     assert.equal(status, 200);
     const facts = (body as MemoryFactsBody).facts;
-    assert.equal(facts.length, 2);
+    assert.equal(facts.length, 1, "默认只返回事实，候选不混入");
     const factHit = facts.find((f) => f.stage === "fact");
-    const candidateHit = facts.find((f) => f.stage === "candidate");
-    assert.ok(factHit !== undefined && candidateHit !== undefined, "候选与事实同时命中");
+    assert.ok(factHit !== undefined, "事实命中");
+    const superset = (await getFacts(runtime.port, "TypeScript", "&include=candidates=1")).body as MemoryFactsBody;
+    assert.equal(superset.facts.length, 2, "显式 include=candidates 时返回超集");
+    const candidateHit = superset.facts.find((f) => f.stage === "candidate");
+    assert.ok(candidateHit !== undefined, "超集里候选仍可见（统一索引未变）");
     assert.equal(factHit.type, "fact");
     assert.equal(factHit.content, "我喜欢用 TypeScript 写脚本");
     assert.equal(factHit.sensitivity, "private");
