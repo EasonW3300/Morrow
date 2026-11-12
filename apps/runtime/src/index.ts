@@ -78,6 +78,19 @@ export {
   type SessionHistory,
   type SessionSummary,
 } from "./sessions.ts";
+// 全局 Persona（M7-A-T1 / Issue #58，ADR-0009）
+export {
+  DEFAULT_PERSONA,
+  PERSONA_EVENT_TYPES,
+  PERSONA_LIMITS,
+  PersonaService,
+  PersonaValidationError,
+  composePersonaPrompt,
+  parsePersona,
+} from "./persona.ts";
+export type { Persona, PersonaServiceOptions, PersonaUpdateResult } from "./persona.ts";
+export { personaRoutes } from "./persona-routes.ts";
+export type { PersonaRoute, PersonaRouteContext } from "./persona-routes.ts";
 export {
   TaskService,
   TaskError,

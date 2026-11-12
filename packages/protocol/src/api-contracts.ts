@@ -75,6 +75,49 @@ export interface MemoryWriteInput {
   sensitivity?: SensitivityLevel;
 }
 
+// --- Persona（票 M7-A-T1 / Issue #58；GLOSSARY Persona、ADR-0009）------------
+//
+// 全局人设 = 结构化字段（名字/语气/职责/禁止行为）+ 自由补充。字段顺序固定不可配置：
+// 拼装顺序为 名字 → 语气 → 职责 → 禁止 → 其他（缓存前缀稳定性依赖这个顺序）。
+// `GET/PUT /v1/persona` 的请求/响应形状即此类型；每次 PUT 写入 `persona.updated`
+// 事件（payload 为全量 Persona），随账本同步传播。
+export interface Persona {
+  /** 助手名字（非空且 ≤ PERSONA_LIMITS.name 字符） */
+  name: string;
+  /** 语气设定（≤ PERSONA_LIMITS.tone 字符） */
+  tone: string;
+  /** 职责清单（每项 ≤ PERSONA_LIMITS.responsibilityItem 字符，最多 responsibilities 项） */
+  responsibilities: string[];
+  /** 禁止行为清单（每项 ≤ PERSONA_LIMITS.prohibitionItem 字符，最多 prohibitions 项） */
+  prohibitions: string[];
+  /** 其他自由设定（≤ PERSONA_LIMITS.extra 字符） */
+  extra: string;
+}
+
+/**
+ * Persona 字段长度上限（服务端校验与桌面表单共用的唯一真相源）。
+ * name 的 40 字符上限来自票面验收；其余为 ADR-0009「结构化优于纯文本」的防呆边界
+ * （避免把整段提示词塞进单个字段，也避免无限增长破坏缓存前缀的稳定性）。
+ */
+export const PERSONA_LIMITS = {
+  name: 40,
+  tone: 200,
+  responsibilityItem: 120,
+  responsibilities: 20,
+  prohibitionItem: 120,
+  prohibitions: 20,
+  extra: 2000,
+} as const;
+
+/** Persona 默认值：首次无 `persona.updated` 事件时 GET 返回这一份（缺省即默认）。 */
+export const DEFAULT_PERSONA: Persona = {
+  name: "Morrow",
+  tone: "简洁直接",
+  responsibilities: ["个人助理与开发助手"],
+  prohibitions: [],
+  extra: "",
+};
+
 // --- 设备与配对（M3-T2 / Issue #31；FR-DEP-2、GLOSSARY Device/Replica）--------
 //
 // 设备身份 = ed25519 公钥；指纹 = 公钥原始 32 字节的 SHA-256 前 16 hex。

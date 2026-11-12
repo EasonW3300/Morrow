@@ -19,10 +19,12 @@ export type {
   PairingJoinResponse,
   MemoryEntryKind,
   MemoryWriteInput,
+  Persona,
   ProviderCompatConfig,
   ProviderRecord,
   SensitivityLevel,
 } from "./api-contracts.ts";
+export { DEFAULT_PERSONA, PERSONA_LIMITS } from "./api-contracts.ts";
 export type {
   ExecutionLease,
   ExecutionReconcileEvidence,

@@ -44,6 +44,11 @@ export const SESSION_EVENT_TYPES = {
 export interface AgentRuntimeExtras {
   /** 会话运行时可用的工具（缺省 []） */
   tools?: MorrowTool[];
+  /**
+   * 会话 system prompt（票 M7-A-T1 / Issue #58）：Persona 按固定顺序拼装后的文本。
+   * 由工厂透传给 createPiAdapter（缺省不传 = 适配器空提示词）。
+   */
+  systemPrompt?: string;
 }
 
 export type AgentAdapterFactory = (
@@ -158,6 +163,11 @@ export interface SessionManagerOptions {
   toolObserver?: ToolObserver | null;
   /** 会话运行时的工具工厂（M1-T1：按会话构建 memory.write 工具，经工厂 extras 注入） */
   agentTools?: (sessionId: string) => MorrowTool[];
+  /**
+   * 会话 system prompt 读取面（票 M7-A-T1 / Issue #58）：返回 undefined = 不注入。
+   * 在创建 AgentRuntime 时求值（会话复用一个运行时；改 Persona 影响后续新会话）。
+   */
+  systemPrompt?: ((sessionId: string) => string | undefined) | null;
 }
 
 export class SessionManager {
@@ -170,6 +180,7 @@ export class SessionManager {
   readonly #memory: MemoryObserver | null;
   readonly #toolObserver: ToolObserver | null;
   readonly #agentTools: ((sessionId: string) => MorrowTool[]) | null;
+  readonly #systemPrompt: ((sessionId: string) => string | undefined) | null;
   readonly #states = new Map<string, SessionState>();
   #disposed = false;
 
@@ -182,6 +193,7 @@ export class SessionManager {
     this.#memory = options.memory ?? null;
     this.#toolObserver = options.toolObserver ?? null;
     this.#agentTools = options.agentTools ?? null;
+    this.#systemPrompt = options.systemPrompt ?? null;
     this.#factoryUnavailableReason =
       options.factoryUnavailableReason ??
       "no model provider configured (register one via POST /v1/providers or set MORROW_PROVIDER_BASE_URL / MORROW_PROVIDER_API_KEY / MORROW_PROVIDER_MODEL)";
@@ -408,10 +420,14 @@ export class SessionManager {
         let runtime = state.runtime;
         if (runtime === null) {
           try {
+            const systemPrompt = this.#systemPrompt?.(sessionId);
             runtime = await (this.#factory as AgentAdapterFactory)(
               sessionId,
               await this.#providerFor(sessionId),
-              { tools: this.#agentTools?.(sessionId) ?? [] },
+              {
+                tools: this.#agentTools?.(sessionId) ?? [],
+                ...(systemPrompt === undefined ? {} : { systemPrompt }),
+              },
             );
           } catch (err) {
             this.#append(sessionId, SESSION_EVENT_TYPES.agentError, "agent:runtime", { message: errorMessage(err) }, input.userEventId);
