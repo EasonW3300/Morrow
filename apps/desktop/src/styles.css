@@ -676,6 +676,140 @@ input[type="radio"] {
   gap: 2px;
 }
 
+/* M7-A-T2：行内「⋯」+ 右键菜单；菜单绝对定位在行内 */
+.session-row {
+  position: relative;
+  display: flex;
+  align-items: stretch;
+}
+
+.session-row .session-item {
+  flex: 1;
+  min-width: 0;
+}
+
+.session-menu-trigger {
+  flex: none;
+  align-self: center;
+  width: 24px;
+  height: 24px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--color-text-tertiary);
+  cursor: pointer;
+  opacity: 0.55;
+  line-height: 1;
+}
+
+.session-row:hover .session-menu-trigger,
+.session-menu-trigger:focus-visible {
+  opacity: 1;
+}
+
+.session-menu-trigger:hover {
+  background: var(--color-surface-secondary);
+  color: var(--color-text-primary);
+}
+
+.session-menu {
+  position: absolute;
+  top: calc(100% - 2px);
+  right: var(--space-2);
+  z-index: 20;
+  min-width: 120px;
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  background: var(--color-surface);
+  border: 1px solid var(--color-separator);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-popover);
+}
+
+.session-menu-item {
+  text-align: left;
+  padding: var(--space-2) var(--space-3);
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--color-text-primary);
+  cursor: pointer;
+  font-size: var(--font-size-body);
+}
+
+.session-menu-item:hover {
+  background: var(--color-surface-secondary);
+}
+
+.session-menu-item.danger {
+  color: var(--color-danger);
+}
+
+.session-rename {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-2);
+  width: 100%;
+}
+
+.session-rename-input {
+  width: 100%;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--color-separator);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface);
+  color: var(--color-text-primary);
+}
+
+.session-rename-actions {
+  display: flex;
+  gap: var(--space-2);
+}
+
+.session-rename-error {
+  color: var(--color-danger);
+  font-size: var(--font-size-caption);
+}
+
+/* 设置 → 会话管理（归档 / 30 天内软删） */
+.managed-sessions {
+  list-style: none;
+  margin: var(--space-3) 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.managed-session-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-3);
+  border: 1px solid var(--color-separator);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+}
+
+.managed-session-main {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.managed-session-meta {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--font-size-caption);
+  color: var(--color-text-secondary);
+}
+
 .session-item {
   width: 100%;
   text-align: left;
@@ -783,6 +917,17 @@ input[type="radio"] {
   background: var(--color-danger-soft);
   color: var(--color-danger-strong);
   border: 1px solid var(--color-danger-border);
+  border-radius: var(--radius-md);
+  white-space: pre-wrap;
+}
+
+/* 结果提示（M7-A-T1：Persona 保存成功）；与错误横幅同款排版、成功配色 */
+.banner-note {
+  margin: var(--space-2) var(--space-4) 0;
+  padding: var(--space-2) var(--space-3);
+  background: var(--color-success-soft);
+  color: var(--color-success-strong);
+  border: 1px solid var(--color-success-border);
   border-radius: var(--radius-md);
   white-space: pre-wrap;
 }

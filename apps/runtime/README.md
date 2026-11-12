@@ -70,6 +70,8 @@ provider 参数）；凭据库可经 `startRuntime(config, { secretStore })` 注
 | GET | `/v1/events` | `{ events: EventEnvelope[], total, limit, offset }`；query：`limit`（1–200，默认 50）、`offset`、`replica_id`（uuid 过滤）；非法入参 400 |
 | POST | `/v1/sessions` | 建会话，body `{ title?, provider_id? }`（provider_id 需已注册，或为 env 回退）→ 201 `{ session_id, event_id, sequence, occurred_at, provider_id?, title? }`；未知 provider_id → 400 `unknown_provider` |
 | GET | `/v1/sessions` | 会话列表（`session.created` 投影，含显式 `provider_id`）→ `{ sessions: [...] }` |
+| GET | `/v1/persona` | 全局人设（M7-A-T1 / Issue #58）→ `{ persona }`；无 `persona.updated` 事件时返回默认值（名字 Morrow / 语气简洁直接 / 职责个人助理与开发助手 / 禁止空 / 其他空） |
+| PUT | `/v1/persona` | 保存全局人设，body `{ name, tone, responsibilities[], prohibitions[], extra }`（name 非空且 ≤40 字符；tone ≤200；清单每项 ≤120 且最多 20 条；extra ≤2000）→ 200 `{ persona, event_id, sequence, occurred_at }`；非法 400 `invalid_persona` |
 | POST | `/v1/sessions/:id/messages` | 发送用户输入，body `{ text }`（非空字符串）→ 202 `{ message_id, event_id, sequence, status }`；status `processing`（本轮立即驱动）或 `queued`（同会话有轮次在跑，FIFO 排队） |
 | GET | `/v1/sessions/:id/messages` | 历史投影 → `{ session_id, messages: [{ message_id, role, text, stop_reason?, event_id, sequence, occurred_at }] }` |
 | GET | `/v1/sessions/:id/stream` | SSE 会话事件流（见下节） |
@@ -208,6 +210,7 @@ M0 不设队列上限（单用户本地场景）。
 | `tool.finished` | `agent:runtime` | 对应 tool.started | `{ tool_call_id, tool_name, text, is_error, duration_ms? }` |
 | `agent.error` | `agent:runtime` | message.user | `{ message }` |
 | `message.assistant` | `agent:runtime` | message.user | `{ message_id, text, stop_reason }` |
+| `persona.updated` | `owner` | null | `{ name, tone, responsibilities, prohibitions, extra }`（M7-A-T1：payload 为全量 Persona；拼装顺序固定为 名字→语气→职责→禁止→其他，注入会话 system prompt 与记忆抽取器，不注入任务规划器） |
 | `memory.candidate_created` | `agent:runtime` | 来源 message.user | `{ candidate_id, content, kind, sensitivity, confidence, source_id, source_event_id, rule }`（M1-T1；rule = 命中的启发式规则 / `memory.write` / 抽取器规则名） |
 | `memory.extracted` | `agent:runtime` | 本轮 message.assistant | `{ user_event_id, assistant_event_id?, extracted_count, skipped_duplicates, candidate_ids }`（M1-T2：抽取运行收尾，0 条也留痕——管线跑过且可审计） |
 | `memory.consolidated` | `agent:runtime` | 自动路径 = 同轮 memory.extracted；decide 路径 = 候选来源事件 | `{ candidate_count, created_fact_ids, updated_fact_ids, corroborated_fact_ids, conflict_ids, candidate_ids }`（M1-T2：巩固运行收尾；无待巩固候选时不产生空运行事件） |

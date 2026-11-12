@@ -103,6 +103,36 @@ export default function App() {
     }
   }, [base, ephemeralId, refreshSessions]);
 
+  /** 会话元数据（M7-A-T2）：改名/归档/删除都写账本事件，刷新即折叠结果。 */
+  const renameSession = useCallback(
+    async (sessionId: string, title: string) => {
+      if (!base) return;
+      await api.renameSession(base, sessionId, title);
+      await refreshSessions();
+    },
+    [base, refreshSessions],
+  );
+
+  const archiveSession = useCallback(
+    async (sessionId: string) => {
+      if (!base) return;
+      await api.archiveSession(base, sessionId);
+      setSelectedId((current) => (current === sessionId ? null : current));
+      await refreshSessions();
+    },
+    [base, refreshSessions],
+  );
+
+  const deleteSession = useCallback(
+    async (sessionId: string) => {
+      if (!base) return;
+      await api.deleteSession(base, sessionId);
+      setSelectedId((current) => (current === sessionId ? null : current));
+      await refreshSessions();
+    },
+    [base, refreshSessions],
+  );
+
   /** Chat 任务卡片 → Task 视图（路由从简：切页签 + 预选任务） */
   const openTask = useCallback((taskId: string) => {
     setOpenTaskId(taskId);
@@ -175,6 +205,9 @@ export default function App() {
               sessions={sessions.filter((session) => session.kind !== "ephemeral")}
               selectedId={selectedId}
               onSelect={setSelectedId}
+              onRename={renameSession}
+              onArchive={archiveSession}
+              onDelete={deleteSession}
             />
             {listError !== null && <div className="list-error">{listError}</div>}
             <div className="sidebar-foot">控制面 {base.replace("http://", "")}</div>

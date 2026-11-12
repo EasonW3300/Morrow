@@ -31,6 +31,7 @@ import type {
   PairingCodeResponse,
   PairingJoinRequest,
   PairingJoinResponse,
+  Persona,
   PermissionGrant,
   ProviderRecord,
   SyncRunReport,
@@ -66,6 +67,7 @@ export type {
   PairingCodeResponse,
   PairingJoinRequest,
   PairingJoinResponse,
+  Persona,
   PermissionGrant,
   ProviderRecord,
   SyncRunReport,
@@ -136,11 +138,16 @@ async function request<T>(base: string, path: string, init?: RequestInit): Promi
 
 export interface SessionSummary {
   session_id: string;
+  event_id?: string;
   title?: string;
   occurred_at: string;
   sequence: number;
   /** 会话类型（票 M7-A-T3）：normal 缺省；ephemeral = 临时会话 */
   kind?: "normal" | "ephemeral";
+  /** 归档时间（M7-A-T2；取消归档后缺省） */
+  archived_at?: string;
+  /** 软删时间（M7-A-T2；恢复后缺省；30 天后服务端折叠剔除） */
+  deleted_at?: string;
 }
 
 /** GET /v1/memory/facts 命中条目（票 M7-A-T3 起带 scope） */
@@ -176,6 +183,21 @@ export interface PromoteMemoryResult {
   from_scope: string;
   to_scope: "owner";
   event_id: string;
+}
+
+/** GET /v1/sessions?include= 的过滤值：缺省只回活动会话 */
+export type SessionListInclude = "archived" | "deleted" | "all";
+
+/** 会话元数据端点（rename/archive/unarchive/delete/restore）的 200 载荷 */
+export interface SessionMetadataMutation {
+  session_id: string;
+  event_id: string | null;
+  sequence: number | null;
+  changed: boolean;
+  title?: string;
+  archived_at?: string | null;
+  deleted_at?: string | null;
+  restored_at?: string;
 }
 
 export interface MessageRecord {
@@ -383,8 +405,45 @@ export interface TaskReconcileResult {
 }
 
 export const api = {
-  listSessions(base: string): Promise<SessionSummary[]> {
-    return request<{ sessions: SessionSummary[] }>(base, "/v1/sessions").then((r) => r.sessions);
+  listSessions(base: string, include?: SessionListInclude): Promise<SessionSummary[]> {
+    const query = include === undefined ? "" : `?include=${encodeURIComponent(include)}`;
+    return request<{ sessions: SessionSummary[] }>(base, `/v1/sessions${query}`).then((r) => r.sessions);
+  },
+
+  renameSession(base: string, sessionId: string, title: string): Promise<SessionMetadataMutation> {
+    return request<SessionMetadataMutation>(base, `/v1/sessions/${encodeURIComponent(sessionId)}/rename`, {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ title }),
+    });
+  },
+
+  archiveSession(base: string, sessionId: string): Promise<SessionMetadataMutation> {
+    return request<SessionMetadataMutation>(base, `/v1/sessions/${encodeURIComponent(sessionId)}/archive`, {
+      method: "POST",
+      headers: JSON_HEADERS,
+    });
+  },
+
+  unarchiveSession(base: string, sessionId: string): Promise<SessionMetadataMutation> {
+    return request<SessionMetadataMutation>(base, `/v1/sessions/${encodeURIComponent(sessionId)}/unarchive`, {
+      method: "POST",
+      headers: JSON_HEADERS,
+    });
+  },
+
+  restoreSession(base: string, sessionId: string): Promise<SessionMetadataMutation> {
+    return request<SessionMetadataMutation>(base, `/v1/sessions/${encodeURIComponent(sessionId)}/restore`, {
+      method: "POST",
+      headers: JSON_HEADERS,
+    });
+  },
+
+  /** 软删（30 天内可恢复；删除不影响记忆） */
+  deleteSession(base: string, sessionId: string): Promise<SessionMetadataMutation> {
+    return request<SessionMetadataMutation>(base, `/v1/sessions/${encodeURIComponent(sessionId)}`, {
+      method: "DELETE",
+    });
   },
 
   createSession(base: string, title?: string): Promise<{ session_id: string }> {
@@ -413,15 +472,6 @@ export const api = {
     });
   },
 
-  /** 临时会话恢复（关闭后 24h 内；过期 409 session_expired） */
-  restoreSession(base: string, sessionId: string): Promise<RestoreSessionResult> {
-    return request<RestoreSessionResult>(base, `/v1/sessions/${sessionId}/restore`, {
-      method: "POST",
-      headers: JSON_HEADERS,
-      body: "{}",
-    });
-  },
-
   /** 记忆检索（票 M7-A-T3：scope=session:<id> 看到全局 + 该会话；缺省全局） */
   searchMemory(base: string, q: string, scope?: string): Promise<MemoryHit[]> {
     const params = new URLSearchParams({ q });
@@ -436,6 +486,20 @@ export const api = {
       headers: JSON_HEADERS,
       body: "{}",
     });
+  },
+
+  // --- 全局 Persona（票 M7-A-T1 / Issue #58，ADR-0009） ---
+
+  getPersona(base: string): Promise<Persona> {
+    return request<{ persona: Persona }>(base, "/v1/persona").then((r) => r.persona);
+  },
+
+  updatePersona(base: string, persona: Persona): Promise<Persona> {
+    return request<{ persona: Persona }>(base, "/v1/persona", {
+      method: "PUT",
+      headers: JSON_HEADERS,
+      body: JSON.stringify(persona),
+    }).then((r) => r.persona);
   },
 
   history(base: string, sessionId: string): Promise<SessionHistory> {

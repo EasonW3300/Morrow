@@ -28,7 +28,9 @@ import { MemoryStore } from "./memory/store.ts";
 import { createMemoryWriteTool } from "./memory/tool.ts";
 import { memoryRoutes } from "./memory/routes.ts";
 import { MemoryProjector } from "./memory/projection.ts";
-import { LlmMemoryExtractor, LLM_EXTRACTOR_SYSTEM_PROMPT, type MemoryExtractor } from "./memory/extraction.ts";
+import { LlmMemoryExtractor, type MemoryExtractor } from "./memory/extraction.ts";
+import { PersonaService, composePersonaPrompt } from "./persona.ts";
+import { personaRoutes } from "./persona-routes.ts";
 import { SyncCursorStore } from "./sync/cursors.ts";
 import { SyncEngine } from "./sync/engine.ts";
 import { syncRoutes } from "./sync/routes.ts";
@@ -41,7 +43,14 @@ import { SyncFileMerger } from "./sync/files.ts";
 import { MemoryProjectionRebuilder } from "./memory/rebuild.ts";
 import { TaskProjectionRebuilder } from "./task-rebuild.ts";
 import { ProviderRegistry, ProviderRegistryError, ENV_PROVIDER_ID, type ProviderResolver, type ResolvedProvider } from "./providers.ts";
-import { SessionLifecycleError, SessionManager, type AgentRuntimeExtras, type SessionFrame, type SessionKind } from "./sessions.ts";
+import {
+  SessionLifecycleError,
+  SessionManager,
+  type AgentAdapterFactory,
+  type AgentRuntimeExtras,
+  type SessionFrame,
+  type SessionKind,
+} from "./sessions.ts";
 import { ChannelRegistry, type ChannelAdapterRegistration } from "./channels/registry.ts";
 import { channelRoutes } from "./channels/routes.ts";
 import { createChannelOutboundSink } from "./channels/outbox.ts";
@@ -115,6 +124,8 @@ interface RequestContext {
   ledger: EventLedger;
   replicaId: string;
   sessions: SessionManager;
+  /** 全局人设（M7-A-T1 / Issue #58：GET/PUT /v1/persona） */
+  persona: PersonaService;
   providers: ProviderRegistry;
   devices: DeviceRegistry;
   /** 设备配对服务（M3-T2 / Issue #31：配对码 / claim / 撤销 / token 校验） */
@@ -170,8 +181,9 @@ export interface RuntimeOptions {
    * Agent Loop 运行时工厂（PiAdapter 接口注入 seam）。缺省时用默认工厂
    * （createPiAdapter，Provider 配置由 ProviderResolver 按会话解析）；
    * 无任何 Provider 时发消息 503（provider_not_configured）。
+   * extras.systemPrompt（M7-A-T1）为 Persona 拼装结果，工厂应透传给适配器。
    */
-  agentAdapterFactory?: (sessionId: string, provider: ResolvedProvider | null) => Promise<AgentRuntime>;
+  agentAdapterFactory?: AgentAdapterFactory;
   /**
    * 凭据库注入 seam（票 T5）：缺省按平台探测（macOS Keychain 实测；Windows/Linux
    * 未实测）。测试与宿主可注入内存桩避免触碰用户钥匙串。
@@ -315,6 +327,11 @@ export interface RuntimeOptions {
    * 默认 1000；0 = 不启动定时器（测试手动 drain，避免时序不确定）。
    */
   notificationDrainIntervalMs?: number;
+  /**
+   * 会话元数据时钟注入（M7-A-T2 / Issue #59）：软删 30 天保留期到期判定可被测试拨快
+   * （零 sleep）。缺省系统时间。
+   */
+  sessionsNow?: () => Date;
 }
 
 export interface RuntimeHandle {
@@ -327,6 +344,8 @@ export interface RuntimeHandle {
   pairing: PairingService;
   /** 会话管理器（库形态可直用：abort / 订阅等测试与宿主 seam） */
   sessions: SessionManager;
+  /** 全局人设（M7-A-T1 / Issue #58；库形态可直用） */
+  persona: PersonaService;
   /** 记忆服务（票 M1-T1 / Issue #13：候选写入 + FTS 检索，库形态可直用） */
   memory: MemoryService;
   /** 记忆投影器（票 M1-T3 / Issue #15：dataDir/memory/*.md，幂等再生成，库形态可直用） */
@@ -400,9 +419,17 @@ const routes: Route[] = [
   { method: "GET", re: /^\/v1\/sessions\/([^/]+)\/messages$/, handler: handleHistory },
   { method: "POST", re: /^\/v1\/sessions\/([^/]+)\/messages$/, handler: handleSendMessage },
   { method: "GET", re: /^\/v1\/sessions\/([^/]+)\/stream$/, handler: handleStream },
-  // 票 M7-A-T3：临时会话 close/restore（仅 kind=ephemeral 分支；普通会话关闭语义属 T5）
-  { method: "POST", re: /^\/v1\/sessions\/([^/]+)\/close$/, handler: handleCloseSession },
+  // M7-A 会话元数据（票 T2 / Issue #59）：改名/归档/取消归档/恢复/软删。
+  // 全部写账本事件，列表折叠消费（无 sessions 表）。
+  { method: "POST", re: /^\/v1\/sessions\/([^/]+)\/rename$/, handler: handleRenameSession },
+  { method: "POST", re: /^\/v1\/sessions\/([^/]+)\/archive$/, handler: handleArchiveSession },
+  { method: "POST", re: /^\/v1\/sessions\/([^/]+)\/unarchive$/, handler: handleUnarchiveSession },
+  // 恢复端点两会话语义合一（见 handleRestoreSession）：临时会话 → 关闭后 24h 内重开；
+  // 普通会话 → 软删 30 天内的恢复（票 T2 / T3 共用路径）
   { method: "POST", re: /^\/v1\/sessions\/([^/]+)\/restore$/, handler: handleRestoreSession },
+  { method: "DELETE", re: /^\/v1\/sessions\/([^/]+)$/, handler: handleDeleteSession },
+  // 票 M7-A-T3：临时会话关闭（仅 kind=ephemeral 分支；普通会话关闭语义属 T5）
+  { method: "POST", re: /^\/v1\/sessions\/([^/]+)\/close$/, handler: handleCloseSession },
   { method: "POST", re: /^\/v1\/tasks$/, handler: handleCreateTask },
   { method: "GET", re: /^\/v1\/tasks$/, handler: handleListTasks },
   { method: "GET", re: /^\/v1\/tasks\/([^/]+)$/, handler: handleGetTask },
@@ -433,6 +460,13 @@ const routes: Route[] = [
   ...outboxRoutes,
   ...notificationRoutes,
   ...memoryRoutes,
+  // 全局人设（M7-A-T1 / Issue #58）：GET/PUT /v1/persona——ctx.persona 桥接到 persona 自有路由签名
+  ...personaRoutes.map((route) => ({
+    method: route.method,
+    re: route.re,
+    handler: (req: IncomingMessage, res: ServerResponse, url: URL, ctx: RequestContext, params: string[]) =>
+      route.handler(req, res, url, { persona: ctx.persona }, params),
+  })),
   ...contactRoutes,
   ...channelRoutes,
   // 能力调用端点（#22 修复批 / FR-CAP-5）：POST /v1/capabilities/:id/invoke（body = 工具
@@ -574,6 +608,9 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
   // （默认确定性实现），轮次收尾（message.assistant 落账）由 SessionManager 触发后台抽取。
   // 抽取器选择（M1 code-review 补齐）：注入 > config.memoryExtractor=llm（经 PiAdapter
   // 一次 prompt）> 默认启发式（MemoryService 内建）。
+  // 全局人设（M7-A-T1 / Issue #58）：账本唯一真相源 + 内存缓存。先于记忆/会话构建——
+  // 抽取器与会话 system prompt 都要读取当前人设。
+  const persona = new PersonaService({ ledger, replicaId: config.replicaId });
   const memoryStore = MemoryStore.open(config.dataDir);
   // 记忆投影器（票 M1-T3 / Issue #15，FR-MEM-6）：facts → dataDir/memory/*.md；
   // 注入 MemoryService（导入修订后单事实刷新 / 删除后投影文件移除），投影命令走路由。
@@ -591,9 +628,11 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
       ? { extractor: options.memoryExtractor }
       : config.memoryExtractor === "llm"
         ? {
-            // 默认 Provider + 抽取系统提示词（goal 形参在此工厂路径不消费，传空占位）
+            // 默认 Provider + 抽取系统提示词；提示词由 LlmMemoryExtractor 每次按当前
+            // Persona 拼装（票 M7-A-T1：前置人设段落，缺省退回原文案）。
             extractor: new LlmMemoryExtractor(
-              async () => defaultTaskRuntimeFactory(providers, LLM_EXTRACTOR_SYSTEM_PROMPT)("", undefined),
+              async (systemPrompt) => defaultTaskRuntimeFactory(providers, systemPrompt)("", undefined),
+              { persona: () => persona.get() },
             ),
           }
         : {}),
@@ -762,6 +801,11 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     ...(options.sessionNow === undefined ? {} : { now: options.sessionNow }),
     // 记忆（M1-T1）：高价值规则即时写候选；memory.write 工具按会话注入 Agent Loop
     memory,
+    // 全局 Persona → 会话 system prompt（M7-A-T1 / Issue #58）：固定顺序拼装，随会话
+    // AgentRuntime 创建注入；不注入任务规划器。
+    systemPrompt: () => composePersonaPrompt(persona.get()),
+    // 元数据时钟（M7-A-T2）：软删 30 天到期判定
+    ...(options.sessionsNow === undefined ? {} : { now: options.sessionsNow }),
     // 工具完成观察（M2-T5）：tool.finished → Skill 案例收集（is_error → failure）。
     // 观察是增强路径：失败记日志不阻断会话主链路。
     toolObserver: {
@@ -1007,6 +1051,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     ledger,
     replicaId: config.replicaId,
     sessions,
+    persona,
     providers,
     devices,
     pairing,
@@ -1107,6 +1152,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     port,
     ledger,
     sessions,
+    persona,
     providers,
     devices,
     pairing,
@@ -1203,7 +1249,8 @@ export function resolveSelfBaseUrl(config: RuntimeConfig, port: number): string 
 }
 
 /** 生产默认工厂：按会话解析的 Provider → createPiAdapter（OpenAI 兼容协议，ADR-0002）。
- *  extras.tools（M1-T1：memory.write）经 tools 通道注册进 Agent Loop。 */
+ *  extras.tools（M1-T1：memory.write）经 tools 通道注册进 Agent Loop；
+ *  extras.systemPrompt（M7-A-T1：Persona 拼装结果）经 systemPrompt 通道注入会话。 */
 function defaultAgentFactory(): (
   sessionId: string,
   provider: ResolvedProvider | null,
@@ -1220,6 +1267,7 @@ function defaultAgentFactory(): (
       apiKey: provider.apiKey.length > 0 ? provider.apiKey : "unused",
       model: { id: provider.modelId, contextWindow: provider.contextWindow, maxTokens: provider.maxTokens },
       ...(provider.compat !== undefined ? { compat: provider.compat } : {}),
+      ...(extras?.systemPrompt !== undefined ? { systemPrompt: extras.systemPrompt } : {}),
       tools: extras?.tools ?? [],
     });
   };
@@ -1455,8 +1503,183 @@ async function handleCreateSession(
   });
 }
 
-function handleListSessions(_req: IncomingMessage, res: ServerResponse, _url: URL, ctx: RequestContext): void {
-  sendJson(res, 200, { sessions: ctx.sessions.listSessions() });
+function handleListSessions(_req: IncomingMessage, res: ServerResponse, url: URL, ctx: RequestContext): void {
+  const include = url.searchParams.get("include");
+  if (include !== null && include !== "archived" && include !== "deleted" && include !== "all") {
+    sendError(res, 400, "invalid_query", "include must be one of archived | deleted | all");
+    return;
+  }
+  sendJson(res, 200, {
+    sessions: include === null ? ctx.sessions.listSessions() : ctx.sessions.listSessions({ include }),
+  });
+}
+
+// --- M7-A 会话元数据 handlers（票 T2 / Issue #59）----------------------------
+
+const SESSION_TITLE_MAX_LENGTH = 120;
+
+interface RenameSessionBody {
+  title?: unknown;
+}
+
+async function handleRenameSession(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _url: URL,
+  ctx: RequestContext,
+  params: string[],
+): Promise<void> {
+  const sessionId = params[0];
+  if (!ctx.sessions.sessionExists(sessionId)) {
+    sendError(res, 404, "not_found", `session ${sessionId} does not exist`);
+    return;
+  }
+  const body = await readJsonBody(req, res);
+  if (body === null) return;
+  const { title } = body as RenameSessionBody;
+  if (typeof title !== "string" || title.trim().length === 0) {
+    sendError(res, 400, "invalid_body", "title must be a non-empty string");
+    return;
+  }
+  const trimmed = title.trim();
+  if (trimmed.length > SESSION_TITLE_MAX_LENGTH) {
+    sendError(res, 400, "invalid_body", `title must be at most ${SESSION_TITLE_MAX_LENGTH} characters`);
+    return;
+  }
+  const mutation = ctx.sessions.renameSession(sessionId, trimmed);
+  if (mutation === null) {
+    sendError(res, 404, "not_found", `session ${sessionId} does not exist`);
+    return;
+  }
+  sendJson(res, 200, {
+    session_id: sessionId,
+    title: trimmed,
+    event_id: mutation.eventId,
+    sequence: mutation.sequence,
+    changed: mutation.changed,
+  });
+}
+
+function handleArchiveSession(
+  _req: IncomingMessage,
+  res: ServerResponse,
+  _url: URL,
+  ctx: RequestContext,
+  params: string[],
+): void {
+  const sessionId = params[0];
+  const mutation = ctx.sessions.archiveSession(sessionId);
+  if (mutation === null) {
+    sendError(res, 404, "not_found", `session ${sessionId} does not exist`);
+    return;
+  }
+  sendJson(res, 200, {
+    session_id: sessionId,
+    archived_at: mutation.archivedAt ?? null,
+    event_id: mutation.eventId,
+    sequence: mutation.sequence,
+    changed: mutation.changed,
+  });
+}
+
+function handleUnarchiveSession(
+  _req: IncomingMessage,
+  res: ServerResponse,
+  _url: URL,
+  ctx: RequestContext,
+  params: string[],
+): void {
+  const sessionId = params[0];
+  const mutation = ctx.sessions.unarchiveSession(sessionId);
+  if (mutation === null) {
+    sendError(res, 404, "not_found", `session ${sessionId} does not exist`);
+    return;
+  }
+  sendJson(res, 200, {
+    session_id: sessionId,
+    archived_at: null,
+    event_id: mutation.eventId,
+    sequence: mutation.sequence,
+    changed: mutation.changed,
+  });
+}
+
+function handleDeleteSession(
+  _req: IncomingMessage,
+  res: ServerResponse,
+  _url: URL,
+  ctx: RequestContext,
+  params: string[],
+): void {
+  const sessionId = params[0];
+  const mutation = ctx.sessions.deleteSession(sessionId);
+  if (mutation === null) {
+    sendError(res, 404, "not_found", `session ${sessionId} does not exist`);
+    return;
+  }
+  sendJson(res, 200, {
+    session_id: sessionId,
+    deleted_at: mutation.deletedAt ?? null,
+    event_id: mutation.eventId,
+    sequence: mutation.sequence,
+    changed: mutation.changed,
+  });
+}
+
+/**
+ * 会话恢复（M7-A 共用端点，票 T2 / Issue #59 + 票 T3 / Issue #60）：
+ *   临时会话（kind=ephemeral）且处于关闭态 → 关闭后 24h 内重开（语义见 T3）；
+ *   其余 → 软删 30 天内的会话恢复（T2；只清删除标记，归档态保留）。
+ * 两条路径互斥：ephemeral 关闭态优先；未关闭的临时会话落到 T2 的 not_deleted 语义。
+ */
+function handleRestoreSession(
+  _req: IncomingMessage,
+  res: ServerResponse,
+  _url: URL,
+  ctx: RequestContext,
+  params: string[],
+): void {
+  const sessionId = params[0];
+  if (ctx.sessions.sessionKind(sessionId) === "ephemeral" && ctx.sessions.isClosed(sessionId)) {
+    try {
+      const result = ctx.sessions.restoreEphemeralSession(sessionId);
+      sendJson(res, 200, {
+        session_id: sessionId,
+        restored_at: result.restoredAt,
+        event_id: result.eventId,
+      });
+    } catch (err) {
+      handleSessionLifecycleError(res, err);
+    }
+    return;
+  }
+  const result = ctx.sessions.restoreSession(sessionId);
+  switch (result.status) {
+    case "unknown":
+      sendError(res, 404, "not_found", `session ${sessionId} does not exist`);
+      return;
+    case "not_deleted":
+      sendError(res, 409, "session_not_deleted", `session ${sessionId} is not deleted`);
+      return;
+    case "expired":
+      sendError(
+        res,
+        409,
+        "restore_window_expired",
+        `session ${sessionId} was deleted more than 30 days ago and can no longer be restored (ledger events are retained)`,
+      );
+      return;
+    case "restored":
+      sendJson(res, 200, {
+        session_id: sessionId,
+        deleted_at: null,
+        restored_at: result.restoredAt,
+        event_id: result.eventId,
+        sequence: result.sequence,
+        changed: true,
+      });
+      return;
+  }
 }
 
 /**
@@ -1472,20 +1695,6 @@ function handleCloseSession(_req: IncomingMessage, res: ServerResponse, _url: UR
       closed_at: result.closedAt,
       restorable_until: result.restorableUntil,
       ...(result.eventId === null ? {} : { event_id: result.eventId }),
-    });
-  } catch (err) {
-    handleSessionLifecycleError(res, err);
-  }
-}
-
-/** 临时会话恢复（票 M7-A-T3）：关闭后 24h 内；过期 → 409 session_expired */
-function handleRestoreSession(_req: IncomingMessage, res: ServerResponse, _url: URL, ctx: RequestContext, params: string[]): void {
-  try {
-    const result = ctx.sessions.restoreEphemeralSession(params[0]);
-    sendJson(res, 200, {
-      session_id: params[0],
-      restored_at: result.restoredAt,
-      event_id: result.eventId,
     });
   } catch (err) {
     handleSessionLifecycleError(res, err);

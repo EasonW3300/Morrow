@@ -22,6 +22,16 @@ import { uuidv7 } from "./uuid-v7.ts";
  *                     （error/aborted 轮也落盘，text 为已产出前缀，stop_reason 区分；
  *                      causation → message.user）
  *
+ * M7-A 会话元数据（票 T2 / Issue #59）：改名/归档/软删/恢复也走账本事件，
+ * 会话列表仍是对账本的折叠（不引入 sessions 表——避免第二真相源）：
+ *   session.renamed    actor owner   payload { title }
+ *   session.archived   actor owner   归档（默认列表收起）
+ *   session.unarchived actor owner   取消归档
+ *   session.deleted    actor owner   软删（occurred_at 起 30 天可恢复）
+ *   session.restored   actor owner   清除删除标记（归档态保留）
+ * 折叠按事件 sequence 顺序施加（后写覆盖前写）；软删过期后从折叠结果剔除，
+ * 但账本事件永久保留——折叠是投影，不是删除。
+ *
  * 串行语义：同会话输入 FIFO 排队（POST 立即 202），Agent Loop 逐轮驱动，
  * 不并发、不丢事件。文本增量（text_delta）是易失的展示层事件，只进 SSE 不进账本；
  * 账本里 message.assistant 的 text 是权威全文。
@@ -35,10 +45,18 @@ export const SESSION_EVENT_TYPES = {
   agentError: "agent.error",
   toolStarted: "tool.started",
   toolFinished: "tool.finished",
-  /** 临时会话关闭（票 M7-A-T3）：payload {kind:"ephemeral", closed_at}；24h 恢复窗口起点 */
-  sessionClosed: "session.closed",
-  /** 临时会话恢复（票 M7-A-T3）：payload {restored_at}；清除关闭状态（24h 内有效） */
+  // M7-A 元数据事件族（票 T2 / Issue #59）
+  sessionRenamed: "session.renamed",
+  sessionArchived: "session.archived",
+  sessionUnarchived: "session.unarchived",
+  sessionDeleted: "session.deleted",
   sessionRestored: "session.restored",
+  /**
+   * 临时会话关闭/恢复（票 M7-A-T3）：与 T2 的 session.restored（软删恢复）**分名**，
+   * 避免同一 event_type 承载两种生命周期语义。payload 分别含 closed_at / restored_at。
+   */
+  sessionEphemeralClosed: "session.ephemeral_closed",
+  sessionEphemeralRestored: "session.ephemeral_restored",
 } as const;
 
 /** 会话类型（票 M7-A-T3 / ADR-0010）：ephemeral = 临时会话（写入隔离 + 禁写入类能力 + 24h 生命周期） */
@@ -60,6 +78,29 @@ export class SessionLifecycleError extends Error {
   }
 }
 
+/** 软删保留期（30 天）：deleted_at + 保留期后折叠剔除，账本事件保留 */
+export const SESSION_DELETE_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+
+/** 列表过滤：缺省只回活动会话；archived/deleted 在活动会话之外追加对应状态 */
+export type SessionListInclude = "archived" | "deleted" | "all";
+
+/** 元数据端点返回的变更摘要（event_id/sequence 为 null = 幂等 no-op，未追加事件） */
+export interface SessionMetadataMutation {
+  sessionId: string;
+  eventId: string | null;
+  sequence: number | null;
+  changed: boolean;
+  title?: string;
+  archivedAt?: string;
+  deletedAt?: string;
+}
+
+export type SessionRestoreResult =
+  | { status: "unknown" }
+  | { status: "not_deleted" }
+  | { status: "expired" }
+  | { status: "restored"; eventId: string; sequence: number; restoredAt: string };
+
 /** 生产默认 createPiAdapter；测试注入 FakePi（同构 AgentRuntime 接口）。
  *  provider 为会话解析出的运行时配置（ProviderResolver 未配置时为 null）；
  *  extras.tools 为会话可用的工具（M1-T1：memory.write，经 PiAdapter tools 通道注册）；
@@ -67,6 +108,11 @@ export class SessionLifecycleError extends Error {
 export interface AgentRuntimeExtras {
   /** 会话运行时可用的工具（缺省 []） */
   tools?: MorrowTool[];
+  /**
+   * 会话 system prompt（票 M7-A-T1 / Issue #58）：Persona 按固定顺序拼装后的文本。
+   * 由工厂透传给 createPiAdapter（缺省不传 = 适配器空提示词）。
+   */
+  systemPrompt?: string;
 }
 
 export type AgentAdapterFactory = (
@@ -118,7 +164,7 @@ export type SessionFrame =
   | { kind: "delta"; delta: string }
   | { kind: "done" };
 
-/** 会话列表条目（session.created 投影；provider_id 仅显式绑定时存在） */
+/** 会话列表条目（session.created 投影 + 元数据事件折叠；provider_id 仅显式绑定时存在） */
 export interface SessionSummary {
   session_id: string;
   event_id: string;
@@ -128,6 +174,10 @@ export interface SessionSummary {
   provider_id?: string;
   /** 会话类型（票 M7-A-T3）：normal 缺省；ephemeral = 临时会话 */
   kind: SessionKind;
+  /** 归档时间（session.archived 的 occurred_at；取消归档后清除） */
+  archived_at?: string;
+  /** 软删时间（session.deleted 的 occurred_at；恢复后清除；30 天后折叠剔除） */
+  deleted_at?: string;
 }
 
 /** 历史投影条目（message.user / message.assistant 投影） */
@@ -183,7 +233,15 @@ export interface SessionManagerOptions {
   toolObserver?: ToolObserver | null;
   /** 会话运行时的工具工厂（M1-T1：按会话构建 memory.write 工具，经工厂 extras 注入） */
   agentTools?: (sessionId: string) => MorrowTool[];
-  /** 时钟注入（票 M7-A-T3：临时会话 close/restore 与 24h 判定测试零 sleep）；缺省系统时间 */
+  /**
+   * 会话 system prompt 读取面（票 M7-A-T1 / Issue #58）：返回 undefined = 不注入。
+   * 在创建 AgentRuntime 时求值（会话复用一个运行时；改 Persona 影响后续新会话）。
+   */
+  systemPrompt?: ((sessionId: string) => string | undefined) | null;
+  /**
+   * 会话时钟（票 M7-A-T2 软删 30 天 / 票 M7-A-T3 临时会话 close/restore 与 24h 判定）：
+   * 测试注入可拨快时钟（零 sleep）。缺省系统时间。
+   */
   now?: () => Date;
 }
 
@@ -197,6 +255,7 @@ export class SessionManager {
   readonly #memory: MemoryObserver | null;
   readonly #toolObserver: ToolObserver | null;
   readonly #agentTools: ((sessionId: string) => MorrowTool[]) | null;
+  readonly #systemPrompt: ((sessionId: string) => string | undefined) | null;
   readonly #now: () => Date;
   readonly #states = new Map<string, SessionState>();
   #disposed = false;
@@ -210,6 +269,7 @@ export class SessionManager {
     this.#memory = options.memory ?? null;
     this.#toolObserver = options.toolObserver ?? null;
     this.#agentTools = options.agentTools ?? null;
+    this.#systemPrompt = options.systemPrompt ?? null;
     this.#now = options.now ?? (() => new Date());
     this.#factoryUnavailableReason =
       options.factoryUnavailableReason ??
@@ -256,25 +316,119 @@ export class SessionManager {
     return { sessionId, eventId: envelope.event_id, sequence, occurredAt: envelope.occurred_at };
   }
 
-  /** 会话列表：session.created 投影（seq 升序） */
-  listSessions(): SessionSummary[] {
+  /**
+   * 会话列表：对账本的折叠（M7-A-T2）。先扫 session.created 建基座，再按 sequence
+   * 顺序施加 renamed/archived/unarchived/deleted/restored（后写覆盖前写）。
+   *
+   * 默认只回活动会话（未归档、未软删）；include=archived 追加归档、include=deleted
+   * 追加未过期的软删、include=all 两者都追加。软删超过 30 天（注入时钟判定）从所有
+   * 视图剔除——账本事件仍在，重建/审计不受影响。
+   */
+  listSessions(options: { include?: SessionListInclude } = {}): SessionSummary[] {
+    const include = options.include;
     const out: SessionSummary[] = [];
-    for (const { sequence, envelope } of this.#ledger.scan({ eventType: SESSION_EVENT_TYPES.sessionCreated })) {
-      const sessionId = envelope.session_id;
-      if (sessionId === null || sessionId === undefined) continue;
-      const title = envelope.payload.title;
-      const providerId = envelope.payload.provider_id;
-      out.push({
-        session_id: sessionId,
-        event_id: envelope.event_id,
-        sequence,
-        occurred_at: envelope.occurred_at,
-        ...(typeof title === "string" && title.length > 0 ? { title } : {}),
-        ...(typeof providerId === "string" ? { provider_id: providerId } : {}),
-        kind: envelope.payload.kind === "ephemeral" ? "ephemeral" : "normal",
-      });
+    for (const folded of this.#foldSessions()) {
+      if (folded.expired) continue;
+      const { summary } = folded;
+      if (summary.deleted_at !== undefined) {
+        if (include !== "deleted" && include !== "all") continue;
+      } else if (summary.archived_at !== undefined) {
+        if (include !== "archived" && include !== "all") continue;
+      }
+      out.push(summary);
     }
     return out;
+  }
+
+  /** 改名：session.renamed（actor owner）。未知会话返回 null（HTTP 层 404）。 */
+  renameSession(sessionId: string, title: string): SessionMetadataMutation | null {
+    if (this.#foldSession(sessionId) === null) return null;
+    const entry = this.#appendMetadata(sessionId, SESSION_EVENT_TYPES.sessionRenamed, { title });
+    return {
+      sessionId,
+      eventId: entry.envelope.event_id,
+      sequence: entry.sequence,
+      changed: true,
+      title,
+    };
+  }
+
+  /** 归档：session.archived。已归档为幂等 no-op（不追加事件）。 */
+  archiveSession(sessionId: string): SessionMetadataMutation | null {
+    const folded = this.#foldSession(sessionId);
+    if (folded === null) return null;
+    if (folded.summary.archived_at !== undefined) {
+      return {
+        sessionId,
+        eventId: null,
+        sequence: null,
+        changed: false,
+        archivedAt: folded.summary.archived_at,
+      };
+    }
+    const entry = this.#appendMetadata(sessionId, SESSION_EVENT_TYPES.sessionArchived, {});
+    return {
+      sessionId,
+      eventId: entry.envelope.event_id,
+      sequence: entry.sequence,
+      changed: true,
+      archivedAt: entry.envelope.occurred_at,
+    };
+  }
+
+  /** 取消归档：session.unarchived。未归档为幂等 no-op。 */
+  unarchiveSession(sessionId: string): SessionMetadataMutation | null {
+    const folded = this.#foldSession(sessionId);
+    if (folded === null) return null;
+    if (folded.summary.archived_at === undefined) {
+      return { sessionId, eventId: null, sequence: null, changed: false };
+    }
+    const entry = this.#appendMetadata(sessionId, SESSION_EVENT_TYPES.sessionUnarchived, {});
+    return { sessionId, eventId: entry.envelope.event_id, sequence: entry.sequence, changed: true };
+  }
+
+  /**
+   * 软删：session.deleted。已删除为幂等 no-op——**不追加事件、不延长 30 天保留期**
+   * （重复删除不能把到期日往后推）。删除只作用于会话投影，不动记忆。
+   */
+  deleteSession(sessionId: string): SessionMetadataMutation | null {
+    const folded = this.#foldSession(sessionId);
+    if (folded === null) return null;
+    if (folded.summary.deleted_at !== undefined) {
+      return {
+        sessionId,
+        eventId: null,
+        sequence: null,
+        changed: false,
+        deletedAt: folded.summary.deleted_at,
+      };
+    }
+    const entry = this.#appendMetadata(sessionId, SESSION_EVENT_TYPES.sessionDeleted, {});
+    return {
+      sessionId,
+      eventId: entry.envelope.event_id,
+      sequence: entry.sequence,
+      changed: true,
+      deletedAt: entry.envelope.occurred_at,
+    };
+  }
+
+  /**
+   * 恢复软删：session.restored（只清删除标记，此前的归档态保留）。
+   * 未删除 → not_deleted；已过 30 天保留期 → expired（HTTP 409）；未知会话 → unknown。
+   */
+  restoreSession(sessionId: string): SessionRestoreResult {
+    const folded = this.#foldSession(sessionId);
+    if (folded === null) return { status: "unknown" };
+    if (folded.summary.deleted_at === undefined) return { status: "not_deleted" };
+    if (this.#isDeleteExpired(folded.summary.deleted_at)) return { status: "expired" };
+    const entry = this.#appendMetadata(sessionId, SESSION_EVENT_TYPES.sessionRestored, {});
+    return {
+      status: "restored",
+      eventId: entry.envelope.event_id,
+      sequence: entry.sequence,
+      restoredAt: entry.envelope.occurred_at,
+    };
   }
 
   sessionExists(sessionId: string): boolean {
@@ -316,7 +470,7 @@ export class SessionManager {
       };
     }
     const closedAt = this.#now().toISOString();
-    const entry = this.#append(sessionId, SESSION_EVENT_TYPES.sessionClosed, "owner", {
+    const entry = this.#append(sessionId, SESSION_EVENT_TYPES.sessionEphemeralClosed, "owner", {
       kind: "ephemeral",
       closed_at: closedAt,
     }, null);
@@ -353,7 +507,7 @@ export class SessionManager {
       );
     }
     const restoredAt = this.#now().toISOString();
-    const entry = this.#append(sessionId, SESSION_EVENT_TYPES.sessionRestored, "owner", {
+    const entry = this.#append(sessionId, SESSION_EVENT_TYPES.sessionEphemeralRestored, "owner", {
       restored_at: restoredAt,
     }, null);
     return { restoredAt, eventId: entry.envelope.event_id };
@@ -366,14 +520,104 @@ export class SessionManager {
     for (const { envelope } of this.#ledger.scan({ sessionId })) {
       if (envelope.event_type === SESSION_EVENT_TYPES.sessionCreated) {
         kind = envelope.payload.kind === "ephemeral" ? "ephemeral" : "normal";
-      } else if (envelope.event_type === SESSION_EVENT_TYPES.sessionClosed) {
+      } else if (envelope.event_type === SESSION_EVENT_TYPES.sessionEphemeralClosed) {
         closedAt =
           typeof envelope.payload.closed_at === "string" ? envelope.payload.closed_at : envelope.occurred_at;
-      } else if (envelope.event_type === SESSION_EVENT_TYPES.sessionRestored) {
+      } else if (envelope.event_type === SESSION_EVENT_TYPES.sessionEphemeralRestored) {
         closedAt = null;
       }
     }
     return { kind, closedAt };
+  }
+
+  // --- M7-A 会话元数据折叠 --------------------------------------------------
+
+  /**
+   * 折叠全部会话状态：created 建基座，元数据事件按 sequence 施加。
+   * expired 在最后按注入时钟统一判定（deleted_at + 30d）。
+   */
+  #foldSessions(): Array<{ summary: SessionSummary; expired: boolean }> {
+    const entries: LedgerEntry[] = [];
+    for (const eventType of [
+      SESSION_EVENT_TYPES.sessionCreated,
+      SESSION_EVENT_TYPES.sessionRenamed,
+      SESSION_EVENT_TYPES.sessionArchived,
+      SESSION_EVENT_TYPES.sessionUnarchived,
+      SESSION_EVENT_TYPES.sessionDeleted,
+      SESSION_EVENT_TYPES.sessionRestored,
+    ]) {
+      entries.push(...this.#ledger.scan({ eventType }));
+    }
+    entries.sort((a, b) => a.sequence - b.sequence);
+
+    const byId = new Map<string, SessionSummary>();
+    for (const { sequence, envelope } of entries) {
+      const sessionId = envelope.session_id;
+      if (sessionId === null || sessionId === undefined) continue;
+      switch (envelope.event_type) {
+        case SESSION_EVENT_TYPES.sessionCreated: {
+          if (byId.has(sessionId)) break; // 重复 created 不覆盖既有投影
+          const title = envelope.payload.title;
+          const providerId = envelope.payload.provider_id;
+          byId.set(sessionId, {
+            session_id: sessionId,
+            event_id: envelope.event_id,
+            sequence,
+            occurred_at: envelope.occurred_at,
+            kind: envelope.payload.kind === "ephemeral" ? "ephemeral" : "normal",
+            ...(typeof title === "string" && title.length > 0 ? { title } : {}),
+            ...(typeof providerId === "string" ? { provider_id: providerId } : {}),
+          });
+          break;
+        }
+        case SESSION_EVENT_TYPES.sessionRenamed: {
+          const summary = byId.get(sessionId);
+          if (summary === undefined) break;
+          const title = envelope.payload.title;
+          if (typeof title === "string" && title.length > 0) summary.title = title;
+          break;
+        }
+        case SESSION_EVENT_TYPES.sessionArchived: {
+          const summary = byId.get(sessionId);
+          if (summary !== undefined) summary.archived_at = envelope.occurred_at;
+          break;
+        }
+        case SESSION_EVENT_TYPES.sessionUnarchived: {
+          const summary = byId.get(sessionId);
+          if (summary !== undefined) delete summary.archived_at;
+          break;
+        }
+        case SESSION_EVENT_TYPES.sessionDeleted: {
+          const summary = byId.get(sessionId);
+          if (summary !== undefined) summary.deleted_at = envelope.occurred_at;
+          break;
+        }
+        case SESSION_EVENT_TYPES.sessionRestored: {
+          const summary = byId.get(sessionId);
+          if (summary !== undefined) delete summary.deleted_at;
+          break;
+        }
+      }
+    }
+
+    return [...byId.values()].map((summary) => ({
+      summary,
+      expired: summary.deleted_at !== undefined && this.#isDeleteExpired(summary.deleted_at),
+    }));
+  }
+
+  #foldSession(sessionId: string): { summary: SessionSummary; expired: boolean } | null {
+    return this.#foldSessions().find((folded) => folded.summary.session_id === sessionId) ?? null;
+  }
+
+  #isDeleteExpired(deletedAt: string): boolean {
+    const deletedMs = Date.parse(deletedAt);
+    if (Number.isNaN(deletedMs)) return false;
+    return this.#now().getTime() - deletedMs >= SESSION_DELETE_RETENTION_MS;
+  }
+
+  #appendMetadata(sessionId: string, eventType: string, payload: Record<string, unknown>): LedgerEntry {
+    return this.#append(sessionId, eventType, "owner", payload, null);
   }
 
   /** 会话内事件（seq > afterSeq，SSE Last-Event-ID 重放用） */
@@ -539,10 +783,14 @@ export class SessionManager {
         let runtime = state.runtime;
         if (runtime === null) {
           try {
+            const systemPrompt = this.#systemPrompt?.(sessionId);
             runtime = await (this.#factory as AgentAdapterFactory)(
               sessionId,
               await this.#providerFor(sessionId),
-              { tools: this.#agentTools?.(sessionId) ?? [] },
+              {
+                tools: this.#agentTools?.(sessionId) ?? [],
+                ...(systemPrompt === undefined ? {} : { systemPrompt }),
+              },
             );
           } catch (err) {
             this.#append(sessionId, SESSION_EVENT_TYPES.agentError, "agent:runtime", { message: errorMessage(err) }, input.userEventId);

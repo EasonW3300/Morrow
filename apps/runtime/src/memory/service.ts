@@ -307,10 +307,10 @@ export class MemoryService {
     for (const { envelope } of this.#ledger.scan()) {
       const sessionId = envelope.session_id;
       if (sessionId === undefined || sessionId === null) continue;
-      if (envelope.event_type === SESSION_EVENT_TYPES.sessionClosed) {
+      if (envelope.event_type === SESSION_EVENT_TYPES.sessionEphemeralClosed) {
         const at = typeof envelope.payload.closed_at === "string" ? envelope.payload.closed_at : envelope.occurred_at;
         closedAt.set(sessionId, at);
-      } else if (envelope.event_type === SESSION_EVENT_TYPES.sessionRestored) {
+      } else if (envelope.event_type === SESSION_EVENT_TYPES.sessionEphemeralRestored) {
         closedAt.delete(sessionId);
       }
     }

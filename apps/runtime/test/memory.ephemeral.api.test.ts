@@ -274,8 +274,8 @@ test("24h：关闭后可恢复；到期后作用域检索不到而账本事件�
     const during = await searchFacts(runtime.port, "航班", scope);
     assert.equal((during.body as { facts: FactHit[] }).facts.length, 1, "关闭但未到期：作用域仍可见");
 
-    const closeEvent = (await allEvents(runtime.port)).find((e) => e.event_type === "session.closed");
-    assert.ok(closeEvent, "session.closed 入账本");
+    const closeEvent = (await allEvents(runtime.port)).find((e) => e.event_type === "session.ephemeral_closed");
+    assert.ok(closeEvent, "session.ephemeral_closed 入账本");
     assert.equal(closeEvent.payload.kind, "ephemeral");
 
     // 已关闭的会话不能再发消息（恢复后才可继续）
@@ -323,8 +323,8 @@ test("24h 内恢复：作用域记忆重新可见", async () => {
     const after = await searchFacts(runtime.port, "备用钥匙", scope);
     assert.equal((after.body as { facts: FactHit[] }).facts.length, 1, "恢复后作用域记忆可见");
 
-    const restoreEvent = (await allEvents(runtime.port)).find((e) => e.event_type === "session.restored");
-    assert.ok(restoreEvent, "session.restored 入账本");
+    const restoreEvent = (await allEvents(runtime.port)).find((e) => e.event_type === "session.ephemeral_restored");
+    assert.ok(restoreEvent, "session.ephemeral_restored 入账本");
 
     // 普通会话不走 ephemeral 生命周期端点
     const normal = await createSession(runtime.port, {});
