@@ -186,9 +186,13 @@ test("软删 30 天到期：注入时钟拨快后从所有折叠视图剔除，�
     assert.equal(((await listSessions(runtime.port, "all")).body as SessionSummary[]).length, 1);
     assert.equal(((await listSessions(runtime.port, "deleted")).body as SessionSummary[]).length, 1);
 
-    // 拨快超过保留期。额外留 60s 余量：注入时钟的起点早于 startRuntime/建删请求，
-    // 全量测试并行跑时 setup 耗时可能超过原先的 1s，导致「刚过期」被误判为未过期。
-    nowMs += 30 * DAY_MS + 60_000;
+    // 以**实际 deleted_at**（账本事件真实时间）为基准拨时钟。
+    // 曾经的写法是 nowMs += 30d + 1000（基于测试开始时刻），当机器负载导致
+    // 启动耗时超过 1 秒时，真实 deleted_at 会晚于 nowMs，+1s 余量被吃掉 →
+    // 到期判定不成立 → 全量并发跑必挂、单跑却通过（错误归因的经典陷阱）。
+    const deletedAtMs = Date.parse((deleted.body as SessionMutation).deleted_at ?? "");
+    assert.ok(Number.isFinite(deletedAtMs), "删除响应应带 deleted_at");
+    nowMs = deletedAtMs + 30 * DAY_MS + 1000;
     assert.equal(((await listSessions(runtime.port)).body as SessionSummary[]).length, 0);
     assert.equal(((await listSessions(runtime.port, "deleted")).body as SessionSummary[]).length, 0);
     assert.equal(((await listSessions(runtime.port, "all")).body as SessionSummary[]).length, 0, "过期删除从折叠结果剔除");
