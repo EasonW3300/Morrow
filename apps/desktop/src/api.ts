@@ -31,6 +31,7 @@ import type {
   PairingCodeResponse,
   PairingJoinRequest,
   PairingJoinResponse,
+  Persona,
   PermissionGrant,
   ProviderRecord,
   SyncRunReport,
@@ -66,6 +67,7 @@ export type {
   PairingCodeResponse,
   PairingJoinRequest,
   PairingJoinResponse,
+  Persona,
   PermissionGrant,
   ProviderRecord,
   SyncRunReport,
@@ -413,6 +415,20 @@ export const api = {
       headers: JSON_HEADERS,
       body: JSON.stringify(title === undefined ? {} : { title }),
     });
+  },
+
+  // --- 全局 Persona（票 M7-A-T1 / Issue #58，ADR-0009） ---
+
+  getPersona(base: string): Promise<Persona> {
+    return request<{ persona: Persona }>(base, "/v1/persona").then((r) => r.persona);
+  },
+
+  updatePersona(base: string, persona: Persona): Promise<Persona> {
+    return request<{ persona: Persona }>(base, "/v1/persona", {
+      method: "PUT",
+      headers: JSON_HEADERS,
+      body: JSON.stringify(persona),
+    }).then((r) => r.persona);
   },
 
   history(base: string, sessionId: string): Promise<SessionHistory> {

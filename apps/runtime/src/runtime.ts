@@ -28,7 +28,9 @@ import { MemoryStore } from "./memory/store.ts";
 import { createMemoryWriteTool } from "./memory/tool.ts";
 import { memoryRoutes } from "./memory/routes.ts";
 import { MemoryProjector } from "./memory/projection.ts";
-import { LlmMemoryExtractor, LLM_EXTRACTOR_SYSTEM_PROMPT, type MemoryExtractor } from "./memory/extraction.ts";
+import { LlmMemoryExtractor, type MemoryExtractor } from "./memory/extraction.ts";
+import { PersonaService, composePersonaPrompt } from "./persona.ts";
+import { personaRoutes } from "./persona-routes.ts";
 import { SyncCursorStore } from "./sync/cursors.ts";
 import { SyncEngine } from "./sync/engine.ts";
 import { syncRoutes } from "./sync/routes.ts";
@@ -41,7 +43,7 @@ import { SyncFileMerger } from "./sync/files.ts";
 import { MemoryProjectionRebuilder } from "./memory/rebuild.ts";
 import { TaskProjectionRebuilder } from "./task-rebuild.ts";
 import { ProviderRegistry, ProviderRegistryError, ENV_PROVIDER_ID, type ProviderResolver, type ResolvedProvider } from "./providers.ts";
-import { SessionManager, type AgentRuntimeExtras, type SessionFrame } from "./sessions.ts";
+import { SessionManager, type AgentAdapterFactory, type AgentRuntimeExtras, type SessionFrame } from "./sessions.ts";
 import { ChannelRegistry, type ChannelAdapterRegistration } from "./channels/registry.ts";
 import { channelRoutes } from "./channels/routes.ts";
 import { createChannelOutboundSink } from "./channels/outbox.ts";
@@ -115,6 +117,8 @@ interface RequestContext {
   ledger: EventLedger;
   replicaId: string;
   sessions: SessionManager;
+  /** 全局人设（M7-A-T1 / Issue #58：GET/PUT /v1/persona） */
+  persona: PersonaService;
   providers: ProviderRegistry;
   devices: DeviceRegistry;
   /** 设备配对服务（M3-T2 / Issue #31：配对码 / claim / 撤销 / token 校验） */
@@ -170,8 +174,9 @@ export interface RuntimeOptions {
    * Agent Loop 运行时工厂（PiAdapter 接口注入 seam）。缺省时用默认工厂
    * （createPiAdapter，Provider 配置由 ProviderResolver 按会话解析）；
    * 无任何 Provider 时发消息 503（provider_not_configured）。
+   * extras.systemPrompt（M7-A-T1）为 Persona 拼装结果，工厂应透传给适配器。
    */
-  agentAdapterFactory?: (sessionId: string, provider: ResolvedProvider | null) => Promise<AgentRuntime>;
+  agentAdapterFactory?: AgentAdapterFactory;
   /**
    * 凭据库注入 seam（票 T5）：缺省按平台探测（macOS Keychain 实测；Windows/Linux
    * 未实测）。测试与宿主可注入内存桩避免触碰用户钥匙串。
@@ -327,6 +332,8 @@ export interface RuntimeHandle {
   pairing: PairingService;
   /** 会话管理器（库形态可直用：abort / 订阅等测试与宿主 seam） */
   sessions: SessionManager;
+  /** 全局人设（M7-A-T1 / Issue #58；库形态可直用） */
+  persona: PersonaService;
   /** 记忆服务（票 M1-T1 / Issue #13：候选写入 + FTS 检索，库形态可直用） */
   memory: MemoryService;
   /** 记忆投影器（票 M1-T3 / Issue #15：dataDir/memory/*.md，幂等再生成，库形态可直用） */
@@ -437,6 +444,13 @@ const routes: Route[] = [
   ...outboxRoutes,
   ...notificationRoutes,
   ...memoryRoutes,
+  // 全局人设（M7-A-T1 / Issue #58）：GET/PUT /v1/persona——ctx.persona 桥接到 persona 自有路由签名
+  ...personaRoutes.map((route) => ({
+    method: route.method,
+    re: route.re,
+    handler: (req: IncomingMessage, res: ServerResponse, url: URL, ctx: RequestContext, params: string[]) =>
+      route.handler(req, res, url, { persona: ctx.persona }, params),
+  })),
   ...contactRoutes,
   ...channelRoutes,
   // 能力调用端点（#22 修复批 / FR-CAP-5）：POST /v1/capabilities/:id/invoke（body = 工具
@@ -578,6 +592,9 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
   // （默认确定性实现），轮次收尾（message.assistant 落账）由 SessionManager 触发后台抽取。
   // 抽取器选择（M1 code-review 补齐）：注入 > config.memoryExtractor=llm（经 PiAdapter
   // 一次 prompt）> 默认启发式（MemoryService 内建）。
+  // 全局人设（M7-A-T1 / Issue #58）：账本唯一真相源 + 内存缓存。先于记忆/会话构建——
+  // 抽取器与会话 system prompt 都要读取当前人设。
+  const persona = new PersonaService({ ledger, replicaId: config.replicaId });
   const memoryStore = MemoryStore.open(config.dataDir);
   // 记忆投影器（票 M1-T3 / Issue #15，FR-MEM-6）：facts → dataDir/memory/*.md；
   // 注入 MemoryService（导入修订后单事实刷新 / 删除后投影文件移除），投影命令走路由。
@@ -593,9 +610,11 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
       ? { extractor: options.memoryExtractor }
       : config.memoryExtractor === "llm"
         ? {
-            // 默认 Provider + 抽取系统提示词（goal 形参在此工厂路径不消费，传空占位）
+            // 默认 Provider + 抽取系统提示词；提示词由 LlmMemoryExtractor 每次按当前
+            // Persona 拼装（票 M7-A-T1：前置人设段落，缺省退回原文案）。
             extractor: new LlmMemoryExtractor(
-              async () => defaultTaskRuntimeFactory(providers, LLM_EXTRACTOR_SYSTEM_PROMPT)("", undefined),
+              async (systemPrompt) => defaultTaskRuntimeFactory(providers, systemPrompt)("", undefined),
+              { persona: () => persona.get() },
             ),
           }
         : {}),
@@ -754,6 +773,9 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     providerRequired: options.agentAdapterFactory === undefined,
     // 记忆（M1-T1）：高价值规则即时写候选；memory.write 工具按会话注入 Agent Loop
     memory,
+    // 全局 Persona → 会话 system prompt（M7-A-T1 / Issue #58）：固定顺序拼装，随会话
+    // AgentRuntime 创建注入；不注入任务规划器。
+    systemPrompt: () => composePersonaPrompt(persona.get()),
     // 元数据时钟（M7-A-T2）：软删 30 天到期判定
     ...(options.sessionsNow === undefined ? {} : { now: options.sessionsNow }),
     // 工具完成观察（M2-T5）：tool.finished → Skill 案例收集（is_error → failure）。
@@ -996,6 +1018,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     ledger,
     replicaId: config.replicaId,
     sessions,
+    persona,
     providers,
     devices,
     pairing,
@@ -1096,6 +1119,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     port,
     ledger,
     sessions,
+    persona,
     providers,
     devices,
     pairing,
@@ -1192,7 +1216,8 @@ export function resolveSelfBaseUrl(config: RuntimeConfig, port: number): string 
 }
 
 /** 生产默认工厂：按会话解析的 Provider → createPiAdapter（OpenAI 兼容协议，ADR-0002）。
- *  extras.tools（M1-T1：memory.write）经 tools 通道注册进 Agent Loop。 */
+ *  extras.tools（M1-T1：memory.write）经 tools 通道注册进 Agent Loop；
+ *  extras.systemPrompt（M7-A-T1：Persona 拼装结果）经 systemPrompt 通道注入会话。 */
 function defaultAgentFactory(): (
   sessionId: string,
   provider: ResolvedProvider | null,
@@ -1209,6 +1234,7 @@ function defaultAgentFactory(): (
       apiKey: provider.apiKey.length > 0 ? provider.apiKey : "unused",
       model: { id: provider.modelId, contextWindow: provider.contextWindow, maxTokens: provider.maxTokens },
       ...(provider.compat !== undefined ? { compat: provider.compat } : {}),
+      ...(extras?.systemPrompt !== undefined ? { systemPrompt: extras.systemPrompt } : {}),
       tools: extras?.tools ?? [],
     });
   };

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useReducer, useState } from "react";
 import {
   api,
   ApiError,
@@ -6,6 +6,7 @@ import {
   type ProviderRecord,
   type SessionSummary,
 } from "./api.ts";
+import { PERSONA_LIMITS } from "@morrow/protocol/browser";
 import { describeConnectivity } from "./connectivity-ui.ts";
 import { describeRestoreWindow } from "./session-ui.ts";
 import {
@@ -17,15 +18,23 @@ import {
   type ProviderFormErrors,
   type ProviderFormValues,
 } from "./provider-form.ts";
+import {
+  describePersonaImpact,
+  initialPersonaSaveState,
+  personaSaveReducer,
+  personaToForm,
+  type PersonaFormValues,
+} from "./persona-ui.ts";
 import { CapabilitiesView } from "./CapabilitiesView.tsx";
 import { ChannelsView } from "./ChannelsView.tsx";
 import { DevicesView } from "./DevicesView.tsx";
 import { useConfirm } from "./design-system/ConfirmDialog.tsx";
 
 /**
- * 设置页（PRD §5.1 设置区）：四个子页签——「Provider 与模型」（票 T7 / Issue #8）、
- * 「能力管理」（票 M2-T6 / Issue #27）、「设备与同步」（票 M3-T6 / Issue #35）与
- * 「渠道」（票 M4-T8 / Issue #45：适配器/白名单/联系人/通知规则/Outbox）。
+ * 设置页（PRD §5.1 设置区）：子页签——「Provider 与模型」（票 T7 / Issue #8）、
+ * 「Persona」（M7-A-T1 / Issue #58）、「能力管理」（票 M2-T6 / Issue #27）、
+ * 「设备与同步」（票 M3-T6 / Issue #35）、「渠道」（票 M4-T8 / Issue #45）与
+ * 「会话管理」（M7-A-T2 / Issue #59：归档/软删恢复）。
  * 能力管理页签可由 Task 视图的能力引用卡跳入（initialCapabilityName 预选详情）。
  */
 export function SettingsView({
@@ -35,7 +44,9 @@ export function SettingsView({
   base: string;
   initialCapabilityName?: string | null;
 }) {
-  const [section, setSection] = useState<"providers" | "capabilities" | "devices" | "channels" | "sessions">(
+  const [section, setSection] = useState<
+    "providers" | "persona" | "capabilities" | "devices" | "channels" | "sessions"
+  >(
     initialCapabilityName !== null ? "capabilities" : "providers",
   );
 
@@ -50,6 +61,7 @@ export function SettingsView({
         {(
           [
             ["providers", "Provider 与模型"],
+            ["persona", "Persona"],
             ["capabilities", "能力管理"],
             ["devices", "设备与同步"],
             ["channels", "渠道"],
@@ -66,12 +78,185 @@ export function SettingsView({
         ))}
       </div>
       {section === "providers" && <ProvidersSection base={base} />}
+      {section === "persona" && <PersonaSection base={base} />}
       {section === "capabilities" && (
         <CapabilitiesView base={base} initialCapabilityName={initialCapabilityName} />
       )}
       {section === "devices" && <DevicesView base={base} />}
       {section === "channels" && <ChannelsView base={base} />}
       {section === "sessions" && <SessionManagementSection base={base} />}
+    </div>
+  );
+}
+
+/**
+ * Persona 页（票 M7-A-T1 / Issue #58，FR-A1/A4/A5）：结构化四字段 + 其他自由文本。
+ * 保存前读取会话总数并弹确认（列出受影响会话数与三类后果）；取消不写入。
+ */
+function PersonaSection({ base }: { base: string }) {
+  const [form, setForm] = useState<PersonaFormValues>(() => personaToForm());
+  const [loadState, setLoadState] = useState<"loading" | "ready" | "error">("loading");
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [saveState, dispatch] = useReducer(personaSaveReducer, initialPersonaSaveState);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const persona = await api.getPersona(base);
+        if (cancelled) return;
+        setForm(personaToForm(persona));
+        setLoadState("ready");
+        setLoadError(null);
+      } catch (err) {
+        if (cancelled) return;
+        setLoadState("error");
+        setLoadError(readableError(err, "加载 Persona 失败"));
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [base]);
+
+  /** 点「保存」：先取受影响会话数（GET /v1/sessions 计数），再交给状态机校验/确认。 */
+  const startSave = async () => {
+    if (saveState.status === "saving" || saveState.status === "confirming") return;
+    try {
+      const sessions = await api.listSessions(base);
+      dispatch({ type: "submit", values: form, sessionCount: sessions.length });
+    } catch (err) {
+      setLoadError(readableError(err, "读取受影响会话数失败"));
+    }
+  };
+
+  const confirmSave = async () => {
+    if (saveState.status !== "confirming") return;
+    const persona = saveState.persona;
+    dispatch({ type: "confirm" });
+    try {
+      const updated = await api.updatePersona(base, persona);
+      setForm(personaToForm(updated));
+      dispatch({ type: "saved", persona: updated });
+    } catch (err) {
+      dispatch({ type: "failed", message: readableError(err, "保存 Persona 失败") });
+    }
+  };
+
+  const errors = saveState.status === "idle" ? saveState.errors : {};
+  const confirming = saveState.status === "confirming" || saveState.status === "saving";
+
+  return (
+    <div className="settings-section">
+      <div className="page-head">
+        <h2>Persona</h2>
+        <button
+          className="btn primary"
+          onClick={() => void startSave()}
+          disabled={loadState !== "ready" || saveState.status === "saving" || saveState.status === "confirming"}
+        >
+          保存
+        </button>
+      </div>
+      <p className="page-hint">
+        全局人设：同时注入每个会话的 system prompt 与记忆抽取器（不注入任务规划器）。
+        拼装顺序固定为 名字 → 语气 → 职责 → 禁止行为 → 其他，不可调整。
+      </p>
+      {loadError !== null && <div className="banner-error">{loadError}</div>}
+      {saveState.status === "saved" && (
+        <div className="banner-note">
+          已保存。新会话将使用新 Persona；既有会话的缓存前缀会在下一轮失效。
+          <button className="btn" onClick={() => dispatch({ type: "reset" })}>
+            知道了
+          </button>
+        </div>
+      )}
+      {saveState.status === "error" && (
+        <div className="banner-error">
+          {saveState.message}
+          <button className="btn" onClick={() => dispatch({ type: "reset" })}>
+            关闭
+          </button>
+        </div>
+      )}
+
+      {loadState === "loading" && <div className="empty-note">正在加载 Persona…</div>}
+
+      {loadState === "ready" && (
+        <div className="form-card">
+          <div className="form-grid">
+            <Field label="名字" error={errors.name} hint={`默认 Morrow；最多 ${PERSONA_LIMITS.name} 字符`}>
+              <input
+                value={form.name}
+                onChange={(e) => setForm({ ...form, name: e.target.value })}
+                placeholder="例如：Morrow"
+                autoFocus
+              />
+            </Field>
+            <Field label="语气" error={errors.tone} hint="默认「简洁直接」">
+              <input
+                value={form.tone}
+                onChange={(e) => setForm({ ...form, tone: e.target.value })}
+                placeholder="例如：简洁直接"
+              />
+            </Field>
+          </div>
+          <Field
+            label="职责"
+            error={errors.responsibilities}
+            hint="每行一条；默认「个人助理与开发助手」"
+          >
+            <textarea
+              rows={4}
+              value={form.responsibilities}
+              onChange={(e) => setForm({ ...form, responsibilities: e.target.value })}
+              placeholder={"个人助理\n开发助手"}
+            />
+          </Field>
+          <Field label="禁止行为" error={errors.prohibitions} hint="每行一条；默认空">
+            <textarea
+              rows={3}
+              value={form.prohibitions}
+              onChange={(e) => setForm({ ...form, prohibitions: e.target.value })}
+              placeholder="例如：不要编造事实"
+            />
+          </Field>
+          <Field label="其他设定" error={errors.extra} hint={`自由补充；最多 ${PERSONA_LIMITS.extra} 字符；默认空`}>
+            <textarea
+              rows={4}
+              value={form.extra}
+              onChange={(e) => setForm({ ...form, extra: e.target.value })}
+              placeholder="例如：回答先给结论，再展开细节。"
+            />
+          </Field>
+        </div>
+      )}
+
+      {confirming && (() => {
+        const notice = describePersonaImpact(
+          saveState.status === "confirming" || saveState.status === "saving" ? saveState.sessionCount : 0,
+        );
+        const saving = saveState.status === "saving";
+        return (
+          <div className="form-card" role="dialog" aria-label={notice.title}>
+            <h3>{notice.title}</h3>
+            <ul className="page-hint">
+              {notice.lines.map((line) => (
+                <li key={line}>{line}</li>
+              ))}
+            </ul>
+            <p className="page-hint">取消将不会写入任何变更。</p>
+            <div className="form-actions">
+              <button className="btn primary" onClick={() => void confirmSave()} disabled={saving}>
+                {saving ? "保存中…" : notice.confirmLabel}
+              </button>
+              <button className="btn" onClick={() => dispatch({ type: "cancel" })} disabled={saving}>
+                取消
+              </button>
+            </div>
+          </div>
+        );
+      })()}
     </div>
   );
 }
