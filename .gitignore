@@ -36,3 +36,6 @@ apps/desktop/src-tauri/gen/schemas/
 
 # 部署暂存目录（server-verify.sh 生成，含 Linux 二进制）
 .deploy-staging/
+
+# Agent 工作产物（计划/会话临时文件），不入库
+.zcode/
