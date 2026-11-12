@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { api, ApiError, type TaskSummary } from "./api.ts";
+import { api, ApiError, type SessionAttachment, type TaskSummary } from "./api.ts";
 import {
   applyFrame,
   emptyChatState,
@@ -11,6 +11,7 @@ import {
 } from "./sse.ts";
 import { taskStatusLabel, taskStatusTone } from "./task-ui.ts";
 import { describeSendError, type SendErrorView } from "./chat-ui.ts";
+import { addAttachmentPaths, attachmentLabel } from "./workspace-ui.ts";
 import { Badge } from "./design-system/primitives/Badge.tsx";
 import { Button } from "./design-system/primitives/Button.tsx";
 import { GlassSurface } from "./design-system/primitives/GlassSurface.tsx";
@@ -59,6 +60,10 @@ export function ChatView({
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
   const [sessionTasks, setSessionTasks] = useState<TaskSummary[]>([]);
+  const [attachments, setAttachments] = useState<SessionAttachment[]>([]);
+  const [attachmentPath, setAttachmentPath] = useState("");
+  const [attachmentError, setAttachmentError] = useState<string | null>(null);
+  const [attachmentBusy, setAttachmentBusy] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -126,6 +131,55 @@ export function ChatView({
     };
   }, [base, sessionId]);
 
+  // 只读附件（票 M7-A-T4）：进入会话即加载；增删走控制面，服务端负责读取与上限校验。
+  useEffect(() => {
+    let cancelled = false;
+    setAttachments([]);
+    setAttachmentError(null);
+    void api
+      .listAttachments(base, sessionId)
+      .then((result) => {
+        if (!cancelled) setAttachments(result.attachments);
+      })
+      .catch(() => {
+        // 附件列表失败不阻塞对话主链路
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [base, sessionId]);
+
+  const addAttachment = async (): Promise<void> => {
+    const paths = addAttachmentPaths([], attachmentPath);
+    if (paths.length === 0 || attachmentBusy) return;
+    setAttachmentBusy(true);
+    setAttachmentError(null);
+    try {
+      const result = await api.addAttachments(base, sessionId, paths);
+      setAttachments(result.attachments);
+      setAttachmentPath("");
+    } catch (err) {
+      setAttachmentError(err instanceof ApiError ? `${err.code}: ${err.message}` : String(err));
+    } finally {
+      setAttachmentBusy(false);
+    }
+  };
+
+  const removeAttachment = async (path: string): Promise<void> => {
+    if (attachmentBusy) return;
+    setAttachmentBusy(true);
+    setAttachmentError(null);
+    try {
+      const result = await api.removeAttachments(base, sessionId, [path]);
+      setAttachments(result.attachments);
+      setAttachmentPath((current) => (current === path ? "" : current));
+    } catch (err) {
+      setAttachmentError(err instanceof ApiError ? `${err.code}: ${err.message}` : String(err));
+    } finally {
+      setAttachmentBusy(false);
+    }
+  };
+
   const send = async () => {
     const text = draft.trim();
     if (text.length === 0 || sending) return;
@@ -192,6 +246,43 @@ export function ChatView({
           <div className="empty-chat">发送第一条消息开始对话</div>
         )}
         <div ref={bottomRef} />
+      </div>
+      <div className="attachment-bar">
+        {attachments.length > 0 && (
+          <div className="attachment-chips" aria-label="会话附件">
+            {attachments.map((attachment) => (
+              <span key={attachment.path} className="attachment-chip" title={attachment.path}>
+                <span className="attachment-chip-name">{attachmentLabel(attachment)}</span>
+                <button
+                  className="attachment-chip-remove"
+                  aria-label={`移除附件 ${attachment.name}`}
+                  disabled={attachmentBusy}
+                  onClick={() => void removeAttachment(attachment.path)}
+                >
+                  ×
+                </button>
+              </span>
+            ))}
+          </div>
+        )}
+        <div className="attachment-add">
+          <input
+            value={attachmentPath}
+            placeholder="添加只读附件路径（回车附加）"
+            spellCheck={false}
+            onChange={(event) => setAttachmentPath(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") {
+                event.preventDefault();
+                void addAttachment();
+              }
+            }}
+          />
+          <Button size="sm" disabled={attachmentBusy || attachmentPath.trim().length === 0} onClick={() => void addAttachment()}>
+            附加
+          </Button>
+        </div>
+        {attachmentError !== null && <div className="list-error">{attachmentError}</div>}
       </div>
       <GlassSurface className="composer">
         <textarea

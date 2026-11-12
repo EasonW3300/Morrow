@@ -13,6 +13,7 @@ import {
   type SessionActionId,
   type SessionMenuState,
 } from "./session-ui.ts";
+import { workspaceDetail, workspaceLabel } from "./workspace-ui.ts";
 
 /**
  * 会话侧栏列表（session.created + 元数据事件折叠投影；标题缺省用短 id）。
@@ -173,6 +174,11 @@ export function SessionList({
                     <span className="session-title">
                       {session.title ?? `会话 ${session.session_id.slice(0, 8)}`}
                     </span>
+                    {session.workspace !== undefined && (
+                      <span className="session-workspace" title={workspaceDetail(session.workspace)}>
+                        {workspaceLabel(session.workspace)}
+                      </span>
+                    )}
                     <span className="session-time">{shortTime(session.occurred_at)}</span>
                   </button>
                   <button
