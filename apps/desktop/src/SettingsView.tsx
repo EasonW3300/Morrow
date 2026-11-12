@@ -165,7 +165,7 @@ function PersonaSection({ base }: { base: string }) {
       {loadError !== null && <div className="banner-error">{loadError}</div>}
       {saveState.status === "saved" && (
         <div className="banner-note">
-          已保存。新会话将使用新 Persona；既有会话的缓存前缀会在下一轮失效。
+          已保存。新建会话将使用新 Persona；进行中的会话保持原人设与上下文。
           <button className="btn" onClick={() => dispatch({ type: "reset" })}>
             知道了
           </button>
