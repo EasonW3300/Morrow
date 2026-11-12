@@ -19,6 +19,20 @@ _Avoid_: 朋友、协作者
 **Replica（副本）**: 同一 Owner 的数据在一个 Device 上的完整本地拷贝；副本间通过事件同步保持一致。
 _Avoid_: 节点
 
+## 人设与模式
+
+**Persona（人设）**: Owner 可编辑的全局默认身份设定（名字、语气、边界），注入每个会话的 system prompt 与记忆抽取器；修改会使既有对话的 KV 缓存前缀失效。
+
+**Ephemeral Session（临时会话）**: 只读全局记忆、写入不进入长期记忆的会话；用于一次性问答。
+
+**Session Archive（会话归档）**: 把会话从默认列表收起但完整保留；与删除不同，不设自动清除。
+
+## 扩展
+
+**MCP Server**: 通过 Model Context Protocol 提供 tools 的外部进程；接入后其工具视为沙箱类 capability，受同一五维权限约束。
+
+**Skill Package（技能包）**: 可安装的分发单元，含声明式 `morrow.skill.json`；可执行部分只能注册为沙箱类 capability，安装时禁止执行安装脚本。
+
 ## 渠道与会话
 
 **Channel（渠道）**: Owner 或 Trusted Contact 与 Agent 之间的通信入口（桌面 UI、语音、Telegram、微信、QQ）。
