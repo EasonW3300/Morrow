@@ -5,7 +5,7 @@ import { createPiAdapter, type AgentRuntime, type MorrowTool } from "@morrow/pi-
 import packageJson from "../package.json" with { type: "json" };
 import piAdapterPackageJson from "../../../packages/pi-adapter/package.json" with { type: "json" };
 import { ensureBuiltinCapabilities, MEMORY_WRITE_CAPABILITY_MANIFEST } from "./capabilities/builtin.ts";
-import { CAPABILITY_EVENT_TYPES, PermissionEngine, type CapabilityLifecycleEvent } from "./capabilities/engine.ts";
+import { CAPABILITY_EVENT_TYPES, PermissionEngine, isEphemeralWriteClassCapability, type CapabilityLifecycleEvent } from "./capabilities/engine.ts";
 import type { CapabilityRecord } from "@morrow/protocol";
 import { capabilityRoutes } from "./capabilities/routes.ts";
 import { skillRoutes } from "./capabilities/skills/routes.ts";
@@ -43,7 +43,14 @@ import { SyncFileMerger } from "./sync/files.ts";
 import { MemoryProjectionRebuilder } from "./memory/rebuild.ts";
 import { TaskProjectionRebuilder } from "./task-rebuild.ts";
 import { ProviderRegistry, ProviderRegistryError, ENV_PROVIDER_ID, type ProviderResolver, type ResolvedProvider } from "./providers.ts";
-import { SessionManager, type AgentAdapterFactory, type AgentRuntimeExtras, type SessionFrame } from "./sessions.ts";
+import {
+  SessionLifecycleError,
+  SessionManager,
+  type AgentAdapterFactory,
+  type AgentRuntimeExtras,
+  type SessionFrame,
+  type SessionKind,
+} from "./sessions.ts";
 import { ChannelRegistry, type ChannelAdapterRegistration } from "./channels/registry.ts";
 import { channelRoutes } from "./channels/routes.ts";
 import { createChannelOutboundSink } from "./channels/outbox.ts";
@@ -202,6 +209,11 @@ export interface RuntimeOptions {
    * LLM 抽取（经 PiAdapter）。
    */
   memoryExtractor?: MemoryExtractor;
+  /**
+   * 会话/记忆时钟注入（票 M7-A-T3）：临时会话 close/restore 时间戳与 24h 到期清理
+   * 共用同一时钟——测试拨快即可验证到期语义（零 sleep）。缺省系统时间。
+   */
+  sessionNow?: () => Date;
   /**
    * 沙箱执行 Runner 注入 seam（M2-T2 / Issue #23）：缺省 = DockerRunner（探测本机
    * 容器运行时 docker/podman/OrbStack；无运行时 → sandboxed 调用拒绝）。测试注入
@@ -412,8 +424,12 @@ const routes: Route[] = [
   { method: "POST", re: /^\/v1\/sessions\/([^/]+)\/rename$/, handler: handleRenameSession },
   { method: "POST", re: /^\/v1\/sessions\/([^/]+)\/archive$/, handler: handleArchiveSession },
   { method: "POST", re: /^\/v1\/sessions\/([^/]+)\/unarchive$/, handler: handleUnarchiveSession },
+  // 恢复端点两会话语义合一（见 handleRestoreSession）：临时会话 → 关闭后 24h 内重开；
+  // 普通会话 → 软删 30 天内的恢复（票 T2 / T3 共用路径）
   { method: "POST", re: /^\/v1\/sessions\/([^/]+)\/restore$/, handler: handleRestoreSession },
   { method: "DELETE", re: /^\/v1\/sessions\/([^/]+)$/, handler: handleDeleteSession },
+  // 票 M7-A-T3：临时会话关闭（仅 kind=ephemeral 分支；普通会话关闭语义属 T5）
+  { method: "POST", re: /^\/v1\/sessions\/([^/]+)\/close$/, handler: handleCloseSession },
   { method: "POST", re: /^\/v1\/tasks$/, handler: handleCreateTask },
   { method: "GET", re: /^\/v1\/tasks$/, handler: handleListTasks },
   { method: "GET", re: /^\/v1\/tasks\/([^/]+)$/, handler: handleGetTask },
@@ -606,6 +622,8 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     projector,
     // 本机删除 → 删除集合立即生效（离线副本的旧修订在导入时被跳过）
     onFactDeleted: (envelope) => tombstones.recordFactDeletion(envelope, ledger),
+    // 临时会话 24h 到期清理的时钟（与会话生命周期同一注入点；缺省系统时间）
+    ...(options.sessionNow === undefined ? {} : { now: options.sessionNow }),
     ...(options.memoryExtractor !== undefined
       ? { extractor: options.memoryExtractor }
       : config.memoryExtractor === "llm"
@@ -619,6 +637,13 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
           }
         : {}),
   });
+  // 临时会话到期清理的启动扫描（票 M7-A-T3）：重启后立即可见的过期会话不再进检索面；
+  // 运行期由 MemoryService.search 的惰性清理兜底（无定时器，语义与注入时钟一致）。
+  try {
+    memory.sweepExpiredEphemeralScopes();
+  } catch (err) {
+    console.error("[morrow] ephemeral memory sweep on startup failed:", err);
+  }
   // 记忆同步语义层（M3-T3 / Issue #32）：三方合并 + 冲突入 M1 队列 + 投影重建。
   // 晚绑定到 sync.afterImport：T1 引擎在每批导入落账后调用。
   const syncConflicts = SyncConflictStore.open(config.dataDir);
@@ -763,6 +788,8 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
   // contactCapabilitiesForSession——联系人会话只注入 scope 声明的能力工具；
   // null/未接线 = Owner 或普通会话，不做联系人收窄。
   let contactToolCapabilities: ((sessionId: string) => string[] | null) | null = null;
+  // 临时会话判定（票 M7-A-T3）：晚绑定到 SessionManager（构造闭包在运行时执行）
+  let ephemeralSession: ((sessionId: string) => boolean) | null = null;
   // 会话工具注入改查注册表（票 M2-T1）：enabled 且有内置实现的 typescript 能力才实例化
   const sessions = new SessionManager({
     ledger,
@@ -771,6 +798,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     providers,
     // 注入工厂（测试/宿主自带 Agent Loop）时不做 Provider 预检（T4 语义）；默认工厂要求有 Provider
     providerRequired: options.agentAdapterFactory === undefined,
+    ...(options.sessionNow === undefined ? {} : { now: options.sessionNow }),
     // 记忆（M1-T1）：高价值规则即时写候选；memory.write 工具按会话注入 Agent Loop
     memory,
     // 全局 Persona → 会话 system prompt（M7-A-T1 / Issue #58）：固定顺序拼装，随会话
@@ -798,13 +826,18 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     // 工具注入改查注册表（票 M2-T1）：enabled 且有内置实现的 typescript 能力才实例化
     agentTools: (sessionId) => {
       const contactScopes = contactToolCapabilities?.(sessionId) ?? null;
+      // 临时会话禁写入类能力（票 M7-A-T3）：权限单入口的判定同样约束 Agent 工具面，
+      // 不只拦 HTTP invoke——模型在临时会话里看不到写操作类能力工具。
+      const ephemeral = ephemeralSession?.(sessionId) === true;
       return capabilities
         .list({ status: "enabled", runtime: "typescript" })
         .filter((capability) => builtinToolFactories[capability.name] !== undefined)
         .filter((capability) => contactScopes === null || contactScopes.includes(capability.name))
+        .filter((capability) => !ephemeral || !isEphemeralWriteClassCapability(capability.manifest))
         .map((capability) => builtinToolFactories[capability.name](sessionId));
     },
   });
+  ephemeralSession = (sessionId) => sessions.sessionKind(sessionId) === "ephemeral";
   // 任务域（M1-T4）：规划器/节点工厂注入语义对齐会话——注入时不做 Provider 预检，
   // 默认工厂路径要求存在可解析的默认 Provider（POST /v1/tasks 预检 503 依据）。
   const taskPlannerInjected = options.taskPlannerFactory !== undefined;
@@ -1429,6 +1462,7 @@ function listen(server: Server, host: string, port: number): Promise<number> {
 interface CreateSessionBody {
   title?: unknown;
   provider_id?: unknown;
+  kind?: unknown;
 }
 
 async function handleCreateSession(
@@ -1439,24 +1473,31 @@ async function handleCreateSession(
 ): Promise<void> {
   const body = await readJsonBody(req, res);
   if (body === null) return; // 响应已在 readJsonBody 里写出
-  const { title, provider_id: providerId } = body as CreateSessionBody;
+  const { title, provider_id: providerId, kind } = body as CreateSessionBody;
   if (title !== undefined && (typeof title !== "string" || title.trim().length === 0)) {
     sendError(res, 400, "invalid_body", "title must be a non-empty string when present");
+    return;
+  }
+  if (kind !== undefined && kind !== "normal" && kind !== "ephemeral") {
+    sendError(res, 400, "invalid_body", 'kind must be "normal" or "ephemeral" when present');
     return;
   }
   if (providerId !== undefined && (typeof providerId !== "string" || !ctx.providers.exists(providerId))) {
     sendError(res, 400, "unknown_provider", `provider "${String(providerId)}" is not registered (GET /v1/providers for the list)`);
     return;
   }
+  const sessionKind: SessionKind = kind === "ephemeral" ? "ephemeral" : "normal";
   const created = ctx.sessions.createSession(
     title === undefined ? undefined : title.trim(),
     typeof providerId === "string" ? providerId : undefined,
+    sessionKind,
   );
   sendJson(res, 201, {
     session_id: created.sessionId,
     event_id: created.eventId,
     sequence: created.sequence,
     occurred_at: created.occurredAt,
+    kind: sessionKind,
     ...(typeof providerId === "string" ? { provider_id: providerId } : {}),
     ...(title === undefined ? {} : { title: title.trim() }),
   });
@@ -1585,6 +1626,12 @@ function handleDeleteSession(
   });
 }
 
+/**
+ * 会话恢复（M7-A 共用端点，票 T2 / Issue #59 + 票 T3 / Issue #60）：
+ *   临时会话（kind=ephemeral）且处于关闭态 → 关闭后 24h 内重开（语义见 T3）；
+ *   其余 → 软删 30 天内的会话恢复（T2；只清删除标记，归档态保留）。
+ * 两条路径互斥：ephemeral 关闭态优先；未关闭的临时会话落到 T2 的 not_deleted 语义。
+ */
 function handleRestoreSession(
   _req: IncomingMessage,
   res: ServerResponse,
@@ -1593,6 +1640,19 @@ function handleRestoreSession(
   params: string[],
 ): void {
   const sessionId = params[0];
+  if (ctx.sessions.sessionKind(sessionId) === "ephemeral" && ctx.sessions.isClosed(sessionId)) {
+    try {
+      const result = ctx.sessions.restoreEphemeralSession(sessionId);
+      sendJson(res, 200, {
+        session_id: sessionId,
+        restored_at: result.restoredAt,
+        event_id: result.eventId,
+      });
+    } catch (err) {
+      handleSessionLifecycleError(res, err);
+    }
+    return;
+  }
   const result = ctx.sessions.restoreSession(sessionId);
   switch (result.status) {
     case "unknown":
@@ -1622,6 +1682,33 @@ function handleRestoreSession(
   }
 }
 
+/**
+ * 临时会话关闭（票 M7-A-T3）：本票只做 ephemeral 分支——
+ *   body 缺省 / 空对象；普通会话 → 409 not_ephemeral（未提交改动三选一属 T5）。
+ * 关闭后 24h 内可 restore；到期由 MemoryService 的作用域清理落定（账本保留）。
+ */
+function handleCloseSession(_req: IncomingMessage, res: ServerResponse, _url: URL, ctx: RequestContext, params: string[]): void {
+  try {
+    const result = ctx.sessions.closeEphemeralSession(params[0]);
+    sendJson(res, 200, {
+      session_id: params[0],
+      closed_at: result.closedAt,
+      restorable_until: result.restorableUntil,
+      ...(result.eventId === null ? {} : { event_id: result.eventId }),
+    });
+  } catch (err) {
+    handleSessionLifecycleError(res, err);
+  }
+}
+
+function handleSessionLifecycleError(res: ServerResponse, err: unknown): void {
+  if (err instanceof SessionLifecycleError) {
+    sendError(res, err.code === "not_found" ? 404 : 409, err.code, err.message);
+    return;
+  }
+  throw err;
+}
+
 interface SendMessageBody {
   text?: unknown;
 }
@@ -1636,6 +1723,15 @@ async function handleSendMessage(
   const sessionId = params[0];
   if (!ctx.sessions.sessionExists(sessionId)) {
     sendError(res, 404, "not_found", `session ${sessionId} does not exist`);
+    return;
+  }
+  if (ctx.sessions.isClosed(sessionId)) {
+    sendError(
+      res,
+      409,
+      "session_closed",
+      `session ${sessionId} is closed; POST /v1/sessions/${sessionId}/restore within 24h to continue`,
+    );
     return;
   }
   if (!ctx.sessions.agentAvailable) {
@@ -1909,6 +2005,11 @@ async function handleInvokeCapability(
   if (body === null) return; // 响应已在 readJsonBody 里写出（415/413/400）
   const startedAt = Date.now();
   try {
+    // 临时会话禁写入类能力（票 M7-A-T3 / ADR-0010）：权限单入口判定，先于执行链
+    // （未知能力不在此拒绝，留给 unknown_tool；UI 侧同门禁用按钮，双保险）。
+    if (sessionId !== undefined && ctx.sessions.sessionKind(sessionId) === "ephemeral") {
+      ctx.capabilities.assertEphemeralUse(capabilityId);
+    }
     const result = await ctx.sandbox.invoke(capabilityId, body, { actorId: "owner", ...(sessionId !== undefined ? { sessionId } : {}) });
     // 先落审计后返回（账本可追踪优先于响应时延；审计失败不改变执行结果口径）
     appendCapabilityUsed(ctx, capabilityId, result, result.duration_ms, sessionId);

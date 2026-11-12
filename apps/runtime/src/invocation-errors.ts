@@ -57,11 +57,13 @@ export function sendInvocationError(res: ServerResponse, err: unknown): boolean 
   }
   if (err instanceof CapabilityError) {
     const status =
-      err.code === "not_found" || err.code === "version_not_found"
-        ? 404
-        : err.code === "invalid_state"
-          ? 409
-          : 400;
+      err.code === "forbidden"
+        ? 403
+        : err.code === "not_found" || err.code === "version_not_found"
+          ? 404
+          : err.code === "invalid_state"
+            ? 409
+            : 400;
     sendError(res, status, err.code === "escalation" ? "capability_escalation" : `capability_${err.code}`, err.message);
     return true;
   }

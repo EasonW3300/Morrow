@@ -67,7 +67,9 @@ export type CapabilityErrorCode =
   | "not_found"
   | "version_not_found"
   | "version_conflict"
-  | "invalid_state";
+  | "invalid_state"
+  /** 临时会话内的写入类能力（票 M7-A-T3 / ADR-0010）：HTTP 403 */
+  | "forbidden";
 
 export class CapabilityError extends Error {
   code: CapabilityErrorCode;
@@ -289,6 +291,23 @@ export function escalationMessage(violations: PermissionViolation[]): string {
   return (
     `manifest permissions exceed the PermissionGrant (${violations.length} violation(s)): ` +
     violations.map((v) => `${v.dimension}: ${v.reason}`).join("; ")
+  );
+}
+
+/**
+ * 写入类能力判定（票 M7-A-T3 / ADR-0010）：临时会话内禁用「注册能力 / 生成代码 /
+ * 写操作类」调用——写入类的确定性口径是 manifest 任一权限维非空（filesystem /
+ * network / shell / channels / credentials 都会产生会话之外的副作用）。五维全空的
+ * 纯计算能力（含 memory.write：其写入由 scope 隔离约束，不是外部副作用）放行。
+ */
+export function isEphemeralWriteClassCapability(manifest: CapabilityManifest): boolean {
+  const permissions = manifest.permissions;
+  return (
+    permissions.filesystem.length > 0 ||
+    permissions.network.length > 0 ||
+    permissions.shell.length > 0 ||
+    permissions.channels.length > 0 ||
+    permissions.credentials.length > 0
   );
 }
 
@@ -809,6 +828,25 @@ export class PermissionEngine {
       );
     }
     return { allowed: true, name: row.name, version: row.version };
+  }
+
+  /**
+   * 临时会话写入门（票 M7-A-T3 / ADR-0010）：写入类能力（见
+   * isEphemeralWriteClassCapability）在临时会话内一律拒绝（forbidden → HTTP 403）。
+   * 与 assertRuntimeUse 同属权限单入口——网关与 Agent 工具注入都调这里，不在 UI
+   * 单点实现。未知能力不在此拒绝（留给执行链的 unknown_tool，语义更准确）。
+   */
+  assertEphemeralUse(name: string): void {
+    this.#assertOpen();
+    const row = this.#store.get(name);
+    if (row === null) return;
+    const manifest = JSON.parse(row.manifest) as CapabilityManifest;
+    if (isEphemeralWriteClassCapability(manifest)) {
+      throw new CapabilityError(
+        "forbidden",
+        `capability "${name}" is write-class (${manifest.permissions.filesystem.length + manifest.permissions.network.length + manifest.permissions.shell.length + manifest.permissions.channels.length + manifest.permissions.credentials.length} permission entry/entries) and cannot be used from an ephemeral session`,
+      );
+    }
   }
 
   /**

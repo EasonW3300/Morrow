@@ -130,7 +130,9 @@ export class MemoryProjector {
    */
   projectAll(): ProjectionResult {
     mkdirSync(this.dir, { recursive: true });
-    const facts = this.#store.listFacts();
+    // 票 M7-A-T3：投影目录是**长期记忆**的落盘面——临时会话作用域（session:<id>）
+    // 的候选/事实不投影，提升为 owner 后才进入（promote 后由服务层 writeFact 刷新）。
+    const facts = this.#store.listFacts({ scope: "owner" });
     const live = new Map<string, string>();
     for (const fact of facts) {
       live.set(fact.fact_id, renderFactMarkdown(fact, this.#store.factSourceEventIds(fact.fact_id)));
@@ -159,10 +161,10 @@ export class MemoryProjector {
     return { written, unchanged, removed };
   }
 
-  /** 单事实刷新（导入修订落定后调用）；事实不存在或已删时不写并返回 false */
+  /** 单事实刷新（导入修订落定后调用）；事实不存在、已删、已逻辑过期或非 owner 作用域时不写并返回 false */
   writeFact(factId: string): boolean {
     const fact = this.#store.getFact(factId);
-    if (fact === null || fact.deleted_at !== null) return false;
+    if (fact === null || fact.deleted_at !== null || fact.expired_at !== null || fact.scope !== "owner") return false;
     mkdirSync(this.dir, { recursive: true });
     writeFileSync(join(this.dir, `${factId}.md`), renderFactMarkdown(fact, this.#store.factSourceEventIds(factId)), "utf8");
     return true;

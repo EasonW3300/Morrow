@@ -7,8 +7,14 @@ import { MarkdownParseError, type MemoryProjector } from "./projection.ts";
  * 记忆控制面路由（票 M1-T1 / Issue #13 检索 + M1-T2 / Issue #14 候选/冲突 + M1-T3 /
  * Issue #15 投影/导入/删除，PRD §6.2）：
  *
- *   GET  /v1/memory/facts?q=关键词             FTS5 关键词检索（候选与事实统一索引），
- *                                              命中条目带 sources（来源账本 event_id 数组）
+ *   GET  /v1/memory/facts?q=关键词[&scope=owner|session:<id>]
+ *                                              FTS5 关键词检索（候选与事实统一索引），
+ *                                              命中条目带 sources（来源账本 event_id 数组）；
+ *                                              scope 缺省 owner 只查全局，session:<id>
+ *                                              查全局 + 该会话（票 M7-A-T3）
+ *   POST /v1/memory/:id/promote               提升为长期记忆（candidate 或 fact）：
+ *                                              scope session:* → owner + memory.promoted；
+ *                                              非 session scope → 409（票 M7-A-T3）
  *   GET  /v1/memory/candidates?status=          候选列表（status 过滤：pending /
  *                                              consolidated / dismissed / conflicted）
  *   POST /v1/memory/candidates/:id/decide      Owner 决定：accept → 进巩固（绕过置信度
@@ -78,6 +84,11 @@ export const memoryRoutes: MemoryRoute[] = [
     handler: handleMemoryImport,
   },
   {
+    method: "POST",
+    re: /^\/v1\/memory\/([^/]+)\/promote$/,
+    handler: handlePromoteMemory,
+  },
+  {
     method: "DELETE",
     re: /^\/v1\/memory\/facts\/([^/]+)$/,
     handler: handleDeleteFact,
@@ -96,6 +107,16 @@ function handleMemoryFacts(_req: IncomingMessage, res: ServerResponse, url: URL,
     return;
   }
   const keyword = q.trim();
+  const scopeRaw = url.searchParams.get("scope");
+  let scope: string | undefined;
+  if (scopeRaw !== null) {
+    const trimmed = scopeRaw.trim();
+    if (trimmed !== "owner" && !/^session:[^:/]+$/.test(trimmed)) {
+      sendError(res, 400, "invalid_query", 'scope must be "owner" or "session:<session_id>"');
+      return;
+    }
+    scope = trimmed;
+  }
   // 语义修正（v0.1.1）：端点名为 facts，默认就只返回**已巩固的长期事实**。
   // 底层 FTS 是「候选 + 事实」统一索引（M1-T1 的超集实现），直接把候选混进 facts
   // 会让同一条记忆出现两次（stage=candidate 与 stage=fact），容易被误读成重复写入。
@@ -103,9 +124,9 @@ function handleMemoryFacts(_req: IncomingMessage, res: ServerResponse, url: URL,
   // 允许 include=candidates 或 include=candidates=1（后者会被 URL 解析成 "candidates=1"）
   const includeRaw = url.searchParams.get("include") ?? "";
   const includeCandidates = includeRaw.split(",").some((part) => part.trim().startsWith("candidates"));
-  const hits = ctx.memory.search(keyword);
+  const hits = ctx.memory.search(keyword, scope === undefined ? {} : { scope });
   const facts = includeCandidates ? hits : hits.filter((hit) => hit.stage === "fact");
-  sendJson(res, 200, { q: keyword, facts });
+  sendJson(res, 200, { q: keyword, ...(scope === undefined ? {} : { scope }), facts });
 }
 
 function handleListCandidates(_req: IncomingMessage, res: ServerResponse, url: URL, ctx: MemoryRouteContext): void {
@@ -228,6 +249,15 @@ async function handleMemoryImport(req: IncomingMessage, res: ServerResponse, _ur
       sendError(res, 400, "memory_invalid_input", err.message);
       return;
     }
+    handleMemoryControlError(res, err);
+  }
+}
+
+/** 提升为长期记忆（票 M7-A-T3）：candidate 或 fact 均可；非 session scope → 409 */
+function handlePromoteMemory(_req: IncomingMessage, res: ServerResponse, _url: URL, ctx: MemoryRouteContext, params: string[]): void {
+  try {
+    sendJson(res, 200, ctx.memory.promoteMemory(params[0]));
+  } catch (err) {
     handleMemoryControlError(res, err);
   }
 }

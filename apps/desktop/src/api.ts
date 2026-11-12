@@ -142,10 +142,47 @@ export interface SessionSummary {
   title?: string;
   occurred_at: string;
   sequence: number;
+  /** 会话类型（票 M7-A-T3）：normal 缺省；ephemeral = 临时会话 */
+  kind?: "normal" | "ephemeral";
   /** 归档时间（M7-A-T2；取消归档后缺省） */
   archived_at?: string;
   /** 软删时间（M7-A-T2；恢复后缺省；30 天后服务端折叠剔除） */
   deleted_at?: string;
+}
+
+/** GET /v1/memory/facts 命中条目（票 M7-A-T3 起带 scope） */
+export interface MemoryHit {
+  id: string;
+  stage: "candidate" | "fact";
+  type: string;
+  content: string;
+  sensitivity: string;
+  confidence?: number;
+  version: number;
+  sources: string[];
+  scope: string;
+  created_at: string;
+}
+
+export interface CloseSessionResult {
+  session_id: string;
+  closed_at: string;
+  restorable_until: string;
+  event_id?: string;
+}
+
+export interface RestoreSessionResult {
+  session_id: string;
+  restored_at: string;
+  event_id: string;
+}
+
+export interface PromoteMemoryResult {
+  id: string;
+  entry_kind: "candidate" | "fact";
+  from_scope: string;
+  to_scope: "owner";
+  event_id: string;
 }
 
 /** GET /v1/sessions?include= 的过滤值：缺省只回活动会话 */
@@ -414,6 +451,40 @@ export const api = {
       method: "POST",
       headers: JSON_HEADERS,
       body: JSON.stringify(title === undefined ? {} : { title }),
+    });
+  },
+
+  /** 临时会话（票 M7-A-T3）：kind=ephemeral；写入隔离 + 禁写入类能力 + 24h 生命周期 */
+  createEphemeralSession(base: string, title?: string): Promise<{ session_id: string; kind: "ephemeral" }> {
+    return request<{ session_id: string; kind: "ephemeral" }>(base, "/v1/sessions", {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify(title === undefined ? { kind: "ephemeral" } : { kind: "ephemeral", title }),
+    });
+  },
+
+  /** 临时会话关闭；返回 restorable_until（24h 窗口截止） */
+  closeSession(base: string, sessionId: string): Promise<CloseSessionResult> {
+    return request<CloseSessionResult>(base, `/v1/sessions/${sessionId}/close`, {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: "{}",
+    });
+  },
+
+  /** 记忆检索（票 M7-A-T3：scope=session:<id> 看到全局 + 该会话；缺省全局） */
+  searchMemory(base: string, q: string, scope?: string): Promise<MemoryHit[]> {
+    const params = new URLSearchParams({ q });
+    if (scope !== undefined) params.set("scope", scope);
+    return request<{ facts: MemoryHit[] }>(base, `/v1/memory/facts?${params.toString()}`).then((r) => r.facts);
+  },
+
+  /** 提升为长期记忆（scope session:* → owner；非 session scope 409） */
+  promoteMemory(base: string, entryId: string): Promise<PromoteMemoryResult> {
+    return request<PromoteMemoryResult>(base, `/v1/memory/${entryId}/promote`, {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: "{}",
     });
   },
 

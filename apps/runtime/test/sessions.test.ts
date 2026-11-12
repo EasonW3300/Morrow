@@ -132,7 +132,7 @@ test("POST /v1/sessions records session.created; GET /v1/sessions lists it", asy
     assert.equal(createdEvent.session_id, created.session_id);
     assert.equal(createdEvent.actor_id, "owner");
     assert.equal(createdEvent.replica_id, REPLICA);
-    assert.deepEqual(createdEvent.payload, { title: "demo session" });
+    assert.deepEqual(createdEvent.payload, { title: "demo session", kind: "normal" });
   } finally {
     await runtime.close();
     removeDir(dir);

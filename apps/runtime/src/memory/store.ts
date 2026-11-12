@@ -51,6 +51,10 @@ export interface MemoryCandidateRow {
   occurred_at: string;
   version: number;
   status: string;
+  /** 记忆作用域（票 M7-A-T3）：owner（缺省，长期记忆池）/ session:<id>（临时会话） */
+  scope: string;
+  /** 逻辑清理时间（临时会话 24h 到期；非空 = 退出检索与巩固面，行保留） */
+  expired_at: string | null;
   created_at: string;
 }
 
@@ -62,6 +66,11 @@ export interface CreateCandidateInput {
   sensitivity?: SensitivityLevel;
   /** 发生时间（来源事件时间）；缺省写入时刻 */
   occurredAt?: string;
+  /**
+   * 记忆作用域（票 M7-A-T3）：缺省 owner（长期记忆池）；
+   * 临时会话写入 session:<session_id>（只读全局 + 本会话，默认不外溢）。
+   */
+  scope?: string;
   source: {
     /** 证据形态，M1-T1 恒为 "message"（任务事件等来源是后续票的扩展点） */
     kind: string;
@@ -101,6 +110,10 @@ export interface MemoryFactRow {
   created_at: string;
   updated_at: string;
   deleted_at: string | null;
+  /** 记忆作用域（票 M7-A-T3）：owner / session:<id>；提升后变 owner */
+  scope: string;
+  /** 逻辑清理时间（临时会话 24h 到期）；非空 = 退出检索与投影面，行保留 */
+  expired_at: string | null;
 }
 
 /** 事实版本历史条目（GLOSSARY: MemoryRevision；FR-MEM-5 自动更新留历史） */
@@ -162,6 +175,8 @@ export interface MemorySearchHit {
   version: number;
   /** 来源回链：账本 event_id 列表（PRD §6.4 `sources`） */
   sources: string[];
+  /** 条目作用域（票 M7-A-T3）：owner / session:<id>——UI 据此标「临时」/禁用提升 */
+  scope: string;
   created_at: string;
 }
 
@@ -181,6 +196,8 @@ CREATE TABLE IF NOT EXISTS memory_candidates (
   occurred_at  TEXT NOT NULL,
   version      INTEGER NOT NULL DEFAULT 1 CHECK (version >= 1),
   status       TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'consolidated', 'dismissed', 'conflicted')),
+  scope        TEXT NOT NULL DEFAULT 'owner',
+  expired_at   TEXT,
   created_at   TEXT NOT NULL
 );
 `;
@@ -207,7 +224,9 @@ CREATE TABLE IF NOT EXISTS memory_facts (
   valid_until TEXT,
   created_at  TEXT NOT NULL,
   updated_at  TEXT NOT NULL,
-  deleted_at  TEXT
+  deleted_at  TEXT,
+  scope       TEXT NOT NULL DEFAULT 'owner',
+  expired_at  TEXT
 );
 
 CREATE TABLE IF NOT EXISTS memory_fact_sources (
@@ -296,6 +315,28 @@ function migrateFactDeletedAt(db: SqliteDatabase): void {
   db.exec("ALTER TABLE memory_facts ADD COLUMN deleted_at TEXT");
 }
 
+/**
+ * 记忆作用域列迁移（票 M7-A-T3 / Issue #60）：memory_candidates / memory_facts 增
+ * scope（缺省 owner）。候选表若在 T1 旧库重建路径已按新 DDL 建出，这里跳过；
+ * 事实表/已迁移候选表走 ALTER ADD COLUMN（SQLite 允许带缺省值的 NOT NULL，不触碰既有行）。
+ */
+function migrateScopeColumns(db: SqliteDatabase): void {
+  for (const table of ["memory_candidates", "memory_facts"]) {
+    const columns = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+    if (columns.some((c) => c.name === "scope")) continue;
+    db.exec(`ALTER TABLE ${table} ADD COLUMN scope TEXT NOT NULL DEFAULT 'owner'`);
+  }
+}
+
+/** 逻辑清理列（临时会话 24h 到期）：非空 = 退出检索/巩固/投影面，行与账本保留 */
+function migrateExpiredAtColumns(db: SqliteDatabase): void {
+  for (const table of ["memory_candidates", "memory_facts"]) {
+    const columns = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+    if (columns.some((c) => c.name === "expired_at")) continue;
+    db.exec(`ALTER TABLE ${table} ADD COLUMN expired_at TEXT`);
+  }
+}
+
 /** CJK 表意文字 + 假名 + 谚文（unicode61 之下需要拆字的区段） */
 const CJK_RE = /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af]/;
 
@@ -328,6 +369,16 @@ function clampLimit(limit: number | undefined): number {
   return Math.min(limit, 200);
 }
 
+/**
+ * 作用域可见性（票 M7-A-T3 / ADR-0010）：
+ *   owner 查询只看 owner（长期记忆池，默认不外溢）；
+ *   session:<id> 查询看 owner + 该会话（只读全局继续成立，不串其他会话）。
+ */
+function scopeVisible(entryScope: string, queryScope: string): boolean {
+  if (queryScope === "owner") return entryScope === "owner";
+  return entryScope === "owner" || entryScope === queryScope;
+}
+
 export class MemoryStore {
   readonly #db: SqliteDatabase;
   #closed = false;
@@ -349,12 +400,19 @@ export class MemoryStore {
   #updateFactStmt;
   #insertRevisionStmt;
   #listFactsStmt;
+  #listFactsByScopeStmt;
   #listAllFactsStmt;
   #revisionByVersionStmt;
   #listRevisionsStmt;
   #listAllRevisionsStmt;
   #deleteFactStmt;
   #deleteFtsEntryStmt;
+  #promoteCandidateStmt;
+  #promoteFactStmt;
+  #candidateIdsByScopeStmt;
+  #factIdsByScopeStmt;
+  #expireCandidateStmt;
+  #expireFactStmt;
   #insertConflictStmt;
   #getConflictStmt;
   #listConflictsAllStmt;
@@ -368,14 +426,16 @@ export class MemoryStore {
     // 事实表补 deleted_at 列（票 M1-T3 软删，幂等）
     migrateCandidateStatuses(db);
     migrateFactDeletedAt(db);
+    migrateScopeColumns(db);
+    migrateExpiredAtColumns(db);
     db.exec(CONFLICTS_CREATE_SQL);
     this.#insertSourceStmt = db.prepare(
       "INSERT INTO memory_sources (source_id, kind, event_id, session_id, created_at) VALUES (?, ?, ?, ?, ?)",
     );
     this.#insertCandidateStmt = db.prepare(
       `INSERT INTO memory_candidates
-         (candidate_id, content, kind, sensitivity, confidence, source_id, observed_at, occurred_at, version, status, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 'pending', ?)`,
+         (candidate_id, content, kind, sensitivity, confidence, source_id, observed_at, occurred_at, version, status, scope, expired_at, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 'pending', ?, NULL, ?)`,
     );
     this.#insertFtsStmt = db.prepare(
       "INSERT INTO memory_fts (content, entry_id, entry_kind) VALUES (?, ?, ?)",
@@ -384,7 +444,7 @@ export class MemoryStore {
       "SELECT entry_id, entry_kind FROM memory_fts WHERE memory_fts MATCH ? ORDER BY rank LIMIT 50",
     );
     this.#candidateByIdStmt = db.prepare(
-      `SELECT c.candidate_id, c.content, c.kind, c.sensitivity, c.confidence, c.source_id, c.observed_at, c.occurred_at, c.version, c.status, c.created_at, s.event_id AS source_event_id
+      `SELECT c.candidate_id, c.content, c.kind, c.sensitivity, c.confidence, c.source_id, c.observed_at, c.occurred_at, c.version, c.status, c.scope, c.expired_at, c.created_at, s.event_id AS source_event_id
        FROM memory_candidates c JOIN memory_sources s ON s.source_id = c.source_id
        WHERE c.candidate_id = ?`,
     );
@@ -392,7 +452,7 @@ export class MemoryStore {
       "SELECT source_id, kind, event_id, session_id, created_at FROM memory_sources WHERE source_id = ?",
     );
     this.#factByIdStmt = db.prepare(
-      `SELECT fact_id, content, kind, sensitivity, version, valid_from, valid_until, created_at, updated_at, deleted_at
+      `SELECT fact_id, content, kind, sensitivity, version, valid_from, valid_until, created_at, updated_at, deleted_at, scope, expired_at
        FROM memory_facts WHERE fact_id = ?`,
     );
     this.#factSourcesStmt = db.prepare(
@@ -408,19 +468,20 @@ export class MemoryStore {
     this.#listCandidatesAllStmt = db.prepare(
       `SELECT c.*, s.event_id AS source_event_id
        FROM memory_candidates c JOIN memory_sources s ON s.source_id = c.source_id
+       WHERE c.expired_at IS NULL
        ORDER BY c.created_at, c.candidate_id LIMIT ? OFFSET ?`,
     );
     this.#listCandidatesByStatusStmt = db.prepare(
       `SELECT c.*, s.event_id AS source_event_id
        FROM memory_candidates c JOIN memory_sources s ON s.source_id = c.source_id
-       WHERE c.status = ? ORDER BY c.created_at, c.candidate_id LIMIT ? OFFSET ?`,
+       WHERE c.status = ? AND c.expired_at IS NULL ORDER BY c.created_at, c.candidate_id LIMIT ? OFFSET ?`,
     );
     this.#setCandidateStatusStmt = db.prepare(
       "UPDATE memory_candidates SET status = ? WHERE candidate_id = ?",
     );
     this.#insertFactStmt = db.prepare(
-      `INSERT INTO memory_facts (fact_id, content, kind, sensitivity, version, valid_from, valid_until, created_at, updated_at)
-       VALUES (?, ?, ?, ?, 1, ?, NULL, ?, ?)`,
+      `INSERT INTO memory_facts (fact_id, content, kind, sensitivity, version, valid_from, valid_until, created_at, updated_at, scope, expired_at)
+       VALUES (?, ?, ?, ?, 1, ?, NULL, ?, ?, ?, ?)`,
     );
     this.#insertFactSourceStmt = db.prepare(
       "INSERT OR IGNORE INTO memory_fact_sources (fact_id, source_id) VALUES (?, ?)",
@@ -433,11 +494,16 @@ export class MemoryStore {
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
     );
     this.#listFactsStmt = db.prepare(
-      `SELECT fact_id, content, kind, sensitivity, version, valid_from, valid_until, created_at, updated_at, deleted_at
-       FROM memory_facts WHERE valid_until IS NULL AND deleted_at IS NULL ORDER BY created_at, fact_id`,
+      `SELECT fact_id, content, kind, sensitivity, version, valid_from, valid_until, created_at, updated_at, deleted_at, scope, expired_at
+       FROM memory_facts WHERE valid_until IS NULL AND deleted_at IS NULL AND expired_at IS NULL ORDER BY created_at, fact_id`,
+    );
+    this.#listFactsByScopeStmt = db.prepare(
+      `SELECT fact_id, content, kind, sensitivity, version, valid_from, valid_until, created_at, updated_at, deleted_at, scope, expired_at
+       FROM memory_facts WHERE valid_until IS NULL AND deleted_at IS NULL AND expired_at IS NULL AND scope = ?
+       ORDER BY created_at, fact_id`,
     );
     this.#listAllFactsStmt = db.prepare(
-      `SELECT fact_id, content, kind, sensitivity, version, valid_from, valid_until, created_at, updated_at, deleted_at
+      `SELECT fact_id, content, kind, sensitivity, version, valid_from, valid_until, created_at, updated_at, deleted_at, scope, expired_at
        FROM memory_facts ORDER BY created_at, fact_id`,
     );
     this.#revisionByVersionStmt = db.prepare(
@@ -457,6 +523,25 @@ export class MemoryStore {
     );
     this.#deleteFtsEntryStmt = db.prepare(
       "DELETE FROM memory_fts WHERE entry_id = ? AND entry_kind = ?",
+    );
+    // --- M7-A-T3：提升与临时会话逻辑清理 -------------------------------------
+    this.#promoteCandidateStmt = db.prepare(
+      "UPDATE memory_candidates SET scope = 'owner' WHERE candidate_id = ?",
+    );
+    this.#promoteFactStmt = db.prepare(
+      "UPDATE memory_facts SET scope = 'owner' WHERE fact_id = ?",
+    );
+    this.#candidateIdsByScopeStmt = db.prepare(
+      "SELECT candidate_id FROM memory_candidates WHERE scope = ? AND expired_at IS NULL",
+    );
+    this.#factIdsByScopeStmt = db.prepare(
+      "SELECT fact_id FROM memory_facts WHERE scope = ? AND expired_at IS NULL",
+    );
+    this.#expireCandidateStmt = db.prepare(
+      "UPDATE memory_candidates SET expired_at = ? WHERE candidate_id = ? AND expired_at IS NULL",
+    );
+    this.#expireFactStmt = db.prepare(
+      "UPDATE memory_facts SET expired_at = ? WHERE fact_id = ? AND expired_at IS NULL",
     );
     this.#insertConflictStmt = db.prepare(
       `INSERT INTO memory_conflicts
@@ -517,6 +602,7 @@ export class MemoryStore {
     };
     const occurredAt = input.occurredAt ?? now;
     const sensitivity = input.sensitivity ?? "private";
+    const scope = input.scope ?? "owner";
     const candidate: MemoryCandidateRow = {
       candidate_id: uuidv7(),
       content: input.content,
@@ -528,6 +614,8 @@ export class MemoryStore {
       occurred_at: occurredAt,
       version: 1,
       status: "pending",
+      scope,
+      expired_at: null,
       created_at: now,
     };
 
@@ -549,6 +637,7 @@ export class MemoryStore {
         candidate.source_id,
         candidate.observed_at,
         candidate.occurred_at,
+        candidate.scope,
         candidate.created_at,
       );
       // 候选与事实统一进 FTS（entry_kind 区分）；T2 巩固写入 facts 时复用同一索引
@@ -615,10 +704,17 @@ export class MemoryStore {
   }
 
   /** 现存有效事实（巩固器匹配视图 + 投影面）；created_at 升序（并列匹配的确定性 tie-break）。
-   *  已删（deleted_at 非空）与已过期（valid_until 非空）事实都不在视图内——重投影不复活已删记忆。 */
-  listFacts(): MemoryFactRow[] {
+   *  已删（deleted_at 非空）、已过期（valid_until 非空）与逻辑过期（expired_at 非空）事实
+   *  都不在视图内——重投影不复活已删/已过期记忆。
+   *  filter.scope（票 M7-A-T3）：精确作用域过滤（巩固匹配必须同作用域，避免临时写入
+   *  改写长期事实）；缺省 = 全部作用域。 */
+  listFacts(filter: { scope?: string } = {}): MemoryFactRow[] {
     this.#assertOpen();
-    return this.#listFactsStmt.all() as unknown as MemoryFactRow[];
+    return (
+      filter.scope === undefined
+        ? this.#listFactsStmt.all()
+        : this.#listFactsByScopeStmt.all(filter.scope)
+    ) as unknown as MemoryFactRow[];
   }
 
   /** 全部事实行（含已删/已过期）：投影重建快照与一致性校验用 */
@@ -673,11 +769,14 @@ export class MemoryStore {
     return rows.map((row) => row.event_id);
   }
 
-  /** 巩固新建事实：事实 v1 + 来源多对多 + FTS + 候选转 consolidated（单事务） */
+  /** 巩固新建事实：事实 v1 + 来源多对多 + FTS + 候选转 consolidated（单事务）。
+   *  作用域与逻辑过期状态继承自候选（票 M7-A-T3）——临时会话候选巩固出的事实仍在
+   *  session:<id> 作用域；已过期候选不会因巩固复活到检索面。 */
   createFact(input: { content: string; kind: MemoryEntryKind; sensitivity: SensitivityLevel; candidateId: string; sourceId: string }): MemoryFactRow {
     this.#assertOpen();
     const now = new Date().toISOString();
     return this.#tx(() => {
+      const candidate = this.#getCandidateInTx(input.candidateId);
       const fact: MemoryFactRow = {
         fact_id: uuidv7(),
         content: input.content,
@@ -689,6 +788,8 @@ export class MemoryStore {
         created_at: now,
         updated_at: now,
         deleted_at: null,
+        scope: candidate?.scope ?? "owner",
+        expired_at: candidate?.expired_at ?? null,
       };
       this.#insertFactStmt.run(
         fact.fact_id,
@@ -698,9 +799,13 @@ export class MemoryStore {
         fact.valid_from,
         fact.created_at,
         fact.updated_at,
+        fact.scope,
+        fact.expired_at,
       );
       this.#insertFactSourceStmt.run(fact.fact_id, input.sourceId);
-      this.#insertFtsStmt.run(normalizeForFts(fact.content), fact.fact_id, "fact");
+      if (fact.expired_at === null) {
+        this.#insertFtsStmt.run(normalizeForFts(fact.content), fact.fact_id, "fact");
+      }
       this.#setCandidateStatusInTx(input.candidateId, "consolidated");
       return fact;
     });
@@ -819,8 +924,8 @@ export class MemoryStore {
       }
       const insertFact = this.#db.prepare(
         `INSERT INTO memory_facts
-           (fact_id, content, kind, sensitivity, version, valid_from, valid_until, created_at, updated_at, deleted_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           (fact_id, content, kind, sensitivity, version, valid_from, valid_until, created_at, updated_at, deleted_at, scope, expired_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       );
       for (const fact of snapshot.facts) {
         insertFact.run(
@@ -834,6 +939,8 @@ export class MemoryStore {
           fact.created_at,
           fact.updated_at,
           fact.deleted_at,
+          fact.scope,
+          fact.expired_at,
         );
       }
       const insertRevision = this.#db.prepare(
@@ -858,9 +965,9 @@ export class MemoryStore {
       for (const link of snapshot.factSources) {
         insertFactSource.run(link.fact_id, link.source_id);
       }
-      // 检索面与 listFacts 同口径：已删 / 已过期事实不索引
+      // 检索面与 listFacts 同口径：已删 / 已过期 / 逻辑过期事实不索引
       for (const fact of snapshot.facts) {
-        if (fact.deleted_at !== null || fact.valid_until !== null) continue;
+        if (fact.deleted_at !== null || fact.valid_until !== null || fact.expired_at !== null) continue;
         this.#insertFtsStmt.run(normalizeForFts(fact.content), fact.fact_id, "fact");
       }
     });
@@ -1001,9 +1108,11 @@ export class MemoryStore {
       revision.source_id,
       revision.created_at,
     );
-    // FTS 刷新：旧文本出、新文本进（检索面始终跟随版本链头部）
+    // FTS 刷新：旧文本出、新文本进（检索面始终跟随版本链头部）；逻辑过期事实不重进索引
     this.#deleteFtsEntryStmt.run(factId, "fact");
-    this.#insertFtsStmt.run(normalizeForFts(fact.content), factId, "fact");
+    if (fact.expired_at === null) {
+      this.#insertFtsStmt.run(normalizeForFts(fact.content), factId, "fact");
+    }
     // 本次更新的证据（候选来源）补进事实来源多对多
     this.#insertFactSourceStmt.run(factId, input.sourceId);
     return { fact, revision };
@@ -1017,6 +1126,12 @@ export class MemoryStore {
     const row = this.#factByIdStmt.get(factId) as unknown as MemoryFactRow | undefined;
     if (row === undefined) throw new Error(`fact ${factId} does not exist`);
     return row;
+  }
+
+  #getCandidateInTx(candidateId: string): (MemoryCandidateRow & { source_event_id: string }) | null {
+    return (this.#candidateByIdStmt.get(candidateId) as unknown as
+      | (MemoryCandidateRow & { source_event_id: string })
+      | undefined) ?? null;
   }
 
   #getConflictInTx(conflictId: string): MemoryConflictRow {
@@ -1043,29 +1158,92 @@ export class MemoryStore {
    *
    * options.sensitivity 在**检索层**过滤（M4-T6 / Issue #43）：可信联系人记忆引用
    * 只允许 sensitivity=public，private/locked 不进入结果集（不是返回后再由 UI 筛）。
+   *
+   * options.scope（票 M7-A-T3 / ADR-0010）：作用域在检索层过滤——
+   *   "owner"（缺省）只看长期记忆池（全局），临时会话写入不可见；
+   *   "session:<id>" = 全局（owner）+ 该会话，兑现「临时会话只读全局」。
+   * 逻辑过期（expired_at 非空）条目已在 #candidateHit/#factHit 出口剔除。
    */
-  search(q: string, options: { sensitivity?: SensitivityLevel } = {}): MemorySearchHit[] {
+  search(q: string, options: { sensitivity?: SensitivityLevel; scope?: string } = {}): MemorySearchHit[] {
     this.#assertOpen();
     const query = buildFtsQuery(q);
     const rows = this.#ftsScanStmt.all(query) as unknown as FtsRow[];
+    const queryScope = options.scope ?? "owner";
     const hits: MemorySearchHit[] = [];
     for (const row of rows) {
       if (row.entry_kind === "candidate") {
         const hit = this.#candidateHit(row.entry_id);
-        if (hit !== null && (options.sensitivity === undefined || hit.sensitivity === options.sensitivity)) hits.push(hit);
+        if (
+          hit !== null &&
+          scopeVisible(hit.scope, queryScope) &&
+          (options.sensitivity === undefined || hit.sensitivity === options.sensitivity)
+        ) {
+          hits.push(hit);
+        }
       } else if (row.entry_kind === "fact") {
         const hit = this.#factHit(row.entry_id);
-        if (hit !== null && (options.sensitivity === undefined || hit.sensitivity === options.sensitivity)) hits.push(hit);
+        if (
+          hit !== null &&
+          scopeVisible(hit.scope, queryScope) &&
+          (options.sensitivity === undefined || hit.sensitivity === options.sensitivity)
+        ) {
+          hits.push(hit);
+        }
       }
     }
     return hits;
+  }
+
+  /**
+   * 提升为长期记忆（票 M7-A-T3）：把候选或事实的 scope 改写为 owner（行内事务）。
+   * 只做行变更，作用域合法性（必须 session:*）由服务层判定；未知 id 返回 null。
+   */
+  promoteToOwner(entryId: string): { stage: "candidate" | "fact"; from_scope: string } | null {
+    this.#assertOpen();
+    return this.#tx(() => {
+      const candidate = this.#getCandidateInTx(entryId);
+      if (candidate !== null) {
+        this.#promoteCandidateStmt.run(entryId);
+        return { stage: "candidate" as const, from_scope: candidate.scope };
+      }
+      const fact = this.getFact(entryId);
+      if (fact !== null) {
+        this.#promoteFactStmt.run(entryId);
+        return { stage: "fact" as const, from_scope: fact.scope };
+      }
+      return null;
+    });
+  }
+
+  /**
+   * 临时会话 24h 到期的逻辑清理（票 M7-A-T3 / ADR-0010）：把该作用域的候选与事实
+   * 标记 expired_at 并从 FTS 移除（检索面立即退出）；行与来源/修订/账本事件全部保留
+   * （append-only 审计）。返回被清理的 id 清单（事实 id 供投影文件移除）。
+   */
+  expireScope(scope: string, expiredAt: string): { candidateIds: string[]; factIds: string[] } {
+    this.#assertOpen();
+    return this.#tx(() => {
+      const candidateIds = (this.#candidateIdsByScopeStmt.all(scope) as unknown as Array<{ candidate_id: string }>).map(
+        (row) => row.candidate_id,
+      );
+      const factIds = (this.#factIdsByScopeStmt.all(scope) as unknown as Array<{ fact_id: string }>).map((row) => row.fact_id);
+      for (const candidateId of candidateIds) {
+        this.#expireCandidateStmt.run(expiredAt, candidateId);
+        this.#deleteFtsEntryStmt.run(candidateId, "candidate");
+      }
+      for (const factId of factIds) {
+        this.#expireFactStmt.run(expiredAt, factId);
+        this.#deleteFtsEntryStmt.run(factId, "fact");
+      }
+      return { candidateIds, factIds };
+    });
   }
 
   #candidateHit(candidateId: string): MemorySearchHit | null {
     const row = this.#candidateByIdStmt.get(candidateId) as unknown as
       | (MemoryCandidateRow & { source_id: string })
       | undefined;
-    if (row === undefined) return null;
+    if (row === undefined || row.expired_at !== null) return null;
     const source = this.#sourceByIdStmt.get(row.source_id) as unknown as MemorySourceRow | undefined;
     return {
       id: row.candidate_id,
@@ -1076,22 +1254,14 @@ export class MemoryStore {
       confidence: row.confidence,
       version: row.version,
       sources: source === undefined ? [] : [source.event_id],
+      scope: row.scope,
       created_at: row.created_at,
     };
   }
 
   #factHit(factId: string): MemorySearchHit | null {
-    const row = this.#factByIdStmt.get(factId) as unknown as
-      | {
-          fact_id: string;
-          content: string;
-          kind: MemoryEntryKind;
-          sensitivity: SensitivityLevel;
-          version: number;
-          created_at: string;
-        }
-      | undefined;
-    if (row === undefined) return null;
+    const row = this.#factByIdStmt.get(factId) as unknown as MemoryFactRow | undefined;
+    if (row === undefined || row.expired_at !== null) return null;
     const sourceRows = this.#factSourcesStmt.all(factId) as unknown as Array<{ event_id: string }>;
     return {
       id: row.fact_id,
@@ -1101,6 +1271,7 @@ export class MemoryStore {
       sensitivity: row.sensitivity,
       version: row.version,
       sources: sourceRows.map((s) => s.event_id),
+      scope: row.scope,
       created_at: row.created_at,
     };
   }
