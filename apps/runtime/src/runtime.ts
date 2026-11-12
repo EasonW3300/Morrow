@@ -821,6 +821,12 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
       : await buildConfiguredChannels({
           secretStore,
           ...(options.channelBootstrap ?? {}),
+          // Owner 的平台身份（MORROW_OWNER_<CHANNEL>_IDS）：没有它，Owner 自己在渠道里
+          // 发的消息会被 unknown_sender 拒绝（防冒充的默认是对的，缺的是配置入口）。
+          // 显式 channelBootstrap.ownerNativeIds 优先于环境配置（测试/宿主可覆盖）。
+          ...(options.channelBootstrap?.ownerNativeIds === undefined && config.ownerNativeIds !== undefined
+            ? { ownerNativeIds: config.ownerNativeIds }
+            : {}),
         });
   const explicitChannelIds = new Set(explicitChannelAdapters.map((registration) => registration.adapter.channelId));
   const autoChannelAdapters = configuredChannelAdapters.filter(

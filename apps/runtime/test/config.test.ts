@@ -121,3 +121,27 @@ test("MORROW_MEMORY_EXTRACTOR: heuristic default, llm opt-in, unknown value reje
   assert.throws(() => loadConfig({ MORROW_DATA_DIR: dir, MORROW_MEMORY_EXTRACTOR: "gpt-5" }), /MORROW_MEMORY_EXTRACTOR/);
   removeDir(dir);
 });
+
+test("MORROW_OWNER_<CHANNEL>_IDS：解析为 ownerNativeIds（逗号分隔、去重、空串忽略）", () => {
+  // 回归（v0.1.0 真机联调）：ownerNativeIds 在装配层支持但**没有任何配置入口**，
+  // 导致 Owner 自己在 QQ 里发消息被 unknown_sender 拒绝。这里锁住环境变量解析。
+  const loaded = loadConfig({
+    MORROW_PORT: "0",
+    MORROW_DATA_DIR: "/tmp/morrow-owner-ids-test",
+    MORROW_REPLICA_ID: "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+    MORROW_OWNER_QQ_IDS: " FBE72705F609C036A8E7C3D59970721D , ,FBE72705F609C036A8E7C3D59970721D,ABC123 ",
+    MORROW_OWNER_FEISHU_IDS: "ou_abc",
+  });
+  assert.deepEqual(loaded.ownerNativeIds?.qq, ["FBE72705F609C036A8E7C3D59970721D", "ABC123"]);
+  assert.deepEqual(loaded.ownerNativeIds?.feishu, ["ou_abc"]);
+  assert.deepEqual(loaded.ownerNativeIds?.wechat, []);
+});
+
+test("ownerNativeIds：未配置时为空数组（不是 undefined 崩溃）", () => {
+  const loaded = loadConfig({
+    MORROW_PORT: "0",
+    MORROW_DATA_DIR: "/tmp/morrow-owner-ids-test2",
+    MORROW_REPLICA_ID: "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+  });
+  assert.deepEqual(loaded.ownerNativeIds, { feishu: [], qq: [], wechat: [] });
+});

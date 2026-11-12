@@ -38,6 +38,18 @@ export interface RuntimeConfig {
    * 地址退化为 127.0.0.1，仅本机可用）——跨网络部署必须显式配置 Tailscale/LAN 地址。
    */
   publicBaseUrl?: string | null;
+  /**
+   * Owner 在各渠道的平台原生身份 id（v0.1.1 修复）。
+   *
+   * 渠道入站靠 `channel_identities` 把「平台发送者」映射为 owner / contact:<id>；
+   * 没有映射的消息一律 `channel.inbound_rejected(unknown_sender)` 丢弃——这是防冒充的
+   * 正确默认，但此前**没有任何配置入口**能声明"这个平台 id 就是我"，导致 Owner 自己
+   * 在 QQ/飞书里发消息也被拒（v0.1.0 真机联调发现）。
+   *
+   * 环境变量：MORROW_OWNER_QQ_IDS / MORROW_OWNER_FEISHU_IDS / MORROW_OWNER_WECHAT_IDS
+   * （逗号分隔，可多个——同一平台多账号）。
+   */
+  ownerNativeIds?: { feishu?: string[]; qq?: string[]; wechat?: string[] };
 }
 
 /** OpenAI Chat Completions 兼容端点配置（GLOSSARY: Provider） */
@@ -74,6 +86,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     provider: parseProviderConfig(env),
     memoryExtractor: parseMemoryExtractor(env),
     publicBaseUrl: parsePublicBaseUrl(env),
+    ownerNativeIds: parseOwnerNativeIds(env),
   };
 }
 
@@ -109,6 +122,32 @@ function parseMemoryExtractor(env: Record<string, string | undefined>): "heurist
   if (raw === undefined || raw === "") return "heuristic";
   if (raw === "heuristic" || raw === "llm") return raw;
   throw new Error(`invalid MORROW_MEMORY_EXTRACTOR: "${raw}" ("heuristic" or "llm" expected)`);
+}
+
+/**
+ * Owner 平台原生身份（MORROW_OWNER_<CHANNEL>_IDS，逗号分隔）：缺省空。
+ *
+ * 只接受非空、去重后的 id；空字符串视为未配置。不做格式校验——各平台 id 形态不同
+ * （QQ 是 32 位十六进制 member_openid，飞书是 ou_xxx，微信待定），硬编码格式只会
+ * 在未来平台改版时误伤。配错的表现是 inbound_rejected(unknown_sender) 留痕可查。
+ */
+function parseOwnerNativeIds(
+  env: Record<string, string | undefined>,
+): { feishu: string[]; qq: string[]; wechat: string[] } {
+  const read = (name: string): string[] => {
+    const raw = env[name];
+    if (raw === undefined) return [];
+    const ids = raw
+      .split(",")
+      .map((part) => part.trim())
+      .filter((part) => part.length > 0);
+    return [...new Set(ids)];
+  };
+  return {
+    feishu: read("MORROW_OWNER_FEISHU_IDS"),
+    qq: read("MORROW_OWNER_QQ_IDS"),
+    wechat: read("MORROW_OWNER_WECHAT_IDS"),
+  };
 }
 
 /** 设备密钥后端（MORROW_SECRET_BACKEND）：auto = 平台凭据库；memory = 仅进程内存。 */
