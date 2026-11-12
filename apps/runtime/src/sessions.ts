@@ -1,5 +1,7 @@
 import type { AgentRuntime, MorrowAgentEvent, MorrowTool } from "@morrow/pi-adapter";
 import type { ActorId, EventEnvelope, SessionAttachment, SessionWorkspace } from "@morrow/protocol";
+import { realpathSync } from "node:fs";
+import { resolve } from "node:path";
 import { buildEventEnvelope } from "./envelope.ts";
 import type { EventLedger, LedgerEntry } from "./ledger.ts";
 import type { ProviderResolver, ResolvedProvider } from "./providers.ts";
@@ -58,6 +60,11 @@ export const SESSION_EVENT_TYPES = {
    */
   sessionEphemeralClosed: "session.ephemeral_closed",
   sessionEphemeralRestored: "session.ephemeral_restored",
+  /**
+   * 普通会话关闭（票 M7-A-T5 / Issue #63）：与 ephemeral 的关闭**分名**，
+   * payload 记录未提交改动的处理结果（commit / keep / discard / null）。
+   */
+  sessionClosed: "session.closed",
   // M7-A 工作区与附件（票 T4 / Issue #61）：绑定/附件都走账本事件，摘要折叠消费
   sessionWorkspaceBound: "session.workspace_bound",
   sessionAttachmentAdded: "session.attachment_added",
@@ -85,6 +92,27 @@ export class SessionLifecycleError extends Error {
 
 /** 软删保留期（30 天）：deleted_at + 保留期后折叠剔除，账本事件保留 */
 export const SESSION_DELETE_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+
+/** 未提交改动的处理选择（会话关闭三选一；缺省 = 未给选择） */
+export type UncommittedChoice = "commit" | "keep" | "discard";
+
+/** 普通会话关闭时写入 session.closed 的结果（payload 与 HTTP 响应同源） */
+export interface NormalCloseOutcome {
+  /** null = 无未提交改动，不需要选择 */
+  uncommitted: UncommittedChoice | null;
+  /** 关闭时的未提交文件（无改动的空数组） */
+  files: string[];
+  /** commit 分支的结果 */
+  commit?: string;
+  /** discard 分支清理的文件数 */
+  discarded?: number;
+}
+
+/** 同分支持有者（409 branch_in_use 的 payload：session_id + 标题） */
+export interface BranchHolder {
+  sessionId: string;
+  title?: string;
+}
 
 /** 列表过滤：缺省只回活动会话；archived/deleted 在活动会话之外追加对应状态 */
 export type SessionListInclude = "archived" | "deleted" | "all";
@@ -292,6 +320,12 @@ export class SessionManager {
   readonly #now: () => Date;
   readonly #workspace: WorkspaceManager | null;
   readonly #states = new Map<string, SessionState>();
+  /**
+   * 同分支持有者注册表（票 M7-A-T5）：key = `<repo 规范化路径>\0<branch>`。
+   * 写入路径（bind/close/delete/rename）就地失效；`branchHolder()` 同时用账本重建
+   * 核对，两处不一致时以账本为准并纠正缓存——重启后仅靠账本也能拒绝。
+   */
+  #branchRegistry: Map<string, BranchHolder> | null = null;
   #disposed = false;
 
   constructor(options: SessionManagerOptions) {
@@ -379,6 +413,7 @@ export class SessionManager {
   renameSession(sessionId: string, title: string): SessionMetadataMutation | null {
     if (this.#foldSession(sessionId) === null) return null;
     const entry = this.#appendMetadata(sessionId, SESSION_EVENT_TYPES.sessionRenamed, { title });
+    this.#branchRegistry = null;
     return {
       sessionId,
       eventId: entry.envelope.event_id,
@@ -439,6 +474,7 @@ export class SessionManager {
       };
     }
     const entry = this.#appendMetadata(sessionId, SESSION_EVENT_TYPES.sessionDeleted, {});
+    this.#branchRegistry = null;
     return {
       sessionId,
       eventId: entry.envelope.event_id,
@@ -458,6 +494,7 @@ export class SessionManager {
     if (folded.summary.deleted_at === undefined) return { status: "not_deleted" };
     if (this.#isDeleteExpired(folded.summary.deleted_at)) return { status: "expired" };
     const entry = this.#appendMetadata(sessionId, SESSION_EVENT_TYPES.sessionRestored, {});
+    this.#branchRegistry = null;
     return {
       status: "restored",
       eventId: entry.envelope.event_id,
@@ -476,6 +513,101 @@ export class SessionManager {
    */
   workspaceOf(sessionId: string): SessionWorkspace | null {
     return this.#foldSession(sessionId)?.summary.workspace ?? null;
+  }
+
+  /**
+   * 同仓库同分支的持有者（票 M7-A-T5）：活动、未关闭、未软删的会话中，workspace 的
+   * `repo_path + branch` 与本请求相同的那个。`excludeSessionId` 用于重绑自身。
+   *
+   * 判定口径两处一致：内存注册表（写路径失效的就地缓存）与账本重建（`#foldSessions`
+   * + 生命周期折叠）。两者不一致时以账本为准并纠正缓存——新进程（重启）没有内存态，
+   * 仅靠账本也能拒绝第二个会话。
+   */
+  branchHolder(repoPath: string, branch: string, excludeSessionId?: string): BranchHolder | null {
+    const key = branchKey(repoPath, branch);
+    const fromLedger = this.#rebuildBranchRegistry();
+    if (this.#branchRegistry === null) {
+      this.#branchRegistry = fromLedger;
+    } else if (!sameBranchHolders(this.#branchRegistry, fromLedger)) {
+      // 缓存陈旧（漏失效）时以账本为准
+      this.#branchRegistry = fromLedger;
+    }
+    const holder = fromLedger.get(key) ?? null;
+    if (holder === null) return null;
+    if (holder.sessionId === excludeSessionId) return null;
+    return holder;
+  }
+
+  /** 会话标题（缺省 undefined）：提交信息与 409 持有者提示共用。 */
+  sessionTitle(sessionId: string): string | undefined {
+    return this.#foldSession(sessionId)?.summary.title;
+  }
+
+  /** 已关闭会话的 closed_at（未关闭/未知会话 null）。 */
+  closedAtOf(sessionId: string): string | null {
+    return this.#lifecycleOf(sessionId).closedAt;
+  }
+
+  /**
+   * 关闭普通会话（票 M7-A-T5）：写 `session.closed`（与 ephemeral 的
+   * `session.ephemeral_closed` 分名，互不覆盖）。幂等：已关闭时返回既有 closed_at，
+   * 不重复记账。
+   */
+  closeNormalSession(
+    sessionId: string,
+    outcome: NormalCloseOutcome,
+  ): { closedAt: string; eventId: string | null } {
+    const lifecycle = this.#lifecycleOf(sessionId);
+    if (lifecycle.kind === null) {
+      throw new SessionLifecycleError("not_found", `session ${sessionId} does not exist`);
+    }
+    if (lifecycle.kind === "ephemeral") {
+      throw new SessionLifecycleError(
+        "not_ephemeral",
+        `session ${sessionId} is ephemeral; use the ephemeral close semantics`,
+      );
+    }
+    if (lifecycle.closedAt !== null) {
+      return { closedAt: lifecycle.closedAt, eventId: null };
+    }
+    const closedAt = this.#now().toISOString();
+    const entry = this.#append(
+      sessionId,
+      SESSION_EVENT_TYPES.sessionClosed,
+      "owner",
+      {
+        kind: "normal",
+        closed_at: closedAt,
+        uncommitted: outcome.uncommitted,
+        files: outcome.files,
+        ...(outcome.commit === undefined ? {} : { commit: outcome.commit }),
+        ...(outcome.discarded === undefined ? {} : { discarded: outcome.discarded }),
+      },
+      null,
+    );
+    // 关闭即释放分支：之后的会话可以重新占用同一分支
+    this.#branchRegistry = null;
+    return { closedAt, eventId: entry.envelope.event_id };
+  }
+
+  /** 账本重建的持有者表（供 branchHolder 校验；重启后的唯一依据）。 */
+  #rebuildBranchRegistry(): Map<string, BranchHolder> {
+    const map = new Map<string, BranchHolder>();
+    for (const folded of this.#foldSessions()) {
+      if (folded.expired) continue;
+      const summary = folded.summary;
+      if (summary.deleted_at !== undefined) continue;
+      const workspace = summary.workspace;
+      if (workspace === undefined || workspace.repo_path === undefined || workspace.branch === undefined) {
+        continue;
+      }
+      if (this.#lifecycleOf(summary.session_id).closedAt !== null) continue; // 已关闭不持有
+      map.set(branchKey(workspace.repo_path, workspace.branch), {
+        sessionId: summary.session_id,
+        ...(summary.title === undefined ? {} : { title: summary.title }),
+      });
+    }
+    return map;
   }
 
   /** 会话附件（只读元数据；路径由账本事件折叠，内容在注入时按路径重读）。 */
@@ -504,6 +636,7 @@ export class SessionManager {
       return { sessionId, eventId: null, sequence: null, changed: false, workspace: current };
     }
     const entry = this.#appendMetadata(sessionId, SESSION_EVENT_TYPES.sessionWorkspaceBound, { workspace });
+    this.#branchRegistry = null;
     return {
       sessionId,
       eventId: entry.envelope.event_id,
@@ -615,6 +748,7 @@ export class SessionManager {
       kind: "ephemeral",
       closed_at: closedAt,
     }, null);
+    this.#branchRegistry = null;
     return {
       closedAt,
       restorableUntil: new Date(Date.parse(closedAt) + EPHEMERAL_SESSION_TTL_MS).toISOString(),
@@ -651,6 +785,7 @@ export class SessionManager {
     const entry = this.#append(sessionId, SESSION_EVENT_TYPES.sessionEphemeralRestored, "owner", {
       restored_at: restoredAt,
     }, null);
+    this.#branchRegistry = null;
     return { restoredAt, eventId: entry.envelope.event_id };
   }
 
@@ -662,6 +797,10 @@ export class SessionManager {
       if (envelope.event_type === SESSION_EVENT_TYPES.sessionCreated) {
         kind = envelope.payload.kind === "ephemeral" ? "ephemeral" : "normal";
       } else if (envelope.event_type === SESSION_EVENT_TYPES.sessionEphemeralClosed) {
+        closedAt =
+          typeof envelope.payload.closed_at === "string" ? envelope.payload.closed_at : envelope.occurred_at;
+      } else if (envelope.event_type === SESSION_EVENT_TYPES.sessionClosed) {
+        // 普通会话关闭（票 M7-A-T5）：关闭态同样阻止继续发消息，并释放分支持有
         closedAt =
           typeof envelope.payload.closed_at === "string" ? envelope.payload.closed_at : envelope.occurred_at;
       } else if (envelope.event_type === SESSION_EVENT_TYPES.sessionEphemeralRestored) {
@@ -1193,4 +1332,29 @@ function readStringArray(value: unknown): string[] {
 
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/** 仓库路径规范化（同仓库判定口径）：尽量 realpath（macOS /var → /private/var），失败回退 resolve。 */
+function normalizeRepoPath(repoPath: string): string {
+  const resolved = resolve(repoPath);
+  try {
+    return realpathSync(resolved);
+  } catch {
+    return resolved;
+  }
+}
+
+/** 分支持有唯一键：仓库规范化路径 + 分支名。 */
+function branchKey(repoPath: string, branch: string): string {
+  return `${normalizeRepoPath(repoPath)}\u0000${branch}`;
+}
+
+/** 两份持有者表是否一致（用于「内存注册表 vs 账本重建」的一致性核对）。 */
+function sameBranchHolders(a: Map<string, BranchHolder>, b: Map<string, BranchHolder>): boolean {
+  if (a.size !== b.size) return false;
+  for (const [key, holder] of a) {
+    const other = b.get(key);
+    if (other === undefined || other.sessionId !== holder.sessionId || other.title !== holder.title) return false;
+  }
+  return true;
 }

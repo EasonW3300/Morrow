@@ -141,6 +141,17 @@ export default function App() {
     [base, refreshSessions],
   );
 
+  /** 关闭会话（M7-A-T5）：409 uncommitted_changes 由 SessionList 弹三选一后重发。 */
+  const closeSession = useCallback(
+    async (sessionId: string, uncommitted?: "commit" | "keep" | "discard") => {
+      if (!base) return;
+      await api.closeSession(base, sessionId, uncommitted);
+      setSelectedId((current) => (current === sessionId ? null : current));
+      await refreshSessions();
+    },
+    [base, refreshSessions],
+  );
+
   const deleteSession = useCallback(
     async (sessionId: string) => {
       if (!base) return;
@@ -230,6 +241,7 @@ export default function App() {
               onSelect={setSelectedId}
               onRename={renameSession}
               onArchive={archiveSession}
+              onClose={closeSession}
               onDelete={deleteSession}
             />
             {listError !== null && <div className="list-error">{listError}</div>}

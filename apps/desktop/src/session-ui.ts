@@ -16,7 +16,7 @@ export function sessionState(
   return "active";
 }
 
-export type SessionActionId = "rename" | "archive" | "unarchive" | "delete" | "restore";
+export type SessionActionId = "rename" | "archive" | "unarchive" | "close" | "delete" | "restore";
 
 export interface SessionAction {
   id: SessionActionId;
@@ -33,6 +33,7 @@ export function sessionActions(
       return [
         { id: "rename", label: "重命名" },
         { id: "archive", label: "归档" },
+        { id: "close", label: "关闭会话" },
         { id: "delete", label: "删除", danger: true },
       ];
     case "archived":
@@ -105,4 +106,65 @@ export function describeRestoreWindow(deletedAt: string, now: number = Date.now(
   if (remaining <= 0) return "已过 30 天恢复期";
   const days = Math.ceil(remaining / DAY_MS);
   return `还剩 ${days} 天可恢复`;
+}
+
+// --- 会话关闭三选一（票 M7-A-T5 / Issue #63）--------------------------------
+
+export type UncommittedChoice = "commit" | "keep" | "discard";
+
+export interface UncommittedOption {
+  id: UncommittedChoice;
+  label: string;
+  description: string;
+  /** discard 是破坏性操作（UI 用 danger 样式 + 二次确认） */
+  danger?: boolean;
+}
+
+/** 三选一对话框的选项顺序与文案（提交 / 保留 / 丢弃）。 */
+export function uncommittedOptions(): UncommittedOption[] {
+  return [
+    { id: "commit", label: "提交到本分支", description: "把改动提交到会话分支后再关闭" },
+    { id: "keep", label: "保留工作区", description: "关闭会话，但保留所有未提交改动" },
+    {
+      id: "discard",
+      label: "丢弃改动",
+      description: "执行 checkout + clean，不可撤销",
+      danger: true,
+    },
+  ];
+}
+
+/** 409 的 code 是否为「有未提交改动」。 */
+export function isUncommittedConflict(code: string | undefined): boolean {
+  return code === "uncommitted_changes";
+}
+
+/** 从错误信封 details 提取改动文件列表（缺失/非法 → 空数组）。 */
+export function uncommittedFiles(details: Record<string, unknown> | undefined): string[] {
+  const files = details?.files;
+  if (!Array.isArray(files)) return [];
+  return files.filter((item): item is string => typeof item === "string" && item.length > 0);
+}
+
+export function closeUncommittedTitle(): string {
+  return "会话有未提交改动";
+}
+
+/** 三选一对话框的说明文案：绝不静默丢弃。 */
+export function closeUncommittedMessage(files: string[]): string {
+  return `关闭前请选择如何处理这 ${files.length} 个改动文件；未提供选择时不会关闭。`;
+}
+
+/** discard 二次确认文案：必须红字警示「将丢弃这些改动」。 */
+export function discardConfirmTitle(): string {
+  return "丢弃这些改动？";
+}
+
+export function discardWarning(files: string[]): string {
+  const shown = files.slice(0, 8);
+  const rest = files.length - shown.length;
+  const list = shown.map((file) => `• ${file}`).join("\n");
+  return `将丢弃这些改动（${files.length} 个文件），此操作不可撤销：\n${list}${
+    rest > 0 ? `\n… 还有 ${rest} 个文件` : ""
+  }`;
 }

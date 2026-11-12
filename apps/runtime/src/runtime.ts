@@ -49,8 +49,10 @@ import {
   SessionManager,
   type AgentAdapterFactory,
   type AgentRuntimeExtras,
+  type NormalCloseOutcome,
   type SessionFrame,
   type SessionKind,
+  type UncommittedChoice,
 } from "./sessions.ts";
 import { DefaultWorkspaceManager, WorkspaceError, defaultBranchForSession, type WorkspaceManager } from "./workspace.ts";
 import { ChannelRegistry, type ChannelAdapterRegistration } from "./channels/registry.ts";
@@ -1708,22 +1710,144 @@ function handleRestoreSession(
 }
 
 /**
- * 临时会话关闭（票 M7-A-T3）：本票只做 ephemeral 分支——
- *   body 缺省 / 空对象；普通会话 → 409 not_ephemeral（未提交改动三选一属 T5）。
- * 关闭后 24h 内可 restore；到期由 MemoryService 的作用域清理落定（账本保留）。
+ * 会话关闭（票 M7-A-T3 + 票 M7-A-T5 / Issue #63，ADR-0012）：
+ *   - 临时会话（kind=ephemeral）保持 T3 语义：写 session.ephemeral_closed，24h 可恢复；
+ *     本端点不接受三选一（body 里的 uncommitted 被忽略）。
+ *   - 普通会话：有未提交改动且未给 `uncommitted` → 409 uncommitted_changes + 文件列表；
+ *     commit → 提交到会话分支；keep → 工作区不动；discard → 仅清理本会话 worktree。
+ *     关闭写 session.closed（payload 含选择结果 / commit id / 清理文件数）。
  */
-function handleCloseSession(_req: IncomingMessage, res: ServerResponse, _url: URL, ctx: RequestContext, params: string[]): void {
-  try {
-    const result = ctx.sessions.closeEphemeralSession(params[0]);
+async function handleCloseSession(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _url: URL,
+  ctx: RequestContext,
+  params: string[],
+): Promise<void> {
+  const sessionId = params[0];
+  const kind = ctx.sessions.sessionKind(sessionId);
+  if (kind === null) {
+    sendError(res, 404, "not_found", `session ${sessionId} does not exist`);
+    return;
+  }
+  if (kind === "ephemeral") {
+    try {
+      const result = ctx.sessions.closeEphemeralSession(sessionId);
+      sendJson(res, 200, {
+        session_id: sessionId,
+        closed_at: result.closedAt,
+        restorable_until: result.restorableUntil,
+        ...(result.eventId === null ? {} : { event_id: result.eventId }),
+      });
+    } catch (err) {
+      handleSessionLifecycleError(res, err);
+    }
+    return;
+  }
+
+  const alreadyClosed = ctx.sessions.closedAtOf(sessionId);
+  if (alreadyClosed !== null) {
     sendJson(res, 200, {
-      session_id: params[0],
-      closed_at: result.closedAt,
-      restorable_until: result.restorableUntil,
-      ...(result.eventId === null ? {} : { event_id: result.eventId }),
+      session_id: sessionId,
+      closed_at: alreadyClosed,
+      uncommitted: null,
+      files: [],
+      event_id: null,
+    });
+    return;
+  }
+
+  const body = await readOptionalJsonBody(req, res);
+  if (body === null) return;
+  const rawChoice = body.uncommitted;
+  if (rawChoice !== undefined && rawChoice !== "commit" && rawChoice !== "keep" && rawChoice !== "discard") {
+    sendError(res, 400, "invalid_body", 'uncommitted must be "commit", "keep" or "discard" when present');
+    return;
+  }
+  const choice = rawChoice as UncommittedChoice | undefined;
+
+  const workspace = ctx.sessions.workspaceOf(sessionId);
+  let files: string[] = [];
+  if (workspace !== null && workspace.repo_path !== undefined) {
+    try {
+      files = await ctx.workspace.uncommittedChanges(workspace.path);
+    } catch (err) {
+      sendWorkspaceError(res, err);
+      return;
+    }
+  }
+
+  if (files.length > 0 && choice === undefined) {
+    sendError(
+      res,
+      409,
+      "uncommitted_changes",
+      `session ${sessionId} has ${files.length} uncommitted change(s); pass uncommitted=commit|keep|discard`,
+      { session_id: sessionId, files, ...(workspace === null ? {} : { workspace: workspace.path }) },
+    );
+    return;
+  }
+
+  let outcome: NormalCloseOutcome = { uncommitted: null, files: [] };
+  if (files.length > 0 && choice !== undefined) {
+    if (workspace === null) {
+      sendError(res, 409, "workspace_not_bound", `session ${sessionId} has no bound workspace to handle changes in`);
+      return;
+    }
+    if (choice === "commit") {
+      const title = (ctx.sessions.sessionTitle(sessionId) ?? "untitled").replace(/\s+/g, " ").trim() || "untitled";
+      try {
+        const committed = await ctx.workspace.commitChanges(
+          workspace.path,
+          `morrow: session ${sessionId.slice(0, 8)} ${title}`,
+        );
+        outcome = { uncommitted: "commit", files: committed.files, commit: committed.commit };
+      } catch (err) {
+        sendWorkspaceError(res, err);
+        return;
+      }
+    } else if (choice === "discard") {
+      try {
+        const discarded = await ctx.workspace.discardChanges(sessionId, workspace.path);
+        outcome = { uncommitted: "discard", files: discarded.files, discarded: discarded.discarded };
+      } catch (err) {
+        sendWorkspaceError(res, err);
+        return;
+      }
+    } else {
+      outcome = { uncommitted: "keep", files };
+    }
+  }
+
+  try {
+    const closed = ctx.sessions.closeNormalSession(sessionId, outcome);
+    sendJson(res, 200, {
+      session_id: sessionId,
+      closed_at: closed.closedAt,
+      event_id: closed.eventId,
+      uncommitted: outcome.uncommitted,
+      files: outcome.files,
+      ...(outcome.commit === undefined ? {} : { commit: outcome.commit }),
+      ...(outcome.discarded === undefined ? {} : { discarded: outcome.discarded }),
     });
   } catch (err) {
     handleSessionLifecycleError(res, err);
   }
+}
+
+/**
+ * 可选 JSON body（关闭端点）：content-type 不是 JSON 或显式 content-length: 0 时按
+ * 空对象处理——`{uncommitted?}` 是可选的，老客户端/脚本 POST 空体仍是合法请求。
+ */
+async function readOptionalJsonBody(
+  req: IncomingMessage,
+  res: ServerResponse,
+): Promise<Record<string, unknown> | null> {
+  const contentType = req.headers["content-type"];
+  const length = req.headers["content-length"];
+  const isJson = typeof contentType === "string" && /^application\/json\b/i.test(contentType.trim());
+  if (!isJson || length === "0") return {};
+  return await readJsonBody(req, res);
 }
 
 function handleSessionLifecycleError(res: ServerResponse, err: unknown): void {
@@ -1797,6 +1921,15 @@ async function handleBindWorkspace(
       sendWorkspaceError(res, err);
       return;
     }
+    // 同仓库同分支占用检查（票 M7-A-T5）：必须在绑定前拒绝，避免两个会话共享
+    // 同一棵工作树；持有者信息来自内存注册表 + 账本重建（重启后一致）。
+    if (workspace.repo_path !== undefined && workspace.branch !== undefined) {
+      const holder = ctx.sessions.branchHolder(workspace.repo_path, workspace.branch, sessionId);
+      if (holder !== null) {
+        sendBranchInUse(res, holder, workspace.repo_path, workspace.branch);
+        return;
+      }
+    }
     const mutation = ctx.sessions.bindWorkspace(sessionId, workspace);
     if (mutation === null) {
       sendError(res, 404, "not_found", `session ${sessionId} does not exist`);
@@ -1826,6 +1959,13 @@ async function handleBindWorkspace(
     try {
       const cloned = await ctx.workspace.cloneFrom(url.trim(), baseBranch === undefined ? {} : { baseBranch });
       reused = cloned.reused;
+      // 建分支前先查持有者（票 M7-A-T5）：命中时给持有者信息，而不是笼统的
+      // branch_exists——同一分支被活动会话占用必须显式拒绝。
+      const holder = ctx.sessions.branchHolder(cloned.repoPath, newBranch, sessionId);
+      if (holder !== null) {
+        sendBranchInUse(res, holder, cloned.repoPath, newBranch);
+        return;
+      }
       const created = await ctx.workspace.ensureBranch(cloned.repoPath, baseBranch, newBranch);
       const worktree = await ctx.workspace.prepareWorktree(cloned.repoPath, created.branch, sessionId);
       workspace = {
@@ -1972,6 +2112,28 @@ async function handleRemoveAttachments(
   });
 }
 
+/** 同分支占用（票 M7-A-T5）：409 + 持有者 session_id/标题，UI 直接展示"谁占着"。 */
+function sendBranchInUse(
+  res: ServerResponse,
+  holder: { sessionId: string; title?: string },
+  repoPath: string,
+  branch: string,
+): void {
+  const who = holder.title === undefined ? holder.sessionId : `${holder.sessionId} (${holder.title})`;
+  sendError(
+    res,
+    409,
+    "branch_in_use",
+    `branch "${branch}" in ${repoPath} is already held by session ${who}; use another branch`,
+    {
+      branch,
+      repo_path: repoPath,
+      holder_session_id: holder.sessionId,
+      ...(holder.title === undefined ? {} : { holder_title: holder.title }),
+    },
+  );
+}
+
 /** 工作区错误 → HTTP 状态（可操作错误码不合并成 500）。 */
 function sendWorkspaceError(res: ServerResponse, err: unknown): void {
   if (!(err instanceof WorkspaceError)) throw err;
@@ -1982,7 +2144,8 @@ function sendWorkspaceError(res: ServerResponse, err: unknown): void {
         ? 500
         : err.code === "branch_exists" ||
             err.code === "branch_in_use" ||
-            err.code === "base_not_found"
+            err.code === "base_not_found" ||
+            err.code === "not_isolated"
           ? 409
           : 400;
   sendError(res, status, err.code, err.message);

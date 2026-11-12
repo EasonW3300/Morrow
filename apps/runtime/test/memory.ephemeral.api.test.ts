@@ -326,11 +326,16 @@ test("24h 内恢复：作用域记忆重新可见", async () => {
     const restoreEvent = (await allEvents(runtime.port)).find((e) => e.event_type === "session.ephemeral_restored");
     assert.ok(restoreEvent, "session.ephemeral_restored 入账本");
 
-    // 普通会话不走 ephemeral 生命周期端点
+    // 普通会话关闭走 T5 语义（session.closed），不产生 ephemeral 的 24h 恢复窗口
     const normal = await createSession(runtime.port, {});
-    const notEphemeral = await postJson(runtime.port, `/v1/sessions/${normal.session_id}/close`);
-    assert.equal(notEphemeral.status, 409);
-    assert.equal(notEphemeral.body.error.code, "not_ephemeral");
+    const normalClosed = await postJson(runtime.port, `/v1/sessions/${normal.session_id}/close`);
+    assert.equal(normalClosed.status, 200, JSON.stringify(normalClosed.body));
+    assert.equal(normalClosed.body.restorable_until, undefined);
+    assert.ok(
+      (await allEvents(runtime.port)).some(
+        (e) => e.event_type === "session.closed" && e.session_id === normal.session_id,
+      ),
+    );
   } finally {
     await runtime.close();
     removeDir(dir);
