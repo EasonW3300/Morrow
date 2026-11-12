@@ -199,6 +199,64 @@ export interface MemoryHit {
   created_at: string;
 }
 
+/** 只读记忆视图（票 M7-A-T6 / Issue #62）：来源回链 / 版本链 / 分组簇 */
+export interface MemoryOverviewSource {
+  event_id: string;
+  session_id: string | null;
+  occurred_at: string;
+}
+
+export interface MemoryOverviewRevision {
+  version: number;
+  createdAt: string;
+  reason: string | null;
+  sourceEventId: string | null;
+}
+
+export interface MemoryOverviewEntry {
+  id: string;
+  content: string;
+  kind: string;
+  sensitivity: string;
+  version: number;
+  scope: string;
+  occurred_at: string;
+  createdAt: string;
+  updatedAt: string;
+  revisions: number[];
+  revision_history: MemoryOverviewRevision[];
+  sources: MemoryOverviewSource[];
+}
+
+export interface MemoryOverviewCluster {
+  theme: string | null;
+  entries: MemoryOverviewEntry[];
+}
+
+export interface MemoryOverviewGroup {
+  kind: string;
+  count: number;
+  clusters: MemoryOverviewCluster[];
+}
+
+export type MemoryOverviewResponse =
+  | {
+      view: "tree";
+      scope: string;
+      directory: string | null;
+      total: number;
+      groups: MemoryOverviewGroup[];
+    }
+  | {
+      view: "timeline";
+      scope: string;
+      directory: string | null;
+      total: number;
+      limit: number;
+      offset: number;
+      entries: MemoryOverviewEntry[];
+    };
+
 export interface CloseSessionResult {
   session_id: string;
   closed_at: string;
@@ -535,6 +593,18 @@ export const api = {
       headers: JSON_HEADERS,
       body: "{}",
     });
+  },
+
+  /** 只读记忆视图（票 M7-A-T6）：tree = 按 kind 分组 + 弱主题聚类；timeline = 倒序分页 */
+  memoryOverview(
+    base: string,
+    options: { view: "tree" | "timeline"; scope?: string; limit?: number; offset?: number },
+  ): Promise<MemoryOverviewResponse> {
+    const params = new URLSearchParams({ view: options.view });
+    if (options.scope !== undefined) params.set("scope", options.scope);
+    if (options.limit !== undefined) params.set("limit", String(options.limit));
+    if (options.offset !== undefined) params.set("offset", String(options.offset));
+    return request<MemoryOverviewResponse>(base, `/v1/memory/overview?${params.toString()}`);
   },
 
   /** 记忆检索（票 M7-A-T3：scope=session:<id> 看到全局 + 该会话；缺省全局） */

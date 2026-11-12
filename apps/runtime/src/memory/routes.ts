@@ -5,8 +5,13 @@ import { MarkdownParseError, type MemoryProjector } from "./projection.ts";
 
 /**
  * 记忆控制面路由（票 M1-T1 / Issue #13 检索 + M1-T2 / Issue #14 候选/冲突 + M1-T3 /
- * Issue #15 投影/导入/删除，PRD §6.2）：
+ * Issue #15 投影/导入/删除 + M7-A-T6 / Issue #62 只读视图，PRD §6.2）：
  *
+ *   GET  /v1/memory/overview?view=tree|timeline&scope=owner|session:<id>
+ *                                              只读记忆视图：tree = 按 kind 分组 +
+ *                                              弱主题聚类（复用 consolidator 词元）；
+ *                                              timeline = occurred_at 倒序分页
+ *                                              （limit/offset）。无写方法（PUT/DELETE → 405）
  *   GET  /v1/memory/facts?q=关键词[&scope=owner|session:<id>]
  *                                              FTS5 关键词检索（候选与事实统一索引），
  *                                              命中条目带 sources（来源账本 event_id 数组）；
@@ -55,6 +60,11 @@ const CONFLICT_STATUSES = ["open", "resolved"] as const;
 export const memoryRoutes: MemoryRoute[] = [
   {
     method: "GET",
+    re: /^\/v1\/memory\/overview$/,
+    handler: handleMemoryOverview,
+  },
+  {
+    method: "GET",
     re: /^\/v1\/memory\/facts$/,
     handler: handleMemoryFacts,
   },
@@ -100,6 +110,49 @@ export const memoryRoutes: MemoryRoute[] = [
   },
 ];
 
+/**
+ * 只读记忆视图（票 M7-A-T6 / Issue #62）：GET /v1/memory/overview?view=tree|timeline
+ * （&scope=owner|session:<id>；timeline 另支持 limit/offset）。本端点只挂 GET——
+ * PUT/DELETE/POST 由 runtime 的路由分发统一回 405（无任何写能力）。
+ */
+function handleMemoryOverview(_req: IncomingMessage, res: ServerResponse, url: URL, ctx: MemoryRouteContext): void {
+  const viewRaw = url.searchParams.get("view") ?? "tree";
+  if (viewRaw !== "tree" && viewRaw !== "timeline") {
+    sendError(res, 400, "invalid_query", 'view must be "tree" or "timeline"');
+    return;
+  }
+  const scopeResult = parseScopeParam(url, res);
+  if (!scopeResult.ok) return;
+  if (viewRaw === "tree") {
+    sendJson(res, 200, ctx.memory.overview({ view: "tree", ...(scopeResult.scope === undefined ? {} : { scope: scopeResult.scope }) }));
+    return;
+  }
+  const page = parsePaging(url, res, { defaultLimit: 50 });
+  if (page === null) return;
+  sendJson(
+    res,
+    200,
+    ctx.memory.overview({
+      view: "timeline",
+      ...(scopeResult.scope === undefined ? {} : { scope: scopeResult.scope }),
+      limit: page.limit,
+      offset: page.offset,
+    }),
+  );
+}
+
+/** scope 查询参数（owner / session:<id>）；非法时写 400 并返回 ok=false */
+function parseScopeParam(url: URL, res: ServerResponse): { ok: true; scope?: string } | { ok: false } {
+  const scopeRaw = url.searchParams.get("scope");
+  if (scopeRaw === null) return { ok: true };
+  const trimmed = scopeRaw.trim();
+  if (trimmed !== "owner" && !/^session:[^:/]+$/.test(trimmed)) {
+    sendError(res, 400, "invalid_query", 'scope must be "owner" or "session:<session_id>"');
+    return { ok: false };
+  }
+  return { ok: true, scope: trimmed };
+}
+
 function handleMemoryFacts(_req: IncomingMessage, res: ServerResponse, url: URL, ctx: MemoryRouteContext): void {
   const q = url.searchParams.get("q");
   if (q === null || q.trim().length === 0) {
@@ -107,16 +160,9 @@ function handleMemoryFacts(_req: IncomingMessage, res: ServerResponse, url: URL,
     return;
   }
   const keyword = q.trim();
-  const scopeRaw = url.searchParams.get("scope");
-  let scope: string | undefined;
-  if (scopeRaw !== null) {
-    const trimmed = scopeRaw.trim();
-    if (trimmed !== "owner" && !/^session:[^:/]+$/.test(trimmed)) {
-      sendError(res, 400, "invalid_query", 'scope must be "owner" or "session:<session_id>"');
-      return;
-    }
-    scope = trimmed;
-  }
+  const scopeResult = parseScopeParam(url, res);
+  if (!scopeResult.ok) return;
+  const { scope } = scopeResult;
   // 语义修正（v0.1.1）：端点名为 facts，默认就只返回**已巩固的长期事实**。
   // 底层 FTS 是「候选 + 事实」统一索引（M1-T1 的超集实现），直接把候选混进 facts
   // 会让同一条记忆出现两次（stage=candidate 与 stage=fact），容易被误读成重复写入。
