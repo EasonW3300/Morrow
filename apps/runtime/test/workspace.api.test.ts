@@ -74,6 +74,18 @@ function fakeWorkspace(overrides: Partial<WorkspaceManager> = {}): WorkspaceMana
     async status() {
       return { isRepo: true, repoPath: "/fake/repo", branch: "main", dirtyFiles: 0 };
     },
+    async uncommittedChanges() {
+      calls.push("uncommittedChanges");
+      return [];
+    },
+    async commitChanges(_dir, message) {
+      calls.push(`commitChanges:${message}`);
+      return { commit: "deadbeef", files: ["README.md"] };
+    },
+    async discardChanges(sessionId) {
+      calls.push(`discardChanges:${sessionId}`);
+      return { discarded: 1, files: ["README.md"] };
+    },
   };
   return Object.assign(base, overrides, { calls });
 }

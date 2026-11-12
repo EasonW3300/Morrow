@@ -10,6 +10,9 @@
  * - prepareWorktree：同仓库多会话隔离到 `~/.morrow/worktrees/sessions/<session>`。
  * - attach：只读读取会话附件（数量/大小上限见常量），**绝不写入**文件。
  * - status：分支/脏文件状态（摘要与诊断用）。
+ * - uncommittedChanges / commitChanges / discardChanges：会话关闭三选一（票 M7-A-T5）。
+ *   discard 是破坏性操作，**只允许本会话 worktree**（路径前缀校验），绝不对任意路径
+ *   执行 `git clean`。
  *
  * 默认实现全部走 `execFile` 子进程（不引入 git 库依赖），并沿用 worktree.ts 的
  * 约定：`-c` 身份 + 环境变量双重注入（不依赖宿主 git 配置）。
@@ -17,10 +20,10 @@
  */
 
 import { execFile } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, statSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
-import { basename, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import type { SessionAttachment } from "@morrow/protocol";
 import type { SecretStore } from "./keyring.ts";
@@ -64,6 +67,7 @@ export type WorkspaceErrorCode =
   | "base_not_found"
   | "clone_failed"
   | "git_failed"
+  | "not_isolated"
   | "invalid_attachment"
   | "attachment_too_large";
 
@@ -132,6 +136,18 @@ export interface WorkspaceStatus {
   dirtyFiles: number;
 }
 
+/** 提交结果（commit 动作）：commit id + 提交前的改动文件 */
+export interface CommitResult {
+  commit: string;
+  files: string[];
+}
+
+/** 丢弃结果（discard 动作）：清理的文件数 + 清理前的改动文件 */
+export interface DiscardResult {
+  discarded: number;
+  files: string[];
+}
+
 /** `attach()` 的读取结果：元数据 + 注入文本（truncated 仅在文件读取时超出单文件上限出现） */
 export interface AttachmentContent extends SessionAttachment {
   content: string;
@@ -146,6 +162,16 @@ export interface WorkspaceManager {
   readGhToken(): Promise<string | null>;
   attach(paths: string[]): Promise<AttachmentContent[]>;
   status(repoPath: string): Promise<WorkspaceStatus>;
+  /** 未提交改动（`git status --porcelain` → 路径数组；重命名两边都列出） */
+  uncommittedChanges(dir: string): Promise<string[]>;
+  /** 提交全部改动到当前分支（会话关闭 commit）；返回 commit id 与提交前的文件 */
+  commitChanges(dir: string, message: string): Promise<CommitResult>;
+  /**
+   * 丢弃改动（会话关闭 discard）：`git checkout -- .` + `git clean -fd`。
+   * 安全约束：`dir` 必须是本会话 worktree（`<worktreesRoot>/<sessionId>`），
+   * 否则抛 not_isolated 且**不触碰**该目录。
+   */
+  discardChanges(sessionId: string, dir: string): Promise<DiscardResult>;
 }
 
 export interface DefaultWorkspaceManagerOptions {
@@ -382,6 +408,90 @@ export class DefaultWorkspaceManager implements WorkspaceManager {
     };
   }
 
+  /** 未提交改动路径（会话关闭三选一的 409 文件列表 / commit / discard 预览）。 */
+  async uncommittedChanges(dir: string): Promise<string[]> {
+    const porcelain = await this.#git(["status", "--porcelain"], dir);
+    if (porcelain.code !== 0) {
+      throw new WorkspaceError("git_failed", `git status failed: ${firstLine(porcelain.stderr)}`, {
+        stderr: porcelain.stderr,
+      });
+    }
+    return parsePorcelainPaths(porcelain.stdout);
+  }
+
+  /** 提交全部改动（含未跟踪文件）到当前分支；身份由 GIT_IDENTITY 注入。 */
+  async commitChanges(dir: string, message: string): Promise<CommitResult> {
+    const files = await this.uncommittedChanges(dir);
+    if (files.length === 0) {
+      const head = await this.#git(["rev-parse", "HEAD"], dir);
+      if (head.code === 0) return { commit: head.stdout.trim(), files: [] };
+      throw new WorkspaceError("git_failed", "cannot resolve HEAD for an empty commit", { dir });
+    }
+    const add = await this.#git(["add", "-A"], dir);
+    if (add.code !== 0) {
+      throw new WorkspaceError("git_failed", `git add failed: ${firstLine(add.stderr)}`, { stderr: add.stderr });
+    }
+    const commit = await this.#git(["commit", "-m", message], dir);
+    if (commit.code !== 0) {
+      throw new WorkspaceError("git_failed", `git commit failed: ${firstLine(commit.stderr)}`, {
+        stderr: commit.stderr,
+      });
+    }
+    const head = await this.#git(["rev-parse", "HEAD"], dir);
+    if (head.code !== 0) {
+      throw new WorkspaceError("git_failed", `git rev-parse HEAD failed: ${firstLine(head.stderr)}`, {
+        stderr: head.stderr,
+      });
+    }
+    return { commit: head.stdout.trim(), files };
+  }
+
+  /**
+   * 丢弃改动：先做路径归属校验（`<worktreesRoot>/<sessionId>`，并解析符号链接），
+   * 再 `git checkout -- .` + `git clean -fd`。伪造/他人目录抛 not_isolated，目录不动。
+   */
+  async discardChanges(sessionId: string, dir: string): Promise<DiscardResult> {
+    const root = resolve(this.#worktreesRoot);
+    const expected = resolve(root, sessionId);
+    const actual = resolve(dir);
+    // 严格前缀：父目录必须是 worktreesRoot、目录名必须等于 sessionId——
+    // 同时挡住 `../` 穿越与「同根下的他人会话目录」。
+    if (dirname(expected) !== root || basename(expected) !== sessionId || actual !== expected) {
+      throw new WorkspaceError(
+        "not_isolated",
+        `refusing to discard in ${actual}: only this session's worktree (${expected}) may be cleaned`,
+        { expected, actual },
+      );
+    }
+    // 符号链接兜底：两边都存在时要求 realpath 一致（防止 worktree 目录被替换成指向别处的链接）
+    try {
+      if (realpathSync(actual) !== realpathSync(expected)) {
+        throw new WorkspaceError(
+          "not_isolated",
+          `refusing to discard in ${actual}: it resolves outside this session's worktree`,
+          { expected, actual },
+        );
+      }
+    } catch (err) {
+      if (err instanceof WorkspaceError) throw err;
+      // 目录不存在：交给 git 报错（下面的 uncommittedChanges 会失败）
+    }
+    const files = await this.uncommittedChanges(actual);
+    const checkout = await this.#git(["checkout", "--", "."], actual);
+    if (checkout.code !== 0) {
+      throw new WorkspaceError("git_failed", `git checkout failed: ${firstLine(checkout.stderr)}`, {
+        stderr: checkout.stderr,
+      });
+    }
+    const clean = await this.#git(["clean", "-fd"], actual);
+    if (clean.code !== 0) {
+      throw new WorkspaceError("git_failed", `git clean failed: ${firstLine(clean.stderr)}`, {
+        stderr: clean.stderr,
+      });
+    }
+    return { discarded: files.length, files };
+  }
+
   // --- 内部 -----------------------------------------------------------------
 
   async #findCloneByRemote(normalizedUrl: string): Promise<string | null> {
@@ -525,6 +635,39 @@ export function expandHome(path: string): string {
   if (path === "~") return homedir();
   if (path.startsWith("~/")) return resolve(homedir(), path.slice(2));
   return path;
+}
+
+/**
+ * `git status --porcelain` 输出 → 路径数组。
+ * 每行格式为 `XY <path>`（XY 两位状态 + 空格）；重命名/复制为 `XY old -> new`，
+ * 两边都返回（`discard` 的文件数按行计，与 `git clean -fd` 的行为一致）。
+ * git 对特殊字符路径会加双引号并做 C 风格转义，能 JSON 解析时还原。
+ */
+export function parsePorcelainPaths(stdout: string): string[] {
+  const paths: string[] = [];
+  for (const raw of stdout.split("\n")) {
+    if (raw.trim().length === 0) continue;
+    let rest = raw.length >= 3 ? raw.slice(3) : raw.trim();
+    const arrow = rest.indexOf(" -> ");
+    if (arrow >= 0) {
+      paths.push(decodePorcelainPath(rest.slice(0, arrow)), decodePorcelainPath(rest.slice(arrow + 4)));
+    } else {
+      paths.push(decodePorcelainPath(rest));
+    }
+  }
+  return paths;
+}
+
+function decodePorcelainPath(path: string): string {
+  const trimmed = path.trim();
+  if (trimmed.startsWith('"') && trimmed.endsWith('"')) {
+    try {
+      return JSON.parse(trimmed) as string;
+    } catch {
+      return trimmed.slice(1, -1);
+    }
+  }
+  return trimmed;
 }
 
 function firstLine(text: string): string {

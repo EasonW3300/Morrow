@@ -2,16 +2,25 @@ import { useEffect, useState } from "react";
 import { ApiError, type SessionSummary } from "./api.ts";
 import { useConfirm } from "./design-system/ConfirmDialog.tsx";
 import { Button } from "./design-system/primitives/Button.tsx";
+import { GlassSurface } from "./design-system/primitives/GlassSurface.tsx";
 import {
   closeSessionMenu,
+  closeUncommittedMessage,
+  closeUncommittedTitle,
   deleteSessionConfirmMessage,
   deleteSessionConfirmTitle,
+  discardConfirmTitle,
+  discardWarning,
+  isUncommittedConflict,
   openSessionMenu,
   sessionActions,
   toggleSessionMenu,
+  uncommittedFiles,
+  uncommittedOptions,
   validateSessionTitle,
   type SessionActionId,
   type SessionMenuState,
+  type UncommittedChoice,
 } from "./session-ui.ts";
 import { workspaceDetail, workspaceLabel } from "./workspace-ui.ts";
 
@@ -19,6 +28,8 @@ import { workspaceDetail, workspaceLabel } from "./workspace-ui.ts";
  * 会话侧栏列表（session.created + 元数据事件折叠投影；标题缺省用短 id）。
  * M7-A-T2（Issue #59）：行内「⋯」与右键菜单两个入口，动作含重命名（内联编辑）、
  * 归档、删除（二次确认写明记忆不受影响 + 30 天内可恢复）。
+ * M7-A-T5（Issue #63）：关闭会话时若服务端返回 409 uncommitted_changes，弹三选一
+ * 对话框（展示文件列表）；discard 再走一次红字二次确认。
  */
 export function SessionList({
   sessions,
@@ -26,6 +37,7 @@ export function SessionList({
   onSelect,
   onRename,
   onArchive,
+  onClose,
   onDelete,
 }: {
   sessions: SessionSummary[];
@@ -33,6 +45,7 @@ export function SessionList({
   onSelect: (sessionId: string) => void;
   onRename?: (sessionId: string, title: string) => Promise<void>;
   onArchive?: (sessionId: string) => Promise<void>;
+  onClose?: (sessionId: string, uncommitted?: UncommittedChoice) => Promise<void>;
   onDelete?: (sessionId: string) => Promise<void>;
 }) {
   const [menu, setMenu] = useState<SessionMenuState>({ openFor: null });
@@ -40,6 +53,7 @@ export function SessionList({
   const [renameDraft, setRenameDraft] = useState("");
   const [renameError, setRenameError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [uncommitted, setUncommitted] = useState<{ sessionId: string; files: string[] } | null>(null);
   const [busy, setBusy] = useState(false);
   const [confirm, confirmDialog] = useConfirm();
 
@@ -98,6 +112,21 @@ export function SessionList({
           setActionError(errorText(err));
         }
         return;
+      case "close": {
+        setBusy(true);
+        try {
+          await onClose?.(session.session_id);
+        } catch (err) {
+          if (err instanceof ApiError && isUncommittedConflict(err.code)) {
+            setUncommitted({ sessionId: session.session_id, files: uncommittedFiles(err.details) });
+          } else {
+            setActionError(errorText(err));
+          }
+        } finally {
+          setBusy(false);
+        }
+        return;
+      }
       case "delete": {
         const ok = await confirm({
           title: deleteSessionConfirmTitle(),
@@ -117,6 +146,38 @@ export function SessionList({
       case "unarchive":
       case "restore":
         return;
+    }
+  };
+
+  /** 三选一：选择后重发关闭请求；discard 先经红字二次确认。 */
+  const chooseUncommitted = async (choice: UncommittedChoice): Promise<void> => {
+    if (uncommitted === null) return;
+    const target = uncommitted;
+    if (choice === "discard") {
+      const ok = await confirm({
+        title: discardConfirmTitle(),
+        message: <span className="danger-text">{discardWarning(target.files)}</span>,
+        confirmLabel: "丢弃",
+        cancelLabel: "取消",
+        tone: "danger",
+      });
+      if (!ok) return;
+    }
+    setBusy(true);
+    setActionError(null);
+    try {
+      await onClose?.(target.sessionId, choice);
+      setUncommitted(null);
+    } catch (err) {
+      if (err instanceof ApiError && isUncommittedConflict(err.code)) {
+        // 选择期间工作区又变化：刷新文件列表，仍留在对话框
+        setUncommitted({ sessionId: target.sessionId, files: uncommittedFiles(err.details) });
+      } else {
+        setActionError(errorText(err));
+        setUncommitted(null);
+      }
+    } finally {
+      setBusy(false);
     }
   };
 
@@ -215,6 +276,45 @@ export function SessionList({
       </ul>
       {actionError !== null && <div className="list-error">{actionError}</div>}
       {confirmDialog}
+      {uncommitted !== null && (
+        <div className="modal-backdrop" role="presentation" onClick={() => setUncommitted(null)}>
+          <GlassSurface
+            variant="elevated"
+            className="modal-card modal-card--compact"
+            role="dialog"
+            aria-modal="true"
+            aria-label={closeUncommittedTitle()}
+            onClick={(event) => event.stopPropagation()}
+          >
+            <h3>{closeUncommittedTitle()}</h3>
+            <p className="modal-body-text">{closeUncommittedMessage(uncommitted.files)}</p>
+            <ul className="uncommitted-files" aria-label="未提交改动">
+              {uncommitted.files.map((file) => (
+                <li key={file} className="mono">
+                  {file}
+                </li>
+              ))}
+            </ul>
+            <div className="form-actions uncommitted-actions">
+              {uncommittedOptions().map((option) => (
+                <Button
+                  key={option.id}
+                  variant={option.danger === true ? "danger" : "primary"}
+                  className={option.danger === true ? "danger-solid" : undefined}
+                  title={option.description}
+                  disabled={busy}
+                  onClick={() => void chooseUncommitted(option.id)}
+                >
+                  {option.label}
+                </Button>
+              ))}
+              <Button onClick={() => setUncommitted(null)} disabled={busy}>
+                取消
+              </Button>
+            </div>
+          </GlassSurface>
+        </div>
+      )}
     </>
   );
 }

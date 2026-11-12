@@ -257,11 +257,22 @@ export type MemoryOverviewResponse =
       entries: MemoryOverviewEntry[];
     };
 
+export type UncommittedChoice = "commit" | "keep" | "discard";
+
 export interface CloseSessionResult {
   session_id: string;
   closed_at: string;
-  restorable_until: string;
-  event_id?: string;
+  /** ephemeral 会话专属：24h 恢复窗口截止（普通会话缺省） */
+  restorable_until?: string;
+  event_id?: string | null;
+  /** 普通会话：未提交改动的处理结果（null = 无改动） */
+  uncommitted?: UncommittedChoice | null;
+  /** 关闭时的未提交文件（keep 返回；commit/discard 为处理前列表） */
+  files?: string[];
+  /** commit 产生的新提交 id */
+  commit?: string;
+  /** discard 清理的文件数 */
+  discarded?: number;
 }
 
 export interface RestoreSessionResult {
@@ -586,12 +597,15 @@ export const api = {
     });
   },
 
-  /** 临时会话关闭；返回 restorable_until（24h 窗口截止） */
-  closeSession(base: string, sessionId: string): Promise<CloseSessionResult> {
+  /**
+   * 关闭会话（票 M7-A-T3/T5）：ephemeral → 24h 可恢复；普通会话若有未提交改动，
+   * 不带选择时服务端返回 409 uncommitted_changes（details.files），选择后重发。
+   */
+  closeSession(base: string, sessionId: string, uncommitted?: UncommittedChoice): Promise<CloseSessionResult> {
     return request<CloseSessionResult>(base, `/v1/sessions/${sessionId}/close`, {
       method: "POST",
       headers: JSON_HEADERS,
-      body: "{}",
+      body: JSON.stringify(uncommitted === undefined ? {} : { uncommitted }),
     });
   },
 
