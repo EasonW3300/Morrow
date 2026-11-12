@@ -27,6 +27,8 @@ _Avoid_: 节点
 
 **Session Archive（会话归档）**: 把会话从默认列表收起但完整保留；与删除不同，不设自动清除。
 
+**Full Permission Mode（完全权限）**: 会话级的执行模式，跳过逐次命令确认；但静态危险模式拦截、执行前快照与审计照常生效——含义是"不问 Owner"，不是"无边界"。
+
 ## 扩展
 
 **MCP Server**: 通过 Model Context Protocol 提供 tools 的外部进程；接入后其工具视为沙箱类 capability，受同一五维权限约束。
