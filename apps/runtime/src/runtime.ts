@@ -310,6 +310,11 @@ export interface RuntimeOptions {
    * 默认 1000；0 = 不启动定时器（测试手动 drain，避免时序不确定）。
    */
   notificationDrainIntervalMs?: number;
+  /**
+   * 会话元数据时钟注入（M7-A-T2 / Issue #59）：软删 30 天保留期到期判定可被测试拨快
+   * （零 sleep）。缺省系统时间。
+   */
+  sessionsNow?: () => Date;
 }
 
 export interface RuntimeHandle {
@@ -395,6 +400,13 @@ const routes: Route[] = [
   { method: "GET", re: /^\/v1\/sessions\/([^/]+)\/messages$/, handler: handleHistory },
   { method: "POST", re: /^\/v1\/sessions\/([^/]+)\/messages$/, handler: handleSendMessage },
   { method: "GET", re: /^\/v1\/sessions\/([^/]+)\/stream$/, handler: handleStream },
+  // M7-A 会话元数据（票 T2 / Issue #59）：改名/归档/取消归档/恢复/软删。
+  // 全部写账本事件，列表折叠消费（无 sessions 表）。
+  { method: "POST", re: /^\/v1\/sessions\/([^/]+)\/rename$/, handler: handleRenameSession },
+  { method: "POST", re: /^\/v1\/sessions\/([^/]+)\/archive$/, handler: handleArchiveSession },
+  { method: "POST", re: /^\/v1\/sessions\/([^/]+)\/unarchive$/, handler: handleUnarchiveSession },
+  { method: "POST", re: /^\/v1\/sessions\/([^/]+)\/restore$/, handler: handleRestoreSession },
+  { method: "DELETE", re: /^\/v1\/sessions\/([^/]+)$/, handler: handleDeleteSession },
   { method: "POST", re: /^\/v1\/tasks$/, handler: handleCreateTask },
   { method: "GET", re: /^\/v1\/tasks$/, handler: handleListTasks },
   { method: "GET", re: /^\/v1\/tasks\/([^/]+)$/, handler: handleGetTask },
@@ -742,6 +754,8 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     providerRequired: options.agentAdapterFactory === undefined,
     // 记忆（M1-T1）：高价值规则即时写候选；memory.write 工具按会话注入 Agent Loop
     memory,
+    // 元数据时钟（M7-A-T2）：软删 30 天到期判定
+    ...(options.sessionsNow === undefined ? {} : { now: options.sessionsNow }),
     // 工具完成观察（M2-T5）：tool.finished → Skill 案例收集（is_error → failure）。
     // 观察是增强路径：失败记日志不阻断会话主链路。
     toolObserver: {
@@ -1422,8 +1436,164 @@ async function handleCreateSession(
   });
 }
 
-function handleListSessions(_req: IncomingMessage, res: ServerResponse, _url: URL, ctx: RequestContext): void {
-  sendJson(res, 200, { sessions: ctx.sessions.listSessions() });
+function handleListSessions(_req: IncomingMessage, res: ServerResponse, url: URL, ctx: RequestContext): void {
+  const include = url.searchParams.get("include");
+  if (include !== null && include !== "archived" && include !== "deleted" && include !== "all") {
+    sendError(res, 400, "invalid_query", "include must be one of archived | deleted | all");
+    return;
+  }
+  sendJson(res, 200, {
+    sessions: include === null ? ctx.sessions.listSessions() : ctx.sessions.listSessions({ include }),
+  });
+}
+
+// --- M7-A 会话元数据 handlers（票 T2 / Issue #59）----------------------------
+
+const SESSION_TITLE_MAX_LENGTH = 120;
+
+interface RenameSessionBody {
+  title?: unknown;
+}
+
+async function handleRenameSession(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _url: URL,
+  ctx: RequestContext,
+  params: string[],
+): Promise<void> {
+  const sessionId = params[0];
+  if (!ctx.sessions.sessionExists(sessionId)) {
+    sendError(res, 404, "not_found", `session ${sessionId} does not exist`);
+    return;
+  }
+  const body = await readJsonBody(req, res);
+  if (body === null) return;
+  const { title } = body as RenameSessionBody;
+  if (typeof title !== "string" || title.trim().length === 0) {
+    sendError(res, 400, "invalid_body", "title must be a non-empty string");
+    return;
+  }
+  const trimmed = title.trim();
+  if (trimmed.length > SESSION_TITLE_MAX_LENGTH) {
+    sendError(res, 400, "invalid_body", `title must be at most ${SESSION_TITLE_MAX_LENGTH} characters`);
+    return;
+  }
+  const mutation = ctx.sessions.renameSession(sessionId, trimmed);
+  if (mutation === null) {
+    sendError(res, 404, "not_found", `session ${sessionId} does not exist`);
+    return;
+  }
+  sendJson(res, 200, {
+    session_id: sessionId,
+    title: trimmed,
+    event_id: mutation.eventId,
+    sequence: mutation.sequence,
+    changed: mutation.changed,
+  });
+}
+
+function handleArchiveSession(
+  _req: IncomingMessage,
+  res: ServerResponse,
+  _url: URL,
+  ctx: RequestContext,
+  params: string[],
+): void {
+  const sessionId = params[0];
+  const mutation = ctx.sessions.archiveSession(sessionId);
+  if (mutation === null) {
+    sendError(res, 404, "not_found", `session ${sessionId} does not exist`);
+    return;
+  }
+  sendJson(res, 200, {
+    session_id: sessionId,
+    archived_at: mutation.archivedAt ?? null,
+    event_id: mutation.eventId,
+    sequence: mutation.sequence,
+    changed: mutation.changed,
+  });
+}
+
+function handleUnarchiveSession(
+  _req: IncomingMessage,
+  res: ServerResponse,
+  _url: URL,
+  ctx: RequestContext,
+  params: string[],
+): void {
+  const sessionId = params[0];
+  const mutation = ctx.sessions.unarchiveSession(sessionId);
+  if (mutation === null) {
+    sendError(res, 404, "not_found", `session ${sessionId} does not exist`);
+    return;
+  }
+  sendJson(res, 200, {
+    session_id: sessionId,
+    archived_at: null,
+    event_id: mutation.eventId,
+    sequence: mutation.sequence,
+    changed: mutation.changed,
+  });
+}
+
+function handleDeleteSession(
+  _req: IncomingMessage,
+  res: ServerResponse,
+  _url: URL,
+  ctx: RequestContext,
+  params: string[],
+): void {
+  const sessionId = params[0];
+  const mutation = ctx.sessions.deleteSession(sessionId);
+  if (mutation === null) {
+    sendError(res, 404, "not_found", `session ${sessionId} does not exist`);
+    return;
+  }
+  sendJson(res, 200, {
+    session_id: sessionId,
+    deleted_at: mutation.deletedAt ?? null,
+    event_id: mutation.eventId,
+    sequence: mutation.sequence,
+    changed: mutation.changed,
+  });
+}
+
+function handleRestoreSession(
+  _req: IncomingMessage,
+  res: ServerResponse,
+  _url: URL,
+  ctx: RequestContext,
+  params: string[],
+): void {
+  const sessionId = params[0];
+  const result = ctx.sessions.restoreSession(sessionId);
+  switch (result.status) {
+    case "unknown":
+      sendError(res, 404, "not_found", `session ${sessionId} does not exist`);
+      return;
+    case "not_deleted":
+      sendError(res, 409, "session_not_deleted", `session ${sessionId} is not deleted`);
+      return;
+    case "expired":
+      sendError(
+        res,
+        409,
+        "restore_window_expired",
+        `session ${sessionId} was deleted more than 30 days ago and can no longer be restored (ledger events are retained)`,
+      );
+      return;
+    case "restored":
+      sendJson(res, 200, {
+        session_id: sessionId,
+        deleted_at: null,
+        restored_at: result.restoredAt,
+        event_id: result.eventId,
+        sequence: result.sequence,
+        changed: true,
+      });
+      return;
+  }
 }
 
 interface SendMessageBody {
