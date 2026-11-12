@@ -70,12 +70,16 @@ export type { RuntimeConfig, ProviderConfig } from "./config.ts";
 export {
   SessionManager,
   SESSION_EVENT_TYPES,
+  SESSION_DELETE_RETENTION_MS,
   type AgentAdapterFactory,
   type AgentRuntimeExtras,
   type MemoryObserver,
   type MessageRecord,
   type SessionFrame,
   type SessionHistory,
+  type SessionListInclude,
+  type SessionMetadataMutation,
+  type SessionRestoreResult,
   type SessionSummary,
 } from "./sessions.ts";
 export {
