@@ -397,6 +397,20 @@ input[type="radio"] {
   color: var(--text-dim);
 }
 
+.provider-default-flag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  border-radius: var(--radius-pill, 999px);
+  font-size: 12px;
+  /* 与禁用按钮区分：不是"不可点"，而是"已生效"的状态标识 */
+  color: var(--color-accent, #2563eb);
+  background: color-mix(in srgb, var(--color-accent, #2563eb) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--color-accent, #2563eb) 24%, transparent);
+  white-space: nowrap;
+}
+
 .provider-actions {
   display: flex;
   gap: 8px;

@@ -226,13 +226,22 @@ function ProvidersSection({ base }: { base: string }) {
                   <button className="btn" onClick={() => void runTest(record)} disabled={test?.state === "testing"}>
                     {test?.state === "testing" ? "测试中…" : "测试连通"}
                   </button>
-                  <button
-                    className="btn"
-                    onClick={() => void makeDefault(record)}
-                    disabled={busyId === record.provider_id || record.provider_id === defaultId}
-                  >
-                    设为默认
-                  </button>
+                  {/* 已是默认时不再渲染一个灰掉且无说明的按钮（v0.1.1 修）：
+                      旧实现 disabled 但不给原因，看起来像"功能坏了"。改为静态标识。 */}
+                  {record.provider_id === defaultId ? (
+                    <span className="provider-default-flag" title="该 Provider 已是默认，新会话会使用它">
+                      已是默认
+                    </span>
+                  ) : (
+                    <button
+                      className="btn"
+                      onClick={() => void makeDefault(record)}
+                      disabled={busyId === record.provider_id}
+                      title="新会话将使用该 Provider"
+                    >
+                      设为默认
+                    </button>
+                  )}
                   {!isEnv && (
                     <>
                       <button className="btn" onClick={() => openEdit(record)}>编辑</button>
