@@ -99,14 +99,13 @@ test("确认弹窗状态机：校验失败停留 idle；通过进入 confirming�
   if (failed.status === "error") assert.equal(failed.message, "网络错误");
 });
 
-test("确认文案列出受影响会话数与三类后果（缓存前缀/计费/风格基准）", () => {
+test("确认文案如实说明生效范围（新建会话生效 / 进行中会话保持）与代价", () => {
   const notice = describePersonaImpact(12);
   const text = [notice.title, ...notice.lines].join("\n");
   assert.ok(text.includes("12"));
-  assert.ok(text.includes("受影响会话数"));
-  assert.ok(text.includes("KV 缓存前缀会失效"));
-  assert.ok(text.includes("按全量 prompt 计费"));
-  assert.ok(text.includes("历史对话的风格基准会改变"));
+  assert.ok(text.includes("新建会话"), "说明新手设的生效范围");
+  assert.ok(text.includes("进行中的会话"), "说明进行中会话保持原人设");
+  assert.ok(text.includes("风格基准会改变"));
 });
 
 test("状态机不允许跳过确认直接保存", () => {

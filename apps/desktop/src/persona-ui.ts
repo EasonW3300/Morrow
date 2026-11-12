@@ -146,10 +146,13 @@ export function describePersonaImpact(sessionCount: number): PersonaImpactNotice
   return {
     title: "保存 Persona 前确认",
     lines: [
-      `受影响会话数：${sessionCount} 个既有会话。`,
-      "所有既有会话的 KV 缓存前缀会失效。",
-      "下一轮请求将按全量 prompt 计费。",
-      "历史对话的风格基准会改变。",
+      `当前共有 ${sessionCount} 个会话。`,
+      // 如实描述（v0.2.0 修正）：系统 prompt 在会话首次创建 AgentRuntime 时注入并随该会话
+      // 复用；已在进行中的会话会保持原人设与上下文，新手设从**新建会话**开始生效。
+      // 旧文案写"所有既有会话下一轮即失效"，与实现不符——那是把代价说重了，同样是不诚实。
+      "新手设从**新建会话**开始生效；已在进行中的会话保持原人设（上下文不中断）。",
+      "若希望旧会话也换人设，请新建会话并重新交代上下文。",
+      "历史对话的风格基准会改变（旧会话仍按原人设回答）。",
     ],
     confirmLabel: "保存并接受影响",
   };
