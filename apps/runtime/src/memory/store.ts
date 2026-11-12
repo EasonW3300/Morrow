@@ -401,6 +401,8 @@ export class MemoryStore {
   #insertRevisionStmt;
   #listFactsStmt;
   #listFactsByScopeStmt;
+  #listFactsVisibleStmt;
+  #factSourceRowsStmt;
   #listAllFactsStmt;
   #revisionByVersionStmt;
   #listRevisionsStmt;
@@ -501,6 +503,19 @@ export class MemoryStore {
       `SELECT fact_id, content, kind, sensitivity, version, valid_from, valid_until, created_at, updated_at, deleted_at, scope, expired_at
        FROM memory_facts WHERE valid_until IS NULL AND deleted_at IS NULL AND expired_at IS NULL AND scope = ?
        ORDER BY created_at, fact_id`,
+    );
+    // 只读记忆视图（票 M7-A-T6）：参与作用域语义 = owner（全局）∪ 查询作用域
+    this.#listFactsVisibleStmt = db.prepare(
+      `SELECT fact_id, content, kind, sensitivity, version, valid_from, valid_until, created_at, updated_at, deleted_at, scope, expired_at
+       FROM memory_facts
+       WHERE valid_until IS NULL AND deleted_at IS NULL AND expired_at IS NULL AND (scope = 'owner' OR scope = ?)
+       ORDER BY created_at, fact_id`,
+    );
+    // 来源行（含 session_id / 创建时间）：只读视图 sources[] 的存储面
+    this.#factSourceRowsStmt = db.prepare(
+      `SELECT ms.source_id, ms.kind, ms.event_id, ms.session_id, ms.created_at
+       FROM memory_fact_sources fs JOIN memory_sources ms ON ms.source_id = fs.source_id
+       WHERE fs.fact_id = ? ORDER BY ms.created_at, ms.source_id`,
     );
     this.#listAllFactsStmt = db.prepare(
       `SELECT fact_id, content, kind, sensitivity, version, valid_from, valid_until, created_at, updated_at, deleted_at, scope, expired_at
@@ -721,6 +736,23 @@ export class MemoryStore {
   listAllFacts(): MemoryFactRow[] {
     this.#assertOpen();
     return this.#listAllFactsStmt.all() as unknown as MemoryFactRow[];
+  }
+
+  /**
+   * 只读记忆视图的可见事实（票 M7-A-T6 / Issue #62）：按作用域语义返回
+   *   owner        → 仅 owner（全局树不含 session:*）
+   *   session:<id> → owner ∪ 该会话（与检索面 scopeVisible 同口径）
+   * 已删 / 已过期 / 逻辑过期事实不在视图内（与 listFacts 同口径）。
+   */
+  listFactsForScope(queryScope: string): MemoryFactRow[] {
+    this.#assertOpen();
+    return this.#listFactsVisibleStmt.all(queryScope) as unknown as MemoryFactRow[];
+  }
+
+  /** 事实的来源行（含 session_id 与创建时间；memory_fact_sources 的顺序投影） */
+  factSources(factId: string): MemorySourceRow[] {
+    this.#assertOpen();
+    return this.#factSourceRowsStmt.all(factId) as unknown as MemorySourceRow[];
   }
 
   /** 指定版本的修订（三方合并的基线查找）；不存在返回 null */

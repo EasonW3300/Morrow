@@ -32,6 +32,12 @@ import {
   MemoryStore,
 } from "./store.ts";
 import { detectHighValue } from "./heuristics.ts";
+import {
+  buildTreeGroups,
+  paginateTimeline,
+  type MemoryOverviewEntry,
+  type MemoryOverviewGroup,
+} from "./overview.ts";
 
 /**
  * 记忆服务（票 M1-T1 / Issue #13；抽取/巩固管线 M1-T2 / Issue #14；投影/受控导入/删除
@@ -160,6 +166,25 @@ export interface MemoryDeleteResult {
   /** memory.fact_deleted 事件 id */
   event_id: string;
 }
+
+/** 只读记忆视图响应（票 M7-A-T6 / Issue #62）；directory = 记忆投影目录（打开目录入口用） */
+export type MemoryOverviewResponse =
+  | {
+      view: "tree";
+      scope: string;
+      directory: string | null;
+      total: number;
+      groups: MemoryOverviewGroup[];
+    }
+  | {
+      view: "timeline";
+      scope: string;
+      directory: string | null;
+      total: number;
+      limit: number;
+      offset: number;
+      entries: MemoryOverviewEntry[];
+    };
 
 /** 工具入参非法（空内容 / 越界 confidence / 未知 sensitivity 或 kind） */
 export class MemoryWriteError extends Error {
@@ -618,6 +643,88 @@ export class MemoryService {
   /** 单事实版本历史（三方合并基线查找；同步语义用） */
   listRevisions(factId: string): ReturnType<MemoryStore["listRevisions"]> {
     return this.#store.listRevisions(factId);
+  }
+
+  /**
+   * 只读记忆视图（票 M7-A-T6 / Issue #62）：tree = 按 kind 分组 + 弱主题聚类；
+   * timeline = occurred_at 倒序分页。作用域语义与检索面一致（owner / owner ∪ session:<id>）。
+   * 事实无 occurred_at 列——单条记忆的 occurred_at 取**最早来源事件的账本时间**
+   * （用户第一次说出这件事的时刻，与候选 occurred_at 同口径）；无来源时回退 valid_from。
+   * 修订的 source_event_id 经来源行回链；sources[].session_id/occurred_at 优先取账本事件，
+   * 事件在本地缺失（同步落库等）时回退来源行。
+   */
+  overview(input: {
+    view: "tree" | "timeline";
+    scope?: string;
+    limit?: number;
+    offset?: number;
+  }): MemoryOverviewResponse {
+    const scope = input.scope ?? "owner";
+    const events = this.#ledgerEventIndex();
+    const entries = this.#overviewEntries(scope, events);
+    const directory = this.#projector?.dir ?? null;
+    if (input.view === "tree") {
+      return { view: "tree", scope, directory, total: entries.length, groups: buildTreeGroups(entries) };
+    }
+    const page = paginateTimeline(entries, { limit: input.limit ?? 50, offset: input.offset ?? 0 });
+    return { view: "timeline", scope, directory, ...page };
+  }
+
+  #overviewEntries(
+    scope: string,
+    events: Map<string, { sessionId: string | null; occurredAt: string }>,
+  ): MemoryOverviewEntry[] {
+    return this.#store.listFactsForScope(scope).map((fact) => {
+      const sourceRows = this.#store.factSources(fact.fact_id);
+      const eventIdBySourceId = new Map(sourceRows.map((row) => [row.source_id, row.event_id]));
+      const sources = sourceRows.map((row) => {
+        const event = events.get(row.event_id);
+        return {
+          event_id: row.event_id,
+          session_id: row.session_id ?? event?.sessionId ?? null,
+          occurred_at: event?.occurredAt ?? row.created_at,
+        };
+      });
+      const occurredAt =
+        sources.length === 0
+          ? fact.valid_from
+          : sources.reduce((earliest, source) => (source.occurred_at < earliest ? source.occurred_at : earliest), sources[0].occurred_at);
+      const revisions = this.#store.listRevisions(fact.fact_id);
+      return {
+        id: fact.fact_id,
+        content: fact.content,
+        kind: fact.kind,
+        sensitivity: fact.sensitivity,
+        version: fact.version,
+        scope: fact.scope,
+        occurred_at: occurredAt,
+        createdAt: fact.created_at,
+        updatedAt: fact.updated_at,
+        revisions: revisions.map((revision) => revision.version),
+        revision_history: revisions.map((revision) => ({
+          version: revision.version,
+          createdAt: revision.created_at,
+          reason: revision.reason,
+          sourceEventId:
+            revision.source_id === null
+              ? null
+              : (eventIdBySourceId.get(revision.source_id) ?? this.#store.getSource(revision.source_id)?.event_id ?? null),
+        })),
+        sources,
+      } satisfies MemoryOverviewEntry;
+    });
+  }
+
+  /** 账本事件索引（event_id → 会话/发生时间）：只读视图的来源回链解析用，单次扫描 */
+  #ledgerEventIndex(): Map<string, { sessionId: string | null; occurredAt: string }> {
+    const index = new Map<string, { sessionId: string | null; occurredAt: string }>();
+    for (const { envelope } of this.#ledger.scan()) {
+      index.set(envelope.event_id, {
+        sessionId: envelope.session_id ?? null,
+        occurredAt: envelope.occurred_at,
+      });
+    }
+    return index;
   }
 
   // --- 抽取/巩固管线（票 M1-T2 / Issue #14）------------------------------------
