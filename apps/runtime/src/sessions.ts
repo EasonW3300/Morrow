@@ -35,7 +35,30 @@ export const SESSION_EVENT_TYPES = {
   agentError: "agent.error",
   toolStarted: "tool.started",
   toolFinished: "tool.finished",
+  /** 临时会话关闭（票 M7-A-T3）：payload {kind:"ephemeral", closed_at}；24h 恢复窗口起点 */
+  sessionClosed: "session.closed",
+  /** 临时会话恢复（票 M7-A-T3）：payload {restored_at}；清除关闭状态（24h 内有效） */
+  sessionRestored: "session.restored",
 } as const;
+
+/** 会话类型（票 M7-A-T3 / ADR-0010）：ephemeral = 临时会话（写入隔离 + 禁写入类能力 + 24h 生命周期） */
+export type SessionKind = "normal" | "ephemeral";
+
+/** 临时会话关闭后的保留窗口（24h；MemoryService 的到期清理与此同口径） */
+export const EPHEMERAL_SESSION_TTL_MS = 24 * 60 * 60 * 1000;
+
+/** 临时会话生命周期操作错误（HTTP 层映射：not_found → 404；其余 → 409） */
+export type SessionLifecycleErrorCode = "not_found" | "not_ephemeral" | "invalid_state" | "session_expired";
+
+export class SessionLifecycleError extends Error {
+  code: SessionLifecycleErrorCode;
+
+  constructor(code: SessionLifecycleErrorCode, message: string) {
+    super(message);
+    this.name = "SessionLifecycleError";
+    this.code = code;
+  }
+}
 
 /** 生产默认 createPiAdapter；测试注入 FakePi（同构 AgentRuntime 接口）。
  *  provider 为会话解析出的运行时配置（ProviderResolver 未配置时为 null）；
@@ -103,6 +126,8 @@ export interface SessionSummary {
   occurred_at: string;
   title?: string;
   provider_id?: string;
+  /** 会话类型（票 M7-A-T3）：normal 缺省；ephemeral = 临时会话 */
+  kind: SessionKind;
 }
 
 /** 历史投影条目（message.user / message.assistant 投影） */
@@ -158,6 +183,8 @@ export interface SessionManagerOptions {
   toolObserver?: ToolObserver | null;
   /** 会话运行时的工具工厂（M1-T1：按会话构建 memory.write 工具，经工厂 extras 注入） */
   agentTools?: (sessionId: string) => MorrowTool[];
+  /** 时钟注入（票 M7-A-T3：临时会话 close/restore 与 24h 判定测试零 sleep）；缺省系统时间 */
+  now?: () => Date;
 }
 
 export class SessionManager {
@@ -170,6 +197,7 @@ export class SessionManager {
   readonly #memory: MemoryObserver | null;
   readonly #toolObserver: ToolObserver | null;
   readonly #agentTools: ((sessionId: string) => MorrowTool[]) | null;
+  readonly #now: () => Date;
   readonly #states = new Map<string, SessionState>();
   #disposed = false;
 
@@ -182,6 +210,7 @@ export class SessionManager {
     this.#memory = options.memory ?? null;
     this.#toolObserver = options.toolObserver ?? null;
     this.#agentTools = options.agentTools ?? null;
+    this.#now = options.now ?? (() => new Date());
     this.#factoryUnavailableReason =
       options.factoryUnavailableReason ??
       "no model provider configured (register one via POST /v1/providers or set MORROW_PROVIDER_BASE_URL / MORROW_PROVIDER_API_KEY / MORROW_PROVIDER_MODEL)";
@@ -203,12 +232,18 @@ export class SessionManager {
    * 建会话：session.created 入账本（actor owner；session_id = 新 uuid v7）。
    * providerId（票 T5）：显式 Provider 绑定，存在性由 HTTP 层经 ProviderResolver 校验
    * （未知 id → 400 unknown_provider）；落进 payload，列表与重启后按账本重放投影。
+   * kind（票 M7-A-T3）：normal（缺省）/ ephemeral；payload 恒记录 kind。
    */
-  createSession(title?: string, providerId?: string): { sessionId: string; eventId: string; sequence: number; occurredAt: string } {
+  createSession(
+    title?: string,
+    providerId?: string,
+    kind: SessionKind = "normal",
+  ): { sessionId: string; eventId: string; sequence: number; occurredAt: string } {
     const sessionId = uuidv7();
     const payload: Record<string, unknown> = {
       ...(title === undefined ? {} : { title }),
       ...(providerId === undefined ? {} : { provider_id: providerId }),
+      kind,
     };
     const envelope = buildEventEnvelope({
       replicaId: this.#replicaId,
@@ -236,6 +271,7 @@ export class SessionManager {
         occurred_at: envelope.occurred_at,
         ...(typeof title === "string" && title.length > 0 ? { title } : {}),
         ...(typeof providerId === "string" ? { provider_id: providerId } : {}),
+        kind: envelope.payload.kind === "ephemeral" ? "ephemeral" : "normal",
       });
     }
     return out;
@@ -243,6 +279,101 @@ export class SessionManager {
 
   sessionExists(sessionId: string): boolean {
     return this.#ledger.scan({ sessionId }).length > 0;
+  }
+
+  /** 会话类型（票 M7-A-T3；未知会话 null）。由 session.created payload 折叠得出。 */
+  sessionKind(sessionId: string): SessionKind | null {
+    return this.#lifecycleOf(sessionId).kind;
+  }
+
+  /** 会话是否处于「已关闭且未恢复」（临时会话 24h 窗口内；普通会话恒 false） */
+  isClosed(sessionId: string): boolean {
+    return this.#lifecycleOf(sessionId).closedAt !== null;
+  }
+
+  /**
+   * 关闭临时会话（票 M7-A-T3）：session.closed 入账本（payload 含 closed_at 与 kind）。
+   * 幂等：已关闭且未恢复时返回既有 closed_at（不重复记账）。
+   * 仅 ephemeral 分支——普通会话的关闭语义（未提交改动三选一）由 T5 的
+   * POST /v1/sessions/:id/close 扩展，本票对其返回 not_ephemeral（见报告冲突点）。
+   */
+  closeEphemeralSession(sessionId: string): { closedAt: string; restorableUntil: string; eventId: string | null } {
+    const lifecycle = this.#lifecycleOf(sessionId);
+    if (lifecycle.kind === null) {
+      throw new SessionLifecycleError("not_found", `session ${sessionId} does not exist`);
+    }
+    if (lifecycle.kind !== "ephemeral") {
+      throw new SessionLifecycleError(
+        "not_ephemeral",
+        `session ${sessionId} is a normal session; ephemeral close/restore applies to kind=ephemeral only`,
+      );
+    }
+    if (lifecycle.closedAt !== null) {
+      return {
+        closedAt: lifecycle.closedAt,
+        restorableUntil: new Date(Date.parse(lifecycle.closedAt) + EPHEMERAL_SESSION_TTL_MS).toISOString(),
+        eventId: null,
+      };
+    }
+    const closedAt = this.#now().toISOString();
+    const entry = this.#append(sessionId, SESSION_EVENT_TYPES.sessionClosed, "owner", {
+      kind: "ephemeral",
+      closed_at: closedAt,
+    }, null);
+    return {
+      closedAt,
+      restorableUntil: new Date(Date.parse(closedAt) + EPHEMERAL_SESSION_TTL_MS).toISOString(),
+      eventId: entry.envelope.event_id,
+    };
+  }
+
+  /**
+   * 恢复临时会话（票 M7-A-T3）：仅关闭中的 ephemeral 会话、且距 closed_at 未满 24h。
+   * 过期 → session_expired（记忆清理已按作用域落定，不可复活）；未关闭 → invalid_state。
+   */
+  restoreEphemeralSession(sessionId: string): { restoredAt: string; eventId: string } {
+    const lifecycle = this.#lifecycleOf(sessionId);
+    if (lifecycle.kind === null) {
+      throw new SessionLifecycleError("not_found", `session ${sessionId} does not exist`);
+    }
+    if (lifecycle.kind !== "ephemeral") {
+      throw new SessionLifecycleError(
+        "not_ephemeral",
+        `session ${sessionId} is a normal session; ephemeral close/restore applies to kind=ephemeral only`,
+      );
+    }
+    if (lifecycle.closedAt === null) {
+      throw new SessionLifecycleError("invalid_state", `session ${sessionId} is not closed`);
+    }
+    const deadline = Date.parse(lifecycle.closedAt) + EPHEMERAL_SESSION_TTL_MS;
+    if (this.#now().getTime() >= deadline) {
+      throw new SessionLifecycleError(
+        "session_expired",
+        `session ${sessionId} was closed at ${lifecycle.closedAt} and the 24h restore window has ended`,
+      );
+    }
+    const restoredAt = this.#now().toISOString();
+    const entry = this.#append(sessionId, SESSION_EVENT_TYPES.sessionRestored, "owner", {
+      restored_at: restoredAt,
+    }, null);
+    return { restoredAt, eventId: entry.envelope.event_id };
+  }
+
+  /** 会话生命周期折叠（kind + 最后一次 close/restore 后的关闭态） */
+  #lifecycleOf(sessionId: string): { kind: SessionKind | null; closedAt: string | null } {
+    let kind: SessionKind | null = null;
+    let closedAt: string | null = null;
+    for (const { envelope } of this.#ledger.scan({ sessionId })) {
+      if (envelope.event_type === SESSION_EVENT_TYPES.sessionCreated) {
+        kind = envelope.payload.kind === "ephemeral" ? "ephemeral" : "normal";
+      } else if (envelope.event_type === SESSION_EVENT_TYPES.sessionClosed) {
+        closedAt =
+          typeof envelope.payload.closed_at === "string" ? envelope.payload.closed_at : envelope.occurred_at;
+      } else if (envelope.event_type === SESSION_EVENT_TYPES.sessionRestored) {
+        closedAt = null;
+      }
+    }
+    return { kind, closedAt };
   }
 
   /** 会话内事件（seq > afterSeq，SSE Last-Event-ID 重放用） */

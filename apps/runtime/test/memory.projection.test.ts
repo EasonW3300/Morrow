@@ -72,6 +72,8 @@ test("renderFactMarkdown：frontmatter 严格按 PRD §6.4 字段集与顺序，
     created_at: "2026-10-29T12:00:00.000Z",
     updated_at: "2026-10-30T08:30:00.000Z",
     deleted_at: null,
+    scope: "owner",
+    expired_at: null,
   };
   const sources = ["evt-0193-a", "evt-0194-b"];
   const md = renderFactMarkdown(fact, sources);
@@ -211,6 +213,8 @@ test("parseFactMarkdown：render → parse 往返恢复 id/version/sensitivity/s
     created_at: "2026-10-29T12:00:00.000Z",
     updated_at: "2026-10-30T08:30:00.000Z",
     deleted_at: null,
+    scope: "owner",
+    expired_at: null,
   };
   const sources = ["evt-0193-x"];
   const parsed = parseFactMarkdown(renderFactMarkdown(fact, sources));

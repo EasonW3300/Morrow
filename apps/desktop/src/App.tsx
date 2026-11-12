@@ -11,6 +11,7 @@ import { GlassSurface } from "./design-system/primitives/GlassSurface.tsx";
 import { ThemeToggle } from "./design-system/ThemeToggle.tsx";
 import { applyTheme, getInitialTheme, saveTheme, type Theme } from "./design-system/theme.ts";
 import { NotificationCenter } from "./NotificationCenter.tsx";
+import { EphemeralPanel } from "./EphemeralPanel.tsx";
 
 /**
  * 桌面壳根组件：解析控制面地址（sidecar ready）→ 顶栏导航（会话 / 任务 / 设置 / 健康）。
@@ -41,6 +42,7 @@ export default function App() {
   const [listError, setListError] = useState<string | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
+  const [ephemeralId, setEphemeralId] = useState<string | null>(null);
   const [theme, setTheme] = useState<Theme>(() => getInitialTheme());
 
   useEffect(() => {
@@ -86,6 +88,20 @@ export default function App() {
       setCreating(false);
     }
   }, [base, refreshSessions]);
+
+  /** 临时会话（票 M7-A-T3）：右上角按钮 → 右侧独立面板；已打开时只切回会话视图 */
+  const openEphemeral = useCallback(async () => {
+    setView("chat");
+    if (!base || ephemeralId !== null) return;
+    try {
+      const { session_id } = await api.createEphemeralSession(base);
+      await refreshSessions();
+      setEphemeralId(session_id);
+      setListError(null);
+    } catch (err) {
+      setListError(err instanceof ApiError ? `${err.code}: ${err.message}` : String(err));
+    }
+  }, [base, ephemeralId, refreshSessions]);
 
   /** Chat 任务卡片 → Task 视图（路由从简：切页签 + 预选任务） */
   const openTask = useCallback((taskId: string) => {
@@ -134,6 +150,9 @@ export default function App() {
           ))}
         </nav>
         <div className="topbar-actions">
+          <Button variant="ghost" size="sm" selected={ephemeralId !== null} onClick={() => void openEphemeral()}>
+            临时会话
+          </Button>
           <NotificationCenter base={base} onOpenTask={openTask} />
           <ThemeToggle theme={theme} onToggle={toggleTheme} />
         </div>
@@ -152,7 +171,11 @@ export default function App() {
                 {creating ? "创建中…" : "新建会话"}
               </Button>
             </div>
-            <SessionList sessions={sessions} selectedId={selectedId} onSelect={setSelectedId} />
+            <SessionList
+              sessions={sessions.filter((session) => session.kind !== "ephemeral")}
+              selectedId={selectedId}
+              onSelect={setSelectedId}
+            />
             {listError !== null && <div className="list-error">{listError}</div>}
             <div className="sidebar-foot">控制面 {base.replace("http://", "")}</div>
           </GlassSurface>
@@ -171,6 +194,9 @@ export default function App() {
               />
             )}
           </main>
+          {ephemeralId !== null && (
+            <EphemeralPanel base={base} sessionId={ephemeralId} onExit={() => setEphemeralId(null)} />
+          )}
         </div>
       )}
       {view === "tasks" && (

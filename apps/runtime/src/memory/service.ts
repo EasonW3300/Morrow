@@ -1,7 +1,7 @@
 import type { MemoryEntryKind, MemoryWriteInput, SensitivityLevel } from "@morrow/protocol";
 import { buildEventEnvelope } from "../envelope.ts";
 import type { EventLedger } from "../ledger.ts";
-import { SESSION_EVENT_TYPES } from "../sessions.ts";
+import { EPHEMERAL_SESSION_TTL_MS, SESSION_EVENT_TYPES } from "../sessions.ts";
 import {
   type ConflictReason,
   type ConsolidationAction,
@@ -64,6 +64,12 @@ import { detectHighValue } from "./heuristics.ts";
  *   memory.conflict_resolved  冲突裁决落定（T2；keep_old 只留此事件，事实不动）
  *   memory.import_received    受控导入证据事件（T3 / Issue #15；人工编辑的来源回链目标）
  *   memory.fact_deleted       删除标记 tombstone（T3；软删 + 投影移除，M3 同步传播的单机前置）
+ *   memory.promoted           提升为长期记忆（M7-A-T3：scope session:* → owner）
+ *
+ * 作用域（M7-A-T3 / ADR-0010）：普通会话写入 scope=owner；临时会话（session.created
+ * payload.kind="ephemeral"）的写入（即时/工具/后台抽取）一律 scope=session:<id>，
+ * 检索默认 owner（全局），会话上下文用 session:<id>（全局 + 本会话）。临时会话关闭
+ * 24h 后由 sweepExpiredEphemeralScopes 逻辑清理（标记过期 + FTS/投影移除，账本保留）。
  *
  * 顺序约定：先落行（事务），后记账本事件；账本 append 失败向调用方抛错（后台路径
  * 由 fire-and-forget 捕获记日志）——行是可重建投影，事件缺失即本次写入未生效。
@@ -79,6 +85,7 @@ export const MEMORY_EVENT_TYPES = {
   conflictResolved: "memory.conflict_resolved",
   importReceived: "memory.import_received",
   factDeleted: "memory.fact_deleted",
+  promoted: "memory.promoted",
 } as const;
 
 /** memory.write 工具路径在事件 payload.rule 里的标注值 */
@@ -193,6 +200,10 @@ export class MemoryService {
   readonly #projector: MemoryProjector | null;
   /** 删除事件观察者（票 M3-T3）：删除 tombstone 落账后通知同步层维护删除集合。 */
   readonly #onFactDeleted: ((envelope: ReturnType<typeof buildEventEnvelope>) => void) | null;
+  /** 时钟注入（票 M7-A-T3：临时会话 24h 到期测试零 sleep）；缺省系统时间 */
+  readonly #now: () => Date;
+  /** 临时会话关闭后的保留窗口（毫秒，默认 24h；与 SessionManager 同口径） */
+  readonly #ephemeralTtlMs: number;
 
   constructor(deps: {
     store: MemoryStore;
@@ -206,6 +217,10 @@ export class MemoryService {
     projector?: MemoryProjector;
     /** 删除事件观察者（票 M3-T3）：runtime 注入 TombstoneStore.recordFactDeletion。 */
     onFactDeleted?: (envelope: ReturnType<typeof buildEventEnvelope>) => void;
+    /** 时钟注入（票 M7-A-T3：24h 到期判定/清理时间戳）；缺省系统时间 */
+    now?: () => Date;
+    /** 临时会话保留窗口（毫秒，默认 24h） */
+    ephemeralTtlMs?: number;
   }) {
     this.#store = deps.store;
     this.#ledger = deps.ledger;
@@ -214,6 +229,8 @@ export class MemoryService {
     this.#consolidator = deps.consolidator ?? new DefaultConsolidator();
     this.#projector = deps.projector ?? null;
     this.#onFactDeleted = deps.onFactDeleted ?? null;
+    this.#now = deps.now ?? (() => new Date());
+    this.#ephemeralTtlMs = deps.ephemeralTtlMs ?? EPHEMERAL_SESSION_TTL_MS;
   }
 
   /**
@@ -268,9 +285,98 @@ export class MemoryService {
     });
   }
 
-  /** FTS5 关键词检索（MemoryStore 透传；命中含来源回链）。options 在检索层过滤。 */
-  search(q: string, options: { sensitivity?: SensitivityLevel } = {}): MemorySearchHit[] {
+  /** FTS5 关键词检索（MemoryStore 透传；命中含来源回链）。options 在检索层过滤。
+   *  scope（票 M7-A-T3）：缺省 owner 只查全局；session:<id> 查全局 + 该会话。
+   *  检索前先做一次临时会话到期清理，保证读到的是清理后的检索面（零定时器依赖）。 */
+  search(q: string, options: { sensitivity?: SensitivityLevel; scope?: string } = {}): MemorySearchHit[] {
+    this.sweepExpiredEphemeralScopes();
     return this.#store.search(q, options);
+  }
+
+  /**
+   * 临时会话 24h 到期的逻辑清理（票 M7-A-T3 / ADR-0010）：
+   * 关闭（session.closed）且无后续 session.restored、距 closed_at 已满保留窗口的会话，
+   * 其 session:<id> 作用域的候选与事实标记 expired_at 并移出 FTS；投影文件同步移除。
+   * 账本事件不删不改（append-only），到期状态可由 close/restore 事件重新导出。
+   * 返回本次新清理的会话 id（供测试/运维观察；幂等：已清理的不会重复返回）。
+   */
+  sweepExpiredEphemeralScopes(): string[] {
+    const nowMs = this.#now().getTime();
+    // 折叠会话关闭状态：close 记 closed_at，restore 清除（与 SessionManager 同口径）
+    const closedAt = new Map<string, string>();
+    for (const { envelope } of this.#ledger.scan()) {
+      const sessionId = envelope.session_id;
+      if (sessionId === undefined || sessionId === null) continue;
+      if (envelope.event_type === SESSION_EVENT_TYPES.sessionClosed) {
+        const at = typeof envelope.payload.closed_at === "string" ? envelope.payload.closed_at : envelope.occurred_at;
+        closedAt.set(sessionId, at);
+      } else if (envelope.event_type === SESSION_EVENT_TYPES.sessionRestored) {
+        closedAt.delete(sessionId);
+      }
+    }
+    const swept: string[] = [];
+    for (const [sessionId, at] of closedAt) {
+      const expiresAt = Date.parse(at) + this.#ephemeralTtlMs;
+      if (!Number.isFinite(expiresAt) || nowMs < expiresAt) continue;
+      const scope = `session:${sessionId}`;
+      const { candidateIds, factIds } = this.#store.expireScope(scope, new Date(nowMs).toISOString());
+      if (candidateIds.length === 0 && factIds.length === 0) continue;
+      for (const factId of factIds) this.#projector?.removeFact(factId);
+      swept.push(sessionId);
+    }
+    return swept;
+  }
+
+  /**
+   * 提升为长期记忆（票 M7-A-T3，ADR-0010）：候选或事实的 scope 由 session:<id> 改为
+   * owner，并写 memory.promoted（payload 含原 scope）。非 session 作用域 → 409
+   * （invalid_state）；未知 id → 404。事实提升后补写 §6.4 投影文件（候选在巩固后
+   * 按 owner 落投影）。
+   */
+  promoteMemory(entryId: string): {
+    id: string;
+    entry_kind: "candidate" | "fact";
+    from_scope: string;
+    to_scope: "owner";
+    event_id: string;
+  } {
+    const candidate = this.#store.getCandidate(entryId);
+    const fact = candidate === null ? this.#store.getFact(entryId) : null;
+    const row = candidate ?? fact;
+    if (row === null) {
+      throw new MemoryControlError("not_found", `memory entry "${entryId}" does not exist`);
+    }
+    const stage: "candidate" | "fact" = candidate !== null ? "candidate" : "fact";
+    const fromScope = row.scope;
+    if (!fromScope.startsWith("session:")) {
+      throw new MemoryControlError(
+        "invalid_state",
+        `memory entry "${entryId}" is in scope "${fromScope}"; only session-scoped entries can be promoted`,
+      );
+    }
+    if (row.expired_at !== null) {
+      throw new MemoryControlError("invalid_state", `memory entry "${entryId}" has expired and cannot be promoted`);
+    }
+    const promoted = this.#store.promoteToOwner(entryId);
+    if (promoted === null) {
+      throw new MemoryControlError("not_found", `memory entry "${entryId}" does not exist`);
+    }
+    if (stage === "fact") this.#projector?.writeFact(entryId);
+    const sessionId = fromScope.slice("session:".length);
+    const envelope = buildEventEnvelope({
+      replicaId: this.#replicaId,
+      actorId: "owner",
+      eventType: MEMORY_EVENT_TYPES.promoted,
+      sessionId,
+      payload: {
+        entry_id: entryId,
+        entry_kind: stage,
+        from_scope: fromScope,
+        to_scope: "owner",
+      },
+    });
+    this.#ledger.append(envelope);
+    return { id: entryId, entry_kind: stage, from_scope: fromScope, to_scope: "owner", event_id: envelope.event_id };
   }
 
   /** 会话最新一条 message.user 账本事件（工具写入的来源回链目标） */
@@ -613,6 +719,7 @@ export class MemoryService {
         sensitivity: row.sensitivity,
         confidence: row.confidence,
         sourceId: row.source_id,
+        scope: row.scope,
       }));
     const consolidation = batch.length > 0 ? this.#consolidateBatch(batch, extractedEnvelope.event_id) : null;
     return {
@@ -638,6 +745,7 @@ export class MemoryService {
       sensitivity: row.sensitivity,
       confidence: row.confidence,
       sourceId: row.source_id,
+      scope: row.scope,
     }));
     // 批的 causation = 各候选自己的来源事件；运行事件取首条（同批同轮的常规情形即来源事件）
     return this.#consolidateBatch(views, pending[0].source_event_id);
@@ -659,6 +767,9 @@ export class MemoryService {
     if (candidate.status !== "pending") {
       throw new MemoryControlError("invalid_state", `candidate "${candidateId}" is ${candidate.status}; only pending candidates can be decided`);
     }
+    if (candidate.expired_at !== null) {
+      throw new MemoryControlError("invalid_state", `candidate "${candidateId}" has expired (ephemeral session retention window ended)`);
+    }
     if (decision === "dismiss") {
       this.#store.setCandidateStatus(candidateId, "dismissed");
       return { candidateId, decision, result: null };
@@ -670,6 +781,7 @@ export class MemoryService {
       sensitivity: candidate.sensitivity,
       confidence: candidate.confidence,
       sourceId: candidate.source_id,
+      scope: candidate.scope,
     };
     return { candidateId, decision, result: this.#consolidateBatch([view], candidate.source_event_id) };
   }
@@ -789,7 +901,10 @@ export class MemoryService {
     const corroboratedFactIds: string[] = [];
     const conflictIds: string[] = [];
     for (const candidate of batch) {
-      const facts: ConsolidationFactView[] = this.#store.listFacts().map((row) => ({
+      // 同作用域匹配（票 M7-A-T3）：临时会话候选只与同会话事实比对，绝不改写/冲突
+      // 到 owner 长期事实；owner 候选也只与 owner 事实比对。
+      const scope = candidate.scope ?? "owner";
+      const facts: ConsolidationFactView[] = this.#store.listFacts({ scope }).map((row) => ({
         factId: row.fact_id,
         content: row.content,
         kind: row.kind,
@@ -817,6 +932,7 @@ export class MemoryService {
             kind: fact.kind,
             sensitivity: fact.sensitivity,
             version: fact.version,
+            scope: fact.scope,
             candidate_id: action.candidateId,
             source_event_id: sourceEventId,
           }, sourceEventId);
@@ -933,12 +1049,16 @@ export class MemoryService {
     /** 来源证据形态；缺省 "message"（对话路径），受控导入传 "import" */
     sourceKind?: string;
   }): MemoryWriteResult {
+    // 作用域（票 M7-A-T3）：由会话 kind 推导——临时会话的即时/工具/抽取写入一律
+    // 落在 session:<id>，避免随手一问污染长期画像；导入（无会话）恒 owner。
+    const scope = this.#scopeForSession(input.sessionId);
     const createInput: CreateCandidateInput = {
       content: input.content,
       kind: input.kind,
       confidence: input.confidence,
       sensitivity: input.sensitivity,
       occurredAt: input.occurredAt,
+      scope,
       source: { kind: input.sourceKind ?? "message", eventId: input.sourceEventId, sessionId: input.sessionId },
     };
     const { source, candidate } = this.#store.createCandidate(createInput);
@@ -953,6 +1073,7 @@ export class MemoryService {
         kind: candidate.kind,
         sensitivity: candidate.sensitivity,
         confidence: candidate.confidence,
+        scope: candidate.scope,
         source_id: source.source_id,
         source_event_id: source.event_id,
         rule: input.rule,
@@ -961,5 +1082,20 @@ export class MemoryService {
     });
     const { sequence } = this.#ledger.append(envelope);
     return { source, candidate, eventId: envelope.event_id, sequence };
+  }
+
+  /**
+   * 会话 → 记忆作用域（票 M7-A-T3）：session.created payload.kind="ephemeral" 时
+   * 返回 session:<id>，其余（含未知/导入）返回 owner。读账本而非会话缓存——作用域
+   * 语义不依赖进程内会话状态，重启后同口径。
+   */
+  #scopeForSession(sessionId: string | null): string {
+    if (sessionId === null) return "owner";
+    for (const { envelope } of this.#ledger.scan({ sessionId })) {
+      if (envelope.event_type === SESSION_EVENT_TYPES.sessionCreated) {
+        return envelope.payload.kind === "ephemeral" ? `session:${sessionId}` : "owner";
+      }
+    }
+    return "owner";
   }
 }

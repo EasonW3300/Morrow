@@ -173,6 +173,9 @@ export function replayMemoryEvents(entries: LedgerEntry[], options: MemoryReplay
           created_at: asString(payload.created_at) ?? occurredAt,
           updated_at: occurredAt,
           deleted_at: null,
+          // 票 M7-A-T3：事实作用域由事件携带（缺省 owner；临时会话事实 session:<id>）
+          scope: asString(payload.scope) ?? "owner",
+          expired_at: null,
         };
         state.facts.set(factId, fact);
         linkSource(state, factId, resolveSourceId(state, payload));
@@ -197,6 +200,9 @@ export function replayMemoryEvents(entries: LedgerEntry[], options: MemoryReplay
           created_at: existing?.created_at ?? asString(payload.created_at) ?? occurredAt,
           updated_at: occurredAt,
           deleted_at: null,
+          // 更新不改变作用域（提升单独走 memory.promoted）
+          scope: existing?.scope ?? "owner",
+          expired_at: null,
         };
         state.facts.set(factId, fact);
         const sourceId = resolveSourceId(state, payload);
@@ -233,9 +239,21 @@ export function replayMemoryEvents(entries: LedgerEntry[], options: MemoryReplay
           created_at: existing?.created_at ?? deletedAt,
           updated_at: deletedAt,
           deleted_at: deletedAt,
+          scope: existing?.scope ?? "owner",
+          expired_at: existing?.expired_at ?? null,
         };
         state.facts.set(factId, fact);
         state.deleted.add(factId);
+        break;
+      }
+      case "memory.promoted": {
+        // 票 M7-A-T3：「提升为长期记忆」的作用域迁移必须可重放，否则重建会把已提升
+        // 事实打回 session 作用域。payload 记录 entry_kind/entry_id/from_scope。
+        if (asString(payload.entry_kind) !== "fact") break;
+        const entryId = asString(payload.entry_id);
+        if (entryId === null) break;
+        const existing = state.facts.get(entryId);
+        if (existing !== undefined) existing.scope = "owner";
         break;
       }
       default:
