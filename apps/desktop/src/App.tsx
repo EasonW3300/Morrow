@@ -12,6 +12,7 @@ import { ThemeToggle } from "./design-system/ThemeToggle.tsx";
 import { applyTheme, getInitialTheme, saveTheme, type Theme } from "./design-system/theme.ts";
 import { NotificationCenter } from "./NotificationCenter.tsx";
 import { EphemeralPanel } from "./EphemeralPanel.tsx";
+import { MemoryView } from "./MemoryView.tsx";
 
 /**
  * 桌面壳根组件：解析控制面地址（sidecar ready）→ 顶栏导航（会话 / 任务 / 设置 / 健康）。
@@ -22,12 +23,15 @@ import { EphemeralPanel } from "./EphemeralPanel.tsx";
  * 任务页签（票 M1-T6 / Issue #18）：PRD §5.1 Task 视图简版；Chat 任务卡片经
  * openTaskId 跳转（路由从简：壳内 state 传递，不引路由库）。
  * 能力引用卡（票 M2-T6）：Task 节点用到的能力芯片经 openCapabilityName 跳到设置→能力管理。
+ * 记忆页（票 M7-A-T6 / Issue #62）：只读树/时间线视图，一级页签；来源回链经 openSource
+ * 切回对应会话（壳内 state 路由）。
  */
-type View = "chat" | "tasks" | "settings" | "health";
+type View = "chat" | "tasks" | "memory" | "settings" | "health";
 
 const NAV_ITEMS: { key: View; label: string }[] = [
   { key: "chat", label: "会话" },
   { key: "tasks", label: "任务" },
+  { key: "memory", label: "记忆" },
   { key: "settings", label: "设置" },
   { key: "health", label: "健康" },
 ];
@@ -145,6 +149,12 @@ export default function App() {
     setView("settings");
   }, []);
 
+  /** 记忆来源 → 原会话（票 M7-A-T6）：归档/删除的判定在 MemoryView 内完成，这里只切路由 */
+  const openSourceSession = useCallback((sessionId: string) => {
+    setSelectedId(sessionId);
+    setView("chat");
+  }, []);
+
   if (bootError !== null) {
     return (
       <div className="boot boot-error">
@@ -235,6 +245,15 @@ export default function App() {
       {view === "tasks" && (
         <main className="main page-host">
           <TaskView base={base} initialTaskId={openTaskId} onOpenCapability={openCapability} />
+        </main>
+      )}
+      {view === "memory" && (
+        <main className="main page-host">
+          <MemoryView
+            base={base}
+            activeSessionId={ephemeralId ?? selectedId}
+            onOpenSource={openSourceSession}
+          />
         </main>
       )}
       {view === "settings" && (
