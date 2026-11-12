@@ -12,6 +12,8 @@ import { ThemeToggle } from "./design-system/ThemeToggle.tsx";
 import { applyTheme, getInitialTheme, saveTheme, type Theme } from "./design-system/theme.ts";
 import { NotificationCenter } from "./NotificationCenter.tsx";
 import { EphemeralPanel } from "./EphemeralPanel.tsx";
+import { NewSessionDialog } from "./NewSessionDialog.tsx";
+import { draftToWorkspaceBody, type WorkspaceDraft } from "./workspace-ui.ts";
 
 /**
  * 桌面壳根组件：解析控制面地址（sidecar ready）→ 顶栏导航（会话 / 任务 / 设置 / 健康）。
@@ -41,7 +43,7 @@ export default function App() {
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [listError, setListError] = useState<string | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [creating, setCreating] = useState(false);
+  const [newSessionOpen, setNewSessionOpen] = useState(false);
   const [ephemeralId, setEphemeralId] = useState<string | null>(null);
   const [theme, setTheme] = useState<Theme>(() => getInitialTheme());
 
@@ -74,20 +76,32 @@ export default function App() {
     void refreshSessions();
   }, [refreshSessions]);
 
-  const createSession = useCallback(async () => {
-    if (!base) return;
-    setCreating(true);
-    try {
-      const { session_id } = await api.createSession(base);
+  /**
+   * 新建会话（票 M7-A-T4）：先建会话拿 session id（默认分支名依赖短 id），再按向导
+   * 选择绑定工作区（local/github/none）。绑定失败时会话已创建——刷新列表并选中它，
+   * 错误原样抛给向导展示（不静默吞掉）。
+   */
+  const createSession = useCallback(
+    async (title: string | undefined, draft: WorkspaceDraft) => {
+      if (!base) throw new Error("Runtime 尚未连接");
+      const { session_id } = await api.createSession(base, title);
+      try {
+        if (draft.source !== "none") {
+          const converted = draftToWorkspaceBody(draft);
+          if (!converted.ok) throw new Error(converted.message);
+          await api.bindWorkspace(base, session_id, converted.body);
+        }
+      } catch (err) {
+        await refreshSessions();
+        setSelectedId(session_id);
+        throw err;
+      }
       await refreshSessions();
       setSelectedId(session_id);
       setListError(null);
-    } catch (err) {
-      setListError(err instanceof ApiError ? `${err.code}: ${err.message}` : String(err));
-    } finally {
-      setCreating(false);
-    }
-  }, [base, refreshSessions]);
+    },
+    [base, refreshSessions],
+  );
 
   /** 临时会话（票 M7-A-T3）：右上角按钮 → 右侧独立面板；已打开时只切回会话视图 */
   const openEphemeral = useCallback(async () => {
@@ -195,10 +209,9 @@ export default function App() {
               <Button
                 variant="primary"
                 size="sm"
-                onClick={() => void createSession()}
-                disabled={creating}
+                onClick={() => setNewSessionOpen(true)}
               >
-                {creating ? "创建中…" : "新建会话"}
+                新建会话
               </Button>
             </div>
             <SessionList
@@ -247,6 +260,11 @@ export default function App() {
           <HealthView base={base} />
         </main>
       )}
+      <NewSessionDialog
+        open={newSessionOpen}
+        onClose={() => setNewSessionOpen(false)}
+        onCreate={createSession}
+      />
     </div>
   );
 }

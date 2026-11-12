@@ -1,8 +1,9 @@
 import type { AgentRuntime, MorrowAgentEvent, MorrowTool } from "@morrow/pi-adapter";
-import type { ActorId, EventEnvelope } from "@morrow/protocol";
+import type { ActorId, EventEnvelope, SessionAttachment, SessionWorkspace } from "@morrow/protocol";
 import { buildEventEnvelope } from "./envelope.ts";
 import type { EventLedger, LedgerEntry } from "./ledger.ts";
 import type { ProviderResolver, ResolvedProvider } from "./providers.ts";
+import type { WorkspaceManager } from "./workspace.ts";
 import { uuidv7 } from "./uuid-v7.ts";
 
 /**
@@ -57,6 +58,10 @@ export const SESSION_EVENT_TYPES = {
    */
   sessionEphemeralClosed: "session.ephemeral_closed",
   sessionEphemeralRestored: "session.ephemeral_restored",
+  // M7-A 工作区与附件（票 T4 / Issue #61）：绑定/附件都走账本事件，摘要折叠消费
+  sessionWorkspaceBound: "session.workspace_bound",
+  sessionAttachmentAdded: "session.attachment_added",
+  sessionAttachmentRemoved: "session.attachment_removed",
 } as const;
 
 /** 会话类型（票 M7-A-T3 / ADR-0010）：ephemeral = 临时会话（写入隔离 + 禁写入类能力 + 24h 生命周期） */
@@ -100,6 +105,25 @@ export type SessionRestoreResult =
   | { status: "not_deleted" }
   | { status: "expired" }
   | { status: "restored"; eventId: string; sequence: number; restoredAt: string };
+
+/** 工作区绑定结果（PUT /v1/sessions/:id/workspace 的投影） */
+export interface SessionWorkspaceMutation {
+  sessionId: string;
+  eventId: string | null;
+  sequence: number | null;
+  changed: boolean;
+  workspace: SessionWorkspace | null;
+}
+
+/** 附件增删结果（POST/DELETE /v1/sessions/:id/attachments 的投影） */
+export interface SessionAttachmentMutation {
+  sessionId: string;
+  eventId: string | null;
+  sequence: number | null;
+  changed: boolean;
+  attachments: SessionAttachment[];
+  attachmentCount: number;
+}
 
 /** 生产默认 createPiAdapter；测试注入 FakePi（同构 AgentRuntime 接口）。
  *  provider 为会话解析出的运行时配置（ProviderResolver 未配置时为 null）；
@@ -178,6 +202,10 @@ export interface SessionSummary {
   archived_at?: string;
   /** 软删时间（session.deleted 的 occurred_at；恢复后清除；30 天后折叠剔除） */
   deleted_at?: string;
+  /** 会话工作区（票 M7-A-T4）：最后一次 session.workspace_bound 的 payload；none 时缺省 */
+  workspace?: SessionWorkspace;
+  /** 只读会话附件数量（票 M7-A-T4；attachment_added/removed 折叠） */
+  attachment_count: number;
 }
 
 /** 历史投影条目（message.user / message.assistant 投影） */
@@ -243,6 +271,11 @@ export interface SessionManagerOptions {
    * 测试注入可拨快时钟（零 sleep）。缺省系统时间。
    */
   now?: () => Date;
+  /**
+   * 工作区接缝（票 M7-A-T4 / Issue #61）：附件内容在发消息时按路径重读（只读注入），
+   * 不随账本持久化。缺省 null = 附件仍可登记但不注入（测试/宿主未接线时的保守行为）。
+   */
+  workspace?: WorkspaceManager | null;
 }
 
 export class SessionManager {
@@ -257,6 +290,7 @@ export class SessionManager {
   readonly #agentTools: ((sessionId: string) => MorrowTool[]) | null;
   readonly #systemPrompt: ((sessionId: string) => string | undefined) | null;
   readonly #now: () => Date;
+  readonly #workspace: WorkspaceManager | null;
   readonly #states = new Map<string, SessionState>();
   #disposed = false;
 
@@ -271,6 +305,7 @@ export class SessionManager {
     this.#agentTools = options.agentTools ?? null;
     this.#systemPrompt = options.systemPrompt ?? null;
     this.#now = options.now ?? (() => new Date());
+    this.#workspace = options.workspace ?? null;
     this.#factoryUnavailableReason =
       options.factoryUnavailableReason ??
       "no model provider configured (register one via POST /v1/providers or set MORROW_PROVIDER_BASE_URL / MORROW_PROVIDER_API_KEY / MORROW_PROVIDER_MODEL)";
@@ -435,6 +470,112 @@ export class SessionManager {
     return this.#ledger.scan({ sessionId }).length > 0;
   }
 
+  /**
+   * 会话工作区（票 M7-A-T4）：折叠最后一次 session.workspace_bound；未绑定返回 null。
+   * 列表摘要的 workspace 字段与这里同源（同一折叠逻辑）。
+   */
+  workspaceOf(sessionId: string): SessionWorkspace | null {
+    return this.#foldSession(sessionId)?.summary.workspace ?? null;
+  }
+
+  /** 会话附件（只读元数据；路径由账本事件折叠，内容在注入时按路径重读）。 */
+  attachmentsOf(sessionId: string): SessionAttachment[] {
+    const map = new Map<string, SessionAttachment>();
+    for (const { envelope } of this.#ledger.scan({ sessionId })) {
+      if (envelope.event_type === SESSION_EVENT_TYPES.sessionAttachmentAdded) {
+        for (const attachment of readAttachments(envelope.payload.attachments)) {
+          map.set(attachment.path, attachment);
+        }
+      } else if (envelope.event_type === SESSION_EVENT_TYPES.sessionAttachmentRemoved) {
+        for (const path of readStringArray(envelope.payload.paths)) map.delete(path);
+      }
+    }
+    return [...map.values()];
+  }
+
+  /**
+   * 绑定/解绑工作区：写 session.workspace_bound（actor owner，payload = { workspace }，
+   * null 表示 none）。同工作区重复绑定为幂等 no-op（不追加事件）。
+   */
+  bindWorkspace(sessionId: string, workspace: SessionWorkspace | null): SessionWorkspaceMutation | null {
+    const current = this.workspaceOf(sessionId);
+    if (!this.sessionExists(sessionId)) return null;
+    if (JSON.stringify(current) === JSON.stringify(workspace)) {
+      return { sessionId, eventId: null, sequence: null, changed: false, workspace: current };
+    }
+    const entry = this.#appendMetadata(sessionId, SESSION_EVENT_TYPES.sessionWorkspaceBound, { workspace });
+    return {
+      sessionId,
+      eventId: entry.envelope.event_id,
+      sequence: entry.sequence,
+      changed: true,
+      workspace,
+    };
+  }
+
+  /**
+   * 添加只读附件：写 session.attachment_added（payload = { attachments }）。
+   * 已登记的同路径附件不重复入账（幂等 no-op）；重复/空列表返回 changed=false。
+   * 数量与大小上限由 WorkspaceManager.attach 校验（HTTP 层映射 400）。
+   */
+  addAttachments(sessionId: string, attachments: SessionAttachment[]): SessionAttachmentMutation | null {
+    if (!this.sessionExists(sessionId)) return null;
+    const existing = this.attachmentsOf(sessionId);
+    const known = new Set(existing.map((attachment) => attachment.path));
+    const fresh = attachments.filter((attachment) => !known.has(attachment.path));
+    if (fresh.length === 0) {
+      return {
+        sessionId,
+        eventId: null,
+        sequence: null,
+        changed: false,
+        attachments: existing,
+        attachmentCount: existing.length,
+      };
+    }
+    const entry = this.#appendMetadata(sessionId, SESSION_EVENT_TYPES.sessionAttachmentAdded, {
+      attachments: fresh,
+    });
+    const merged = [...existing, ...fresh];
+    return {
+      sessionId,
+      eventId: entry.envelope.event_id,
+      sequence: entry.sequence,
+      changed: true,
+      attachments: merged,
+      attachmentCount: merged.length,
+    };
+  }
+
+  /** 移除附件：写 session.attachment_removed（payload = { paths }）；未命中为 no-op。 */
+  removeAttachments(sessionId: string, paths: string[]): SessionAttachmentMutation | null {
+    if (!this.sessionExists(sessionId)) return null;
+    const existing = this.attachmentsOf(sessionId);
+    const known = new Set(existing.map((attachment) => attachment.path));
+    const removed = paths.filter((path) => known.has(path));
+    if (removed.length === 0) {
+      return {
+        sessionId,
+        eventId: null,
+        sequence: null,
+        changed: false,
+        attachments: existing,
+        attachmentCount: existing.length,
+      };
+    }
+    const entry = this.#appendMetadata(sessionId, SESSION_EVENT_TYPES.sessionAttachmentRemoved, { paths: removed });
+    const removedSet = new Set(removed);
+    const remaining = existing.filter((attachment) => !removedSet.has(attachment.path));
+    return {
+      sessionId,
+      eventId: entry.envelope.event_id,
+      sequence: entry.sequence,
+      changed: true,
+      attachments: remaining,
+      attachmentCount: remaining.length,
+    };
+  }
+
   /** 会话类型（票 M7-A-T3；未知会话 null）。由 session.created payload 折叠得出。 */
   sessionKind(sessionId: string): SessionKind | null {
     return this.#lifecycleOf(sessionId).kind;
@@ -545,12 +686,16 @@ export class SessionManager {
       SESSION_EVENT_TYPES.sessionUnarchived,
       SESSION_EVENT_TYPES.sessionDeleted,
       SESSION_EVENT_TYPES.sessionRestored,
+      SESSION_EVENT_TYPES.sessionWorkspaceBound,
+      SESSION_EVENT_TYPES.sessionAttachmentAdded,
+      SESSION_EVENT_TYPES.sessionAttachmentRemoved,
     ]) {
       entries.push(...this.#ledger.scan({ eventType }));
     }
     entries.sort((a, b) => a.sequence - b.sequence);
 
     const byId = new Map<string, SessionSummary>();
+    const attachments = new Map<string, Map<string, SessionAttachment>>();
     for (const { sequence, envelope } of entries) {
       const sessionId = envelope.session_id;
       if (sessionId === null || sessionId === undefined) continue;
@@ -565,9 +710,11 @@ export class SessionManager {
             sequence,
             occurred_at: envelope.occurred_at,
             kind: envelope.payload.kind === "ephemeral" ? "ephemeral" : "normal",
+            attachment_count: 0,
             ...(typeof title === "string" && title.length > 0 ? { title } : {}),
             ...(typeof providerId === "string" ? { provider_id: providerId } : {}),
           });
+          attachments.set(sessionId, new Map());
           break;
         }
         case SESSION_EVENT_TYPES.sessionRenamed: {
@@ -597,13 +744,38 @@ export class SessionManager {
           if (summary !== undefined) delete summary.deleted_at;
           break;
         }
+        case SESSION_EVENT_TYPES.sessionWorkspaceBound: {
+          const summary = byId.get(sessionId);
+          if (summary === undefined) break;
+          const workspace = readWorkspace(envelope.payload.workspace);
+          if (workspace === null) delete summary.workspace;
+          else summary.workspace = workspace;
+          break;
+        }
+        case SESSION_EVENT_TYPES.sessionAttachmentAdded: {
+          const byPath = attachments.get(sessionId);
+          if (byPath === undefined) break;
+          for (const attachment of readAttachments(envelope.payload.attachments)) {
+            byPath.set(attachment.path, attachment);
+          }
+          break;
+        }
+        case SESSION_EVENT_TYPES.sessionAttachmentRemoved: {
+          const byPath = attachments.get(sessionId);
+          if (byPath === undefined) break;
+          for (const path of readStringArray(envelope.payload.paths)) byPath.delete(path);
+          break;
+        }
       }
     }
 
-    return [...byId.values()].map((summary) => ({
-      summary,
-      expired: summary.deleted_at !== undefined && this.#isDeleteExpired(summary.deleted_at),
-    }));
+    return [...byId.values()].map((summary) => {
+      summary.attachment_count = attachments.get(summary.session_id)?.size ?? 0;
+      return {
+        summary,
+        expired: summary.deleted_at !== undefined && this.#isDeleteExpired(summary.deleted_at),
+      };
+    });
   }
 
   #foldSession(sessionId: string): { summary: SessionSummary; expired: boolean } | null {
@@ -812,7 +984,9 @@ export class SessionManager {
           });
         });
         try {
-          await runtime.prompt(input.text);
+          // 附件上下文（票 M7-A-T4）：只注入传给 Agent 的 prompt，message.user 账本
+          // payload 仍是用户原文（附件内容不落账本、不写文件）。
+          await runtime.prompt(await this.#promptWithAttachments(sessionId, input.text));
         } catch (err) {
           // 契约上 prompt 只在误用时 reject（并发/dispose 后）；防御性兜底也入账本
           this.#append(sessionId, SESSION_EVENT_TYPES.agentError, "agent:runtime", { message: errorMessage(err) }, input.userEventId);
@@ -823,6 +997,31 @@ export class SessionManager {
       }
     } finally {
       state.running = false;
+    }
+  }
+
+  /**
+   * 附件上下文注入（票 M7-A-T4；注入方式选择见报告/ADR）：
+   * 附加在**发给 Agent 的 user 消息**末尾（不是 system prompt）——system prompt 在
+   * 会话运行时创建时求值一次，之后新增的附件就看不到了；user 消息每轮按当前附件
+   * 路径重读（只读），后加即生效。格式固定为 `<附件内容>` 段落，便于测试与模型识别。
+   * 读取失败只记日志：附件是增强路径，不得阻断本轮对话。
+   */
+  async #promptWithAttachments(sessionId: string, text: string): Promise<string> {
+    if (this.#workspace === null) return text;
+    const attachments = this.attachmentsOf(sessionId);
+    if (attachments.length === 0) return text;
+    try {
+      const contents = await this.#workspace.attach(attachments.map((attachment) => attachment.path));
+      if (contents.length === 0) return text;
+      const sections = contents.map(
+        (attachment) =>
+          `--- 附件: ${attachment.path} (${attachment.size} bytes)${attachment.truncated ? " [truncated]" : ""} ---\n${attachment.content}`,
+      );
+      return `${text}\n\n<附件内容>\n${sections.join("\n\n")}\n</附件内容>`;
+    } catch (err) {
+      console.error("[morrow] attachment injection failed:", err);
+      return text;
     }
   }
 
@@ -953,6 +1152,43 @@ export class SessionManager {
     }
     return state;
   }
+}
+
+/** 账本 payload → 工作区投影（形状校验；非法/缺失返回 null = 解绑）。 */
+function readWorkspace(value: unknown): SessionWorkspace | null {
+  if (value === null || typeof value !== "object") return null;
+  const record = value as Record<string, unknown>;
+  if (record.kind !== "local" && record.kind !== "github") return null;
+  if (typeof record.path !== "string" || record.path.length === 0) return null;
+  return {
+    kind: record.kind,
+    path: record.path,
+    ...(typeof record.repo_path === "string" ? { repo_path: record.repo_path } : {}),
+    ...(typeof record.branch === "string" ? { branch: record.branch } : {}),
+    ...(typeof record.url === "string" ? { url: record.url } : {}),
+    ...(typeof record.base_branch === "string" ? { base_branch: record.base_branch } : {}),
+  };
+}
+
+function readAttachments(value: unknown): SessionAttachment[] {
+  if (!Array.isArray(value)) return [];
+  const out: SessionAttachment[] = [];
+  for (const item of value) {
+    if (item === null || typeof item !== "object") continue;
+    const record = item as Record<string, unknown>;
+    if (typeof record.path !== "string" || record.path.length === 0) continue;
+    out.push({
+      path: record.path,
+      name: typeof record.name === "string" ? record.name : record.path.split("/").pop() ?? record.path,
+      size: typeof record.size === "number" && Number.isFinite(record.size) ? record.size : 0,
+    });
+  }
+  return out;
+}
+
+function readStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is string => typeof item === "string" && item.length > 0);
 }
 
 function errorMessage(err: unknown): string {

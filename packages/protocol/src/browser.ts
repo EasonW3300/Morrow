@@ -30,6 +30,9 @@ export type {
   ProviderCompatConfig,
   ProviderRecord,
   SensitivityLevel,
+  SessionAttachment,
+  SessionWorkspace,
+  SessionWorkspaceKind,
 } from "./api-contracts.ts";
 export { DEFAULT_PERSONA, PERSONA_LIMITS } from "./api-contracts.ts";
 export type {

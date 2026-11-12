@@ -118,6 +118,42 @@ export const DEFAULT_PERSONA: Persona = {
   extra: "",
 };
 
+// --- 会话工作区与附件（票 M7-A-T4 / Issue #61；ADR-0012）---------------------
+//
+// 工作区 = 目录（bash/git/快照以目录为单位）；单文件只作只读会话附件，不进工作区。
+// 会话摘要（GET /v1/sessions 的投影）只加字段：`workspace?` + `attachment_count`。
+
+/** 工作区来源：本地已有目录 或 GitHub 仓库（clone 或关联已有副本） */
+export type SessionWorkspaceKind = "local" | "github";
+
+/**
+ * 会话工作区投影（`session.workspace_bound` 事件 payload 同形）。
+ * - local：`path` 即用户选择的目录；是 git 仓库时带 `repo_path` 与当前 `branch`。
+ * - github：`path` 是本次会话的 worktree 目录（`~/.morrow/worktrees/sessions/<session>`），
+ *   `repo_path` 是主 clone（`~/.morrow/workspaces/<repo>-<short>`），`branch` 为新建分支，
+ *   `base_branch` 为基线分支名，`url` 为用户输入的仓库地址。
+ */
+export interface SessionWorkspace {
+  kind: SessionWorkspaceKind;
+  /** 会话实际工作目录（Agent 的 cwd） */
+  path: string;
+  /** 主仓库路径（git 仓库时存在；本地非 git 目录没有） */
+  repo_path?: string;
+  /** 工作区的 git 分支（非 git 或未检出时缺省） */
+  branch?: string;
+  /** GitHub 来源地址（kind=github 时存在） */
+  url?: string;
+  /** GitHub 分支基线（kind=github 时存在） */
+  base_branch?: string;
+}
+
+/** 会话附件投影（只读；内容不进账本，注入时按路径重读） */
+export interface SessionAttachment {
+  path: string;
+  name: string;
+  size: number;
+}
+
 // --- 设备与配对（M3-T2 / Issue #31；FR-DEP-2、GLOSSARY Device/Replica）--------
 //
 // 设备身份 = ed25519 公钥；指纹 = 公钥原始 32 字节的 SHA-256 前 16 hex。

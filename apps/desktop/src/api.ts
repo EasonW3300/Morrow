@@ -34,6 +34,8 @@ import type {
   Persona,
   PermissionGrant,
   ProviderRecord,
+  SessionAttachment,
+  SessionWorkspace,
   SyncRunReport,
   SyncStatus,
   TaskDetail,
@@ -70,6 +72,8 @@ export type {
   Persona,
   PermissionGrant,
   ProviderRecord,
+  SessionAttachment,
+  SessionWorkspace,
   SyncRunReport,
   SyncStatus,
   TaskDetail,
@@ -148,6 +152,37 @@ export interface SessionSummary {
   archived_at?: string;
   /** 软删时间（M7-A-T2；恢复后缺省；30 天后服务端折叠剔除） */
   deleted_at?: string;
+  /** 会话工作区（M7-A-T4 / Issue #61；未绑定缺省） */
+  workspace?: SessionWorkspace;
+  /** 只读附件数量（M7-A-T4） */
+  attachment_count?: number;
+}
+
+/** PUT /v1/sessions/:id/workspace 的 body（三形态） */
+export type WorkspaceBindingRequest =
+  | { kind: "none" }
+  | { kind: "local"; path: string }
+  | { kind: "github"; url: string; base_branch?: string; new_branch?: string };
+
+/** PUT /v1/sessions/:id/workspace 的 200 载荷 */
+export interface SessionWorkspaceMutation {
+  session_id: string;
+  workspace: SessionWorkspace | null;
+  event_id: string | null;
+  sequence: number | null;
+  changed: boolean;
+  /** github 且命中本机已有 clone 时为 true（未发生网络动作） */
+  reused?: boolean;
+}
+
+/** GET/POST/DELETE /v1/sessions/:id/attachments 的载荷 */
+export interface SessionAttachmentsResult {
+  session_id: string;
+  attachments: SessionAttachment[];
+  attachment_count: number;
+  event_id?: string | null;
+  sequence?: number | null;
+  changed?: boolean;
 }
 
 /** GET /v1/memory/facts 命中条目（票 M7-A-T3 起带 scope） */
@@ -443,6 +478,36 @@ export const api = {
   deleteSession(base: string, sessionId: string): Promise<SessionMetadataMutation> {
     return request<SessionMetadataMutation>(base, `/v1/sessions/${encodeURIComponent(sessionId)}`, {
       method: "DELETE",
+    });
+  },
+
+  // --- 会话工作区与附件（票 M7-A-T4 / Issue #61）---
+
+  bindWorkspace(base: string, sessionId: string, body: WorkspaceBindingRequest): Promise<SessionWorkspaceMutation> {
+    return request<SessionWorkspaceMutation>(base, `/v1/sessions/${encodeURIComponent(sessionId)}/workspace`, {
+      method: "PUT",
+      headers: JSON_HEADERS,
+      body: JSON.stringify(body),
+    });
+  },
+
+  listAttachments(base: string, sessionId: string): Promise<SessionAttachmentsResult> {
+    return request<SessionAttachmentsResult>(base, `/v1/sessions/${encodeURIComponent(sessionId)}/attachments`);
+  },
+
+  addAttachments(base: string, sessionId: string, paths: string[]): Promise<SessionAttachmentsResult> {
+    return request<SessionAttachmentsResult>(base, `/v1/sessions/${encodeURIComponent(sessionId)}/attachments`, {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ paths }),
+    });
+  },
+
+  removeAttachments(base: string, sessionId: string, paths: string[]): Promise<SessionAttachmentsResult> {
+    return request<SessionAttachmentsResult>(base, `/v1/sessions/${encodeURIComponent(sessionId)}/attachments`, {
+      method: "DELETE",
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ paths }),
     });
   },
 

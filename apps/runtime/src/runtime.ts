@@ -1,12 +1,13 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
+import { homedir } from "node:os";
 import { createPiAdapter, type AgentRuntime, type MorrowTool } from "@morrow/pi-adapter";
 import packageJson from "../package.json" with { type: "json" };
 import piAdapterPackageJson from "../../../packages/pi-adapter/package.json" with { type: "json" };
 import { ensureBuiltinCapabilities, MEMORY_WRITE_CAPABILITY_MANIFEST } from "./capabilities/builtin.ts";
 import { CAPABILITY_EVENT_TYPES, PermissionEngine, isEphemeralWriteClassCapability, type CapabilityLifecycleEvent } from "./capabilities/engine.ts";
-import type { CapabilityRecord } from "@morrow/protocol";
+import type { CapabilityRecord, SessionAttachment, SessionWorkspace } from "@morrow/protocol";
 import { capabilityRoutes } from "./capabilities/routes.ts";
 import { skillRoutes } from "./capabilities/skills/routes.ts";
 import { SkillService } from "./capabilities/skills/service.ts";
@@ -51,6 +52,7 @@ import {
   type SessionFrame,
   type SessionKind,
 } from "./sessions.ts";
+import { DefaultWorkspaceManager, WorkspaceError, defaultBranchForSession, type WorkspaceManager } from "./workspace.ts";
 import { ChannelRegistry, type ChannelAdapterRegistration } from "./channels/registry.ts";
 import { channelRoutes } from "./channels/routes.ts";
 import { createChannelOutboundSink } from "./channels/outbox.ts";
@@ -160,6 +162,8 @@ interface RequestContext {
   outbox: OutboxService;
   /** 通知规则与路由（M4-T7 / Issue #44：账本订阅 → 规则匹配 → 桌面/渠道） */
   notifications: NotificationService;
+  /** 会话工作区接缝（票 M7-A-T4：git/gh 副作用与附件读取） */
+  workspace: WorkspaceManager;
 }
 
 type Handler = (
@@ -332,6 +336,12 @@ export interface RuntimeOptions {
    * （零 sleep）。缺省系统时间。
    */
   sessionsNow?: () => Date;
+  /**
+   * 会话工作区接缝（票 M7-A-T4 / Issue #61）：缺省 = DefaultWorkspaceManager，clones 落
+   * `~/.morrow/workspaces`、会话 worktree 落 `~/.morrow/worktrees/sessions`，凭据优先
+   * `gh auth token` 再读 OS 凭据库 `github:pat`。测试注入假实现即可完全隔离真实 git/gh。
+   */
+  workspaceManager?: WorkspaceManager;
 }
 
 export interface RuntimeHandle {
@@ -430,6 +440,11 @@ const routes: Route[] = [
   { method: "DELETE", re: /^\/v1\/sessions\/([^/]+)$/, handler: handleDeleteSession },
   // 票 M7-A-T3：临时会话关闭（仅 kind=ephemeral 分支；普通会话关闭语义属 T5）
   { method: "POST", re: /^\/v1\/sessions\/([^/]+)\/close$/, handler: handleCloseSession },
+  // 票 M7-A-T4：会话工作区（local/github/none）与只读附件（列表/添加/移除）
+  { method: "PUT", re: /^\/v1\/sessions\/([^/]+)\/workspace$/, handler: handleBindWorkspace },
+  { method: "GET", re: /^\/v1\/sessions\/([^/]+)\/attachments$/, handler: handleListAttachments },
+  { method: "POST", re: /^\/v1\/sessions\/([^/]+)\/attachments$/, handler: handleAddAttachments },
+  { method: "DELETE", re: /^\/v1\/sessions\/([^/]+)\/attachments$/, handler: handleRemoveAttachments },
   { method: "POST", re: /^\/v1\/tasks$/, handler: handleCreateTask },
   { method: "GET", re: /^\/v1\/tasks$/, handler: handleListTasks },
   { method: "GET", re: /^\/v1\/tasks\/([^/]+)$/, handler: handleGetTask },
@@ -501,6 +516,13 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
   // com.morrow.device + replica_id）——纯本地回环部署不触碰钥匙串；首次配对才供给。
   // 同步传输在下面构建时要用同一个凭据库（读 token:<peer>），故提前到引擎之前。
   const secretStore = options.secretStore ?? detectSecretStore().store;
+  // 会话工作区（票 M7-A-T4 / Issue #61）：git/gh 副作用全部经此接缝；默认实现不触盘、
+  // 只在绑定/建分支/clone 时执行子进程。凭据链 readGhToken：gh → OS 凭据库 github:pat。
+  const workspaceManager = options.workspaceManager ?? new DefaultWorkspaceManager({
+    workspacesRoot: join(homedir(), ".morrow", "workspaces"),
+    worktreesRoot: join(homedir(), ".morrow", "worktrees", "sessions"),
+    secretStore,
+  });
   // 出站同步传输（M3 同步接线修复 / Issue #34）：启动即按 devices 表接线——
   // base_url 从设备记录读、bearer token 从 SecretStore 读 `token:<peer>`。运行时
   // 设备增删由 DeviceSyncTransport 的读路径惰性重建 + PairingService 变更回调失效。
@@ -806,6 +828,8 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     systemPrompt: () => composePersonaPrompt(persona.get()),
     // 元数据时钟（M7-A-T2）：软删 30 天到期判定
     ...(options.sessionsNow === undefined ? {} : { now: options.sessionsNow }),
+    // 工作区接缝（票 M7-A-T4）：附件注入按路径重读（只读），工作区绑定走同一实现
+    workspace: workspaceManager,
     // 工具完成观察（M2-T5）：tool.finished → Skill 案例收集（is_error → failure）。
     // 观察是增强路径：失败记日志不阻断会话主链路。
     toolObserver: {
@@ -1071,6 +1095,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     contacts,
     outbox,
     notifications,
+    workspace: workspaceManager,
   };
   const server = createServer((req, res) => {
     routeRequest(req, res, ctx);
@@ -1707,6 +1732,260 @@ function handleSessionLifecycleError(res: ServerResponse, err: unknown): void {
     return;
   }
   throw err;
+}
+
+// --- M7-A 工作区与附件 handlers（票 T4 / Issue #61）--------------------------
+
+interface BindWorkspaceBody {
+  kind?: unknown;
+  path?: unknown;
+  url?: unknown;
+  base_branch?: unknown;
+  new_branch?: unknown;
+}
+
+/**
+ * PUT /v1/sessions/:id/workspace：
+ *   { kind: "none" }
+ *   { kind: "local", path }
+ *   { kind: "github", url, base_branch?, new_branch? }
+ * github 路径：clone 或按 remote URL 关联已有副本 → 建分支（默认 morrow/<6位id>，
+ * 基线缺省探测 origin/HEAD）→ 建会话 worktree；全部成功后写 session.workspace_bound。
+ * 失败返回可操作错误（无 PAT/gh 的 clone 失败提示”；分支冲突 409）。
+ */
+async function handleBindWorkspace(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _url: URL,
+  ctx: RequestContext,
+  params: string[],
+): Promise<void> {
+  const sessionId = params[0];
+  if (!ctx.sessions.sessionExists(sessionId)) {
+    sendError(res, 404, "not_found", `session ${sessionId} does not exist`);
+    return;
+  }
+  const body = await readJsonBody(req, res);
+  if (body === null) return;
+  const { kind, path, url, base_branch: baseBranchRaw, new_branch: newBranchRaw } = body as BindWorkspaceBody;
+
+  if (kind === "none") {
+    const mutation = ctx.sessions.bindWorkspace(sessionId, null);
+    if (mutation === null) {
+      sendError(res, 404, "not_found", `session ${sessionId} does not exist`);
+      return;
+    }
+    sendJson(res, 200, workspaceResponse(sessionId, mutation.workspace, mutation));
+    return;
+  }
+
+  if (kind === "local") {
+    if (typeof path !== "string" || path.trim().length === 0) {
+      sendError(res, 400, "invalid_body", "path must be a non-empty string for kind=local");
+      return;
+    }
+    let workspace: SessionWorkspace;
+    try {
+      const binding = await ctx.workspace.bindLocal(path);
+      workspace = {
+        kind: "local",
+        path: binding.path,
+        ...(binding.repoPath === null ? {} : { repo_path: binding.repoPath }),
+        ...(binding.branch === null ? {} : { branch: binding.branch }),
+      };
+    } catch (err) {
+      sendWorkspaceError(res, err);
+      return;
+    }
+    const mutation = ctx.sessions.bindWorkspace(sessionId, workspace);
+    if (mutation === null) {
+      sendError(res, 404, "not_found", `session ${sessionId} does not exist`);
+      return;
+    }
+    sendJson(res, 200, workspaceResponse(sessionId, mutation.workspace, mutation));
+    return;
+  }
+
+  if (kind === "github") {
+    if (typeof url !== "string" || url.trim().length === 0) {
+      sendError(res, 400, "invalid_body", "url must be a non-empty string for kind=github");
+      return;
+    }
+    if (baseBranchRaw !== undefined && (typeof baseBranchRaw !== "string" || baseBranchRaw.trim().length === 0)) {
+      sendError(res, 400, "invalid_body", "base_branch must be a non-empty string when present");
+      return;
+    }
+    if (newBranchRaw !== undefined && (typeof newBranchRaw !== "string" || newBranchRaw.trim().length === 0)) {
+      sendError(res, 400, "invalid_body", "new_branch must be a non-empty string when present");
+      return;
+    }
+    const baseBranch = typeof baseBranchRaw === "string" ? baseBranchRaw.trim() : undefined;
+    const newBranch = typeof newBranchRaw === "string" ? newBranchRaw.trim() : defaultBranchForSession(sessionId);
+    let workspace: SessionWorkspace;
+    let reused = false;
+    try {
+      const cloned = await ctx.workspace.cloneFrom(url.trim(), baseBranch === undefined ? {} : { baseBranch });
+      reused = cloned.reused;
+      const created = await ctx.workspace.ensureBranch(cloned.repoPath, baseBranch, newBranch);
+      const worktree = await ctx.workspace.prepareWorktree(cloned.repoPath, created.branch, sessionId);
+      workspace = {
+        kind: "github",
+        path: worktree.dir,
+        repo_path: cloned.repoPath,
+        branch: created.branch,
+        url: url.trim(),
+        base_branch: created.base,
+      };
+    } catch (err) {
+      sendWorkspaceError(res, err);
+      return;
+    }
+    const mutation = ctx.sessions.bindWorkspace(sessionId, workspace);
+    if (mutation === null) {
+      sendError(res, 404, "not_found", `session ${sessionId} does not exist`);
+      return;
+    }
+    sendJson(res, 200, { ...workspaceResponse(sessionId, mutation.workspace, mutation), reused });
+    return;
+  }
+
+  sendError(res, 400, "invalid_body", 'kind must be "local", "github" or "none"');
+}
+
+function workspaceResponse(
+  sessionId: string,
+  workspace: SessionWorkspace | null,
+  mutation: { eventId: string | null; sequence: number | null; changed: boolean },
+): Record<string, unknown> {
+  return {
+    session_id: sessionId,
+    workspace,
+    event_id: mutation.eventId,
+    sequence: mutation.sequence,
+    changed: mutation.changed,
+  };
+}
+
+interface AttachmentBody {
+  paths?: unknown;
+}
+
+function parseAttachmentPaths(value: unknown): string[] | null {
+  if (!Array.isArray(value) || value.length === 0) return null;
+  const paths: string[] = [];
+  for (const item of value) {
+    if (typeof item !== "string" || item.trim().length === 0) return null;
+    paths.push(item.trim());
+  }
+  return paths;
+}
+
+function handleListAttachments(
+  _req: IncomingMessage,
+  res: ServerResponse,
+  _url: URL,
+  ctx: RequestContext,
+  params: string[],
+): void {
+  const sessionId = params[0];
+  if (!ctx.sessions.sessionExists(sessionId)) {
+    sendError(res, 404, "not_found", `session ${sessionId} does not exist`);
+    return;
+  }
+  const attachments = ctx.sessions.attachmentsOf(sessionId);
+  sendJson(res, 200, { session_id: sessionId, attachments, attachment_count: attachments.length });
+}
+
+async function handleAddAttachments(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _url: URL,
+  ctx: RequestContext,
+  params: string[],
+): Promise<void> {
+  const sessionId = params[0];
+  if (!ctx.sessions.sessionExists(sessionId)) {
+    sendError(res, 404, "not_found", `session ${sessionId} does not exist`);
+    return;
+  }
+  const body = await readJsonBody(req, res);
+  if (body === null) return;
+  const paths = parseAttachmentPaths((body as AttachmentBody).paths);
+  if (paths === null) {
+    sendError(res, 400, "invalid_body", "paths must be a non-empty array of non-empty strings");
+    return;
+  }
+  let attachments: SessionAttachment[];
+  try {
+    // 读取并校验（只读；数量/单文件/总量上限在 DefaultWorkspaceManager 内）
+    attachments = (await ctx.workspace.attach(paths)).map(({ path, name, size }) => ({ path, name, size }));
+  } catch (err) {
+    sendWorkspaceError(res, err);
+    return;
+  }
+  const mutation = ctx.sessions.addAttachments(sessionId, attachments);
+  if (mutation === null) {
+    sendError(res, 404, "not_found", `session ${sessionId} does not exist`);
+    return;
+  }
+  sendJson(res, 200, {
+    session_id: sessionId,
+    attachments: mutation.attachments,
+    attachment_count: mutation.attachmentCount,
+    event_id: mutation.eventId,
+    sequence: mutation.sequence,
+    changed: mutation.changed,
+  });
+}
+
+async function handleRemoveAttachments(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _url: URL,
+  ctx: RequestContext,
+  params: string[],
+): Promise<void> {
+  const sessionId = params[0];
+  if (!ctx.sessions.sessionExists(sessionId)) {
+    sendError(res, 404, "not_found", `session ${sessionId} does not exist`);
+    return;
+  }
+  const body = await readJsonBody(req, res);
+  if (body === null) return;
+  const paths = parseAttachmentPaths((body as AttachmentBody).paths);
+  if (paths === null) {
+    sendError(res, 400, "invalid_body", "paths must be a non-empty array of non-empty strings");
+    return;
+  }
+  const mutation = ctx.sessions.removeAttachments(sessionId, paths);
+  if (mutation === null) {
+    sendError(res, 404, "not_found", `session ${sessionId} does not exist`);
+    return;
+  }
+  sendJson(res, 200, {
+    session_id: sessionId,
+    attachments: mutation.attachments,
+    attachment_count: mutation.attachmentCount,
+    event_id: mutation.eventId,
+    sequence: mutation.sequence,
+    changed: mutation.changed,
+  });
+}
+
+/** 工作区错误 → HTTP 状态（可操作错误码不合并成 500）。 */
+function sendWorkspaceError(res: ServerResponse, err: unknown): void {
+  if (!(err instanceof WorkspaceError)) throw err;
+  const status =
+    err.code === "clone_failed"
+      ? 502
+      : err.code === "git_failed"
+        ? 500
+        : err.code === "branch_exists" ||
+            err.code === "branch_in_use" ||
+            err.code === "base_not_found"
+          ? 409
+          : 400;
+  sendError(res, status, err.code, err.message);
 }
 
 interface SendMessageBody {
