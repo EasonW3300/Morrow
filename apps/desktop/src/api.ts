@@ -138,9 +138,29 @@ async function request<T>(base: string, path: string, init?: RequestInit): Promi
 
 export interface SessionSummary {
   session_id: string;
+  event_id?: string;
   title?: string;
   occurred_at: string;
   sequence: number;
+  /** 归档时间（M7-A-T2；取消归档后缺省） */
+  archived_at?: string;
+  /** 软删时间（M7-A-T2；恢复后缺省；30 天后服务端折叠剔除） */
+  deleted_at?: string;
+}
+
+/** GET /v1/sessions?include= 的过滤值：缺省只回活动会话 */
+export type SessionListInclude = "archived" | "deleted" | "all";
+
+/** 会话元数据端点（rename/archive/unarchive/delete/restore）的 200 载荷 */
+export interface SessionMetadataMutation {
+  session_id: string;
+  event_id: string | null;
+  sequence: number | null;
+  changed: boolean;
+  title?: string;
+  archived_at?: string | null;
+  deleted_at?: string | null;
+  restored_at?: string;
 }
 
 export interface MessageRecord {
@@ -348,8 +368,45 @@ export interface TaskReconcileResult {
 }
 
 export const api = {
-  listSessions(base: string): Promise<SessionSummary[]> {
-    return request<{ sessions: SessionSummary[] }>(base, "/v1/sessions").then((r) => r.sessions);
+  listSessions(base: string, include?: SessionListInclude): Promise<SessionSummary[]> {
+    const query = include === undefined ? "" : `?include=${encodeURIComponent(include)}`;
+    return request<{ sessions: SessionSummary[] }>(base, `/v1/sessions${query}`).then((r) => r.sessions);
+  },
+
+  renameSession(base: string, sessionId: string, title: string): Promise<SessionMetadataMutation> {
+    return request<SessionMetadataMutation>(base, `/v1/sessions/${encodeURIComponent(sessionId)}/rename`, {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ title }),
+    });
+  },
+
+  archiveSession(base: string, sessionId: string): Promise<SessionMetadataMutation> {
+    return request<SessionMetadataMutation>(base, `/v1/sessions/${encodeURIComponent(sessionId)}/archive`, {
+      method: "POST",
+      headers: JSON_HEADERS,
+    });
+  },
+
+  unarchiveSession(base: string, sessionId: string): Promise<SessionMetadataMutation> {
+    return request<SessionMetadataMutation>(base, `/v1/sessions/${encodeURIComponent(sessionId)}/unarchive`, {
+      method: "POST",
+      headers: JSON_HEADERS,
+    });
+  },
+
+  restoreSession(base: string, sessionId: string): Promise<SessionMetadataMutation> {
+    return request<SessionMetadataMutation>(base, `/v1/sessions/${encodeURIComponent(sessionId)}/restore`, {
+      method: "POST",
+      headers: JSON_HEADERS,
+    });
+  },
+
+  /** 软删（30 天内可恢复；删除不影响记忆） */
+  deleteSession(base: string, sessionId: string): Promise<SessionMetadataMutation> {
+    return request<SessionMetadataMutation>(base, `/v1/sessions/${encodeURIComponent(sessionId)}`, {
+      method: "DELETE",
+    });
   },
 
   createSession(base: string, title?: string): Promise<{ session_id: string }> {

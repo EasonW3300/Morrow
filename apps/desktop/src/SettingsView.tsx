@@ -4,9 +4,11 @@ import {
   ApiError,
   type ConnectivityResult,
   type ProviderRecord,
+  type SessionSummary,
 } from "./api.ts";
 import { PERSONA_LIMITS } from "@morrow/protocol/browser";
 import { describeConnectivity } from "./connectivity-ui.ts";
+import { describeRestoreWindow } from "./session-ui.ts";
 import {
   COMPAT_SWITCHES,
   emptyProviderForm,
@@ -29,9 +31,10 @@ import { DevicesView } from "./DevicesView.tsx";
 import { useConfirm } from "./design-system/ConfirmDialog.tsx";
 
 /**
- * 设置页（PRD §5.1 设置区）：四个子页签——「Provider 与模型」（票 T7 / Issue #8）、
- * 「能力管理」（票 M2-T6 / Issue #27）、「设备与同步」（票 M3-T6 / Issue #35）与
- * 「渠道」（票 M4-T8 / Issue #45：适配器/白名单/联系人/通知规则/Outbox）。
+ * 设置页（PRD §5.1 设置区）：子页签——「Provider 与模型」（票 T7 / Issue #8）、
+ * 「Persona」（M7-A-T1 / Issue #58）、「能力管理」（票 M2-T6 / Issue #27）、
+ * 「设备与同步」（票 M3-T6 / Issue #35）、「渠道」（票 M4-T8 / Issue #45）与
+ * 「会话管理」（M7-A-T2 / Issue #59：归档/软删恢复）。
  * 能力管理页签可由 Task 视图的能力引用卡跳入（initialCapabilityName 预选详情）。
  */
 export function SettingsView({
@@ -41,7 +44,9 @@ export function SettingsView({
   base: string;
   initialCapabilityName?: string | null;
 }) {
-  const [section, setSection] = useState<"providers" | "persona" | "capabilities" | "devices" | "channels">(
+  const [section, setSection] = useState<
+    "providers" | "persona" | "capabilities" | "devices" | "channels" | "sessions"
+  >(
     initialCapabilityName !== null ? "capabilities" : "providers",
   );
 
@@ -60,6 +65,7 @@ export function SettingsView({
             ["capabilities", "能力管理"],
             ["devices", "设备与同步"],
             ["channels", "渠道"],
+            ["sessions", "会话管理"],
           ] as const
         ).map(([key, label]) => (
           <button
@@ -78,6 +84,7 @@ export function SettingsView({
       )}
       {section === "devices" && <DevicesView base={base} />}
       {section === "channels" && <ChannelsView base={base} />}
+      {section === "sessions" && <SessionManagementSection base={base} />}
     </div>
   );
 }
@@ -252,6 +259,100 @@ function PersonaSection({ base }: { base: string }) {
       })()}
     </div>
   );
+}
+
+/**
+ * 会话管理（M7-A-T2 / Issue #59）：列出归档与已删除（30 天内）会话；
+ * 归档可取消归档，已删除可恢复。删除不影响记忆，过期删除由服务端折叠剔除。
+ */
+function SessionManagementSection({ base }: { base: string }) {
+  const [sessions, setSessions] = useState<SessionSummary[]>([]);
+  const [listError, setListError] = useState<string | null>(null);
+  const [busyId, setBusyId] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    try {
+      const all = await api.listSessions(base, "all");
+      setSessions(all.filter((session) => session.archived_at !== undefined || session.deleted_at !== undefined));
+      setListError(null);
+    } catch (err) {
+      setListError(readableError(err, "加载会话列表失败"));
+    }
+  }, [base]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const mutate = async (sessionId: string, action: "restore" | "unarchive"): Promise<void> => {
+    setBusyId(sessionId);
+    try {
+      if (action === "restore") await api.restoreSession(base, sessionId);
+      else await api.unarchiveSession(base, sessionId);
+      await load();
+    } catch (err) {
+      setListError(readableError(err, action === "restore" ? "恢复失败" : "取消归档失败"));
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  return (
+    <div className="settings-section">
+      <div className="page-head">
+        <h2>会话管理</h2>
+        <button className="btn" onClick={() => void load()} disabled={busyId !== null}>
+          刷新
+        </button>
+      </div>
+      <p className="page-hint">
+        归档与已删除的会话。软删后 30 天内可恢复；删除只影响会话列表，记忆不受影响。
+      </p>
+      {listError !== null && <div className="banner-error">{listError}</div>}
+      {sessions.length === 0 && listError === null && (
+        <div className="empty-note">没有归档或已删除的会话。</div>
+      )}
+      <ul className="managed-sessions">
+        {sessions.map((session) => {
+          const deleted = session.deleted_at !== undefined;
+          const title = session.title ?? `会话 ${session.session_id.slice(0, 8)}`;
+          return (
+            <li key={session.session_id} className="managed-session-row">
+              <div className="managed-session-main">
+                <strong>{title}</strong>
+                <div className="managed-session-meta">
+                  {deleted ? (
+                    <>
+                      <span className="badge">已删除</span>
+                      <span>{session.deleted_at === undefined ? "" : describeRestoreWindow(session.deleted_at)}</span>
+                    </>
+                  ) : (
+                    <>
+                      <span className="badge">已归档</span>
+                      <span>{session.archived_at === undefined ? "" : shortDate(session.archived_at)}</span>
+                    </>
+                  )}
+                </div>
+              </div>
+              <button
+                className="btn"
+                disabled={busyId === session.session_id}
+                onClick={() => void mutate(session.session_id, deleted ? "restore" : "unarchive")}
+              >
+                {busyId === session.session_id ? "处理中…" : deleted ? "恢复" : "取消归档"}
+              </button>
+            </li>
+          );
+        })}
+      </ul>
+    </div>
+  );
+}
+
+function shortDate(iso: string): string {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "";
+  return date.toLocaleString("zh-CN", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" });
 }
 
 function ProvidersSection({ base }: { base: string }) {
