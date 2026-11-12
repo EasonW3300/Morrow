@@ -11,7 +11,12 @@ import {
   type FeishuChannelAdapterOptions,
 } from "./adapters/feishu/index.ts";
 import { FEISHU_SECRET_SERVICE } from "./adapters/feishu/config.ts";
-import { loadQqConfig, QqChannelAdapter, type QqChannelAdapterOptions } from "./adapters/qq/index.ts";
+import {
+  loadQqConfig,
+  QqChannelAdapter,
+  QqWebSocketTransport,
+  type QqChannelAdapterOptions,
+} from "./adapters/qq/index.ts";
 import { QQ_SECRET_SERVICE } from "./adapters/qq/config.ts";
 import { WeChatChannelAdapter } from "./adapters/wechat/adapter.ts";
 import { WECHAT_ENVIRONMENT, WECHAT_RISK_NOTICE } from "./adapters/wechat/constants.ts";
@@ -306,9 +311,20 @@ export async function buildConfiguredChannels(
     let adapter: ChannelAdapter;
     try {
       const config = await loadQqConfig(options.secretStore);
+      // 真实 QQ 的事件接入是 **WebSocket 网关**（ADR-0004：不监听公网、不需要回调地址）。
+      // 不注入时适配器会回落到 HTTP 长轮询，去打 api.sgroup.qq.com 的 stream 路径——
+      // 该端点不存在，表现为 `event stream responded 404` + health degraded
+      // （v0.1.0 发布后真机联调发现：WS 传输当时只被联调脚本使用，没接进生产装配）。
+      // 宿主/测试显式传 eventTransport 时以显式为准（ChannelTestServer 走长轮询桩）。
+      const qqEventTransport =
+        options.qq?.eventTransport ??
+        new QqWebSocketTransport({
+          ...(options.qq?.apiBaseUrl === undefined ? {} : { apiBaseUrl: options.qq.apiBaseUrl }),
+        });
       adapter = new QqChannelAdapter({
         accountId: "qq-default",
         ...options.qq,
+        eventTransport: qqEventTransport,
         config,
       });
     } catch (err) {

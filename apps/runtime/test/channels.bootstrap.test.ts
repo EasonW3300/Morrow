@@ -10,6 +10,7 @@ import type { RuntimeConfig } from "../src/config.ts";
 import { createInMemorySecretStore, type SecretStore } from "../src/keyring.ts";
 import { startRuntime, type RuntimeHandle } from "../src/runtime.ts";
 import { ChannelTestServer } from "../src/channels/testing/channel-test-server.ts";
+import { HttpLongPollEventTransport } from "../src/channels/event-transport.ts";
 import { registerQqTestStub } from "../src/channels/testing/qq-stub.ts";
 import { StubLocalBridge } from "../src/channels/adapters/wechat/stub-bridge.ts";
 import { json, removeDir, tmpDir } from "./helpers.ts";
@@ -85,6 +86,13 @@ test("startRuntime 自动装配飞书+QQ：未配置不出现，缺省 disabled 
       requestTimeoutMs: 500,
       eventPollTimeoutMs: 20,
       eventReconnectDelayMs: 5,
+      // 本测试验证装配置/启停/健康投影，不需要真实网关：显式用长轮询对接 ChannelTestServer
+      // 的事件队列（生产默认已切到 WebSocket 网关，见 bootstrap 注释）。
+      eventTransport: new HttpLongPollEventTransport({
+        baseUrl: server.baseUrl,
+        pollTimeoutMs: 20,
+        reconnectDelayMs: 5,
+      }),
     },
     ownerNativeIds: { feishu: ["ou_owner"], qq: ["qq_owner"] },
   };
