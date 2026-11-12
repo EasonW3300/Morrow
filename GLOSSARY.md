@@ -29,6 +29,16 @@ _Avoid_: 节点
 
 **Full Permission Mode（完全权限）**: 会话级的执行模式，跳过逐次命令确认；但静态危险模式拦截、执行前快照与审计照常生效——含义是"不问 Owner"，不是"无边界"。
 
+**Plan Mode（计划模式）**: 只读研究 + 提问 + 产出计划的会话模式；工具集被限制为只读，计划以 `<proposed_plan>` 产出并由 Owner 批准后才进入执行。
+
+**Thread Goal（线程目标）**: 挂在单个会话上的长跑意图，带状态机（active/paused/blocked/usage_limited/budget_limited/complete）与 token/时间预算；空闲时可自动续跑，Plan 模式下不续跑。
+
+**Best Mode（自动流转模式）**: 从一个想法出发自动走完"访谈 → 规格 → 拆票 → 实现"四阶段的编排模式；内部以一个 Thread Goal 承载，实现阶段展开为 Task DAG。
+
+**Session Workspace（会话工作区）**: 单个会话绑定的项目目录与分支；bash 执行、写操作与快照的默认边界。
+
+**Session Attachment（会话附件）**: 注入会话上下文的只读文件引用，不属于工作区，不参与写操作与快照。
+
 ## 扩展
 
 **MCP Server**: 通过 Model Context Protocol 提供 tools 的外部进程；接入后其工具视为沙箱类 capability，受同一五维权限约束。
