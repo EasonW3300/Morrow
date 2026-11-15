@@ -87,12 +87,19 @@ export function deleteSessionConfirmMessage(): string {
   return "删除后对话记录会从主列表消失；记忆不受影响，30 天内可在「设置 → 会话管理」恢复。";
 }
 
-/** 恢复截止时间（deleted_at + 30d；与 runtime 折叠判定同口径）。 */
-export function restoreDeadline(deletedAt: string): Date {
+/**
+ * 软删恢复截止时间（deleted_at + 30d；与 runtime 折叠判定同口径）。
+ *
+ * 名字带 `session` 前缀（#64-B3）：`ephemeral-ui.ts` 里还有一套 24h 窗口的
+ * `ephemeralRestoreDeadline`，两者同名异义（30 天软删 vs 24 小时临时会话），
+ * 不加限定前缀会在跨模块 import 时看错。
+ */
+export function sessionRestoreDeadline(deletedAt: string): Date {
   return new Date(Date.parse(deletedAt) + SESSION_RESTORE_WINDOW_MS);
 }
 
-export function canRestore(deletedAt: string, now: number = Date.now()): boolean {
+/** 软删是否仍在 30 天恢复窗口内（到点即不可恢复）。 */
+export function canRestoreSession(deletedAt: string, now: number = Date.now()): boolean {
   const deadline = Date.parse(deletedAt);
   if (Number.isNaN(deadline)) return false;
   return deadline + SESSION_RESTORE_WINDOW_MS > now;

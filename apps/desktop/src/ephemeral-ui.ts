@@ -31,19 +31,25 @@ export function promoteDisabledReason(scope: string): string | null {
   return isEphemeralScope(scope) ? null : "已在长期记忆（owner 作用域），无需提升";
 }
 
-/** 关闭后最晚可恢复时刻（ISO 8601 UTC） */
-export function restoreDeadline(closedAt: string): string {
+/**
+ * 临时会话关闭后最晚可恢复时刻（ISO 8601 UTC）。
+ *
+ * 名字带 `ephemeral` 前缀（#64-B3）：`session-ui.ts` 的 `sessionRestoreDeadline` 是
+ * 30 天软删窗口、返回 Date；这里是 24 小时关闭窗口、返回 ISO 串。同名异义会在
+ * 同时 import 两个模块的地方看错，故显式区分。
+ */
+export function ephemeralRestoreDeadline(closedAt: string): string {
   return new Date(Date.parse(closedAt) + EPHEMERAL_TTL_MS).toISOString();
 }
 
-/** 当前是否仍在 24h 恢复窗口内（恰好到点即视为过期，与后端一致） */
-export function canRestore(closedAt: string, now: Date): boolean {
+/** 当前是否仍在临时会话 24h 恢复窗口内（恰好到点即视为过期，与后端一致） */
+export function canRestoreEphemeral(closedAt: string, now: Date): boolean {
   return now.getTime() < Date.parse(closedAt) + EPHEMERAL_TTL_MS;
 }
 
 /** 关闭后展示的提示文案（写明窗口与截止时刻） */
 export function closeNotice(closedAt: string): string {
-  return `临时会话已关闭：24 小时内可恢复（截止 ${restoreDeadline(closedAt)}），过期后其中的临时记忆不再出现在检索里。`;
+  return `临时会话已关闭：24 小时内可恢复（截止 ${ephemeralRestoreDeadline(closedAt)}），过期后其中的临时记忆不再出现在检索里。`;
 }
 
 /**

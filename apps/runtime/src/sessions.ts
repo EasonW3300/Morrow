@@ -1,5 +1,12 @@
 import type { AgentRuntime, MorrowAgentEvent, MorrowTool } from "@morrow/pi-adapter";
-import type { ActorId, EventEnvelope, SessionAttachment, SessionWorkspace } from "@morrow/protocol";
+import type {
+  ActorId,
+  EventEnvelope,
+  SessionAttachment,
+  SessionKind,
+  SessionSummary,
+  SessionWorkspace,
+} from "@morrow/protocol";
 import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import { buildEventEnvelope } from "./envelope.ts";
@@ -72,14 +79,25 @@ export const SESSION_EVENT_TYPES = {
   sessionAttachmentRemoved: "session.attachment_removed",
 } as const;
 
-/** 会话类型（票 M7-A-T3 / ADR-0010）：ephemeral = 临时会话（写入隔离 + 禁写入类能力 + 24h 生命周期） */
-export type SessionKind = "normal" | "ephemeral";
+/**
+ * 会话类型（票 M7-A-T3 / ADR-0010）：ephemeral = 临时会话（写入隔离 + 禁写入类能力 +
+ * 24h 生命周期）。类型本体在 `@morrow/protocol`（#64-B4 单源），此处 re-export
+ * 保持既有 import 路径不变。
+ */
+export type { SessionKind } from "@morrow/protocol";
 
 /** 临时会话关闭后的保留窗口（24h；MemoryService 的到期清理与此同口径） */
 export const EPHEMERAL_SESSION_TTL_MS = 24 * 60 * 60 * 1000;
 
 /** 临时会话生命周期操作错误（HTTP 层映射：not_found → 404；其余 → 409） */
-export type SessionLifecycleErrorCode = "not_found" | "not_ephemeral" | "invalid_state" | "session_expired";
+export type SessionLifecycleErrorCode =
+  | "not_found"
+  /** 对普通会话调用了「临时会话专属」的生命周期操作（如 ephemeral close/restore） */
+  | "already_ephemeral"
+  /** 对临时会话调用了「普通会话专属」的生命周期操作（如普通 close） */
+  | "not_an_ephemeral_session"
+  | "invalid_state"
+  | "session_expired";
 
 export class SessionLifecycleError extends Error {
   code: SessionLifecycleErrorCode;
@@ -245,25 +263,13 @@ export type SessionFrame =
   | { kind: "delta"; delta: string }
   | { kind: "done" };
 
-/** 会话列表条目（session.created 投影 + 元数据事件折叠；provider_id 仅显式绑定时存在） */
-export interface SessionSummary {
-  session_id: string;
-  event_id: string;
-  sequence: number;
-  occurred_at: string;
-  title?: string;
-  provider_id?: string;
-  /** 会话类型（票 M7-A-T3）：normal 缺省；ephemeral = 临时会话 */
-  kind: SessionKind;
-  /** 归档时间（session.archived 的 occurred_at；取消归档后清除） */
-  archived_at?: string;
-  /** 软删时间（session.deleted 的 occurred_at；恢复后清除；30 天后折叠剔除） */
-  deleted_at?: string;
-  /** 会话工作区（票 M7-A-T4）：最后一次 session.workspace_bound 的 payload；none 时缺省 */
-  workspace?: SessionWorkspace;
-  /** 只读会话附件数量（票 M7-A-T4；attachment_added/removed 折叠） */
-  attachment_count: number;
-}
+/**
+ * 会话列表条目（session.created 投影 + 元数据事件折叠；provider_id 仅显式绑定时存在）。
+ *
+ * #64-B4：类型本体在 `@morrow/protocol`（runtime/desktop 原先各一份且已漂移），
+ * 此处 re-export 保持既有 import 路径与公共出口不变。
+ */
+export type { SessionSummary } from "@morrow/protocol";
 
 /** 历史投影条目（message.user / message.assistant 投影） */
 export interface MessageRecord {
@@ -592,7 +598,7 @@ export class SessionManager {
     }
     if (lifecycle.kind === "ephemeral") {
       throw new SessionLifecycleError(
-        "not_ephemeral",
+        "already_ephemeral",
         `session ${sessionId} is ephemeral; use the ephemeral close semantics`,
       );
     }
@@ -756,7 +762,7 @@ export class SessionManager {
    * 关闭临时会话（票 M7-A-T3）：session.closed 入账本（payload 含 closed_at 与 kind）。
    * 幂等：已关闭且未恢复时返回既有 closed_at（不重复记账）。
    * 仅 ephemeral 分支——普通会话的关闭语义（未提交改动三选一）由 T5 的
-   * POST /v1/sessions/:id/close 扩展，本票对其返回 not_ephemeral（见报告冲突点）。
+   * POST /v1/sessions/:id/close 扩展，本票对普通会话返回 `not_an_ephemeral_session`。
    */
   closeEphemeralSession(sessionId: string): { closedAt: string; restorableUntil: string; eventId: string | null } {
     const lifecycle = this.#lifecycleOf(sessionId);
@@ -765,7 +771,7 @@ export class SessionManager {
     }
     if (lifecycle.kind !== "ephemeral") {
       throw new SessionLifecycleError(
-        "not_ephemeral",
+        "not_an_ephemeral_session",
         `session ${sessionId} is a normal session; ephemeral close/restore applies to kind=ephemeral only`,
       );
     }
@@ -800,7 +806,7 @@ export class SessionManager {
     }
     if (lifecycle.kind !== "ephemeral") {
       throw new SessionLifecycleError(
-        "not_ephemeral",
+        "not_an_ephemeral_session",
         `session ${sessionId} is a normal session; ephemeral close/restore applies to kind=ephemeral only`,
       );
     }
