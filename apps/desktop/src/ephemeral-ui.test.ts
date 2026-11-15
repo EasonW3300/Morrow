@@ -2,14 +2,14 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
   EPHEMERAL_TTL_MS,
-  canRestore,
+  canRestoreEphemeral,
   closeNotice,
   createEphemeralSessionBody,
   ephemeralCapabilityGate,
   ephemeralScope,
   isEphemeralScope,
   promoteDisabledReason,
-  restoreDeadline,
+  ephemeralRestoreDeadline,
 } from "./ephemeral-ui.ts";
 
 test("临时会话作用域：session:<id> 形态与判定", () => {
@@ -31,11 +31,11 @@ test("提升按钮：只有 session 作用域可提升，owner 给出禁用原�
 test("24h 恢复窗口：截止时间 = 关闭时刻 + 24h，窗口内可恢复、到点即过期", () => {
   const closedAt = "2026-11-12T00:00:00.000Z";
   assert.equal(EPHEMERAL_TTL_MS, 24 * 60 * 60 * 1000);
-  assert.equal(restoreDeadline(closedAt), "2026-11-13T00:00:00.000Z");
+  assert.equal(ephemeralRestoreDeadline(closedAt), "2026-11-13T00:00:00.000Z");
 
-  assert.equal(canRestore(closedAt, new Date("2026-11-12T23:59:59.999Z")), true);
-  assert.equal(canRestore(closedAt, new Date("2026-11-13T00:00:00.000Z")), false);
-  assert.equal(canRestore(closedAt, new Date("2026-11-14T00:00:00.000Z")), false);
+  assert.equal(canRestoreEphemeral(closedAt, new Date("2026-11-12T23:59:59.999Z")), true);
+  assert.equal(canRestoreEphemeral(closedAt, new Date("2026-11-13T00:00:00.000Z")), false);
+  assert.equal(canRestoreEphemeral(closedAt, new Date("2026-11-14T00:00:00.000Z")), false);
 });
 
 test("关闭提示：明确写出 24 小时可恢复与截止时刻", () => {

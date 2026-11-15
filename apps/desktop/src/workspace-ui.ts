@@ -84,9 +84,25 @@ export function validateBranchName(raw: string): { ok: true; name: string } | { 
   return { ok: true, name };
 }
 
-/** 服务端缺省分支名（`morrow/<session 前 6 位>`）；向导里作为占位提示。 */
+/**
+ * 服务端缺省分支名（`morrow/<session 短 id>`，取 uuidv7 尾部随机位）；向导里作占位提示。
+ * 与服务端 `sessionShortId` 同口径：uuid 形态取去掉连字符后的末 8 位。权威名始终由
+ * 服务端在建分支时给出（含冲突后缀），这里只用于占位显示。
+ */
 export function defaultBranchFor(sessionId: string): string {
-  return `morrow/${sessionId.slice(0, 6)}`;
+  return `morrow/${sessionShortIdForUi(sessionId)}`;
+}
+
+/** 与 runtime `sessionShortId` 对齐的纯函数版本（无 node:crypto 依赖）。 */
+function sessionShortIdForUi(sessionId: string): string {
+  const hex = sessionId.replace(/-/g, "").toLowerCase();
+  if (/^[0-9a-f]{32}$/.test(hex)) return hex.slice(-8);
+  // 非 uuid 形态：稳定短哈希（仅占位提示用；服务端用 sha1 短哈希，两者不必逐字节相同）
+  let hash = 0;
+  for (let index = 0; index < sessionId.length; index += 1) {
+    hash = (hash * 31 + sessionId.charCodeAt(index)) >>> 0;
+  }
+  return hash.toString(16).padStart(8, "0").slice(0, 8);
 }
 
 /** 草稿 → PUT /workspace body；校验失败返回第一条可读错误。 */

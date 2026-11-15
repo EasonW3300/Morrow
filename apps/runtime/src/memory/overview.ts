@@ -1,4 +1,4 @@
-import type { MemoryEntryKind, SensitivityLevel } from "@morrow/protocol";
+import type { MemoryEntryKind, MemoryOverviewEntry } from "@morrow/protocol";
 import { salientTokens } from "./consolidator.ts";
 
 /**
@@ -21,38 +21,16 @@ import { salientTokens } from "./consolidator.ts";
 
 export const MEMORY_KIND_ORDER: readonly MemoryEntryKind[] = ["fact", "preference", "profile", "procedural"];
 
-/** 版本链概要（展开项用；version 即版本号列表的来源） */
-export interface MemoryOverviewRevision {
-  version: number;
-  createdAt: string;
-  reason: string | null;
-  /** 该修订的来源事件（可回链账本；同步合并产生且本地无对应事件时为 null） */
-  sourceEventId: string | null;
-}
-
-/** 来源回链（PRD §6.4 sources；occurred_at 为账本事件时间，事件缺失时回退来源行创建时间） */
-export interface MemoryOverviewSource {
-  event_id: string;
-  session_id: string | null;
-  occurred_at: string;
-}
-
-/** 只读视图的单条记忆（长期事实；候选不进入该视图——版本链是事实的属性） */
-export interface MemoryOverviewEntry {
-  id: string;
-  content: string;
-  kind: MemoryEntryKind;
-  sensitivity: SensitivityLevel;
-  version: number;
-  scope: string;
-  occurred_at: string;
-  createdAt: string;
-  updatedAt: string;
-  /** 版本号列表（升序；不含当前版本的初始版本也算——事实 v1 无修订时为空） */
-  revisions: number[];
-  revision_history: MemoryOverviewRevision[];
-  sources: MemoryOverviewSource[];
-}
+/**
+ * 视图类型（#64-B4）：MemoryOverviewEntry / Revision / Source 的本体在
+ * `@morrow/protocol`（runtime 与 desktop 原先各一份且已漂移），此处 re-export
+ * 保持既有 import 路径与分组/聚类函数的签名不变。
+ */
+export type {
+  MemoryOverviewEntry,
+  MemoryOverviewRevision,
+  MemoryOverviewSource,
+} from "@morrow/protocol";
 
 export interface MemoryOverviewCluster {
   /** 簇主题词元（null = 无显著词元可作标签） */

@@ -87,12 +87,19 @@ export function deleteSessionConfirmMessage(): string {
   return "删除后对话记录会从主列表消失；记忆不受影响，30 天内可在「设置 → 会话管理」恢复。";
 }
 
-/** 恢复截止时间（deleted_at + 30d；与 runtime 折叠判定同口径）。 */
-export function restoreDeadline(deletedAt: string): Date {
+/**
+ * 软删恢复截止时间（deleted_at + 30d；与 runtime 折叠判定同口径）。
+ *
+ * 名字带 `session` 前缀（#64-B3）：`ephemeral-ui.ts` 里还有一套 24h 窗口的
+ * `ephemeralRestoreDeadline`，两者同名异义（30 天软删 vs 24 小时临时会话），
+ * 不加限定前缀会在跨模块 import 时看错。
+ */
+export function sessionRestoreDeadline(deletedAt: string): Date {
   return new Date(Date.parse(deletedAt) + SESSION_RESTORE_WINDOW_MS);
 }
 
-export function canRestore(deletedAt: string, now: number = Date.now()): boolean {
+/** 软删是否仍在 30 天恢复窗口内（到点即不可恢复）。 */
+export function canRestoreSession(deletedAt: string, now: number = Date.now()): boolean {
   const deadline = Date.parse(deletedAt);
   if (Number.isNaN(deadline)) return false;
   return deadline + SESSION_RESTORE_WINDOW_MS > now;
@@ -118,10 +125,22 @@ export interface UncommittedOption {
   description: string;
   /** discard 是破坏性操作（UI 用 danger 样式 + 二次确认） */
   danger?: boolean;
+  /** 该选项不可用的原因（null/缺省 = 可点）；#64-A5：local 绑定不支持 discard */
+  disabledReason?: string;
 }
 
-/** 三选一对话框的选项顺序与文案（提交 / 保留 / 丢弃）。 */
-export function uncommittedOptions(): UncommittedOption[] {
+/**
+ * 三选一对话框的选项顺序与文案（提交 / 保留 / 丢弃）。
+ *
+ * `workspaceKind`（#64-A5）：local 绑定没有 worktree 隔离，服务端对 discard 返回
+ * `discard_not_supported_for_local`——UI 在选项上同步禁用并说明理由，而不是让用户
+ * 点了才收错误。缺省（未知来源）三个都可用，由服务端兜底。
+ */
+export function uncommittedOptions(workspaceKind?: "local" | "github"): UncommittedOption[] {
+  const discardDisabled =
+    workspaceKind === "local"
+      ? "本地工作区不支持丢弃：目录是你自己的项目，没有被会话 worktree 隔离；请选择提交或保留"
+      : undefined;
   return [
     { id: "commit", label: "提交到本分支", description: "把改动提交到会话分支后再关闭" },
     { id: "keep", label: "保留工作区", description: "关闭会话，但保留所有未提交改动" },
@@ -130,8 +149,16 @@ export function uncommittedOptions(): UncommittedOption[] {
       label: "丢弃改动",
       description: "执行 checkout + clean，不可撤销",
       danger: true,
+      ...(discardDisabled === undefined ? {} : { disabledReason: discardDisabled }),
     },
   ];
+}
+
+/** 服务端错误码 → 用户可读说明（A5 的专用码不再显示为 not_isolated）。 */
+export function discardUnsupportedReason(code: string | undefined): string | null {
+  return code === "discard_not_supported_for_local"
+    ? "本地工作区不支持丢弃（目录是你自己的项目，未被会话 worktree 隔离）；请改用提交或保留"
+    : null;
 }
 
 /** 409 的 code 是否为「有未提交改动」。 */

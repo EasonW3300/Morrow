@@ -69,7 +69,8 @@ test("本地路径/URL/分支校验：空、缺 owner/repo、非法分支名均�
   for (const bad of ["", "-x", "a..b", "a b", "a:b", "bad.lock", "/x", "x/"]) {
     assert.equal(validateBranchName(bad).ok, false, `${bad} 应被拒绝`);
   }
-  assert.equal(defaultBranchFor("01936b9d-aaaa"), "morrow/01936b");
+  // #64-A2：短 id 取 uuidv7 尾部随机位（前缀是时间戳，撞名风险高）
+  assert.equal(defaultBranchFor("01936b9d-8f7a-7abc-9f2e-112233445566"), "morrow/33445566");
 });
 
 test("GitHub 来源需要 clone 前确认，文案说明网络动作与本地已有副本关联", () => {

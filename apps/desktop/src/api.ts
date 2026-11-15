@@ -140,23 +140,13 @@ async function request<T>(base: string, path: string, init?: RequestInit): Promi
   return (await res.json()) as T;
 }
 
-export interface SessionSummary {
-  session_id: string;
-  event_id?: string;
-  title?: string;
-  occurred_at: string;
-  sequence: number;
-  /** 会话类型（票 M7-A-T3）：normal 缺省；ephemeral = 临时会话 */
-  kind?: "normal" | "ephemeral";
-  /** 归档时间（M7-A-T2；取消归档后缺省） */
-  archived_at?: string;
-  /** 软删时间（M7-A-T2；恢复后缺省；30 天后服务端折叠剔除） */
-  deleted_at?: string;
-  /** 会话工作区（M7-A-T4 / Issue #61；未绑定缺省） */
-  workspace?: SessionWorkspace;
-  /** 只读附件数量（M7-A-T4） */
-  attachment_count?: number;
-}
+/**
+ * 会话摘要（#64-B4）：类型本体在 @morrow/protocol，此处只 re-export。
+ * 先前 runtime 与 desktop 各持一份且已漂移（desktop 的 kind / attachment_count 都是
+ * 可选），UI 因此会把缺失字段当成"服务端没给"而不是类型错误。
+ */
+export type { SessionSummary } from "@morrow/protocol/browser";
+import type { SessionSummary } from "@morrow/protocol/browser";
 
 /** PUT /v1/sessions/:id/workspace 的 body（三形态） */
 export type WorkspaceBindingRequest =
@@ -199,34 +189,21 @@ export interface MemoryHit {
   created_at: string;
 }
 
-/** 只读记忆视图（票 M7-A-T6 / Issue #62）：来源回链 / 版本链 / 分组簇 */
-export interface MemoryOverviewSource {
-  event_id: string;
-  session_id: string | null;
-  occurred_at: string;
-}
-
-export interface MemoryOverviewRevision {
-  version: number;
-  createdAt: string;
-  reason: string | null;
-  sourceEventId: string | null;
-}
-
-export interface MemoryOverviewEntry {
-  id: string;
-  content: string;
-  kind: string;
-  sensitivity: string;
-  version: number;
-  scope: string;
-  occurred_at: string;
-  createdAt: string;
-  updatedAt: string;
-  revisions: number[];
-  revision_history: MemoryOverviewRevision[];
-  sources: MemoryOverviewSource[];
-}
+/**
+ * 只读记忆视图（票 M7-A-T6 / Issue #62）：来源回链 / 版本链 / 分组簇。
+ * #64-B4：条目类型本体在 @morrow/protocol（runtime 与 desktop 原先各一份且已漂移，
+ * desktop 的 kind/sensitivity 曾是裸 string）——此处 re-export，UI 只保留视图外壳。
+ */
+export type {
+  MemoryOverviewEntry,
+  MemoryOverviewRevision,
+  MemoryOverviewSource,
+} from "@morrow/protocol/browser";
+import type {
+  MemoryOverviewEntry,
+  MemoryOverviewRevision,
+  MemoryOverviewSource,
+} from "@morrow/protocol/browser";
 
 export interface MemoryOverviewCluster {
   theme: string | null;

@@ -4,13 +4,14 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
   SESSION_TITLE_MAX,
-  canRestore,
+  canRestoreSession,
   closeSessionMenu,
   closeUncommittedMessage,
   closeUncommittedTitle,
   deleteSessionConfirmMessage,
   describeRestoreWindow,
   discardConfirmTitle,
+  discardUnsupportedReason,
   discardWarning,
   isUncommittedConflict,
   openSessionMenu,
@@ -20,7 +21,7 @@ import {
   uncommittedFiles,
   uncommittedOptions,
   validateSessionTitle,
-  restoreDeadline,
+  sessionRestoreDeadline,
 } from "./session-ui.ts";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -80,10 +81,10 @@ test("删除确认文案写明记忆不受影响与 30 天可恢复", () => {
 test("恢复窗口：30 天内可恢复，到期不可恢复，文案给出剩余天数", () => {
   const deletedAt = "2026-01-01T00:00:00.000Z";
   const deletedMs = Date.parse(deletedAt);
-  assert.equal(restoreDeadline(deletedAt).getTime(), deletedMs + 30 * DAY_MS);
-  assert.equal(canRestore(deletedAt, deletedMs + 29 * DAY_MS), true);
-  assert.equal(canRestore(deletedAt, deletedMs + 30 * DAY_MS), false);
-  assert.equal(canRestore(deletedAt, deletedMs + 31 * DAY_MS), false);
+  assert.equal(sessionRestoreDeadline(deletedAt).getTime(), deletedMs + 30 * DAY_MS);
+  assert.equal(canRestoreSession(deletedAt, deletedMs + 29 * DAY_MS), true);
+  assert.equal(canRestoreSession(deletedAt, deletedMs + 30 * DAY_MS), false);
+  assert.equal(canRestoreSession(deletedAt, deletedMs + 31 * DAY_MS), false);
   assert.match(describeRestoreWindow(deletedAt, deletedMs + 29 * DAY_MS), /还剩 1 天可恢复/);
   assert.equal(describeRestoreWindow(deletedAt, deletedMs + 31 * DAY_MS), "已过 30 天恢复期");
 });
@@ -128,4 +129,41 @@ test("discard 二次确认：红字警示「将丢弃这些改动」并列出文
   assert.match(warning, /• a\.ts/);
   assert.doesNotMatch(warning, /• i\.ts/);
   assert.match(warning, /还有 2 个文件/);
+});
+
+test("A5：local 工作区的 discard 选项被禁用并给出理由；github 三个都可点", () => {
+  const localOptions = uncommittedOptions("local");
+  const localDiscard = localOptions.find((option) => option.id === "discard");
+  assert.ok(localDiscard?.disabledReason, "local 的 discard 必须有 disabledReason");
+  assert.match(localDiscard.disabledReason, /本地工作区不支持丢弃/);
+  assert.match(localDiscard.disabledReason, /提交或保留/);
+  assert.equal(localOptions.find((option) => option.id === "commit")?.disabledReason, undefined);
+  assert.equal(localOptions.find((option) => option.id === "keep")?.disabledReason, undefined);
+
+  const githubOptions = uncommittedOptions("github");
+  assert.equal(githubOptions.every((option) => option.disabledReason === undefined), true);
+
+  // 未知来源（缺省）：三个都可用，由服务端兜底
+  assert.equal(uncommittedOptions().every((option) => option.disabledReason === undefined), true);
+});
+
+test("A5：discard_not_supported_for_local 有专用用户可读文案（不显示为 not_isolated）", () => {
+  assert.match(discardUnsupportedReason("discard_not_supported_for_local") ?? "", /本地工作区不支持丢弃/);
+  assert.equal(discardUnsupportedReason("not_isolated"), null);
+  assert.equal(discardUnsupportedReason(undefined), null);
+});
+
+test("B3：30 天软删窗口与 24h 临时会话窗口的辅助函数名字不冲突", async () => {
+  // 两个模块同文件 import 时必须能共存（同名异义会在调用点看错）
+  const sessionUi = await import("./session-ui.ts");
+  const ephemeralUi = await import("./ephemeral-ui.ts");
+  assert.equal(typeof sessionUi.sessionRestoreDeadline, "function");
+  assert.equal(typeof sessionUi.canRestoreSession, "function");
+  assert.equal(typeof ephemeralUi.ephemeralRestoreDeadline, "function");
+  assert.equal(typeof ephemeralUi.canRestoreEphemeral, "function");
+  // 旧名必须不存在（避免残留调用点）
+  assert.equal((sessionUi as Record<string, unknown>).restoreDeadline, undefined);
+  assert.equal((sessionUi as Record<string, unknown>).canRestore, undefined);
+  assert.equal((ephemeralUi as Record<string, unknown>).restoreDeadline, undefined);
+  assert.equal((ephemeralUi as Record<string, unknown>).canRestore, undefined);
 });

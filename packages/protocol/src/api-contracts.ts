@@ -272,3 +272,76 @@ export interface PairingJoinResponse {
   /** 短格式指纹（AB12-CD34-EF56-7890） */
   server_fingerprint_short: string;
 }
+
+// --- 会话摘要与只读记忆视图（票 M7-A；#64-B4 类型单源）------------------------
+//
+// 先前 `apps/runtime/src/sessions.ts` 与 `apps/desktop/src/api.ts` 各持一份
+// SessionSummary / MemoryOverviewEntry，字段已经漂移（runtime 有 kind、
+// attachment_count 是必填；desktop 侧两者都是可选）。这里收敛为唯一真相源：
+// **字段只加不减**，runtime 与 desktop 都从这里 import（runtime 侧纯类型依赖）。
+
+/** 会话类型（ADR-0010）：normal 缺省；ephemeral = 临时会话（写入隔离 + 24h 生命周期） */
+export type SessionKind = "normal" | "ephemeral";
+
+/**
+ * 会话列表条目（`session.created` 投影 + 元数据事件折叠）。
+ *
+ * 字段来源：title ← session.renamed（也来自 created payload）；provider_id ←
+ * session.created.payload.provider_id（仅显式绑定时存在）；archived_at/deleted_at ←
+ * 归档/软删事件（取消归档/恢复后清除）；workspace ← 最后一次 session.workspace_bound；
+ * attachment_count ← attachment_added/removed 折叠。
+ */
+export interface SessionSummary {
+  session_id: string;
+  /** 会话创建事件 id */
+  event_id: string;
+  /** 会话创建事件的账本序号 */
+  sequence: number;
+  /** 会话创建时间（ISO 8601 UTC） */
+  occurred_at: string;
+  title?: string;
+  provider_id?: string;
+  /** 会话类型：normal 缺省；ephemeral = 临时会话 */
+  kind: SessionKind;
+  /** 归档时间（取消归档后清除） */
+  archived_at?: string;
+  /** 软删时间（恢复后清除；30 天后折叠剔除） */
+  deleted_at?: string;
+  /** 会话工作区（未绑定/已解绑时缺省） */
+  workspace?: SessionWorkspace;
+  /** 只读会话附件数量（attachment_added/removed 折叠） */
+  attachment_count: number;
+}
+
+/** 只读记忆视图的版本链条目（版本号列表的来源） */
+export interface MemoryOverviewRevision {
+  version: number;
+  createdAt: string;
+  reason: string | null;
+  /** 该修订的来源事件（可回链账本；同步合并产生且本地无对应事件时为 null） */
+  sourceEventId: string | null;
+}
+
+/** 只读记忆视图的来源回链（PRD §6.4 sources） */
+export interface MemoryOverviewSource {
+  event_id: string;
+  session_id: string | null;
+  occurred_at: string;
+}
+
+/** 只读记忆视图的单条记忆（长期事实；候选不进入该视图——版本链是事实的属性） */
+export interface MemoryOverviewEntry {
+  id: string;
+  content: string;
+  kind: MemoryEntryKind;
+  sensitivity: SensitivityLevel;
+  version: number;
+  scope: string;
+  occurred_at: string;
+  createdAt: string;
+  updatedAt: string;
+  /** 版本号列表（升序；不含当前版本的初始版本也算——事实 v1 无修订时为空） */
+  revisions: number[];
+  revision_history: MemoryOverviewRevision[];
+  sources: MemoryOverviewSource[];
+}

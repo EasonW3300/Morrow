@@ -1,11 +1,19 @@
 import type { AgentRuntime, MorrowAgentEvent, MorrowTool } from "@morrow/pi-adapter";
-import type { ActorId, EventEnvelope, SessionAttachment, SessionWorkspace } from "@morrow/protocol";
+import type {
+  ActorId,
+  EventEnvelope,
+  SessionAttachment,
+  SessionKind,
+  SessionSummary,
+  SessionWorkspace,
+} from "@morrow/protocol";
 import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import { buildEventEnvelope } from "./envelope.ts";
 import type { EventLedger, LedgerEntry } from "./ledger.ts";
 import type { ProviderResolver, ResolvedProvider } from "./providers.ts";
 import type { WorkspaceManager } from "./workspace.ts";
+import { ATTACHMENT_MAX_FILES, ATTACHMENT_MAX_TOTAL_BYTES } from "./workspace.ts";
 import { uuidv7 } from "./uuid-v7.ts";
 
 /**
@@ -71,14 +79,25 @@ export const SESSION_EVENT_TYPES = {
   sessionAttachmentRemoved: "session.attachment_removed",
 } as const;
 
-/** 会话类型（票 M7-A-T3 / ADR-0010）：ephemeral = 临时会话（写入隔离 + 禁写入类能力 + 24h 生命周期） */
-export type SessionKind = "normal" | "ephemeral";
+/**
+ * 会话类型（票 M7-A-T3 / ADR-0010）：ephemeral = 临时会话（写入隔离 + 禁写入类能力 +
+ * 24h 生命周期）。类型本体在 `@morrow/protocol`（#64-B4 单源），此处 re-export
+ * 保持既有 import 路径不变。
+ */
+export type { SessionKind } from "@morrow/protocol";
 
 /** 临时会话关闭后的保留窗口（24h；MemoryService 的到期清理与此同口径） */
 export const EPHEMERAL_SESSION_TTL_MS = 24 * 60 * 60 * 1000;
 
 /** 临时会话生命周期操作错误（HTTP 层映射：not_found → 404；其余 → 409） */
-export type SessionLifecycleErrorCode = "not_found" | "not_ephemeral" | "invalid_state" | "session_expired";
+export type SessionLifecycleErrorCode =
+  | "not_found"
+  /** 对普通会话调用了「临时会话专属」的生命周期操作（如 ephemeral close/restore） */
+  | "already_ephemeral"
+  /** 对临时会话调用了「普通会话专属」的生命周期操作（如普通 close） */
+  | "not_an_ephemeral_session"
+  | "invalid_state"
+  | "session_expired";
 
 export class SessionLifecycleError extends Error {
   code: SessionLifecycleErrorCode;
@@ -87,6 +106,34 @@ export class SessionLifecycleError extends Error {
     super(message);
     this.name = "SessionLifecycleError";
     this.code = code;
+  }
+}
+
+/**
+ * 附件预算超限（ADR-0012 的累计口径）：HTTP 层映射 400。
+ * 独立的错误类型让路由层能把「数量/总量超限」与「单个文件非法」分开呈现。
+ */
+export class AttachmentLimitError extends Error {
+  readonly code = "attachment_limit_exceeded";
+
+  constructor(message: string) {
+    super(message);
+    this.name = "AttachmentLimitError";
+  }
+}
+
+/** 累计上限校验（在合并后的集合上做，单次请求绕不过去）。 */
+export function assertAttachmentBudget(attachments: SessionAttachment[]): void {
+  if (attachments.length > ATTACHMENT_MAX_FILES) {
+    throw new AttachmentLimitError(
+      `too many attachments for this session: ${attachments.length} (max ${ATTACHMENT_MAX_FILES} per session)`,
+    );
+  }
+  const total = attachments.reduce((sum, attachment) => sum + (Number.isFinite(attachment.size) ? attachment.size : 0), 0);
+  if (total > ATTACHMENT_MAX_TOTAL_BYTES) {
+    throw new AttachmentLimitError(
+      `attachments exceed ${ATTACHMENT_MAX_TOTAL_BYTES} bytes in total for this session (current total ${total} bytes)`,
+    );
   }
 }
 
@@ -216,25 +263,13 @@ export type SessionFrame =
   | { kind: "delta"; delta: string }
   | { kind: "done" };
 
-/** 会话列表条目（session.created 投影 + 元数据事件折叠；provider_id 仅显式绑定时存在） */
-export interface SessionSummary {
-  session_id: string;
-  event_id: string;
-  sequence: number;
-  occurred_at: string;
-  title?: string;
-  provider_id?: string;
-  /** 会话类型（票 M7-A-T3）：normal 缺省；ephemeral = 临时会话 */
-  kind: SessionKind;
-  /** 归档时间（session.archived 的 occurred_at；取消归档后清除） */
-  archived_at?: string;
-  /** 软删时间（session.deleted 的 occurred_at；恢复后清除；30 天后折叠剔除） */
-  deleted_at?: string;
-  /** 会话工作区（票 M7-A-T4）：最后一次 session.workspace_bound 的 payload；none 时缺省 */
-  workspace?: SessionWorkspace;
-  /** 只读会话附件数量（票 M7-A-T4；attachment_added/removed 折叠） */
-  attachment_count: number;
-}
+/**
+ * 会话列表条目（session.created 投影 + 元数据事件折叠；provider_id 仅显式绑定时存在）。
+ *
+ * #64-B4：类型本体在 `@morrow/protocol`（runtime/desktop 原先各一份且已漂移），
+ * 此处 re-export 保持既有 import 路径与公共出口不变。
+ */
+export type { SessionSummary } from "@morrow/protocol";
 
 /** 历史投影条目（message.user / message.assistant 投影） */
 export interface MessageRecord {
@@ -563,7 +598,7 @@ export class SessionManager {
     }
     if (lifecycle.kind === "ephemeral") {
       throw new SessionLifecycleError(
-        "not_ephemeral",
+        "already_ephemeral",
         `session ${sessionId} is ephemeral; use the ephemeral close semantics`,
       );
     }
@@ -649,7 +684,10 @@ export class SessionManager {
   /**
    * 添加只读附件：写 session.attachment_added（payload = { attachments }）。
    * 已登记的同路径附件不重复入账（幂等 no-op）；重复/空列表返回 changed=false。
-   * 数量与大小上限由 WorkspaceManager.attach 校验（HTTP 层映射 400）。
+   *
+   * 上限按**累计**校验（ADR-0012：单会话 ≤10 个、单文件 256 KiB、合计 ≤1 MiB）：
+   * 单次请求只带 1 个文件也能靠反复调用突破上限，所以合并后的集合必须再校验一次。
+   * 超限抛 `attachment_limit_exceeded`（HTTP 400，message 写明当前数量与上限）。
    */
   addAttachments(sessionId: string, attachments: SessionAttachment[]): SessionAttachmentMutation | null {
     if (!this.sessionExists(sessionId)) return null;
@@ -666,10 +704,11 @@ export class SessionManager {
         attachmentCount: existing.length,
       };
     }
+    const merged = [...existing, ...fresh];
+    assertAttachmentBudget(merged);
     const entry = this.#appendMetadata(sessionId, SESSION_EVENT_TYPES.sessionAttachmentAdded, {
       attachments: fresh,
     });
-    const merged = [...existing, ...fresh];
     return {
       sessionId,
       eventId: entry.envelope.event_id,
@@ -723,7 +762,7 @@ export class SessionManager {
    * 关闭临时会话（票 M7-A-T3）：session.closed 入账本（payload 含 closed_at 与 kind）。
    * 幂等：已关闭且未恢复时返回既有 closed_at（不重复记账）。
    * 仅 ephemeral 分支——普通会话的关闭语义（未提交改动三选一）由 T5 的
-   * POST /v1/sessions/:id/close 扩展，本票对其返回 not_ephemeral（见报告冲突点）。
+   * POST /v1/sessions/:id/close 扩展，本票对普通会话返回 `not_an_ephemeral_session`。
    */
   closeEphemeralSession(sessionId: string): { closedAt: string; restorableUntil: string; eventId: string | null } {
     const lifecycle = this.#lifecycleOf(sessionId);
@@ -732,7 +771,7 @@ export class SessionManager {
     }
     if (lifecycle.kind !== "ephemeral") {
       throw new SessionLifecycleError(
-        "not_ephemeral",
+        "not_an_ephemeral_session",
         `session ${sessionId} is a normal session; ephemeral close/restore applies to kind=ephemeral only`,
       );
     }
@@ -767,7 +806,7 @@ export class SessionManager {
     }
     if (lifecycle.kind !== "ephemeral") {
       throw new SessionLifecycleError(
-        "not_ephemeral",
+        "not_an_ephemeral_session",
         `session ${sessionId} is a normal session; ephemeral close/restore applies to kind=ephemeral only`,
       );
     }
@@ -1144,7 +1183,8 @@ export class SessionManager {
    * 附加在**发给 Agent 的 user 消息**末尾（不是 system prompt）——system prompt 在
    * 会话运行时创建时求值一次，之后新增的附件就看不到了；user 消息每轮按当前附件
    * 路径重读（只读），后加即生效。格式固定为 `<附件内容>` 段落，便于测试与模型识别。
-   * 读取失败只记日志：附件是增强路径，不得阻断本轮对话。
+   * 读取失败不阻断本轮对话，但**不静默**（#64-A6）：错误记日志，并在 prompt 里留下
+   * `<附件读取失败>` 段落——否则整批附件消失，模型与用户都无从知道。
    */
   async #promptWithAttachments(sessionId: string, text: string): Promise<string> {
     if (this.#workspace === null) return text;
@@ -1160,7 +1200,9 @@ export class SessionManager {
       return `${text}\n\n<附件内容>\n${sections.join("\n\n")}\n</附件内容>`;
     } catch (err) {
       console.error("[morrow] attachment injection failed:", err);
-      return text;
+      const reason = errorMessage(err);
+      const names = attachments.map((attachment) => attachment.path).join("\n");
+      return `${text}\n\n<附件读取失败>\n${reason}\n以下附件未能注入：\n${names}\n</附件读取失败>`;
     }
   }
 
