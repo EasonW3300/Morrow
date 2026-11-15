@@ -11,6 +11,7 @@ import {
   deleteSessionConfirmMessage,
   describeRestoreWindow,
   discardConfirmTitle,
+  discardUnsupportedReason,
   discardWarning,
   isUncommittedConflict,
   openSessionMenu,
@@ -128,4 +129,26 @@ test("discard 二次确认：红字警示「将丢弃这些改动」并列出文
   assert.match(warning, /• a\.ts/);
   assert.doesNotMatch(warning, /• i\.ts/);
   assert.match(warning, /还有 2 个文件/);
+});
+
+test("A5：local 工作区的 discard 选项被禁用并给出理由；github 三个都可点", () => {
+  const localOptions = uncommittedOptions("local");
+  const localDiscard = localOptions.find((option) => option.id === "discard");
+  assert.ok(localDiscard?.disabledReason, "local 的 discard 必须有 disabledReason");
+  assert.match(localDiscard.disabledReason, /本地工作区不支持丢弃/);
+  assert.match(localDiscard.disabledReason, /提交或保留/);
+  assert.equal(localOptions.find((option) => option.id === "commit")?.disabledReason, undefined);
+  assert.equal(localOptions.find((option) => option.id === "keep")?.disabledReason, undefined);
+
+  const githubOptions = uncommittedOptions("github");
+  assert.equal(githubOptions.every((option) => option.disabledReason === undefined), true);
+
+  // 未知来源（缺省）：三个都可用，由服务端兜底
+  assert.equal(uncommittedOptions().every((option) => option.disabledReason === undefined), true);
+});
+
+test("A5：discard_not_supported_for_local 有专用用户可读文案（不显示为 not_isolated）", () => {
+  assert.match(discardUnsupportedReason("discard_not_supported_for_local") ?? "", /本地工作区不支持丢弃/);
+  assert.equal(discardUnsupportedReason("not_isolated"), null);
+  assert.equal(discardUnsupportedReason(undefined), null);
 });

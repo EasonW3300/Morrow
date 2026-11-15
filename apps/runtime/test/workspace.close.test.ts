@@ -5,10 +5,11 @@
 //   commit / keep / discard 三种选择各自产生可观察结果，并写 session.closed。
 // - ephemeral 会话关闭语义保持 T3（session.ephemeral_closed + 24h 可恢复）。
 // - discard 的路径前缀校验：只允许本会话 worktree，伪造目录被拒且不被清理。
+// - #64-A5：local 绑定不支持 discard（专用错误码）；worktree 被换成指向外部的 symlink 被拒。
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createFakePi } from "@morrow/pi-adapter";
 import type { EventEnvelope, SessionWorkspace } from "@morrow/protocol";
@@ -27,7 +28,13 @@ const GIT_ENV = {
 };
 
 function git(cwd: string, args: string[]): string {
-  return execFileSync("git", args, { cwd, env: { ...process.env, ...GIT_ENV }, encoding: "utf8" });
+  // 超时兜底（#64-C / 与 #65 同类脆弱性）：git 子进程卡住时让测试失败而不是挂起整个套件
+  return execFileSync("git", args, {
+    cwd,
+    env: { ...process.env, ...GIT_ENV },
+    encoding: "utf8",
+    timeout: 60_000,
+  });
 }
 
 function testConfig(dir: string): RuntimeConfig {
@@ -405,6 +412,60 @@ test("discard 路径前缀校验：伪造目录 / 非本会话目录一律拒绝
     const result = await workspace.discardChanges("session-1", mine.dir);
     assert.equal(result.discarded, 1);
     assert.equal(git(mine.dir, ["status", "--porcelain"]).trim(), "");
+  } finally {
+    removeDir(root);
+  }
+});
+
+// --- #64-A5：discard 对 local 明确不支持 + realpath 前缀判定 -------------------
+
+test("A5：local 绑定 discard → discard_not_supported_for_local（不伪装成 not_isolated）", async () => {
+  const root = tmpDir("morrow-ws-a5-local-");
+  try {
+    const repo = join(root, "repo");
+    git(root, ["init", "-b", "main", repo]);
+    writeFileSync(join(repo, "README.md"), "precious\n");
+    git(repo, ["add", "."]);
+    git(repo, ["commit", "-m", "init"]);
+    const workspace = new DefaultWorkspaceManager({ workspacesRoot: join(root, "workspaces"), worktreesRoot: join(root, "worktrees") });
+    await assert.rejects(
+      () => workspace.discardChanges("session-1", repo, { workspaceKind: "local" }),
+      (err: unknown) =>
+        err instanceof WorkspaceError &&
+        err.code === "discard_not_supported_for_local" &&
+        /local workspaces/.test(err.message),
+    );
+    assert.equal(readFileSync(join(repo, "README.md"), "utf8"), "precious\n", "本地项目未被清理");
+  } finally {
+    removeDir(root);
+  }
+});
+
+test("A5：worktree 目录被替换成指向外部的 symlink → not_isolated，外部目录未被清理", async () => {
+  const root = tmpDir("morrow-ws-a5-symlink-");
+  try {
+    const { seed } = makeRemote(root);
+    const workspace = new DefaultWorkspaceManager({ workspacesRoot: join(root, "workspaces"), worktreesRoot: join(root, "worktrees") });
+    const sessionId = "session-symlink";
+    await workspace.ensureBranch(seed, "main", "morrow/symlink");
+    const prepared = await workspace.prepareWorktree(seed, "morrow/symlink", sessionId);
+
+    // 外部目录（用户其它项目）：放一份"珍贵"改动
+    const outside = join(root, "outside-project");
+    mkdirSync(outside);
+    writeFileSync(join(outside, "README.md"), "outside precious\n");
+    writeFileSync(join(outside, "other.txt"), "outside other\n");
+
+    // 把本会话 worktree 目录换成指向外部的 symlink
+    rmSync(prepared.dir, { recursive: true, force: true });
+    symlinkSync(outside, prepared.dir, "dir");
+
+    await assert.rejects(
+      () => workspace.discardChanges(sessionId, prepared.dir),
+      (err: unknown) => err instanceof WorkspaceError && err.code === "not_isolated",
+    );
+    assert.equal(readFileSync(join(outside, "README.md"), "utf8"), "outside precious\n");
+    assert.ok(existsSync(join(outside, "other.txt")));
   } finally {
     removeDir(root);
   }

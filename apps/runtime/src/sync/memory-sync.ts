@@ -72,6 +72,8 @@ export class MemorySyncService {
       store: options.store,
       ledger: options.ledger,
       replicaId: options.replicaId,
+      // 重建时按关闭态重新推导临时会话过期（#64-A3）：注入时钟保证与 sweep 同口径。
+      now: this.#now,
     });
   }
 
@@ -520,13 +522,19 @@ function isAuthoritative(envelope: EventEnvelope): boolean {
   return typeof reason === "string" && AUTHORITATIVE_REASONS.has(reason);
 }
 
-/** 只有事实状态或冲突判定变化才需要重建投影（避免每批 sync.* 事件都全账本重放） */
+/**
+ * 只有事实状态或冲突判定变化才需要重建投影（避免每批 sync.* 事件都全账本重放）。
+ *
+ * `memory.promoted` 也在这里（票 #64-A3）：提升改变的是**作用域**，而作用域参与可见性
+ * 判定（owner vs session:<id>）与 FTS 检索面；漏掉它会让提升结果在重建后丢失。
+ */
 function needsRebuild(envelopes: EventEnvelope[]): boolean {
   return envelopes.some(
     (envelope) =>
       envelope.event_type === "memory.fact_created" ||
       envelope.event_type === "memory.fact_updated" ||
       envelope.event_type === "memory.fact_deleted" ||
+      envelope.event_type === "memory.promoted" ||
       envelope.event_type === "sync.conflict",
   );
 }

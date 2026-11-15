@@ -10,6 +10,12 @@ import { CAPABILITY_EVENT_TYPES, PermissionEngine, isEphemeralWriteClassCapabili
 import type { CapabilityRecord, SessionAttachment, SessionWorkspace } from "@morrow/protocol";
 import { capabilityRoutes } from "./capabilities/routes.ts";
 import { skillRoutes } from "./capabilities/skills/routes.ts";
+import {
+  EPHEMERAL_TASK_FORBIDDEN_CODE,
+  assertEphemeralCapabilityUse,
+  ephemeralTaskCreationDenial,
+  type EphemeralGateDeps,
+} from "./ephemeral-gate.ts";
 import { SkillService } from "./capabilities/skills/service.ts";
 import { factoryRoutes } from "./capabilities/factory/routes.ts";
 import { CapabilityFactory } from "./capabilities/factory/service.ts";
@@ -45,6 +51,7 @@ import { MemoryProjectionRebuilder } from "./memory/rebuild.ts";
 import { TaskProjectionRebuilder } from "./task-rebuild.ts";
 import { ProviderRegistry, ProviderRegistryError, ENV_PROVIDER_ID, type ProviderResolver, type ResolvedProvider } from "./providers.ts";
 import {
+  AttachmentLimitError,
   SessionLifecycleError,
   SessionManager,
   type AgentAdapterFactory,
@@ -172,6 +179,8 @@ interface RequestContext {
   notifications: NotificationService;
   /** 会话工作区接缝（票 M7-A-T4：git/gh 副作用与附件读取） */
   workspace: WorkspaceManager;
+  /** 临时会话写入门（票 M7-A-T3 / #64-A4：能力网关、skill invoke、任务创建共用同一判定） */
+  ephemeralGate: EphemeralGateDeps;
 }
 
 type Handler = (
@@ -478,7 +487,15 @@ const routes: Route[] = [
   // M2-T5 Skill 族（GET /v1/capabilities/skills[?match=]、proposals、cases、approve/reject、
   // invoke + T6 别名 /v1/skills*）——必须先于 capabilityRoutes 展开：GET /v1/capabilities/:id
   // 的 `[^/]+` 会吞掉 /v1/capabilities/skills（grants 路由同款先具体后通配）
-  ...skillRoutes,
+  //
+  // 临时会话写入门（FR-A10 / #64-A4）：skill invoke 的 step 能力也要过同一判定——
+  // 路由声明在模块顶层，ctx 在运行时才有，故用桥接闭包按请求取 ctx（per-request 读）。
+  ...skillRoutes.map((route) => ({
+    method: route.method,
+    re: route.re,
+    handler: (req: IncomingMessage, res: ServerResponse, url: URL, ctx: RequestContext, params: string[]) =>
+      route.handler(req, res, url, { skills: ctx.skills, ephemeralGate: ctx.ephemeralGate }, params),
+  })),
   ...syncRoutes,
   ...outboxRoutes,
   ...notificationRoutes,
@@ -677,7 +694,14 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
   // 记忆同步语义层（M3-T3 / Issue #32）：三方合并 + 冲突入 M1 队列 + 投影重建。
   // 晚绑定到 sync.afterImport：T1 引擎在每批导入落账后调用。
   const syncConflicts = SyncConflictStore.open(config.dataDir);
-  const memoryRebuilder = new MemoryProjectionRebuilder({ store: memoryStore, ledger, replicaId: config.replicaId });
+  // 记忆投影重建器（#64-A3）：注入时钟后，重放会按「session.ephemeral_closed + TTL」
+  // 重新推导过期状态——任何投影重建都不会让过期临时记忆回到 FTS/overview。
+  const memoryRebuilder = new MemoryProjectionRebuilder({
+    store: memoryStore,
+    ledger,
+    replicaId: config.replicaId,
+    now: () => (options.sessionNow ?? (() => new Date()))(),
+  });
   const syncMemory = new MemorySyncService({
     store: memoryStore,
     ledger,
@@ -1104,6 +1128,11 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     outbox,
     notifications,
     workspace: workspaceManager,
+    // 临时会话写入门（#64-A4）：能力网关 / skill invoke / 任务创建共用同一判定函数。
+    ephemeralGate: {
+      sessionKind: (sessionId) => sessions.sessionKind(sessionId),
+      capabilities,
+    },
   };
   const server = createServer((req, res) => {
     routeRequest(req, res, ctx);
@@ -1814,7 +1843,11 @@ async function handleCloseSession(
       }
     } else if (choice === "discard") {
       try {
-        const discarded = await ctx.workspace.discardChanges(sessionId, workspace.path);
+        // local 绑定没有 worktree 隔离（目录是用户自己的项目）→ 该来源不支持 discard，
+        // 抛 discard_not_supported_for_local（409）并在文案里指向 commit/keep。
+        const discarded = await ctx.workspace.discardChanges(sessionId, workspace.path, {
+          workspaceKind: workspace.kind,
+        });
         outcome = { uncommitted: "discard", files: discarded.files, discarded: discarded.discarded };
       } catch (err) {
         sendWorkspaceError(res, err);
@@ -2087,13 +2120,24 @@ async function handleAddAttachments(
   }
   let attachments: SessionAttachment[];
   try {
-    // 读取并校验（只读；数量/单文件/总量上限在 DefaultWorkspaceManager 内）
+    // 读取并校验（只读；单次请求的文件数/单文件/总量上限在 DefaultWorkspaceManager 内）
     attachments = (await ctx.workspace.attach(paths)).map(({ path, name, size }) => ({ path, name, size }));
   } catch (err) {
     sendWorkspaceError(res, err);
     return;
   }
-  const mutation = ctx.sessions.addAttachments(sessionId, attachments);
+  let mutation;
+  try {
+    // 累计上限（ADR-0012 / #64-A6）：单次 6 个 + 再来 6 个必须 400——校验在合并后的
+    // 集合上做，单次请求绕过不了单会话 ≤10 的约束。超限抛 AttachmentLimitError。
+    mutation = ctx.sessions.addAttachments(sessionId, attachments);
+  } catch (err) {
+    if (err instanceof AttachmentLimitError) {
+      sendError(res, 400, err.code, err.message);
+      return;
+    }
+    throw err;
+  }
   if (mutation === null) {
     sendError(res, 404, "not_found", `session ${sessionId} does not exist`);
     return;
@@ -2175,7 +2219,8 @@ function sendWorkspaceError(res: ServerResponse, err: unknown): void {
         : err.code === "branch_exists" ||
             err.code === "branch_in_use" ||
             err.code === "base_not_found" ||
-            err.code === "not_isolated"
+            err.code === "not_isolated" ||
+            err.code === "discard_not_supported_for_local"
           ? 409
           : 400;
   // details 平铺进 error 信封（branch_exists 的建议名 / clone 失败的脱敏 stderr 等）：
@@ -2483,11 +2528,10 @@ async function handleInvokeCapability(
   if (body === null) return; // 响应已在 readJsonBody 里写出（415/413/400）
   const startedAt = Date.now();
   try {
-    // 临时会话禁写入类能力（票 M7-A-T3 / ADR-0010）：权限单入口判定，先于执行链
-    // （未知能力不在此拒绝，留给 unknown_tool；UI 侧同门禁用按钮，双保险）。
-    if (sessionId !== undefined && ctx.sessions.sessionKind(sessionId) === "ephemeral") {
-      ctx.capabilities.assertEphemeralUse(capabilityId);
-    }
+    // 临时会话禁写入类能力（票 M7-A-T3 / ADR-0010；#64-A4 收敛到 ephemeral-gate）：
+    // 权限单入口判定，先于执行链（未知能力不在此拒绝，留给 unknown_tool；UI 侧同门禁
+    // 禁用按钮，双保险）。
+    assertEphemeralCapabilityUse(ctx.ephemeralGate, sessionId, [capabilityId]);
     const result = await ctx.sandbox.invoke(capabilityId, body, { actorId: "owner", ...(sessionId !== undefined ? { sessionId } : {}) });
     // 先落审计后返回（账本可追踪优先于响应时延；审计失败不改变执行结果口径）
     appendCapabilityUsed(ctx, capabilityId, result, result.duration_ms, sessionId);
@@ -2536,6 +2580,13 @@ async function handleCreateTask(
   }
   if (typeof sessionId === "string" && !ctx.sessions.sessionExists(sessionId)) {
     sendError(res, 400, "invalid_body", `session "${sessionId}" does not exist`);
+    return;
+  }
+  // 临时会话写入门（FR-A10「并限制任务创建」/ #64-A4）：同一判定函数的任务侧入口。
+  // 先前只在能力 invoke 上拦，临时会话仍可 POST /v1/tasks 拉起带副作用的 DAG。
+  const taskDenial = ephemeralTaskCreationDenial(ctx.ephemeralGate, sessionId);
+  if (taskDenial !== null) {
+    sendError(res, 403, EPHEMERAL_TASK_FORBIDDEN_CODE, taskDenial);
     return;
   }
   let detail;

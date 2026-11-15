@@ -357,6 +357,10 @@ export class MemoryService {
    * owner，并写 memory.promoted（payload 含原 scope）。非 session 作用域 → 409
    * （invalid_state）；未知 id → 404。事实提升后补写 §6.4 投影文件（候选在巩固后
    * 按 owner 落投影）。
+   *
+   * 入口先 sweep（票 #64-A3）：过期状态在**账本 + 时钟**上是可推导的，但行上的
+   * `expired_at` 是缓存——若某次重建把它重置为 null，过期条目会在这里被"复活"。
+   * 所以判定前先按同一口径清理，再以 sweep 之后的行状态判过期（返回 409 而非提升）。
    */
   promoteMemory(entryId: string): {
     id: string;
@@ -365,6 +369,7 @@ export class MemoryService {
     to_scope: "owner";
     event_id: string;
   } {
+    this.sweepExpiredEphemeralScopes();
     const candidate = this.#store.getCandidate(entryId);
     const fact = candidate === null ? this.#store.getFact(entryId) : null;
     const row = candidate ?? fact;
@@ -659,6 +664,9 @@ export class MemoryService {
     limit?: number;
     offset?: number;
   }): MemoryOverviewResponse {
+    // 与 search 同口径（票 #64-A3）：overview 也是检索面，入口先做一次到期清理——
+    // 否则「没搜索过就直接看记忆视图」会看到已过期的临时记忆。
+    this.sweepExpiredEphemeralScopes();
     const scope = input.scope ?? "owner";
     const events = this.#ledgerEventIndex();
     const entries = this.#overviewEntries(scope, events);

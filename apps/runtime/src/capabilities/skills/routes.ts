@@ -1,6 +1,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { readJsonBody, sendError, sendJson } from "../../http-util.ts";
 import { sendInvocationError } from "../../invocation-errors.ts";
+import { assertEphemeralCapabilityUse, type EphemeralGateDeps } from "../../ephemeral-gate.ts";
 import { SkillError, type SkillInvokeResult, type SkillRecord, type SkillService } from "./service.ts";
 
 /**
@@ -33,6 +34,12 @@ export interface SkillRoute {
 
 export interface SkillRouteContext {
   skills: SkillService;
+  /**
+   * 临时会话写入门（FR-A10）：skill invoke 会逐步调用 steps 引用的能力——临时会话里
+   * 这些能力同样要过能力网关的写入门。缺省 undefined = 未接线（不出结论），
+   * runtime 装配时恒注入。
+   */
+  ephemeralGate?: EphemeralGateDeps;
 }
 
 // --- T6 投影（apps/desktop/src/capability-ui.ts 的 SkillSummary/SkillProposal 口径）--
@@ -259,11 +266,31 @@ async function handleInvoke(req: IncomingMessage, res: ServerResponse, _url: URL
   if (body === null) return;
   const sessionId = typeof (body as InvokeBody).session_id === "string" ? (body as InvokeBody).session_id as string : undefined;
   try {
+    // 临时会话写入门（FR-A10）：先前只在 /v1/capabilities/:id/invoke 上判定，skill
+    // 重用路径可以绕过。这里在**执行前**用同一判定函数检查全部 step 的能力——
+    // step 里只要有一个写入类能力，整条 skill 调用即 403（不部分执行）。
+    if (ctx.ephemeralGate !== undefined) {
+      assertEphemeralCapabilityUse(
+        ctx.ephemeralGate,
+        sessionId,
+        skillStepCapabilities(ctx.skills, params[0]),
+      );
+    }
     const result: SkillInvokeResult = await ctx.skills.invoke(params[0], (body as InvokeBody).params ?? {}, sessionId === undefined ? {} : { sessionId });
     sendJson(res, 200, result);
   } catch (err) {
     handleSkillError(res, err);
   }
+}
+
+/**
+ * skill 的 step 能力清单（未知 skill 返回空数组——存在性由 `skills.invoke` 自己报
+ * not_found，门禁不越权改写成别的错误码）。
+ */
+function skillStepCapabilities(skills: SkillService, skillId: string): string[] {
+  const record = skills.getSkill(skillId);
+  if (record === null) return [];
+  return record.steps.map((step) => step.capability_id);
 }
 
 /**

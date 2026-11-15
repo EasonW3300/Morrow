@@ -23,7 +23,7 @@ import { execFile } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, statSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import type { SessionAttachment } from "@morrow/protocol";
 import type { SecretStore } from "./keyring.ts";
@@ -78,6 +78,7 @@ export type WorkspaceErrorCode =
   | "clone_failed"
   | "git_failed"
   | "not_isolated"
+  | "discard_not_supported_for_local"
   | "invalid_attachment"
   | "attachment_too_large";
 
@@ -179,9 +180,14 @@ export interface WorkspaceManager {
   /**
    * 丢弃改动（会话关闭 discard）：`git checkout -- .` + `git clean -fd`。
    * 安全约束：`dir` 必须是本会话 worktree（`<worktreesRoot>/<sessionId>`），
-   * 否则抛 not_isolated 且**不触碰**该目录。
+   * 否则抛 not_isolated 且**不触碰**该目录。local 绑定（无 worktree 隔离）抛
+   * `discard_not_supported_for_local`——三选一里该来源只支持 commit / keep。
    */
-  discardChanges(sessionId: string, dir: string): Promise<DiscardResult>;
+  discardChanges(
+    sessionId: string,
+    dir: string,
+    options?: { workspaceKind?: "local" | "github" },
+  ): Promise<DiscardResult>;
 }
 
 export interface DefaultWorkspaceManagerOptions {
@@ -466,9 +472,25 @@ export class DefaultWorkspaceManager implements WorkspaceManager {
 
   /**
    * 丢弃改动：先做路径归属校验（`<worktreesRoot>/<sessionId>`，并解析符号链接），
-   * 再 `git checkout -- .` + `git clean -fd`。伪造/他人目录抛 not_isolated，目录不动。
+   * 再 `git checkout -- .` + `git clean -fd`。
+   *
+   * local 绑定没有 worktree 隔离（目录是用户自己的项目），**不支持 discard**——
+   * 抛 `discard_not_supported_for_local`（而不是伪装成 not_isolated：前者是"该来源
+   * 不支持这个动作"，后者是"路径不属于本会话"，UI 文案与处置完全不同）。
+   * 伪造/他人目录/符号链接逃逸抛 not_isolated，目录不动。
    */
-  async discardChanges(sessionId: string, dir: string): Promise<DiscardResult> {
+  async discardChanges(
+    sessionId: string,
+    dir: string,
+    options: { workspaceKind?: "local" | "github" } = {},
+  ): Promise<DiscardResult> {
+    if (options.workspaceKind === "local") {
+      throw new WorkspaceError(
+        "discard_not_supported_for_local",
+        `discard is not supported for local workspaces: ${dir} is the user's own project and is not isolated by a session worktree; choose "commit" or "keep" instead`,
+        { path: dir, workspace_kind: "local" },
+      );
+    }
     const root = resolve(this.#worktreesRoot);
     const expected = resolve(root, sessionId);
     const actual = resolve(dir);
@@ -481,13 +503,19 @@ export class DefaultWorkspaceManager implements WorkspaceManager {
         { expected, actual },
       );
     }
-    // 符号链接兜底：两边都存在时要求 realpath 一致（防止 worktree 目录被替换成指向别处的链接）
+    // 符号链接兜底：解析 realpath 后必须仍严格落在 worktreesRoot 之下，且仍等于本会话
+    // 目录。不能比较 realpath(actual) 与 realpath(expected)——两者由同一字符串推出，
+    // 永远相等（旧实现在这里恒真，等于没有校验）。
     try {
-      if (realpathSync(actual) !== realpathSync(expected)) {
+      const realRoot = realpathSync(root);
+      const realExpected = join(realRoot, sessionId);
+      const realActual = realpathSync(actual);
+      const underRoot = realActual.startsWith(`${realRoot}${sep}`);
+      if (!underRoot || realActual !== realExpected) {
         throw new WorkspaceError(
           "not_isolated",
-          `refusing to discard in ${actual}: it resolves outside this session's worktree`,
-          { expected, actual },
+          `refusing to discard in ${actual}: it resolves to ${realActual}, outside this session's worktree (${realExpected})`,
+          { expected: realExpected, actual: realActual },
         );
       }
     } catch (err) {

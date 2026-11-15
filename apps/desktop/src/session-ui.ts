@@ -118,10 +118,22 @@ export interface UncommittedOption {
   description: string;
   /** discard 是破坏性操作（UI 用 danger 样式 + 二次确认） */
   danger?: boolean;
+  /** 该选项不可用的原因（null/缺省 = 可点）；#64-A5：local 绑定不支持 discard */
+  disabledReason?: string;
 }
 
-/** 三选一对话框的选项顺序与文案（提交 / 保留 / 丢弃）。 */
-export function uncommittedOptions(): UncommittedOption[] {
+/**
+ * 三选一对话框的选项顺序与文案（提交 / 保留 / 丢弃）。
+ *
+ * `workspaceKind`（#64-A5）：local 绑定没有 worktree 隔离，服务端对 discard 返回
+ * `discard_not_supported_for_local`——UI 在选项上同步禁用并说明理由，而不是让用户
+ * 点了才收错误。缺省（未知来源）三个都可用，由服务端兜底。
+ */
+export function uncommittedOptions(workspaceKind?: "local" | "github"): UncommittedOption[] {
+  const discardDisabled =
+    workspaceKind === "local"
+      ? "本地工作区不支持丢弃：目录是你自己的项目，没有被会话 worktree 隔离；请选择提交或保留"
+      : undefined;
   return [
     { id: "commit", label: "提交到本分支", description: "把改动提交到会话分支后再关闭" },
     { id: "keep", label: "保留工作区", description: "关闭会话，但保留所有未提交改动" },
@@ -130,8 +142,16 @@ export function uncommittedOptions(): UncommittedOption[] {
       label: "丢弃改动",
       description: "执行 checkout + clean，不可撤销",
       danger: true,
+      ...(discardDisabled === undefined ? {} : { disabledReason: discardDisabled }),
     },
   ];
+}
+
+/** 服务端错误码 → 用户可读说明（A5 的专用码不再显示为 not_isolated）。 */
+export function discardUnsupportedReason(code: string | undefined): string | null {
+  return code === "discard_not_supported_for_local"
+    ? "本地工作区不支持丢弃（目录是你自己的项目，未被会话 worktree 隔离）；请改用提交或保留"
+    : null;
 }
 
 /** 409 的 code 是否为「有未提交改动」。 */

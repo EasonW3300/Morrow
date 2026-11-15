@@ -6,6 +6,7 @@ import { buildEventEnvelope } from "./envelope.ts";
 import type { EventLedger, LedgerEntry } from "./ledger.ts";
 import type { ProviderResolver, ResolvedProvider } from "./providers.ts";
 import type { WorkspaceManager } from "./workspace.ts";
+import { ATTACHMENT_MAX_FILES, ATTACHMENT_MAX_TOTAL_BYTES } from "./workspace.ts";
 import { uuidv7 } from "./uuid-v7.ts";
 
 /**
@@ -87,6 +88,34 @@ export class SessionLifecycleError extends Error {
     super(message);
     this.name = "SessionLifecycleError";
     this.code = code;
+  }
+}
+
+/**
+ * 附件预算超限（ADR-0012 的累计口径）：HTTP 层映射 400。
+ * 独立的错误类型让路由层能把「数量/总量超限」与「单个文件非法」分开呈现。
+ */
+export class AttachmentLimitError extends Error {
+  readonly code = "attachment_limit_exceeded";
+
+  constructor(message: string) {
+    super(message);
+    this.name = "AttachmentLimitError";
+  }
+}
+
+/** 累计上限校验（在合并后的集合上做，单次请求绕不过去）。 */
+export function assertAttachmentBudget(attachments: SessionAttachment[]): void {
+  if (attachments.length > ATTACHMENT_MAX_FILES) {
+    throw new AttachmentLimitError(
+      `too many attachments for this session: ${attachments.length} (max ${ATTACHMENT_MAX_FILES} per session)`,
+    );
+  }
+  const total = attachments.reduce((sum, attachment) => sum + (Number.isFinite(attachment.size) ? attachment.size : 0), 0);
+  if (total > ATTACHMENT_MAX_TOTAL_BYTES) {
+    throw new AttachmentLimitError(
+      `attachments exceed ${ATTACHMENT_MAX_TOTAL_BYTES} bytes in total for this session (current total ${total} bytes)`,
+    );
   }
 }
 
@@ -649,7 +678,10 @@ export class SessionManager {
   /**
    * 添加只读附件：写 session.attachment_added（payload = { attachments }）。
    * 已登记的同路径附件不重复入账（幂等 no-op）；重复/空列表返回 changed=false。
-   * 数量与大小上限由 WorkspaceManager.attach 校验（HTTP 层映射 400）。
+   *
+   * 上限按**累计**校验（ADR-0012：单会话 ≤10 个、单文件 256 KiB、合计 ≤1 MiB）：
+   * 单次请求只带 1 个文件也能靠反复调用突破上限，所以合并后的集合必须再校验一次。
+   * 超限抛 `attachment_limit_exceeded`（HTTP 400，message 写明当前数量与上限）。
    */
   addAttachments(sessionId: string, attachments: SessionAttachment[]): SessionAttachmentMutation | null {
     if (!this.sessionExists(sessionId)) return null;
@@ -666,10 +698,11 @@ export class SessionManager {
         attachmentCount: existing.length,
       };
     }
+    const merged = [...existing, ...fresh];
+    assertAttachmentBudget(merged);
     const entry = this.#appendMetadata(sessionId, SESSION_EVENT_TYPES.sessionAttachmentAdded, {
       attachments: fresh,
     });
-    const merged = [...existing, ...fresh];
     return {
       sessionId,
       eventId: entry.envelope.event_id,
@@ -1144,7 +1177,8 @@ export class SessionManager {
    * 附加在**发给 Agent 的 user 消息**末尾（不是 system prompt）——system prompt 在
    * 会话运行时创建时求值一次，之后新增的附件就看不到了；user 消息每轮按当前附件
    * 路径重读（只读），后加即生效。格式固定为 `<附件内容>` 段落，便于测试与模型识别。
-   * 读取失败只记日志：附件是增强路径，不得阻断本轮对话。
+   * 读取失败不阻断本轮对话，但**不静默**（#64-A6）：错误记日志，并在 prompt 里留下
+   * `<附件读取失败>` 段落——否则整批附件消失，模型与用户都无从知道。
    */
   async #promptWithAttachments(sessionId: string, text: string): Promise<string> {
     if (this.#workspace === null) return text;
@@ -1160,7 +1194,9 @@ export class SessionManager {
       return `${text}\n\n<附件内容>\n${sections.join("\n\n")}\n</附件内容>`;
     } catch (err) {
       console.error("[morrow] attachment injection failed:", err);
-      return text;
+      const reason = errorMessage(err);
+      const names = attachments.map((attachment) => attachment.path).join("\n");
+      return `${text}\n\n<附件读取失败>\n${reason}\n以下附件未能注入：\n${names}\n</附件读取失败>`;
     }
   }
 

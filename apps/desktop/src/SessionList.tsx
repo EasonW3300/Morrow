@@ -10,6 +10,7 @@ import {
   deleteSessionConfirmMessage,
   deleteSessionConfirmTitle,
   discardConfirmTitle,
+  discardUnsupportedReason,
   discardWarning,
   isUncommittedConflict,
   openSessionMenu,
@@ -53,7 +54,12 @@ export function SessionList({
   const [renameDraft, setRenameDraft] = useState("");
   const [renameError, setRenameError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
-  const [uncommitted, setUncommitted] = useState<{ sessionId: string; files: string[] } | null>(null);
+  // workspaceKind 一并记录（#64-A5）：local 绑定不支持 discard，选项需在弹窗里直接禁用
+  const [uncommitted, setUncommitted] = useState<{
+    sessionId: string;
+    files: string[];
+    workspaceKind?: "local" | "github";
+  } | null>(null);
   const [busy, setBusy] = useState(false);
   const [confirm, confirmDialog] = useConfirm();
 
@@ -118,7 +124,11 @@ export function SessionList({
           await onClose?.(session.session_id);
         } catch (err) {
           if (err instanceof ApiError && isUncommittedConflict(err.code)) {
-            setUncommitted({ sessionId: session.session_id, files: uncommittedFiles(err.details) });
+            setUncommitted({
+              sessionId: session.session_id,
+              files: uncommittedFiles(err.details),
+              ...(session.workspace?.kind === undefined ? {} : { workspaceKind: session.workspace.kind }),
+            });
           } else {
             setActionError(errorText(err));
           }
@@ -171,7 +181,15 @@ export function SessionList({
     } catch (err) {
       if (err instanceof ApiError && isUncommittedConflict(err.code)) {
         // 选择期间工作区又变化：刷新文件列表，仍留在对话框
-        setUncommitted({ sessionId: target.sessionId, files: uncommittedFiles(err.details) });
+        setUncommitted({
+          sessionId: target.sessionId,
+          files: uncommittedFiles(err.details),
+          ...(target.workspaceKind === undefined ? {} : { workspaceKind: target.workspaceKind }),
+        });
+      } else if (err instanceof ApiError && discardUnsupportedReason(err.code) !== null) {
+        // #64-A5：local 工作区不支持 discard——显示专用说明（不是笼统的 not_isolated）
+        setActionError(discardUnsupportedReason(err.code));
+        setUncommitted(null);
       } else {
         setActionError(errorText(err));
         setUncommitted(null);
@@ -296,13 +314,13 @@ export function SessionList({
               ))}
             </ul>
             <div className="form-actions uncommitted-actions">
-              {uncommittedOptions().map((option) => (
+              {uncommittedOptions(uncommitted.workspaceKind).map((option) => (
                 <Button
                   key={option.id}
                   variant={option.danger === true ? "danger" : "primary"}
                   className={option.danger === true ? "danger-solid" : undefined}
-                  title={option.description}
-                  disabled={busy}
+                  title={option.disabledReason ?? option.description}
+                  disabled={busy || option.disabledReason !== undefined}
                   onClick={() => void chooseUncommitted(option.id)}
                 >
                   {option.label}
