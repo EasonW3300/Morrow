@@ -163,3 +163,13 @@ M6 是 PRD §8 验收的**最终裁决**，不是又一次里程碑校准。逐�
 - **M5 语音延后（Owner 决定，2026-11-11 确认口径）**：`0.1.0` 的功能范围是 M0–M4，**不含语音**。AC-11 判定**未达成**、AC-14 标注**语音段未达成**；发布说明必须写明「本版不含语音」，不得暗示已具备。`docs/gates/m6-gate-report.md` §4.1 明确：语音**不是 release blocker**，是范围外项。
 - **AC-02 与 QQ 真实层的 Owner 决定**：AC-02 的真实双 Provider 验收**待 Owner 配置密钥**（外部依赖，不计达成）；AC-10 真实平台停在群 @ 15/20 + 私聊 1，**Owner 明确不再补测**，按「部分」登记。
 - **验证边界（不影响上述判定，但不得宣称已验证）**：真实 Ubuntu systemd 部署（脚本 `scripts/real-machine/server-verify.sh` 已交付并经真机迭代，但**无归档 PASS 日志**）、升级回滚演练、Tailscale 双机、飞书/微信真实层、Windows/Linux 真机桌面安装与凭据库 —— 逐条见门禁报告 §10。
+
+---
+
+## M7-A 校准注记（会话体验，2026-11-15）
+
+- **测试规模**：runtime **806**（阶段 A 新增 66）/ desktop **176**（新增 37）/ Rust **9** / Docker Linux workspace+session **30**。
+- **注入时钟成为标准做法**：临时会话 24h 到期、会话软删 30 天到期都用**注入时钟**测试，零 sleep。基线约定：任何与"时间流逝"相关的行为必须经注入时钟验证，不得 `await sleep`。
+- **工作区测试环境**：`WorkspaceManager` 的成功路径用**真实临时 git 仓库**（`mkdtemp` + `git init`），失败路径（clone 失败、无凭据、分支冲突）用注入的假实现。Docker 复核使用 `node:24-alpine` + git 2.54.1（注意：git 2.54 把 worktree 占用文案改为 `already used by worktree at`，本地旧版 git 不暴露该差异）。
+- **门禁口径例外（重要）**：阶段 A 验收期间发现既有测试 `checkpoint.faults.test.ts` 的 P6 在全文件跑时挂起（<https://github.com/EasonW3300/Morrow/issues/65>）。该问题自 M1-T5 引入、与阶段 A 无关，但导致 `test:unit` 无法稳定全绿。**在此票修复前，"全量测试通过"不作为可宣称的门禁结论**；阶段 A 以"除 `checkpoint.faults` 外套件全绿"为准，并在门禁报告 §6 明确标注排除项。
+- **FR-A 裁决**：20 达成 / 2 部分（临时会话禁写入在 HTTP 层无法拒绝、本地工作区为路径输入）/ 1 未验证（`open_memory_dir` 的 Finder 唤起需真机确认）。
