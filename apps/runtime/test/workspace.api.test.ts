@@ -1,6 +1,6 @@
 // 会话工作区与附件 HTTP 主接缝测试（票 M7-A-T4 / Issue #61）：
 // - PUT /v1/sessions/:id/workspace 三形态（local/github/none）；
-// - github 路径走注入的 WorkspaceManager（不触真实 git/gh），分支默认 morrow/<6位id>；
+// - github 路径走注入的 WorkspaceManager（不触真实 git/gh），分支默认 morrow/<短 id>；
 // - 分支冲突 409、clone 失败带 PAT/gh 提示（不静默）；
 // - 附件添加/列表/移除 + 摘要 attachment_count + 账本事件；
 // - 附件注入只进发给 Agent 的 prompt（message.user 账本仍是原文），文件未被写入。
@@ -197,7 +197,7 @@ test("三种工作区来源：local / github / none 均可绑定，摘要与事�
     assert.equal(ws.kind, "github");
     assert.equal(ws.path, `/fake/worktrees/${sessionId}`);
     assert.equal(ws.repo_path, "/fake/workspaces/repo-abc123");
-    assert.equal(ws.branch, `morrow/${sessionId.slice(0, 6)}`);
+    assert.equal(ws.branch, `morrow/${sessionId.replace(/-/g, "").slice(-8)}`);
     assert.equal(ws.base_branch, "main");
     assert.equal(ws.url, "https://github.com/acme/widget.git");
     assert.equal(github.body.reused, false);
@@ -205,13 +205,13 @@ test("三种工作区来源：local / github / none 均可绑定，摘要与事�
     assert.deepEqual(workspace.calls, [
       "bindLocal:/tmp/project",
       "cloneFrom:https://github.com/acme/widget.git",
-      `ensureBranch:/fake/workspaces/repo-abc123:auto:morrow/${sessionId.slice(0, 6)}`,
+      `ensureBranch:/fake/workspaces/repo-abc123:auto:morrow/${sessionId.replace(/-/g, "").slice(-8)}`,
       `prepareWorktree:${sessionId}`,
     ]);
 
     let summaries = await listSessions(runtime.port);
     assert.equal(summaries.length, 1);
-    assert.equal(summaries[0].workspace?.branch, `morrow/${sessionId.slice(0, 6)}`);
+    assert.equal(summaries[0].workspace?.branch, `morrow/${sessionId.replace(/-/g, "").slice(-8)}`);
     assert.equal(summaries[0].attachment_count, 0);
 
     const bound = (await events(runtime.port)).filter((event) => event.event_type === "session.workspace_bound");

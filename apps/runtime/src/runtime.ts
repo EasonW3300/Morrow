@@ -54,7 +54,13 @@ import {
   type SessionKind,
   type UncommittedChoice,
 } from "./sessions.ts";
-import { DefaultWorkspaceManager, WorkspaceError, defaultBranchForSession, type WorkspaceManager } from "./workspace.ts";
+import {
+  DefaultWorkspaceManager,
+  WorkspaceError,
+  branchCandidatesForSession,
+  defaultBranchForSession,
+  type WorkspaceManager,
+} from "./workspace.ts";
 import { ChannelRegistry, type ChannelAdapterRegistration } from "./channels/registry.ts";
 import { channelRoutes } from "./channels/routes.ts";
 import { createChannelOutboundSink } from "./channels/outbox.ts";
@@ -1953,20 +1959,44 @@ async function handleBindWorkspace(
       return;
     }
     const baseBranch = typeof baseBranchRaw === "string" ? baseBranchRaw.trim() : undefined;
-    const newBranch = typeof newBranchRaw === "string" ? newBranchRaw.trim() : defaultBranchForSession(sessionId);
+    const requestedBranch = typeof newBranchRaw === "string" ? newBranchRaw.trim() : undefined;
     let workspace: SessionWorkspace;
     let reused = false;
     try {
       const cloned = await ctx.workspace.cloneFrom(url.trim(), baseBranch === undefined ? {} : { baseBranch });
       reused = cloned.reused;
-      // 建分支前先查持有者（票 M7-A-T5）：命中时给持有者信息，而不是笼统的
-      // branch_exists——同一分支被活动会话占用必须显式拒绝。
-      const holder = ctx.sessions.branchHolder(cloned.repoPath, newBranch, sessionId);
-      if (holder !== null) {
-        sendBranchInUse(res, holder, cloned.repoPath, newBranch);
-        return;
+      // 默认分支名唯一性（#64 / A2）：候选 = `morrow/<短 id>` + `-2`…`-5`。用户显式给了
+      // new_branch 就只试那一个（显式选择撞名要如实报出来，不能偷偷换名）。
+      // 先查持有者（票 M7-A-T5）：命中时给持有者信息而不是笼统的 branch_exists。
+      let created: { branch: string; base: string; baseCommit: string; created: boolean } | null = null;
+      let lastConflict: WorkspaceError | null = null;
+      for (const candidate of requestedBranch === undefined ? branchCandidatesForSession(sessionId) : [requestedBranch]) {
+        const holder = ctx.sessions.branchHolder(cloned.repoPath, candidate, sessionId);
+        if (holder !== null) {
+          sendBranchInUse(res, holder, cloned.repoPath, candidate);
+          return;
+        }
+        try {
+          created = await ctx.workspace.ensureBranch(cloned.repoPath, baseBranch, candidate);
+          break;
+        } catch (err) {
+          if (err instanceof WorkspaceError && err.code === "branch_exists") {
+            lastConflict = err;
+            continue;
+          }
+          throw err;
+        }
       }
-      const created = await ctx.workspace.ensureBranch(cloned.repoPath, baseBranch, newBranch);
+      if (created === null) {
+        // 默认名的 5 个候选全撞车：409 branch_exists 并给建议名（不让 UI 无路可走）。
+        const suggestion = `${defaultBranchForSession(sessionId)}-${Date.now() % 1000}`;
+        throw new WorkspaceError(
+          "branch_exists",
+          lastConflict?.message ??
+            `every default branch candidate already exists in ${cloned.repoPath}; pass an explicit new_branch (e.g. "${suggestion}")`,
+          { repo_path: cloned.repoPath, suggested_branch: suggestion },
+        );
+      }
       const worktree = await ctx.workspace.prepareWorktree(cloned.repoPath, created.branch, sessionId);
       workspace = {
         kind: "github",
@@ -2148,7 +2178,13 @@ function sendWorkspaceError(res: ServerResponse, err: unknown): void {
             err.code === "not_isolated"
           ? 409
           : 400;
-  sendError(res, status, err.code, err.message);
+  // details 平铺进 error 信封（branch_exists 的建议名 / clone 失败的脱敏 stderr 等）：
+  // UI 的 ApiError.details 直接消费，不需要解析 message 文本。
+  const details =
+    err.details !== null && typeof err.details === "object" && !Array.isArray(err.details)
+      ? (err.details as Record<string, unknown>)
+      : undefined;
+  sendError(res, status, err.code, err.message, details);
 }
 
 interface SendMessageBody {

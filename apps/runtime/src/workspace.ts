@@ -30,8 +30,18 @@ import type { SecretStore } from "./keyring.ts";
 
 const execFileP = promisify(execFile);
 
-/** 会话分支缺省前缀（名称 = `morrow/<session 前 6 位>`） */
+/** 会话分支缺省前缀（名称 = `morrow/<session 短 id>`，取 uuidv7 尾部随机位） */
 export const DEFAULT_BRANCH_PREFIX = "morrow/";
+
+/**
+ * 允许注入 GitHub 凭据的 host 白名单。
+ *
+ * clone URL 是用户输入，`normalizeRepoUrl` 接受任意 https/scp/git 地址。凭据**只**能
+ * 注入给明确允许的 host（按 host 精确限定 `http.<origin>.extraHeader`），否则粘贴一个
+ * 第三方 URL 就会把 PAT 作为 Authorization 头送给对方。非白名单 host 不注入 token，
+ * clone 失败时在错误里说明「仅 github.com 支持凭据注入」。
+ */
+export const CREDENTIAL_INJECTION_HOSTS: readonly string[] = ["github.com"];
 
 /** 会话附件上限（票面要求自定并写文档；见 ADR-0012「运行边界」） */
 export const ATTACHMENT_MAX_FILES = 10;
@@ -228,8 +238,9 @@ export class DefaultWorkspaceManager implements WorkspaceManager {
    * GitHub 仓库：先按 remote URL 在本机受管目录里找已有 clone（判定口径见
    * `normalizeRepoUrl`：协议/凭据不参与比较，`.git` 后缀与末尾斜杠忽略），
    * 找到即关联；否则 clone 到 `<workspacesRoot>/<repo>-<url短哈希>`。
-   * 私有仓库用 token 时通过 `GIT_CONFIG_*` 环境变量注入 Authorization 头，
-   * 不把 token 写进 argv、也不写进持久化的 remote URL。
+   * 私有仓库用 token 时按 **host 精确限定**注入 Authorization 头
+   * （`http.https://<host>/.extraHeader`，仅白名单 host；token 不进 argv、不写进
+   * remote URL），非白名单 host 一律不注入。
    */
   async cloneFrom(url: string, options: { baseBranch?: string } = {}): Promise<ClonedWorkspace> {
     const normalized = normalizeRepoUrl(url);
@@ -241,20 +252,27 @@ export class DefaultWorkspaceManager implements WorkspaceManager {
       return { path: existing, repoPath: existing, url, reused: true };
     }
     const token = await this.readGhToken();
+    const host = credentialHost(url);
+    const tokenAllowed = token !== null && host !== null && CREDENTIAL_INJECTION_HOSTS.includes(host);
     mkdirSync(this.#workspacesRoot, { recursive: true });
     const target = this.#targetDir(url, normalized);
     const args = ["clone"];
     if (options.baseBranch !== undefined) args.push("--branch", options.baseBranch);
     args.push(url, target);
-    const result = await this.#git(args, undefined, token);
+    const result = await this.#git(args, undefined, token, url);
     if (result.code !== 0) {
       rmSync(target, { recursive: true, force: true });
+      const stderr = redactCredentials(result.stderr, token);
       const hint =
         token === null
           ? " If this is a private repository, add a GitHub PAT in Settings or run `gh auth login` first."
-          : "";
-      throw new WorkspaceError("clone_failed", `git clone failed: ${firstLine(result.stderr)}${hint}`, {
-        stderr: result.stderr,
+          : tokenAllowed
+            ? ""
+            : ` Credentials are only injected for ${CREDENTIAL_INJECTION_HOSTS.join(", ")}; this URL (${host ?? "unparseable host"}) is not on that list, so no token was sent.`;
+      throw new WorkspaceError("clone_failed", `git clone failed: ${firstLine(stderr)}${hint}`, {
+        stderr,
+        credential_host: host,
+        token_injected: tokenAllowed,
       });
     }
     return { path: target, repoPath: target, url, reused: false };
@@ -540,13 +558,20 @@ export class DefaultWorkspaceManager implements WorkspaceManager {
     return null;
   }
 
-  async #git(args: string[], cwd?: string, token?: string | null): Promise<GitResult> {
+  async #git(args: string[], cwd?: string, token?: string | null, credentialUrl?: string): Promise<GitResult> {
     const env: NodeJS.ProcessEnv = { ...process.env, ...GIT_IDENTITY_ENV };
-    if (token !== null && token !== undefined && token.length > 0) {
-      // 用 GIT_CONFIG_* 注入而非 argv：token 不出现在进程命令行，也不进 remote URL。
+    // 调试开关会把完整请求头（含 Authorization）打到 stderr——运行期一律不继承。
+    delete env.GIT_CURL_VERBOSE;
+    delete env.GIT_TRACE_CURL;
+    delete env.GIT_TRACE_CURL_NO_DATA;
+    // token 只注入给白名单 host，且按 host 精确限定（`http.<origin>.extraHeader`）：
+    // 全局的 `http.extraHeader` 会跟随重定向/子模块/任意远端，等于把 PAT 送到用户
+    // 粘贴的任意 URL。不在白名单 → 不注入（调用方在失败信息里说明原因）。
+    const host = credentialUrl === undefined ? null : credentialHost(credentialUrl);
+    if (token !== null && token !== undefined && token.length > 0 && host !== null && CREDENTIAL_INJECTION_HOSTS.includes(host)) {
       const header = `Authorization: Basic ${Buffer.from(`x-access-token:${token}`).toString("base64")}`;
       env.GIT_CONFIG_COUNT = "1";
-      env.GIT_CONFIG_KEY_0 = "http.extraHeader";
+      env.GIT_CONFIG_KEY_0 = `http.https://${host}/.extraHeader`;
       env.GIT_CONFIG_VALUE_0 = header;
     }
     return this.#gitRunner("git", [...GIT_IDENTITY, ...args], { cwd, env, timeout: 120_000 });
@@ -611,9 +636,72 @@ export function repoNameFromUrl(raw: string): string {
   return name.length > 0 ? name : "repo";
 }
 
-/** 会话分支缺省名：`morrow/<session 前 6 位>`。 */
+/**
+ * 从仓库 URL 取用于凭据注入判定的 host（小写；无法解析 → null）。
+ * 支持 https/ssh/scp 形态；`file:` 与无 host 形态返回 null（这些形态永远不注入 token）。
+ */
+export function credentialHost(raw: string): string | null {
+  const normalized = normalizeRepoUrl(raw);
+  if (normalized === null) return null;
+  // canonicalRemote 的形态：`host/owner/repo` 或 `file/...`
+  const slash = normalized.indexOf("/");
+  const host = slash > 0 ? normalized.slice(0, slash) : normalized;
+  if (host.length === 0 || host === "file") return null;
+  // scp 形态可能带端口（`git@host:2222/owner/repo`），canonicalRemote 保留原样；
+  // host 判定取第一个 ':' 之前的部分。
+  return host.split(":")[0].toLowerCase();
+}
+
+/**
+ * 错误文本脱敏：把注入用的 token 与 `Authorization:`/`extraheader` 相关诊断行抹掉。
+ * clone 失败信息会进 HTTP 错误体（502 clone_failed 的 details.stderr）与日志，
+ * 绝不能带出凭据原文（GIT_CURL_VERBOSE 被继承时 Git 会打印完整请求头）。
+ */
+export function redactCredentials(text: string, token?: string | null): string {
+  let out = text;
+  if (token !== null && token !== undefined && token.length > 0) {
+    out = out.split(token).join("[redacted]");
+    const basic = Buffer.from(`x-access-token:${token}`).toString("base64");
+    out = out.split(basic).join("[redacted]");
+  }
+  return out
+    .split("\n")
+    .map((line) =>
+      /authorization:|extraheader|proxy-authorization:/i.test(line) ? "[redacted: credential header]" : line,
+    )
+    .join("\n");
+}
+
+/** 会话分支缺省名：`morrow/<session 短 id>`（uuidv7 尾部随机位，见 `sessionShortId`）。 */
 export function defaultBranchForSession(sessionId: string): string {
-  return `${DEFAULT_BRANCH_PREFIX}${sessionId.slice(0, 6)}`;
+  return `${DEFAULT_BRANCH_PREFIX}${sessionShortId(sessionId)}`;
+}
+
+/**
+ * 会话分支名里的短 id：取 **uuidv7 尾部随机位**，不是前 6 位。
+ *
+ * uuidv7 前 48 bit 是毫秒时间戳——取前 6 个 hex 等于取时间的高位，约 4.7 小时内新建
+ * 的会话会得到同一个默认分支名，第二个 GitHub 绑定必然撞 409，「自动隔离」失效。
+ * 这里取去掉连字符后的**末 8 位**（随机区），并保留完整 id 的哈希兜底：非 uuid 形态
+ * 的 sessionId 退化为对其做稳定短哈希（同一会话仍得到稳定名字）。
+ */
+export function sessionShortId(sessionId: string): string {
+  const hex = sessionId.replace(/-/g, "").toLowerCase();
+  if (/^[0-9a-f]{32}$/.test(hex)) return hex.slice(-8);
+  const digest = createHash("sha1").update(sessionId).digest("hex");
+  return digest.slice(0, 8);
+}
+
+/**
+ * 默认分支名的候选序列：基础名 + `-2`…`-5` 后缀（最多 5 次尝试）。
+ * 冲突由调用方（runtime 的 github 绑定路径）逐个尝试 ensureBranch；全部撞名后
+ * 由最后一次的 branch_exists 转 409，并在错误里给建议名。
+ */
+export function branchCandidatesForSession(sessionId: string, attempts = 5): string[] {
+  const base = defaultBranchForSession(sessionId);
+  const names = [base];
+  for (let index = 2; index <= attempts; index += 1) names.push(`${base}-${index}`);
+  return names;
 }
 
 /**
