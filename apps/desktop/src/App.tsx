@@ -259,6 +259,7 @@ export default function App() {
                 sessionId={selectedId}
                 onOpenTask={openTask}
                 onOpenSettings={() => setView("settings")}
+                onOpenMemory={() => setView("memory")}
               />
             )}
           </main>
