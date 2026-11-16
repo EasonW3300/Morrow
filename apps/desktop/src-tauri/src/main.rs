@@ -45,6 +45,33 @@ fn sidecar_status(state: tauri::State<SidecarState>) -> SidecarStatusView {
     }
 }
 
+/// 打开记忆投影目录（票 M7-A-T6 / Issue #62）：交给 OS 文件管理器打开既有目录，
+/// 不新开应用窗口、不新起 Morrow 实例。路径由前端从 GET /v1/memory/overview 的
+/// `directory` 字段取得（Runtime 的 dataDir/memory）。
+#[tauri::command]
+fn open_memory_dir(path: String) -> Result<(), String> {
+    let target = std::path::PathBuf::from(&path);
+    if !target.is_dir() {
+        return Err(format!("memory directory does not exist: {path}"));
+    }
+    let mut command = if cfg!(target_os = "macos") {
+        std::process::Command::new("open")
+    } else if cfg!(target_os = "windows") {
+        std::process::Command::new("explorer")
+    } else {
+        std::process::Command::new("xdg-open")
+    };
+    command.arg(&target);
+    let status = command
+        .status()
+        .map_err(|err| format!("failed to launch file manager: {err}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("file manager exited with {status}"))
+    }
+}
+
 fn main() {
     sidecar::install_signal_forwarding();
     tauri::Builder::default()
@@ -78,7 +105,7 @@ fn main() {
             }
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![sidecar_status])
+        .invoke_handler(tauri::generate_handler![sidecar_status, open_memory_dir])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app_handle, event| {

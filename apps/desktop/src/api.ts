@@ -31,8 +31,11 @@ import type {
   PairingCodeResponse,
   PairingJoinRequest,
   PairingJoinResponse,
+  Persona,
   PermissionGrant,
   ProviderRecord,
+  SessionAttachment,
+  SessionWorkspace,
   SyncRunReport,
   SyncStatus,
   TaskDetail,
@@ -66,8 +69,11 @@ export type {
   PairingCodeResponse,
   PairingJoinRequest,
   PairingJoinResponse,
+  Persona,
   PermissionGrant,
   ProviderRecord,
+  SessionAttachment,
+  SessionWorkspace,
   SyncRunReport,
   SyncStatus,
   TaskDetail,
@@ -134,11 +140,145 @@ async function request<T>(base: string, path: string, init?: RequestInit): Promi
   return (await res.json()) as T;
 }
 
-export interface SessionSummary {
+/**
+ * 会话摘要（#64-B4）：类型本体在 @morrow/protocol，此处只 re-export。
+ * 先前 runtime 与 desktop 各持一份且已漂移（desktop 的 kind / attachment_count 都是
+ * 可选），UI 因此会把缺失字段当成"服务端没给"而不是类型错误。
+ */
+export type { SessionSummary } from "@morrow/protocol/browser";
+import type { SessionSummary } from "@morrow/protocol/browser";
+
+/** PUT /v1/sessions/:id/workspace 的 body（三形态） */
+export type WorkspaceBindingRequest =
+  | { kind: "none" }
+  | { kind: "local"; path: string }
+  | { kind: "github"; url: string; base_branch?: string; new_branch?: string };
+
+/** PUT /v1/sessions/:id/workspace 的 200 载荷 */
+export interface SessionWorkspaceMutation {
   session_id: string;
+  workspace: SessionWorkspace | null;
+  event_id: string | null;
+  sequence: number | null;
+  changed: boolean;
+  /** github 且命中本机已有 clone 时为 true（未发生网络动作） */
+  reused?: boolean;
+}
+
+/** GET/POST/DELETE /v1/sessions/:id/attachments 的载荷 */
+export interface SessionAttachmentsResult {
+  session_id: string;
+  attachments: SessionAttachment[];
+  attachment_count: number;
+  event_id?: string | null;
+  sequence?: number | null;
+  changed?: boolean;
+}
+
+/** GET /v1/memory/facts 命中条目（票 M7-A-T3 起带 scope） */
+export interface MemoryHit {
+  id: string;
+  stage: "candidate" | "fact";
+  type: string;
+  content: string;
+  sensitivity: string;
+  confidence?: number;
+  version: number;
+  sources: string[];
+  scope: string;
+  created_at: string;
+}
+
+/**
+ * 只读记忆视图（票 M7-A-T6 / Issue #62）：来源回链 / 版本链 / 分组簇。
+ * #64-B4：条目类型本体在 @morrow/protocol（runtime 与 desktop 原先各一份且已漂移，
+ * desktop 的 kind/sensitivity 曾是裸 string）——此处 re-export，UI 只保留视图外壳。
+ */
+export type {
+  MemoryOverviewEntry,
+  MemoryOverviewRevision,
+  MemoryOverviewSource,
+} from "@morrow/protocol/browser";
+import type {
+  MemoryOverviewEntry,
+  MemoryOverviewRevision,
+  MemoryOverviewSource,
+} from "@morrow/protocol/browser";
+
+export interface MemoryOverviewCluster {
+  theme: string | null;
+  entries: MemoryOverviewEntry[];
+}
+
+export interface MemoryOverviewGroup {
+  kind: string;
+  count: number;
+  clusters: MemoryOverviewCluster[];
+}
+
+export type MemoryOverviewResponse =
+  | {
+      view: "tree";
+      scope: string;
+      directory: string | null;
+      total: number;
+      groups: MemoryOverviewGroup[];
+    }
+  | {
+      view: "timeline";
+      scope: string;
+      directory: string | null;
+      total: number;
+      limit: number;
+      offset: number;
+      entries: MemoryOverviewEntry[];
+    };
+
+export type UncommittedChoice = "commit" | "keep" | "discard";
+
+export interface CloseSessionResult {
+  session_id: string;
+  closed_at: string;
+  /** ephemeral 会话专属：24h 恢复窗口截止（普通会话缺省） */
+  restorable_until?: string;
+  event_id?: string | null;
+  /** 普通会话：未提交改动的处理结果（null = 无改动） */
+  uncommitted?: UncommittedChoice | null;
+  /** 关闭时的未提交文件（keep 返回；commit/discard 为处理前列表） */
+  files?: string[];
+  /** commit 产生的新提交 id */
+  commit?: string;
+  /** discard 清理的文件数 */
+  discarded?: number;
+}
+
+export interface RestoreSessionResult {
+  session_id: string;
+  restored_at: string;
+  event_id: string;
+}
+
+export interface PromoteMemoryResult {
+  id: string;
+  entry_kind: "candidate" | "fact";
+  from_scope: string;
+  to_scope: "owner";
+  event_id: string;
+}
+
+/** GET /v1/sessions?include= 的过滤值：缺省只回活动会话 */
+export type SessionListInclude = "archived" | "deleted" | "all";
+
+/** 会话元数据端点（rename/archive/unarchive/delete/restore）的 200 载荷 */
+export interface SessionMetadataMutation {
+  session_id: string;
+  event_id: string | null;
+  sequence: number | null;
+  changed: boolean;
   title?: string;
-  occurred_at: string;
-  sequence: number;
+  archived_at?: string | null;
+  deleted_at?: string | null;
+  restored_at?: string;
 }
 
 export interface MessageRecord {
@@ -346,8 +486,75 @@ export interface TaskReconcileResult {
 }
 
 export const api = {
-  listSessions(base: string): Promise<SessionSummary[]> {
-    return request<{ sessions: SessionSummary[] }>(base, "/v1/sessions").then((r) => r.sessions);
+  listSessions(base: string, include?: SessionListInclude): Promise<SessionSummary[]> {
+    const query = include === undefined ? "" : `?include=${encodeURIComponent(include)}`;
+    return request<{ sessions: SessionSummary[] }>(base, `/v1/sessions${query}`).then((r) => r.sessions);
+  },
+
+  renameSession(base: string, sessionId: string, title: string): Promise<SessionMetadataMutation> {
+    return request<SessionMetadataMutation>(base, `/v1/sessions/${encodeURIComponent(sessionId)}/rename`, {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ title }),
+    });
+  },
+
+  archiveSession(base: string, sessionId: string): Promise<SessionMetadataMutation> {
+    return request<SessionMetadataMutation>(base, `/v1/sessions/${encodeURIComponent(sessionId)}/archive`, {
+      method: "POST",
+      headers: JSON_HEADERS,
+    });
+  },
+
+  unarchiveSession(base: string, sessionId: string): Promise<SessionMetadataMutation> {
+    return request<SessionMetadataMutation>(base, `/v1/sessions/${encodeURIComponent(sessionId)}/unarchive`, {
+      method: "POST",
+      headers: JSON_HEADERS,
+    });
+  },
+
+  restoreSession(base: string, sessionId: string): Promise<SessionMetadataMutation> {
+    return request<SessionMetadataMutation>(base, `/v1/sessions/${encodeURIComponent(sessionId)}/restore`, {
+      method: "POST",
+      headers: JSON_HEADERS,
+    });
+  },
+
+  /** 软删（30 天内可恢复；删除不影响记忆） */
+  deleteSession(base: string, sessionId: string): Promise<SessionMetadataMutation> {
+    return request<SessionMetadataMutation>(base, `/v1/sessions/${encodeURIComponent(sessionId)}`, {
+      method: "DELETE",
+    });
+  },
+
+  // --- 会话工作区与附件（票 M7-A-T4 / Issue #61）---
+
+  bindWorkspace(base: string, sessionId: string, body: WorkspaceBindingRequest): Promise<SessionWorkspaceMutation> {
+    return request<SessionWorkspaceMutation>(base, `/v1/sessions/${encodeURIComponent(sessionId)}/workspace`, {
+      method: "PUT",
+      headers: JSON_HEADERS,
+      body: JSON.stringify(body),
+    });
+  },
+
+  listAttachments(base: string, sessionId: string): Promise<SessionAttachmentsResult> {
+    return request<SessionAttachmentsResult>(base, `/v1/sessions/${encodeURIComponent(sessionId)}/attachments`);
+  },
+
+  addAttachments(base: string, sessionId: string, paths: string[]): Promise<SessionAttachmentsResult> {
+    return request<SessionAttachmentsResult>(base, `/v1/sessions/${encodeURIComponent(sessionId)}/attachments`, {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ paths }),
+    });
+  },
+
+  removeAttachments(base: string, sessionId: string, paths: string[]): Promise<SessionAttachmentsResult> {
+    return request<SessionAttachmentsResult>(base, `/v1/sessions/${encodeURIComponent(sessionId)}/attachments`, {
+      method: "DELETE",
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ paths }),
+    });
   },
 
   createSession(base: string, title?: string): Promise<{ session_id: string }> {
@@ -356,6 +563,69 @@ export const api = {
       headers: JSON_HEADERS,
       body: JSON.stringify(title === undefined ? {} : { title }),
     });
+  },
+
+  /** 临时会话（票 M7-A-T3）：kind=ephemeral；写入隔离 + 禁写入类能力 + 24h 生命周期 */
+  createEphemeralSession(base: string, title?: string): Promise<{ session_id: string; kind: "ephemeral" }> {
+    return request<{ session_id: string; kind: "ephemeral" }>(base, "/v1/sessions", {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify(title === undefined ? { kind: "ephemeral" } : { kind: "ephemeral", title }),
+    });
+  },
+
+  /**
+   * 关闭会话（票 M7-A-T3/T5）：ephemeral → 24h 可恢复；普通会话若有未提交改动，
+   * 不带选择时服务端返回 409 uncommitted_changes（details.files），选择后重发。
+   */
+  closeSession(base: string, sessionId: string, uncommitted?: UncommittedChoice): Promise<CloseSessionResult> {
+    return request<CloseSessionResult>(base, `/v1/sessions/${sessionId}/close`, {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify(uncommitted === undefined ? {} : { uncommitted }),
+    });
+  },
+
+  /** 只读记忆视图（票 M7-A-T6）：tree = 按 kind 分组 + 弱主题聚类；timeline = 倒序分页 */
+  memoryOverview(
+    base: string,
+    options: { view: "tree" | "timeline"; scope?: string; limit?: number; offset?: number },
+  ): Promise<MemoryOverviewResponse> {
+    const params = new URLSearchParams({ view: options.view });
+    if (options.scope !== undefined) params.set("scope", options.scope);
+    if (options.limit !== undefined) params.set("limit", String(options.limit));
+    if (options.offset !== undefined) params.set("offset", String(options.offset));
+    return request<MemoryOverviewResponse>(base, `/v1/memory/overview?${params.toString()}`);
+  },
+
+  /** 记忆检索（票 M7-A-T3：scope=session:<id> 看到全局 + 该会话；缺省全局） */
+  searchMemory(base: string, q: string, scope?: string): Promise<MemoryHit[]> {
+    const params = new URLSearchParams({ q });
+    if (scope !== undefined) params.set("scope", scope);
+    return request<{ facts: MemoryHit[] }>(base, `/v1/memory/facts?${params.toString()}`).then((r) => r.facts);
+  },
+
+  /** 提升为长期记忆（scope session:* → owner；非 session scope 409） */
+  promoteMemory(base: string, entryId: string): Promise<PromoteMemoryResult> {
+    return request<PromoteMemoryResult>(base, `/v1/memory/${entryId}/promote`, {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: "{}",
+    });
+  },
+
+  // --- 全局 Persona（票 M7-A-T1 / Issue #58，ADR-0009） ---
+
+  getPersona(base: string): Promise<Persona> {
+    return request<{ persona: Persona }>(base, "/v1/persona").then((r) => r.persona);
+  },
+
+  updatePersona(base: string, persona: Persona): Promise<Persona> {
+    return request<{ persona: Persona }>(base, "/v1/persona", {
+      method: "PUT",
+      headers: JSON_HEADERS,
+      body: JSON.stringify(persona),
+    }).then((r) => r.persona);
   },
 
   history(base: string, sessionId: string): Promise<SessionHistory> {

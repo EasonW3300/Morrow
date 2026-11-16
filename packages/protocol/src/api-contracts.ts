@@ -75,6 +75,85 @@ export interface MemoryWriteInput {
   sensitivity?: SensitivityLevel;
 }
 
+// --- Persona（票 M7-A-T1 / Issue #58；GLOSSARY Persona、ADR-0009）------------
+//
+// 全局人设 = 结构化字段（名字/语气/职责/禁止行为）+ 自由补充。字段顺序固定不可配置：
+// 拼装顺序为 名字 → 语气 → 职责 → 禁止 → 其他（缓存前缀稳定性依赖这个顺序）。
+// `GET/PUT /v1/persona` 的请求/响应形状即此类型；每次 PUT 写入 `persona.updated`
+// 事件（payload 为全量 Persona），随账本同步传播。
+export interface Persona {
+  /** 助手名字（非空且 ≤ PERSONA_LIMITS.name 字符） */
+  name: string;
+  /** 语气设定（≤ PERSONA_LIMITS.tone 字符） */
+  tone: string;
+  /** 职责清单（每项 ≤ PERSONA_LIMITS.responsibilityItem 字符，最多 responsibilities 项） */
+  responsibilities: string[];
+  /** 禁止行为清单（每项 ≤ PERSONA_LIMITS.prohibitionItem 字符，最多 prohibitions 项） */
+  prohibitions: string[];
+  /** 其他自由设定（≤ PERSONA_LIMITS.extra 字符） */
+  extra: string;
+}
+
+/**
+ * Persona 字段长度上限（服务端校验与桌面表单共用的唯一真相源）。
+ * name 的 40 字符上限来自票面验收；其余为 ADR-0009「结构化优于纯文本」的防呆边界
+ * （避免把整段提示词塞进单个字段，也避免无限增长破坏缓存前缀的稳定性）。
+ */
+export const PERSONA_LIMITS = {
+  name: 40,
+  tone: 200,
+  responsibilityItem: 120,
+  responsibilities: 20,
+  prohibitionItem: 120,
+  prohibitions: 20,
+  extra: 2000,
+} as const;
+
+/** Persona 默认值：首次无 `persona.updated` 事件时 GET 返回这一份（缺省即默认）。 */
+export const DEFAULT_PERSONA: Persona = {
+  name: "Morrow",
+  tone: "简洁直接",
+  responsibilities: ["个人助理与开发助手"],
+  prohibitions: [],
+  extra: "",
+};
+
+// --- 会话工作区与附件（票 M7-A-T4 / Issue #61；ADR-0012）---------------------
+//
+// 工作区 = 目录（bash/git/快照以目录为单位）；单文件只作只读会话附件，不进工作区。
+// 会话摘要（GET /v1/sessions 的投影）只加字段：`workspace?` + `attachment_count`。
+
+/** 工作区来源：本地已有目录 或 GitHub 仓库（clone 或关联已有副本） */
+export type SessionWorkspaceKind = "local" | "github";
+
+/**
+ * 会话工作区投影（`session.workspace_bound` 事件 payload 同形）。
+ * - local：`path` 即用户选择的目录；是 git 仓库时带 `repo_path` 与当前 `branch`。
+ * - github：`path` 是本次会话的 worktree 目录（`~/.morrow/worktrees/sessions/<session>`），
+ *   `repo_path` 是主 clone（`~/.morrow/workspaces/<repo>-<short>`），`branch` 为新建分支，
+ *   `base_branch` 为基线分支名，`url` 为用户输入的仓库地址。
+ */
+export interface SessionWorkspace {
+  kind: SessionWorkspaceKind;
+  /** 会话实际工作目录（Agent 的 cwd） */
+  path: string;
+  /** 主仓库路径（git 仓库时存在；本地非 git 目录没有） */
+  repo_path?: string;
+  /** 工作区的 git 分支（非 git 或未检出时缺省） */
+  branch?: string;
+  /** GitHub 来源地址（kind=github 时存在） */
+  url?: string;
+  /** GitHub 分支基线（kind=github 时存在） */
+  base_branch?: string;
+}
+
+/** 会话附件投影（只读；内容不进账本，注入时按路径重读） */
+export interface SessionAttachment {
+  path: string;
+  name: string;
+  size: number;
+}
+
 // --- 设备与配对（M3-T2 / Issue #31；FR-DEP-2、GLOSSARY Device/Replica）--------
 //
 // 设备身份 = ed25519 公钥；指纹 = 公钥原始 32 字节的 SHA-256 前 16 hex。
@@ -192,4 +271,77 @@ export interface PairingJoinResponse {
   server_fingerprint: string;
   /** 短格式指纹（AB12-CD34-EF56-7890） */
   server_fingerprint_short: string;
+}
+
+// --- 会话摘要与只读记忆视图（票 M7-A；#64-B4 类型单源）------------------------
+//
+// 先前 `apps/runtime/src/sessions.ts` 与 `apps/desktop/src/api.ts` 各持一份
+// SessionSummary / MemoryOverviewEntry，字段已经漂移（runtime 有 kind、
+// attachment_count 是必填；desktop 侧两者都是可选）。这里收敛为唯一真相源：
+// **字段只加不减**，runtime 与 desktop 都从这里 import（runtime 侧纯类型依赖）。
+
+/** 会话类型（ADR-0010）：normal 缺省；ephemeral = 临时会话（写入隔离 + 24h 生命周期） */
+export type SessionKind = "normal" | "ephemeral";
+
+/**
+ * 会话列表条目（`session.created` 投影 + 元数据事件折叠）。
+ *
+ * 字段来源：title ← session.renamed（也来自 created payload）；provider_id ←
+ * session.created.payload.provider_id（仅显式绑定时存在）；archived_at/deleted_at ←
+ * 归档/软删事件（取消归档/恢复后清除）；workspace ← 最后一次 session.workspace_bound；
+ * attachment_count ← attachment_added/removed 折叠。
+ */
+export interface SessionSummary {
+  session_id: string;
+  /** 会话创建事件 id */
+  event_id: string;
+  /** 会话创建事件的账本序号 */
+  sequence: number;
+  /** 会话创建时间（ISO 8601 UTC） */
+  occurred_at: string;
+  title?: string;
+  provider_id?: string;
+  /** 会话类型：normal 缺省；ephemeral = 临时会话 */
+  kind: SessionKind;
+  /** 归档时间（取消归档后清除） */
+  archived_at?: string;
+  /** 软删时间（恢复后清除；30 天后折叠剔除） */
+  deleted_at?: string;
+  /** 会话工作区（未绑定/已解绑时缺省） */
+  workspace?: SessionWorkspace;
+  /** 只读会话附件数量（attachment_added/removed 折叠） */
+  attachment_count: number;
+}
+
+/** 只读记忆视图的版本链条目（版本号列表的来源） */
+export interface MemoryOverviewRevision {
+  version: number;
+  createdAt: string;
+  reason: string | null;
+  /** 该修订的来源事件（可回链账本；同步合并产生且本地无对应事件时为 null） */
+  sourceEventId: string | null;
+}
+
+/** 只读记忆视图的来源回链（PRD §6.4 sources） */
+export interface MemoryOverviewSource {
+  event_id: string;
+  session_id: string | null;
+  occurred_at: string;
+}
+
+/** 只读记忆视图的单条记忆（长期事实；候选不进入该视图——版本链是事实的属性） */
+export interface MemoryOverviewEntry {
+  id: string;
+  content: string;
+  kind: MemoryEntryKind;
+  sensitivity: SensitivityLevel;
+  version: number;
+  scope: string;
+  occurred_at: string;
+  createdAt: string;
+  updatedAt: string;
+  /** 版本号列表（升序；不含当前版本的初始版本也算——事实 v1 无修订时为空） */
+  revisions: number[];
+  revision_history: MemoryOverviewRevision[];
+  sources: MemoryOverviewSource[];
 }

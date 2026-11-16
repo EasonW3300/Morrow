@@ -1,14 +1,21 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
+import { homedir } from "node:os";
 import { createPiAdapter, type AgentRuntime, type MorrowTool } from "@morrow/pi-adapter";
 import packageJson from "../package.json" with { type: "json" };
 import piAdapterPackageJson from "../../../packages/pi-adapter/package.json" with { type: "json" };
 import { ensureBuiltinCapabilities, MEMORY_WRITE_CAPABILITY_MANIFEST } from "./capabilities/builtin.ts";
-import { CAPABILITY_EVENT_TYPES, PermissionEngine, type CapabilityLifecycleEvent } from "./capabilities/engine.ts";
-import type { CapabilityRecord } from "@morrow/protocol";
+import { CAPABILITY_EVENT_TYPES, PermissionEngine, isEphemeralWriteClassCapability, type CapabilityLifecycleEvent } from "./capabilities/engine.ts";
+import type { CapabilityRecord, SessionAttachment, SessionWorkspace } from "@morrow/protocol";
 import { capabilityRoutes } from "./capabilities/routes.ts";
 import { skillRoutes } from "./capabilities/skills/routes.ts";
+import {
+  EPHEMERAL_TASK_FORBIDDEN_CODE,
+  assertEphemeralCapabilityUse,
+  ephemeralTaskCreationDenial,
+  type EphemeralGateDeps,
+} from "./ephemeral-gate.ts";
 import { SkillService } from "./capabilities/skills/service.ts";
 import { factoryRoutes } from "./capabilities/factory/routes.ts";
 import { CapabilityFactory } from "./capabilities/factory/service.ts";
@@ -28,7 +35,9 @@ import { MemoryStore } from "./memory/store.ts";
 import { createMemoryWriteTool } from "./memory/tool.ts";
 import { memoryRoutes } from "./memory/routes.ts";
 import { MemoryProjector } from "./memory/projection.ts";
-import { LlmMemoryExtractor, LLM_EXTRACTOR_SYSTEM_PROMPT, type MemoryExtractor } from "./memory/extraction.ts";
+import { LlmMemoryExtractor, type MemoryExtractor } from "./memory/extraction.ts";
+import { PersonaService, composePersonaPrompt } from "./persona.ts";
+import { personaRoutes } from "./persona-routes.ts";
 import { SyncCursorStore } from "./sync/cursors.ts";
 import { SyncEngine } from "./sync/engine.ts";
 import { syncRoutes } from "./sync/routes.ts";
@@ -41,7 +50,24 @@ import { SyncFileMerger } from "./sync/files.ts";
 import { MemoryProjectionRebuilder } from "./memory/rebuild.ts";
 import { TaskProjectionRebuilder } from "./task-rebuild.ts";
 import { ProviderRegistry, ProviderRegistryError, ENV_PROVIDER_ID, type ProviderResolver, type ResolvedProvider } from "./providers.ts";
-import { SessionManager, type AgentRuntimeExtras, type SessionFrame } from "./sessions.ts";
+import {
+  AttachmentLimitError,
+  SessionLifecycleError,
+  SessionManager,
+  type AgentAdapterFactory,
+  type AgentRuntimeExtras,
+  type NormalCloseOutcome,
+  type SessionFrame,
+  type SessionKind,
+  type UncommittedChoice,
+} from "./sessions.ts";
+import {
+  DefaultWorkspaceManager,
+  WorkspaceError,
+  branchCandidatesForSession,
+  defaultBranchForSession,
+  type WorkspaceManager,
+} from "./workspace.ts";
 import { ChannelRegistry, type ChannelAdapterRegistration } from "./channels/registry.ts";
 import { channelRoutes } from "./channels/routes.ts";
 import { createChannelOutboundSink } from "./channels/outbox.ts";
@@ -115,6 +141,8 @@ interface RequestContext {
   ledger: EventLedger;
   replicaId: string;
   sessions: SessionManager;
+  /** 全局人设（M7-A-T1 / Issue #58：GET/PUT /v1/persona） */
+  persona: PersonaService;
   providers: ProviderRegistry;
   devices: DeviceRegistry;
   /** 设备配对服务（M3-T2 / Issue #31：配对码 / claim / 撤销 / token 校验） */
@@ -149,6 +177,10 @@ interface RequestContext {
   outbox: OutboxService;
   /** 通知规则与路由（M4-T7 / Issue #44：账本订阅 → 规则匹配 → 桌面/渠道） */
   notifications: NotificationService;
+  /** 会话工作区接缝（票 M7-A-T4：git/gh 副作用与附件读取） */
+  workspace: WorkspaceManager;
+  /** 临时会话写入门（票 M7-A-T3 / #64-A4：能力网关、skill invoke、任务创建共用同一判定） */
+  ephemeralGate: EphemeralGateDeps;
 }
 
 type Handler = (
@@ -170,8 +202,9 @@ export interface RuntimeOptions {
    * Agent Loop 运行时工厂（PiAdapter 接口注入 seam）。缺省时用默认工厂
    * （createPiAdapter，Provider 配置由 ProviderResolver 按会话解析）；
    * 无任何 Provider 时发消息 503（provider_not_configured）。
+   * extras.systemPrompt（M7-A-T1）为 Persona 拼装结果，工厂应透传给适配器。
    */
-  agentAdapterFactory?: (sessionId: string, provider: ResolvedProvider | null) => Promise<AgentRuntime>;
+  agentAdapterFactory?: AgentAdapterFactory;
   /**
    * 凭据库注入 seam（票 T5）：缺省按平台探测（macOS Keychain 实测；Windows/Linux
    * 未实测）。测试与宿主可注入内存桩避免触碰用户钥匙串。
@@ -197,6 +230,11 @@ export interface RuntimeOptions {
    * LLM 抽取（经 PiAdapter）。
    */
   memoryExtractor?: MemoryExtractor;
+  /**
+   * 会话/记忆时钟注入（票 M7-A-T3）：临时会话 close/restore 时间戳与 24h 到期清理
+   * 共用同一时钟——测试拨快即可验证到期语义（零 sleep）。缺省系统时间。
+   */
+  sessionNow?: () => Date;
   /**
    * 沙箱执行 Runner 注入 seam（M2-T2 / Issue #23）：缺省 = DockerRunner（探测本机
    * 容器运行时 docker/podman/OrbStack；无运行时 → sandboxed 调用拒绝）。测试注入
@@ -310,6 +348,17 @@ export interface RuntimeOptions {
    * 默认 1000；0 = 不启动定时器（测试手动 drain，避免时序不确定）。
    */
   notificationDrainIntervalMs?: number;
+  /**
+   * 会话元数据时钟注入（M7-A-T2 / Issue #59）：软删 30 天保留期到期判定可被测试拨快
+   * （零 sleep）。缺省系统时间。
+   */
+  sessionsNow?: () => Date;
+  /**
+   * 会话工作区接缝（票 M7-A-T4 / Issue #61）：缺省 = DefaultWorkspaceManager，clones 落
+   * `~/.morrow/workspaces`、会话 worktree 落 `~/.morrow/worktrees/sessions`，凭据优先
+   * `gh auth token` 再读 OS 凭据库 `github:pat`。测试注入假实现即可完全隔离真实 git/gh。
+   */
+  workspaceManager?: WorkspaceManager;
 }
 
 export interface RuntimeHandle {
@@ -322,6 +371,8 @@ export interface RuntimeHandle {
   pairing: PairingService;
   /** 会话管理器（库形态可直用：abort / 订阅等测试与宿主 seam） */
   sessions: SessionManager;
+  /** 全局人设（M7-A-T1 / Issue #58；库形态可直用） */
+  persona: PersonaService;
   /** 记忆服务（票 M1-T1 / Issue #13：候选写入 + FTS 检索，库形态可直用） */
   memory: MemoryService;
   /** 记忆投影器（票 M1-T3 / Issue #15：dataDir/memory/*.md，幂等再生成，库形态可直用） */
@@ -395,6 +446,22 @@ const routes: Route[] = [
   { method: "GET", re: /^\/v1\/sessions\/([^/]+)\/messages$/, handler: handleHistory },
   { method: "POST", re: /^\/v1\/sessions\/([^/]+)\/messages$/, handler: handleSendMessage },
   { method: "GET", re: /^\/v1\/sessions\/([^/]+)\/stream$/, handler: handleStream },
+  // M7-A 会话元数据（票 T2 / Issue #59）：改名/归档/取消归档/恢复/软删。
+  // 全部写账本事件，列表折叠消费（无 sessions 表）。
+  { method: "POST", re: /^\/v1\/sessions\/([^/]+)\/rename$/, handler: handleRenameSession },
+  { method: "POST", re: /^\/v1\/sessions\/([^/]+)\/archive$/, handler: handleArchiveSession },
+  { method: "POST", re: /^\/v1\/sessions\/([^/]+)\/unarchive$/, handler: handleUnarchiveSession },
+  // 恢复端点两会话语义合一（见 handleRestoreSession）：临时会话 → 关闭后 24h 内重开；
+  // 普通会话 → 软删 30 天内的恢复（票 T2 / T3 共用路径）
+  { method: "POST", re: /^\/v1\/sessions\/([^/]+)\/restore$/, handler: handleRestoreSession },
+  { method: "DELETE", re: /^\/v1\/sessions\/([^/]+)$/, handler: handleDeleteSession },
+  // 票 M7-A-T3：临时会话关闭（仅 kind=ephemeral 分支；普通会话关闭语义属 T5）
+  { method: "POST", re: /^\/v1\/sessions\/([^/]+)\/close$/, handler: handleCloseSession },
+  // 票 M7-A-T4：会话工作区（local/github/none）与只读附件（列表/添加/移除）
+  { method: "PUT", re: /^\/v1\/sessions\/([^/]+)\/workspace$/, handler: handleBindWorkspace },
+  { method: "GET", re: /^\/v1\/sessions\/([^/]+)\/attachments$/, handler: handleListAttachments },
+  { method: "POST", re: /^\/v1\/sessions\/([^/]+)\/attachments$/, handler: handleAddAttachments },
+  { method: "DELETE", re: /^\/v1\/sessions\/([^/]+)\/attachments$/, handler: handleRemoveAttachments },
   { method: "POST", re: /^\/v1\/tasks$/, handler: handleCreateTask },
   { method: "GET", re: /^\/v1\/tasks$/, handler: handleListTasks },
   { method: "GET", re: /^\/v1\/tasks\/([^/]+)$/, handler: handleGetTask },
@@ -420,11 +487,26 @@ const routes: Route[] = [
   // M2-T5 Skill 族（GET /v1/capabilities/skills[?match=]、proposals、cases、approve/reject、
   // invoke + T6 别名 /v1/skills*）——必须先于 capabilityRoutes 展开：GET /v1/capabilities/:id
   // 的 `[^/]+` 会吞掉 /v1/capabilities/skills（grants 路由同款先具体后通配）
-  ...skillRoutes,
+  //
+  // 临时会话写入门（FR-A10 / #64-A4）：skill invoke 的 step 能力也要过同一判定——
+  // 路由声明在模块顶层，ctx 在运行时才有，故用桥接闭包按请求取 ctx（per-request 读）。
+  ...skillRoutes.map((route) => ({
+    method: route.method,
+    re: route.re,
+    handler: (req: IncomingMessage, res: ServerResponse, url: URL, ctx: RequestContext, params: string[]) =>
+      route.handler(req, res, url, { skills: ctx.skills, ephemeralGate: ctx.ephemeralGate }, params),
+  })),
   ...syncRoutes,
   ...outboxRoutes,
   ...notificationRoutes,
   ...memoryRoutes,
+  // 全局人设（M7-A-T1 / Issue #58）：GET/PUT /v1/persona——ctx.persona 桥接到 persona 自有路由签名
+  ...personaRoutes.map((route) => ({
+    method: route.method,
+    re: route.re,
+    handler: (req: IncomingMessage, res: ServerResponse, url: URL, ctx: RequestContext, params: string[]) =>
+      route.handler(req, res, url, { persona: ctx.persona }, params),
+  })),
   ...contactRoutes,
   ...channelRoutes,
   // 能力调用端点（#22 修复批 / FR-CAP-5）：POST /v1/capabilities/:id/invoke（body = 工具
@@ -459,6 +541,13 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
   // com.morrow.device + replica_id）——纯本地回环部署不触碰钥匙串；首次配对才供给。
   // 同步传输在下面构建时要用同一个凭据库（读 token:<peer>），故提前到引擎之前。
   const secretStore = options.secretStore ?? detectSecretStore().store;
+  // 会话工作区（票 M7-A-T4 / Issue #61）：git/gh 副作用全部经此接缝；默认实现不触盘、
+  // 只在绑定/建分支/clone 时执行子进程。凭据链 readGhToken：gh → OS 凭据库 github:pat。
+  const workspaceManager = options.workspaceManager ?? new DefaultWorkspaceManager({
+    workspacesRoot: join(homedir(), ".morrow", "workspaces"),
+    worktreesRoot: join(homedir(), ".morrow", "worktrees", "sessions"),
+    secretStore,
+  });
   // 出站同步传输（M3 同步接线修复 / Issue #34）：启动即按 devices 表接线——
   // base_url 从设备记录读、bearer token 从 SecretStore 读 `token:<peer>`。运行时
   // 设备增删由 DeviceSyncTransport 的读路径惰性重建 + PairingService 变更回调失效。
@@ -566,6 +655,9 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
   // （默认确定性实现），轮次收尾（message.assistant 落账）由 SessionManager 触发后台抽取。
   // 抽取器选择（M1 code-review 补齐）：注入 > config.memoryExtractor=llm（经 PiAdapter
   // 一次 prompt）> 默认启发式（MemoryService 内建）。
+  // 全局人设（M7-A-T1 / Issue #58）：账本唯一真相源 + 内存缓存。先于记忆/会话构建——
+  // 抽取器与会话 system prompt 都要读取当前人设。
+  const persona = new PersonaService({ ledger, replicaId: config.replicaId });
   const memoryStore = MemoryStore.open(config.dataDir);
   // 记忆投影器（票 M1-T3 / Issue #15，FR-MEM-6）：facts → dataDir/memory/*.md；
   // 注入 MemoryService（导入修订后单事实刷新 / 删除后投影文件移除），投影命令走路由。
@@ -577,21 +669,39 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     projector,
     // 本机删除 → 删除集合立即生效（离线副本的旧修订在导入时被跳过）
     onFactDeleted: (envelope) => tombstones.recordFactDeletion(envelope, ledger),
+    // 临时会话 24h 到期清理的时钟（与会话生命周期同一注入点；缺省系统时间）
+    ...(options.sessionNow === undefined ? {} : { now: options.sessionNow }),
     ...(options.memoryExtractor !== undefined
       ? { extractor: options.memoryExtractor }
       : config.memoryExtractor === "llm"
         ? {
-            // 默认 Provider + 抽取系统提示词（goal 形参在此工厂路径不消费，传空占位）
+            // 默认 Provider + 抽取系统提示词；提示词由 LlmMemoryExtractor 每次按当前
+            // Persona 拼装（票 M7-A-T1：前置人设段落，缺省退回原文案）。
             extractor: new LlmMemoryExtractor(
-              async () => defaultTaskRuntimeFactory(providers, LLM_EXTRACTOR_SYSTEM_PROMPT)("", undefined),
+              async (systemPrompt) => defaultTaskRuntimeFactory(providers, systemPrompt)("", undefined),
+              { persona: () => persona.get() },
             ),
           }
         : {}),
   });
+  // 临时会话到期清理的启动扫描（票 M7-A-T3）：重启后立即可见的过期会话不再进检索面；
+  // 运行期由 MemoryService.search 的惰性清理兜底（无定时器，语义与注入时钟一致）。
+  try {
+    memory.sweepExpiredEphemeralScopes();
+  } catch (err) {
+    console.error("[morrow] ephemeral memory sweep on startup failed:", err);
+  }
   // 记忆同步语义层（M3-T3 / Issue #32）：三方合并 + 冲突入 M1 队列 + 投影重建。
   // 晚绑定到 sync.afterImport：T1 引擎在每批导入落账后调用。
   const syncConflicts = SyncConflictStore.open(config.dataDir);
-  const memoryRebuilder = new MemoryProjectionRebuilder({ store: memoryStore, ledger, replicaId: config.replicaId });
+  // 记忆投影重建器（#64-A3）：注入时钟后，重放会按「session.ephemeral_closed + TTL」
+  // 重新推导过期状态——任何投影重建都不会让过期临时记忆回到 FTS/overview。
+  const memoryRebuilder = new MemoryProjectionRebuilder({
+    store: memoryStore,
+    ledger,
+    replicaId: config.replicaId,
+    now: () => (options.sessionNow ?? (() => new Date()))(),
+  });
   const syncMemory = new MemorySyncService({
     store: memoryStore,
     ledger,
@@ -732,6 +842,8 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
   // contactCapabilitiesForSession——联系人会话只注入 scope 声明的能力工具；
   // null/未接线 = Owner 或普通会话，不做联系人收窄。
   let contactToolCapabilities: ((sessionId: string) => string[] | null) | null = null;
+  // 临时会话判定（票 M7-A-T3）：晚绑定到 SessionManager（构造闭包在运行时执行）
+  let ephemeralSession: ((sessionId: string) => boolean) | null = null;
   // 会话工具注入改查注册表（票 M2-T1）：enabled 且有内置实现的 typescript 能力才实例化
   const sessions = new SessionManager({
     ledger,
@@ -740,8 +852,16 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     providers,
     // 注入工厂（测试/宿主自带 Agent Loop）时不做 Provider 预检（T4 语义）；默认工厂要求有 Provider
     providerRequired: options.agentAdapterFactory === undefined,
+    ...(options.sessionNow === undefined ? {} : { now: options.sessionNow }),
     // 记忆（M1-T1）：高价值规则即时写候选；memory.write 工具按会话注入 Agent Loop
     memory,
+    // 全局 Persona → 会话 system prompt（M7-A-T1 / Issue #58）：固定顺序拼装，随会话
+    // AgentRuntime 创建注入；不注入任务规划器。
+    systemPrompt: () => composePersonaPrompt(persona.get()),
+    // 元数据时钟（M7-A-T2）：软删 30 天到期判定
+    ...(options.sessionsNow === undefined ? {} : { now: options.sessionsNow }),
+    // 工作区接缝（票 M7-A-T4）：附件注入按路径重读（只读），工作区绑定走同一实现
+    workspace: workspaceManager,
     // 工具完成观察（M2-T5）：tool.finished → Skill 案例收集（is_error → failure）。
     // 观察是增强路径：失败记日志不阻断会话主链路。
     toolObserver: {
@@ -762,13 +882,18 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     // 工具注入改查注册表（票 M2-T1）：enabled 且有内置实现的 typescript 能力才实例化
     agentTools: (sessionId) => {
       const contactScopes = contactToolCapabilities?.(sessionId) ?? null;
+      // 临时会话禁写入类能力（票 M7-A-T3）：权限单入口的判定同样约束 Agent 工具面，
+      // 不只拦 HTTP invoke——模型在临时会话里看不到写操作类能力工具。
+      const ephemeral = ephemeralSession?.(sessionId) === true;
       return capabilities
         .list({ status: "enabled", runtime: "typescript" })
         .filter((capability) => builtinToolFactories[capability.name] !== undefined)
         .filter((capability) => contactScopes === null || contactScopes.includes(capability.name))
+        .filter((capability) => !ephemeral || !isEphemeralWriteClassCapability(capability.manifest))
         .map((capability) => builtinToolFactories[capability.name](sessionId));
     },
   });
+  ephemeralSession = (sessionId) => sessions.sessionKind(sessionId) === "ephemeral";
   // 任务域（M1-T4）：规划器/节点工厂注入语义对齐会话——注入时不做 Provider 预检，
   // 默认工厂路径要求存在可解析的默认 Provider（POST /v1/tasks 预检 503 依据）。
   const taskPlannerInjected = options.taskPlannerFactory !== undefined;
@@ -982,6 +1107,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     ledger,
     replicaId: config.replicaId,
     sessions,
+    persona,
     providers,
     devices,
     pairing,
@@ -1001,6 +1127,12 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     contacts,
     outbox,
     notifications,
+    workspace: workspaceManager,
+    // 临时会话写入门（#64-A4）：能力网关 / skill invoke / 任务创建共用同一判定函数。
+    ephemeralGate: {
+      sessionKind: (sessionId) => sessions.sessionKind(sessionId),
+      capabilities,
+    },
   };
   const server = createServer((req, res) => {
     routeRequest(req, res, ctx);
@@ -1082,6 +1214,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     port,
     ledger,
     sessions,
+    persona,
     providers,
     devices,
     pairing,
@@ -1178,7 +1311,8 @@ export function resolveSelfBaseUrl(config: RuntimeConfig, port: number): string 
 }
 
 /** 生产默认工厂：按会话解析的 Provider → createPiAdapter（OpenAI 兼容协议，ADR-0002）。
- *  extras.tools（M1-T1：memory.write）经 tools 通道注册进 Agent Loop。 */
+ *  extras.tools（M1-T1：memory.write）经 tools 通道注册进 Agent Loop；
+ *  extras.systemPrompt（M7-A-T1：Persona 拼装结果）经 systemPrompt 通道注入会话。 */
 function defaultAgentFactory(): (
   sessionId: string,
   provider: ResolvedProvider | null,
@@ -1195,6 +1329,7 @@ function defaultAgentFactory(): (
       apiKey: provider.apiKey.length > 0 ? provider.apiKey : "unused",
       model: { id: provider.modelId, contextWindow: provider.contextWindow, maxTokens: provider.maxTokens },
       ...(provider.compat !== undefined ? { compat: provider.compat } : {}),
+      ...(extras?.systemPrompt !== undefined ? { systemPrompt: extras.systemPrompt } : {}),
       tools: extras?.tools ?? [],
     });
   };
@@ -1389,6 +1524,7 @@ function listen(server: Server, host: string, port: number): Promise<number> {
 interface CreateSessionBody {
   title?: unknown;
   provider_id?: unknown;
+  kind?: unknown;
 }
 
 async function handleCreateSession(
@@ -1399,31 +1535,701 @@ async function handleCreateSession(
 ): Promise<void> {
   const body = await readJsonBody(req, res);
   if (body === null) return; // 响应已在 readJsonBody 里写出
-  const { title, provider_id: providerId } = body as CreateSessionBody;
+  const { title, provider_id: providerId, kind } = body as CreateSessionBody;
   if (title !== undefined && (typeof title !== "string" || title.trim().length === 0)) {
     sendError(res, 400, "invalid_body", "title must be a non-empty string when present");
+    return;
+  }
+  if (kind !== undefined && kind !== "normal" && kind !== "ephemeral") {
+    sendError(res, 400, "invalid_body", 'kind must be "normal" or "ephemeral" when present');
     return;
   }
   if (providerId !== undefined && (typeof providerId !== "string" || !ctx.providers.exists(providerId))) {
     sendError(res, 400, "unknown_provider", `provider "${String(providerId)}" is not registered (GET /v1/providers for the list)`);
     return;
   }
+  const sessionKind: SessionKind = kind === "ephemeral" ? "ephemeral" : "normal";
   const created = ctx.sessions.createSession(
     title === undefined ? undefined : title.trim(),
     typeof providerId === "string" ? providerId : undefined,
+    sessionKind,
   );
   sendJson(res, 201, {
     session_id: created.sessionId,
     event_id: created.eventId,
     sequence: created.sequence,
     occurred_at: created.occurredAt,
+    kind: sessionKind,
     ...(typeof providerId === "string" ? { provider_id: providerId } : {}),
     ...(title === undefined ? {} : { title: title.trim() }),
   });
 }
 
-function handleListSessions(_req: IncomingMessage, res: ServerResponse, _url: URL, ctx: RequestContext): void {
-  sendJson(res, 200, { sessions: ctx.sessions.listSessions() });
+function handleListSessions(_req: IncomingMessage, res: ServerResponse, url: URL, ctx: RequestContext): void {
+  const include = url.searchParams.get("include");
+  if (include !== null && include !== "archived" && include !== "deleted" && include !== "all") {
+    sendError(res, 400, "invalid_query", "include must be one of archived | deleted | all");
+    return;
+  }
+  sendJson(res, 200, {
+    sessions: include === null ? ctx.sessions.listSessions() : ctx.sessions.listSessions({ include }),
+  });
+}
+
+// --- M7-A 会话元数据 handlers（票 T2 / Issue #59）----------------------------
+
+const SESSION_TITLE_MAX_LENGTH = 120;
+
+interface RenameSessionBody {
+  title?: unknown;
+}
+
+async function handleRenameSession(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _url: URL,
+  ctx: RequestContext,
+  params: string[],
+): Promise<void> {
+  const sessionId = params[0];
+  if (!ctx.sessions.sessionExists(sessionId)) {
+    sendError(res, 404, "not_found", `session ${sessionId} does not exist`);
+    return;
+  }
+  const body = await readJsonBody(req, res);
+  if (body === null) return;
+  const { title } = body as RenameSessionBody;
+  if (typeof title !== "string" || title.trim().length === 0) {
+    sendError(res, 400, "invalid_body", "title must be a non-empty string");
+    return;
+  }
+  const trimmed = title.trim();
+  if (trimmed.length > SESSION_TITLE_MAX_LENGTH) {
+    sendError(res, 400, "invalid_body", `title must be at most ${SESSION_TITLE_MAX_LENGTH} characters`);
+    return;
+  }
+  const mutation = ctx.sessions.renameSession(sessionId, trimmed);
+  if (mutation === null) {
+    sendError(res, 404, "not_found", `session ${sessionId} does not exist`);
+    return;
+  }
+  sendJson(res, 200, {
+    session_id: sessionId,
+    title: trimmed,
+    event_id: mutation.eventId,
+    sequence: mutation.sequence,
+    changed: mutation.changed,
+  });
+}
+
+function handleArchiveSession(
+  _req: IncomingMessage,
+  res: ServerResponse,
+  _url: URL,
+  ctx: RequestContext,
+  params: string[],
+): void {
+  const sessionId = params[0];
+  const mutation = ctx.sessions.archiveSession(sessionId);
+  if (mutation === null) {
+    sendError(res, 404, "not_found", `session ${sessionId} does not exist`);
+    return;
+  }
+  sendJson(res, 200, {
+    session_id: sessionId,
+    archived_at: mutation.archivedAt ?? null,
+    event_id: mutation.eventId,
+    sequence: mutation.sequence,
+    changed: mutation.changed,
+  });
+}
+
+function handleUnarchiveSession(
+  _req: IncomingMessage,
+  res: ServerResponse,
+  _url: URL,
+  ctx: RequestContext,
+  params: string[],
+): void {
+  const sessionId = params[0];
+  const mutation = ctx.sessions.unarchiveSession(sessionId);
+  if (mutation === null) {
+    sendError(res, 404, "not_found", `session ${sessionId} does not exist`);
+    return;
+  }
+  sendJson(res, 200, {
+    session_id: sessionId,
+    archived_at: null,
+    event_id: mutation.eventId,
+    sequence: mutation.sequence,
+    changed: mutation.changed,
+  });
+}
+
+function handleDeleteSession(
+  _req: IncomingMessage,
+  res: ServerResponse,
+  _url: URL,
+  ctx: RequestContext,
+  params: string[],
+): void {
+  const sessionId = params[0];
+  const mutation = ctx.sessions.deleteSession(sessionId);
+  if (mutation === null) {
+    sendError(res, 404, "not_found", `session ${sessionId} does not exist`);
+    return;
+  }
+  sendJson(res, 200, {
+    session_id: sessionId,
+    deleted_at: mutation.deletedAt ?? null,
+    event_id: mutation.eventId,
+    sequence: mutation.sequence,
+    changed: mutation.changed,
+  });
+}
+
+/**
+ * 会话恢复（M7-A 共用端点，票 T2 / Issue #59 + 票 T3 / Issue #60）：
+ *   临时会话（kind=ephemeral）且处于关闭态 → 关闭后 24h 内重开（语义见 T3）；
+ *   其余 → 软删 30 天内的会话恢复（T2；只清删除标记，归档态保留）。
+ * 两条路径互斥：ephemeral 关闭态优先；未关闭的临时会话落到 T2 的 not_deleted 语义。
+ */
+function handleRestoreSession(
+  _req: IncomingMessage,
+  res: ServerResponse,
+  _url: URL,
+  ctx: RequestContext,
+  params: string[],
+): void {
+  const sessionId = params[0];
+  if (ctx.sessions.sessionKind(sessionId) === "ephemeral" && ctx.sessions.isClosed(sessionId)) {
+    try {
+      const result = ctx.sessions.restoreEphemeralSession(sessionId);
+      sendJson(res, 200, {
+        session_id: sessionId,
+        restored_at: result.restoredAt,
+        event_id: result.eventId,
+      });
+    } catch (err) {
+      handleSessionLifecycleError(res, err);
+    }
+    return;
+  }
+  const result = ctx.sessions.restoreSession(sessionId);
+  switch (result.status) {
+    case "unknown":
+      sendError(res, 404, "not_found", `session ${sessionId} does not exist`);
+      return;
+    case "not_deleted":
+      sendError(res, 409, "session_not_deleted", `session ${sessionId} is not deleted`);
+      return;
+    case "expired":
+      sendError(
+        res,
+        409,
+        "restore_window_expired",
+        `session ${sessionId} was deleted more than 30 days ago and can no longer be restored (ledger events are retained)`,
+      );
+      return;
+    case "restored":
+      sendJson(res, 200, {
+        session_id: sessionId,
+        deleted_at: null,
+        restored_at: result.restoredAt,
+        event_id: result.eventId,
+        sequence: result.sequence,
+        changed: true,
+      });
+      return;
+  }
+}
+
+/**
+ * 会话关闭（票 M7-A-T3 + 票 M7-A-T5 / Issue #63，ADR-0012）：
+ *   - 临时会话（kind=ephemeral）保持 T3 语义：写 session.ephemeral_closed，24h 可恢复；
+ *     本端点不接受三选一（body 里的 uncommitted 被忽略）。
+ *   - 普通会话：有未提交改动且未给 `uncommitted` → 409 uncommitted_changes + 文件列表；
+ *     commit → 提交到会话分支；keep → 工作区不动；discard → 仅清理本会话 worktree。
+ *     关闭写 session.closed（payload 含选择结果 / commit id / 清理文件数）。
+ */
+async function handleCloseSession(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _url: URL,
+  ctx: RequestContext,
+  params: string[],
+): Promise<void> {
+  const sessionId = params[0];
+  const kind = ctx.sessions.sessionKind(sessionId);
+  if (kind === null) {
+    sendError(res, 404, "not_found", `session ${sessionId} does not exist`);
+    return;
+  }
+  if (kind === "ephemeral") {
+    try {
+      const result = ctx.sessions.closeEphemeralSession(sessionId);
+      sendJson(res, 200, {
+        session_id: sessionId,
+        closed_at: result.closedAt,
+        restorable_until: result.restorableUntil,
+        ...(result.eventId === null ? {} : { event_id: result.eventId }),
+      });
+    } catch (err) {
+      handleSessionLifecycleError(res, err);
+    }
+    return;
+  }
+
+  const alreadyClosed = ctx.sessions.closedAtOf(sessionId);
+  if (alreadyClosed !== null) {
+    sendJson(res, 200, {
+      session_id: sessionId,
+      closed_at: alreadyClosed,
+      uncommitted: null,
+      files: [],
+      event_id: null,
+    });
+    return;
+  }
+
+  const body = await readOptionalJsonBody(req, res);
+  if (body === null) return;
+  const rawChoice = body.uncommitted;
+  if (rawChoice !== undefined && rawChoice !== "commit" && rawChoice !== "keep" && rawChoice !== "discard") {
+    sendError(res, 400, "invalid_body", 'uncommitted must be "commit", "keep" or "discard" when present');
+    return;
+  }
+  const choice = rawChoice as UncommittedChoice | undefined;
+
+  const workspace = ctx.sessions.workspaceOf(sessionId);
+  let files: string[] = [];
+  if (workspace !== null && workspace.repo_path !== undefined) {
+    try {
+      files = await ctx.workspace.uncommittedChanges(workspace.path);
+    } catch (err) {
+      sendWorkspaceError(res, err);
+      return;
+    }
+  }
+
+  if (files.length > 0 && choice === undefined) {
+    sendError(
+      res,
+      409,
+      "uncommitted_changes",
+      `session ${sessionId} has ${files.length} uncommitted change(s); pass uncommitted=commit|keep|discard`,
+      { session_id: sessionId, files, ...(workspace === null ? {} : { workspace: workspace.path }) },
+    );
+    return;
+  }
+
+  let outcome: NormalCloseOutcome = { uncommitted: null, files: [] };
+  if (files.length > 0 && choice !== undefined) {
+    if (workspace === null) {
+      sendError(res, 409, "workspace_not_bound", `session ${sessionId} has no bound workspace to handle changes in`);
+      return;
+    }
+    if (choice === "commit") {
+      const title = (ctx.sessions.sessionTitle(sessionId) ?? "untitled").replace(/\s+/g, " ").trim() || "untitled";
+      try {
+        const committed = await ctx.workspace.commitChanges(
+          workspace.path,
+          `morrow: session ${sessionId.slice(0, 8)} ${title}`,
+        );
+        outcome = { uncommitted: "commit", files: committed.files, commit: committed.commit };
+      } catch (err) {
+        sendWorkspaceError(res, err);
+        return;
+      }
+    } else if (choice === "discard") {
+      try {
+        // local 绑定没有 worktree 隔离（目录是用户自己的项目）→ 该来源不支持 discard，
+        // 抛 discard_not_supported_for_local（409）并在文案里指向 commit/keep。
+        const discarded = await ctx.workspace.discardChanges(sessionId, workspace.path, {
+          workspaceKind: workspace.kind,
+        });
+        outcome = { uncommitted: "discard", files: discarded.files, discarded: discarded.discarded };
+      } catch (err) {
+        sendWorkspaceError(res, err);
+        return;
+      }
+    } else {
+      outcome = { uncommitted: "keep", files };
+    }
+  }
+
+  try {
+    const closed = ctx.sessions.closeNormalSession(sessionId, outcome);
+    sendJson(res, 200, {
+      session_id: sessionId,
+      closed_at: closed.closedAt,
+      event_id: closed.eventId,
+      uncommitted: outcome.uncommitted,
+      files: outcome.files,
+      ...(outcome.commit === undefined ? {} : { commit: outcome.commit }),
+      ...(outcome.discarded === undefined ? {} : { discarded: outcome.discarded }),
+    });
+  } catch (err) {
+    handleSessionLifecycleError(res, err);
+  }
+}
+
+/**
+ * 可选 JSON body（关闭端点）：content-type 不是 JSON 或显式 content-length: 0 时按
+ * 空对象处理——`{uncommitted?}` 是可选的，老客户端/脚本 POST 空体仍是合法请求。
+ */
+async function readOptionalJsonBody(
+  req: IncomingMessage,
+  res: ServerResponse,
+): Promise<Record<string, unknown> | null> {
+  const contentType = req.headers["content-type"];
+  const length = req.headers["content-length"];
+  const isJson = typeof contentType === "string" && /^application\/json\b/i.test(contentType.trim());
+  if (!isJson || length === "0") return {};
+  return await readJsonBody(req, res);
+}
+
+function handleSessionLifecycleError(res: ServerResponse, err: unknown): void {
+  if (err instanceof SessionLifecycleError) {
+    sendError(res, err.code === "not_found" ? 404 : 409, err.code, err.message);
+    return;
+  }
+  throw err;
+}
+
+// --- M7-A 工作区与附件 handlers（票 T4 / Issue #61）--------------------------
+
+interface BindWorkspaceBody {
+  kind?: unknown;
+  path?: unknown;
+  url?: unknown;
+  base_branch?: unknown;
+  new_branch?: unknown;
+}
+
+/**
+ * PUT /v1/sessions/:id/workspace：
+ *   { kind: "none" }
+ *   { kind: "local", path }
+ *   { kind: "github", url, base_branch?, new_branch? }
+ * github 路径：clone 或按 remote URL 关联已有副本 → 建分支（默认 morrow/<6位id>，
+ * 基线缺省探测 origin/HEAD）→ 建会话 worktree；全部成功后写 session.workspace_bound。
+ * 失败返回可操作错误（无 PAT/gh 的 clone 失败提示”；分支冲突 409）。
+ */
+async function handleBindWorkspace(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _url: URL,
+  ctx: RequestContext,
+  params: string[],
+): Promise<void> {
+  const sessionId = params[0];
+  if (!ctx.sessions.sessionExists(sessionId)) {
+    sendError(res, 404, "not_found", `session ${sessionId} does not exist`);
+    return;
+  }
+  const body = await readJsonBody(req, res);
+  if (body === null) return;
+  const { kind, path, url, base_branch: baseBranchRaw, new_branch: newBranchRaw } = body as BindWorkspaceBody;
+
+  if (kind === "none") {
+    const mutation = ctx.sessions.bindWorkspace(sessionId, null);
+    if (mutation === null) {
+      sendError(res, 404, "not_found", `session ${sessionId} does not exist`);
+      return;
+    }
+    sendJson(res, 200, workspaceResponse(sessionId, mutation.workspace, mutation));
+    return;
+  }
+
+  if (kind === "local") {
+    if (typeof path !== "string" || path.trim().length === 0) {
+      sendError(res, 400, "invalid_body", "path must be a non-empty string for kind=local");
+      return;
+    }
+    let workspace: SessionWorkspace;
+    try {
+      const binding = await ctx.workspace.bindLocal(path);
+      workspace = {
+        kind: "local",
+        path: binding.path,
+        ...(binding.repoPath === null ? {} : { repo_path: binding.repoPath }),
+        ...(binding.branch === null ? {} : { branch: binding.branch }),
+      };
+    } catch (err) {
+      sendWorkspaceError(res, err);
+      return;
+    }
+    // 同仓库同分支占用检查（票 M7-A-T5）：必须在绑定前拒绝，避免两个会话共享
+    // 同一棵工作树；持有者信息来自内存注册表 + 账本重建（重启后一致）。
+    if (workspace.repo_path !== undefined && workspace.branch !== undefined) {
+      const holder = ctx.sessions.branchHolder(workspace.repo_path, workspace.branch, sessionId);
+      if (holder !== null) {
+        sendBranchInUse(res, holder, workspace.repo_path, workspace.branch);
+        return;
+      }
+    }
+    const mutation = ctx.sessions.bindWorkspace(sessionId, workspace);
+    if (mutation === null) {
+      sendError(res, 404, "not_found", `session ${sessionId} does not exist`);
+      return;
+    }
+    sendJson(res, 200, workspaceResponse(sessionId, mutation.workspace, mutation));
+    return;
+  }
+
+  if (kind === "github") {
+    if (typeof url !== "string" || url.trim().length === 0) {
+      sendError(res, 400, "invalid_body", "url must be a non-empty string for kind=github");
+      return;
+    }
+    if (baseBranchRaw !== undefined && (typeof baseBranchRaw !== "string" || baseBranchRaw.trim().length === 0)) {
+      sendError(res, 400, "invalid_body", "base_branch must be a non-empty string when present");
+      return;
+    }
+    if (newBranchRaw !== undefined && (typeof newBranchRaw !== "string" || newBranchRaw.trim().length === 0)) {
+      sendError(res, 400, "invalid_body", "new_branch must be a non-empty string when present");
+      return;
+    }
+    const baseBranch = typeof baseBranchRaw === "string" ? baseBranchRaw.trim() : undefined;
+    const requestedBranch = typeof newBranchRaw === "string" ? newBranchRaw.trim() : undefined;
+    let workspace: SessionWorkspace;
+    let reused = false;
+    try {
+      const cloned = await ctx.workspace.cloneFrom(url.trim(), baseBranch === undefined ? {} : { baseBranch });
+      reused = cloned.reused;
+      // 默认分支名唯一性（#64 / A2）：候选 = `morrow/<短 id>` + `-2`…`-5`。用户显式给了
+      // new_branch 就只试那一个（显式选择撞名要如实报出来，不能偷偷换名）。
+      // 先查持有者（票 M7-A-T5）：命中时给持有者信息而不是笼统的 branch_exists。
+      let created: { branch: string; base: string; baseCommit: string; created: boolean } | null = null;
+      let lastConflict: WorkspaceError | null = null;
+      for (const candidate of requestedBranch === undefined ? branchCandidatesForSession(sessionId) : [requestedBranch]) {
+        const holder = ctx.sessions.branchHolder(cloned.repoPath, candidate, sessionId);
+        if (holder !== null) {
+          sendBranchInUse(res, holder, cloned.repoPath, candidate);
+          return;
+        }
+        try {
+          created = await ctx.workspace.ensureBranch(cloned.repoPath, baseBranch, candidate);
+          break;
+        } catch (err) {
+          if (err instanceof WorkspaceError && err.code === "branch_exists") {
+            lastConflict = err;
+            continue;
+          }
+          throw err;
+        }
+      }
+      if (created === null) {
+        // 默认名的 5 个候选全撞车：409 branch_exists 并给建议名（不让 UI 无路可走）。
+        const suggestion = `${defaultBranchForSession(sessionId)}-${Date.now() % 1000}`;
+        throw new WorkspaceError(
+          "branch_exists",
+          lastConflict?.message ??
+            `every default branch candidate already exists in ${cloned.repoPath}; pass an explicit new_branch (e.g. "${suggestion}")`,
+          { repo_path: cloned.repoPath, suggested_branch: suggestion },
+        );
+      }
+      const worktree = await ctx.workspace.prepareWorktree(cloned.repoPath, created.branch, sessionId);
+      workspace = {
+        kind: "github",
+        path: worktree.dir,
+        repo_path: cloned.repoPath,
+        branch: created.branch,
+        url: url.trim(),
+        base_branch: created.base,
+      };
+    } catch (err) {
+      sendWorkspaceError(res, err);
+      return;
+    }
+    const mutation = ctx.sessions.bindWorkspace(sessionId, workspace);
+    if (mutation === null) {
+      sendError(res, 404, "not_found", `session ${sessionId} does not exist`);
+      return;
+    }
+    sendJson(res, 200, { ...workspaceResponse(sessionId, mutation.workspace, mutation), reused });
+    return;
+  }
+
+  sendError(res, 400, "invalid_body", 'kind must be "local", "github" or "none"');
+}
+
+function workspaceResponse(
+  sessionId: string,
+  workspace: SessionWorkspace | null,
+  mutation: { eventId: string | null; sequence: number | null; changed: boolean },
+): Record<string, unknown> {
+  return {
+    session_id: sessionId,
+    workspace,
+    event_id: mutation.eventId,
+    sequence: mutation.sequence,
+    changed: mutation.changed,
+  };
+}
+
+interface AttachmentBody {
+  paths?: unknown;
+}
+
+function parseAttachmentPaths(value: unknown): string[] | null {
+  if (!Array.isArray(value) || value.length === 0) return null;
+  const paths: string[] = [];
+  for (const item of value) {
+    if (typeof item !== "string" || item.trim().length === 0) return null;
+    paths.push(item.trim());
+  }
+  return paths;
+}
+
+function handleListAttachments(
+  _req: IncomingMessage,
+  res: ServerResponse,
+  _url: URL,
+  ctx: RequestContext,
+  params: string[],
+): void {
+  const sessionId = params[0];
+  if (!ctx.sessions.sessionExists(sessionId)) {
+    sendError(res, 404, "not_found", `session ${sessionId} does not exist`);
+    return;
+  }
+  const attachments = ctx.sessions.attachmentsOf(sessionId);
+  sendJson(res, 200, { session_id: sessionId, attachments, attachment_count: attachments.length });
+}
+
+async function handleAddAttachments(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _url: URL,
+  ctx: RequestContext,
+  params: string[],
+): Promise<void> {
+  const sessionId = params[0];
+  if (!ctx.sessions.sessionExists(sessionId)) {
+    sendError(res, 404, "not_found", `session ${sessionId} does not exist`);
+    return;
+  }
+  const body = await readJsonBody(req, res);
+  if (body === null) return;
+  const paths = parseAttachmentPaths((body as AttachmentBody).paths);
+  if (paths === null) {
+    sendError(res, 400, "invalid_body", "paths must be a non-empty array of non-empty strings");
+    return;
+  }
+  let attachments: SessionAttachment[];
+  try {
+    // 读取并校验（只读；单次请求的文件数/单文件/总量上限在 DefaultWorkspaceManager 内）
+    attachments = (await ctx.workspace.attach(paths)).map(({ path, name, size }) => ({ path, name, size }));
+  } catch (err) {
+    sendWorkspaceError(res, err);
+    return;
+  }
+  let mutation;
+  try {
+    // 累计上限（ADR-0012 / #64-A6）：单次 6 个 + 再来 6 个必须 400——校验在合并后的
+    // 集合上做，单次请求绕过不了单会话 ≤10 的约束。超限抛 AttachmentLimitError。
+    mutation = ctx.sessions.addAttachments(sessionId, attachments);
+  } catch (err) {
+    if (err instanceof AttachmentLimitError) {
+      sendError(res, 400, err.code, err.message);
+      return;
+    }
+    throw err;
+  }
+  if (mutation === null) {
+    sendError(res, 404, "not_found", `session ${sessionId} does not exist`);
+    return;
+  }
+  sendJson(res, 200, {
+    session_id: sessionId,
+    attachments: mutation.attachments,
+    attachment_count: mutation.attachmentCount,
+    event_id: mutation.eventId,
+    sequence: mutation.sequence,
+    changed: mutation.changed,
+  });
+}
+
+async function handleRemoveAttachments(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _url: URL,
+  ctx: RequestContext,
+  params: string[],
+): Promise<void> {
+  const sessionId = params[0];
+  if (!ctx.sessions.sessionExists(sessionId)) {
+    sendError(res, 404, "not_found", `session ${sessionId} does not exist`);
+    return;
+  }
+  const body = await readJsonBody(req, res);
+  if (body === null) return;
+  const paths = parseAttachmentPaths((body as AttachmentBody).paths);
+  if (paths === null) {
+    sendError(res, 400, "invalid_body", "paths must be a non-empty array of non-empty strings");
+    return;
+  }
+  const mutation = ctx.sessions.removeAttachments(sessionId, paths);
+  if (mutation === null) {
+    sendError(res, 404, "not_found", `session ${sessionId} does not exist`);
+    return;
+  }
+  sendJson(res, 200, {
+    session_id: sessionId,
+    attachments: mutation.attachments,
+    attachment_count: mutation.attachmentCount,
+    event_id: mutation.eventId,
+    sequence: mutation.sequence,
+    changed: mutation.changed,
+  });
+}
+
+/** 同分支占用（票 M7-A-T5）：409 + 持有者 session_id/标题，UI 直接展示"谁占着"。 */
+function sendBranchInUse(
+  res: ServerResponse,
+  holder: { sessionId: string; title?: string },
+  repoPath: string,
+  branch: string,
+): void {
+  const who = holder.title === undefined ? holder.sessionId : `${holder.sessionId} (${holder.title})`;
+  sendError(
+    res,
+    409,
+    "branch_in_use",
+    `branch "${branch}" in ${repoPath} is already held by session ${who}; use another branch`,
+    {
+      branch,
+      repo_path: repoPath,
+      holder_session_id: holder.sessionId,
+      ...(holder.title === undefined ? {} : { holder_title: holder.title }),
+    },
+  );
+}
+
+/** 工作区错误 → HTTP 状态（可操作错误码不合并成 500）。 */
+function sendWorkspaceError(res: ServerResponse, err: unknown): void {
+  if (!(err instanceof WorkspaceError)) throw err;
+  const status =
+    err.code === "clone_failed"
+      ? 502
+      : err.code === "git_failed"
+        ? 500
+        : err.code === "branch_exists" ||
+            err.code === "branch_in_use" ||
+            err.code === "base_not_found" ||
+            err.code === "not_isolated" ||
+            err.code === "discard_not_supported_for_local"
+          ? 409
+          : 400;
+  // details 平铺进 error 信封（branch_exists 的建议名 / clone 失败的脱敏 stderr 等）：
+  // UI 的 ApiError.details 直接消费，不需要解析 message 文本。
+  const details =
+    err.details !== null && typeof err.details === "object" && !Array.isArray(err.details)
+      ? (err.details as Record<string, unknown>)
+      : undefined;
+  sendError(res, status, err.code, err.message, details);
 }
 
 interface SendMessageBody {
@@ -1440,6 +2246,15 @@ async function handleSendMessage(
   const sessionId = params[0];
   if (!ctx.sessions.sessionExists(sessionId)) {
     sendError(res, 404, "not_found", `session ${sessionId} does not exist`);
+    return;
+  }
+  if (ctx.sessions.isClosed(sessionId)) {
+    sendError(
+      res,
+      409,
+      "session_closed",
+      `session ${sessionId} is closed; POST /v1/sessions/${sessionId}/restore within 24h to continue`,
+    );
     return;
   }
   if (!ctx.sessions.agentAvailable) {
@@ -1713,6 +2528,10 @@ async function handleInvokeCapability(
   if (body === null) return; // 响应已在 readJsonBody 里写出（415/413/400）
   const startedAt = Date.now();
   try {
+    // 临时会话禁写入类能力（票 M7-A-T3 / ADR-0010；#64-A4 收敛到 ephemeral-gate）：
+    // 权限单入口判定，先于执行链（未知能力不在此拒绝，留给 unknown_tool；UI 侧同门禁
+    // 禁用按钮，双保险）。
+    assertEphemeralCapabilityUse(ctx.ephemeralGate, sessionId, [capabilityId]);
     const result = await ctx.sandbox.invoke(capabilityId, body, { actorId: "owner", ...(sessionId !== undefined ? { sessionId } : {}) });
     // 先落审计后返回（账本可追踪优先于响应时延；审计失败不改变执行结果口径）
     appendCapabilityUsed(ctx, capabilityId, result, result.duration_ms, sessionId);
@@ -1761,6 +2580,13 @@ async function handleCreateTask(
   }
   if (typeof sessionId === "string" && !ctx.sessions.sessionExists(sessionId)) {
     sendError(res, 400, "invalid_body", `session "${sessionId}" does not exist`);
+    return;
+  }
+  // 临时会话写入门（FR-A10「并限制任务创建」/ #64-A4）：同一判定函数的任务侧入口。
+  // 先前只在能力 invoke 上拦，临时会话仍可 POST /v1/tasks 拉起带副作用的 DAG。
+  const taskDenial = ephemeralTaskCreationDenial(ctx.ephemeralGate, sessionId);
+  if (taskDenial !== null) {
+    sendError(res, 403, EPHEMERAL_TASK_FORBIDDEN_CODE, taskDenial);
     return;
   }
   let detail;

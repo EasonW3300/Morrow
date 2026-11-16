@@ -70,6 +70,8 @@ provider 参数）；凭据库可经 `startRuntime(config, { secretStore })` 注
 | GET | `/v1/events` | `{ events: EventEnvelope[], total, limit, offset }`；query：`limit`（1–200，默认 50）、`offset`、`replica_id`（uuid 过滤）；非法入参 400 |
 | POST | `/v1/sessions` | 建会话，body `{ title?, provider_id? }`（provider_id 需已注册，或为 env 回退）→ 201 `{ session_id, event_id, sequence, occurred_at, provider_id?, title? }`；未知 provider_id → 400 `unknown_provider` |
 | GET | `/v1/sessions` | 会话列表（`session.created` 投影，含显式 `provider_id`）→ `{ sessions: [...] }` |
+| GET | `/v1/persona` | 全局人设（M7-A-T1 / Issue #58）→ `{ persona }`；无 `persona.updated` 事件时返回默认值（名字 Morrow / 语气简洁直接 / 职责个人助理与开发助手 / 禁止空 / 其他空） |
+| PUT | `/v1/persona` | 保存全局人设，body `{ name, tone, responsibilities[], prohibitions[], extra }`（name 非空且 ≤40 字符；tone ≤200；清单每项 ≤120 且最多 20 条；extra ≤2000）→ 200 `{ persona, event_id, sequence, occurred_at }`；非法 400 `invalid_persona` |
 | POST | `/v1/sessions/:id/messages` | 发送用户输入，body `{ text }`（非空字符串）→ 202 `{ message_id, event_id, sequence, status }`；status `processing`（本轮立即驱动）或 `queued`（同会话有轮次在跑，FIFO 排队） |
 | GET | `/v1/sessions/:id/messages` | 历史投影 → `{ session_id, messages: [{ message_id, role, text, stop_reason?, event_id, sequence, occurred_at }] }` |
 | GET | `/v1/sessions/:id/stream` | SSE 会话事件流（见下节） |
@@ -208,6 +210,7 @@ M0 不设队列上限（单用户本地场景）。
 | `tool.finished` | `agent:runtime` | 对应 tool.started | `{ tool_call_id, tool_name, text, is_error, duration_ms? }` |
 | `agent.error` | `agent:runtime` | message.user | `{ message }` |
 | `message.assistant` | `agent:runtime` | message.user | `{ message_id, text, stop_reason }` |
+| `persona.updated` | `owner` | null | `{ name, tone, responsibilities, prohibitions, extra }`（M7-A-T1：payload 为全量 Persona；拼装顺序固定为 名字→语气→职责→禁止→其他，注入会话 system prompt 与记忆抽取器，不注入任务规划器） |
 | `memory.candidate_created` | `agent:runtime` | 来源 message.user | `{ candidate_id, content, kind, sensitivity, confidence, source_id, source_event_id, rule }`（M1-T1；rule = 命中的启发式规则 / `memory.write` / 抽取器规则名） |
 | `memory.extracted` | `agent:runtime` | 本轮 message.assistant | `{ user_event_id, assistant_event_id?, extracted_count, skipped_duplicates, candidate_ids }`（M1-T2：抽取运行收尾，0 条也留痕——管线跑过且可审计） |
 | `memory.consolidated` | `agent:runtime` | 自动路径 = 同轮 memory.extracted；decide 路径 = 候选来源事件 | `{ candidate_count, created_fact_ids, updated_fact_ids, corroborated_fact_ids, conflict_ids, candidate_ids }`（M1-T2：巩固运行收尾；无待巩固候选时不产生空运行事件） |
@@ -221,6 +224,76 @@ M0 不设队列上限（单用户本地场景）。
 每轮恰好一条 `message.assistant` 收尾——正常轮 `stop_reason: "stop"`；错误轮先 `agent.error`
 再落 `stop_reason: "error"` 的 assistant（text 为已产出前缀）；中断轮 `stop_reason: "aborted"`，
 已产出事件不丢失且不污染后续轮次。
+
+## M7-A 会话体验事件族（票 M7-A-T2/T3/T4/T5，Issue #59–#63）
+
+会话元数据、临时会话生命周期、工作区与附件**全部走账本**（无 sessions 表——列表/摘要都是
+事件折叠，避免第二真相源）。event_type 清单只增不减。
+
+| event_type | actor_id | causation_id | payload |
+| --- | --- | --- | --- |
+| `session.renamed` | `owner` | null | `{ title }`（M7-A-T2 / #59；后写覆盖前写） |
+| `session.archived` | `owner` | null | `{}`（归档时间取事件 `occurred_at`；默认列表收起） |
+| `session.unarchived` | `owner` | null | `{}`（清除归档态，幂等 no-op 不重复记账） |
+| `session.deleted` | `owner` | null | `{}`（软删：`occurred_at` 起 30 天可恢复；折叠过期后从视图剔除，账本事件永久保留） |
+| `session.restored` | `owner` | null | `{}`（只清软删标记，此前的归档态保留） |
+| `session.closed` | `owner` | null | `{ kind: "normal", closed_at, uncommitted, files, commit?, discarded? }`（M7-A-T5 / #63：普通会话关闭三选一的结果；与 ephemeral 关闭**分名**） |
+| `session.ephemeral_closed` | `owner` | null | `{ kind: "ephemeral", closed_at }`（M7-A-T3 / #60：临时会话关闭；24h 内可恢复） |
+| `session.ephemeral_restored` | `owner` | null | `{ restored_at }`（清除关闭态；超过 24h 的恢复请求 409 `session_expired`） |
+| `session.workspace_bound` | `owner` | null | `{ workspace: { kind, path, repo_path?, branch?, url?, base_branch? } \| null }`（M7-A-T4 / #61；null = 解绑） |
+| `session.attachment_added` | `owner` | null | `{ attachments: [{ path, name, size }] }`（只读附件元数据；**内容不落账本**） |
+| `session.attachment_removed` | `owner` | null | `{ paths: [string] }` |
+| `persona.updated` | `owner` | null | `{ name, tone, responsibilities, prohibitions, extra }`（全量 Persona；拼装顺序固定为 名字→语气→职责→禁止→其他，注入会话 system prompt 与记忆抽取器，不注入任务规划器） |
+| `memory.promoted` | `owner` | null | `{ entry_id, entry_kind: "candidate" \| "fact", from_scope: "session:<id>", to_scope: "owner" }`（M7-A-T3：提升为长期记忆；**参与投影重建**，重放后作用域不丢） |
+
+临时会话的记忆可见性没有独立的 `memory.ephemeral_closed` / `memory.ephemeral_restored`
+事件——这两个名字**不存在**（若在旧文档里见过，以本表为准）：到期与恢复都是从**会话事件**
+推导的（`session.ephemeral_closed.closed_at` + 24h 与当前时间比较；`session.ephemeral_restored`
+清除关闭态），事件族不需要复制一份记忆侧状态。唯一记忆侧的临时会话事件是
+`memory.promoted`（提升为长期记忆）。
+
+**临时会话到期是推导结果，不是持久化标记**（#64-A3）：`expired_at` 只作缓存，任何投影重建
+（新 fact 事件、`sync.conflict`、启动补建）都按「`session.ephemeral_closed.closed_at` + 24h
+vs 当前时间」重新判定，过期记忆不会因为一次重建复活。`MemoryService.search` / `overview` /
+`promoteMemory` 三个入口都先做同口径 sweep；`promote` 过期条目返回 409 `memory_invalid_state`。
+
+**折叠口径**：`GET /v1/sessions` 是对上述创建/元数据/工作区/附件事件的折叠（按 `sequence`
+施加，后写覆盖前写）；软删超过 30 天从所有视图剔除。`session.closed` 与
+`session.ephemeral_closed` 都使会话不可继续发消息（`POST messages` 409 `session_closed`），
+只有 `session.ephemeral_restored` 能重开。
+
+## M7-A 会话体验端点（票 M7-A-T2/T3/T4/T5）
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/v1/sessions` | 建会话，body `{ title?, provider_id?, kind? }`（`kind` = `normal` 缺省 / `ephemeral`）→ 201；payload 恒记录 kind |
+| GET | `/v1/sessions` | 会话摘要列表，query `include` = `archived` / `deleted` / `all`（缺省只回活动会话）→ `{ sessions: SessionSummary[] }`（类型单源在 `@morrow/protocol`） |
+| POST | `/v1/sessions/:id/rename` | body `{ title }`（trim 非空、≤120）→ 200 `{ session_id, title, event_id, sequence, changed }` |
+| POST | `/v1/sessions/:id/archive` | 归档（已归档为幂等 no-op，`event_id: null`） |
+| POST | `/v1/sessions/:id/unarchive` | 取消归档（未归档为 no-op） |
+| DELETE | `/v1/sessions/:id` | 软删（30 天可恢复；重复删除不延长保留期） |
+| POST | `/v1/sessions/:id/restore` | 两会话语义合一：临时会话 → 关闭后 24h 内重开；普通会话 → 软删 30 天内恢复。过期分别 409 `session_expired` / `expired` |
+| POST | `/v1/sessions/:id/close` | 普通会话关闭（body 可选 `{ uncommitted: "commit" \| "keep" \| "discard" }`）；有未提交改动且未给选择 → 409 `uncommitted_changes`（error 信封带 `files`）。临时会话走 T3 语义（返回 `restorable_until`） |
+| PUT | `/v1/sessions/:id/workspace` | 绑定/解绑工作区：`{ kind: "none" }` / `{ kind: "local", path }` / `{ kind: "github", url, base_branch?, new_branch? }` → 200 `{ session_id, workspace, event_id, sequence, changed, reused? }`。**默认分支名 = `morrow/<session 短 id>`**（uuidv7 尾部随机位；撞名时自动试 `-2`…`-5`，全撞则 409 `branch_exists` 带 `suggested_branch`）。错误：`branch_in_use`（409 + 持有者）、`clone_failed`（502；无凭据时提示 PAT/gh；**仅 github.com 注入凭据**）、`branch_exists`（409） |
+| GET | `/v1/sessions/:id/attachments` | 只读附件清单 → `{ session_id, attachments, attachment_count }` |
+| POST | `/v1/sessions/:id/attachments` | body `{ paths: string[] }` → 200 同上；上限按**累计**校验：单会话 ≤10 个、单文件 256 KiB、合计 ≤1 MiB，超限 400 `attachment_limit_exceeded`（message 含当前数量与上限） |
+| DELETE | `/v1/sessions/:id/attachments` | body `{ paths: string[] }` → 200；未命中为 no-op（`changed: false`） |
+| GET | `/v1/memory/overview` | 只读记忆视图（M7-A-T6 / #62）：query `view=tree\|timeline`（缺省 tree）、`scope=owner\|session:<id>`、`limit`/`offset` → tree `{ groups: [{ kind, count, clusters: [{ theme, entries }] }] }`；timeline `{ total, limit, offset, entries }`。条目形状 `MemoryOverviewEntry`（单源在 protocol） |
+| POST | `/v1/memory/:id/promote` | 提升为长期记忆：`session:<id>` → `owner` + `memory.promoted`；非 session 作用域 / 已过期 → 409 `memory_invalid_state`，未知 → 404 |
+| GET | `/v1/persona` | 全局人设 → `{ persona }`（无 `persona.updated` 时返回默认值） |
+| PUT | `/v1/persona` | 保存人设（五字段校验：name ≤40 / tone ≤200 / 清单每项 ≤120 且 ≤20 条 / extra ≤2000）→ 200；非法 400 `invalid_persona`。**只影响之后新建的会话**（system prompt 随运行时创建求值一次，ADR-0009） |
+
+**临时会话写入门（FR-A10 / #64-A4）是单一入口**：`POST /v1/capabilities/:id/invoke`、
+`POST /v1/capabilities/skills/:id/invoke`（整条 skill 的全部 step 能力）与 `POST /v1/tasks`
+（403 `ephemeral_task_forbidden`）都经 `ephemeral-gate.ts` 的同一判定函数。写入类能力 =
+manifest 任一权限维非空；五维全空的纯计算能力（含 `memory.write`，其写入由 scope 隔离
+约束）放行。普通会话与无会话上下文的调用不受该门影响。
+
+**discard 的边界（ADR-0012 / #64-A5）**：`POST /v1/sessions/:id/close` 的
+`uncommitted=discard` 只对 **github 绑定的会话 worktree** 有效（路径必须是
+`<worktreesRoot>/<sessionId>`，且解析 realpath 后仍在该根之下——symlink 逃逸被拒
+`not_isolated`）。local 绑定没有 worktree 隔离，该来源**不支持 discard**，返回 409
+`discard_not_supported_for_local`（UI 同步禁用该选项并指向 commit/keep）。
 
 ## M1 任务事件族与调度（票 M1-T4 / Issue #16，PRD §4.3 FR-TASK-1/2/6）
 

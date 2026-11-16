@@ -1,5 +1,6 @@
 import type { MemoryEntryKind, SensitivityLevel } from "@morrow/protocol";
 import type { EventLedger, LedgerEntry } from "../ledger.ts";
+import { EPHEMERAL_SESSION_TTL_MS } from "../sessions.ts";
 import type {
   MemoryFactRow,
   MemoryProjectionSnapshot,
@@ -115,6 +116,32 @@ export interface MemoryReplayOptions {
    * 缺省 undefined = 旧行为（不按作者归属过滤，供离线纯重放/兼容测试）。
    */
   localReplicaId?: string;
+  /**
+   * 当前时刻（票 #64-A3）：临时会话到期状态**必须可由账本重放推出**——由
+   * `session.ephemeral_closed.closed_at + TTL` 与当前时刻比较得出，不依赖只存在于
+   * 某一行的 `expired_at` 标记（那会被重放重置为 null，让过期记忆复活）。
+   * 缺省 undefined = 不做过期判定（纯重放/兼容测试）。
+   */
+  now?: Date;
+  /** 临时会话保留窗口（毫秒，默认 = sessions.ts 的 EPHEMERAL_SESSION_TTL_MS） */
+  ephemeralTtlMs?: number;
+}
+
+/** 重放得到的会话关闭态（session.ephemeral_closed → closedAt；restored 清除） */
+function collectEphemeralClosedAt(entries: LedgerEntry[]): Map<string, string> {
+  const closedAt = new Map<string, string>();
+  for (const entry of entries) {
+    const envelope = entry.envelope;
+    const sessionId = envelope.session_id;
+    if (sessionId === null || sessionId === undefined) continue;
+    if (envelope.event_type === "session.ephemeral_closed") {
+      const at = typeof envelope.payload.closed_at === "string" ? envelope.payload.closed_at : envelope.occurred_at;
+      closedAt.set(sessionId, at);
+    } else if (envelope.event_type === "session.ephemeral_restored") {
+      closedAt.delete(sessionId);
+    }
+  }
+  return closedAt;
 }
 
 /** 纯重放：不触库，便于单测与一致性校验 */
@@ -129,6 +156,12 @@ export function replayMemoryEvents(entries: LedgerEntry[], options: MemoryReplay
     conflictedEvents: collectConflictedEvents(entries, options.localReplicaId),
     ignored: 0,
   };
+
+  // 临时会话关闭时刻（票 #64-A3）：与 MemoryService.sweepExpiredEphemeralScopes 同口径，
+  // 但作为**重放输入**参与推导——重建后过期状态不会丢。
+  const ephemeralClosedAt = collectEphemeralClosedAt(entries);
+  const ttl = options.ephemeralTtlMs ?? EPHEMERAL_SESSION_TTL_MS;
+  const nowMs = options.now?.getTime();
 
   for (const entry of entries) {
     const envelope = entry.envelope;
@@ -173,6 +206,9 @@ export function replayMemoryEvents(entries: LedgerEntry[], options: MemoryReplay
           created_at: asString(payload.created_at) ?? occurredAt,
           updated_at: occurredAt,
           deleted_at: null,
+          // 票 M7-A-T3：事实作用域由事件携带（缺省 owner；临时会话事实 session:<id>）
+          scope: asString(payload.scope) ?? "owner",
+          expired_at: null,
         };
         state.facts.set(factId, fact);
         linkSource(state, factId, resolveSourceId(state, payload));
@@ -197,6 +233,9 @@ export function replayMemoryEvents(entries: LedgerEntry[], options: MemoryReplay
           created_at: existing?.created_at ?? asString(payload.created_at) ?? occurredAt,
           updated_at: occurredAt,
           deleted_at: null,
+          // 更新不改变作用域（提升单独走 memory.promoted）
+          scope: existing?.scope ?? "owner",
+          expired_at: null,
         };
         state.facts.set(factId, fact);
         const sourceId = resolveSourceId(state, payload);
@@ -233,16 +272,48 @@ export function replayMemoryEvents(entries: LedgerEntry[], options: MemoryReplay
           created_at: existing?.created_at ?? deletedAt,
           updated_at: deletedAt,
           deleted_at: deletedAt,
+          scope: existing?.scope ?? "owner",
+          expired_at: existing?.expired_at ?? null,
         };
         state.facts.set(factId, fact);
         state.deleted.add(factId);
+        break;
+      }
+      case "memory.promoted": {
+        // 票 M7-A-T3：「提升为长期记忆」的作用域迁移必须可重放，否则重建会把已提升
+        // 事实打回 session 作用域。payload 记录 entry_kind/entry_id/from_scope。
+        if (asString(payload.entry_kind) !== "fact") break;
+        const entryId = asString(payload.entry_id);
+        if (entryId === null) break;
+        const existing = state.facts.get(entryId);
+        if (existing !== undefined) existing.scope = "owner";
         break;
       }
       default:
         break;
     }
   }
+
+  // 临时会话到期（票 #64-A3）：作用域 session:<id> 且该会话已关闭满 TTL 的事实，
+  // 其 expired_at 由「账本里的 closed_at + TTL 与当前时间」推导，而不是某一行缓存。
+  // 这样任何投影重建（新 fact 事件、sync.conflict、启动补建）都不会把过期记忆复活。
+  if (nowMs !== undefined) {
+    for (const fact of state.facts.values()) {
+      const sessionId = ephemeralSessionOf(fact.scope);
+      if (sessionId === null) continue;
+      const closed = ephemeralClosedAt.get(sessionId);
+      if (closed === undefined) continue;
+      const deadline = Date.parse(closed) + ttl;
+      if (!Number.isFinite(deadline) || nowMs < deadline) continue;
+      fact.expired_at = new Date(nowMs).toISOString();
+    }
+  }
   return state;
+}
+
+/** `session:<id>` → id；非临时候选/事实作用域返回 null */
+function ephemeralSessionOf(scope: string): string | null {
+  return scope.startsWith("session:") ? scope.slice("session:".length) : null;
 }
 
 /** 纯重放结果 → MemoryStore 可落库的快照（只保留来源/事实/修订的稳定顺序） */
@@ -276,8 +347,18 @@ export function rebuildMemoryProjection(deps: {
   store: MemoryStore;
   ledger: EventLedger;
   replicaId?: string;
+  /**
+   * 重放时钟（票 #64-A3）：提供时按「session.ephemeral_closed + TTL」推导过期状态，
+   * 重建不会把过期临时记忆复活。缺省 = 不做过期判定（纯重放/兼容测试）。
+   */
+  now?: Date;
+  ephemeralTtlMs?: number;
 }): RebuildResult {
-  const state = replayMemoryEvents(deps.ledger.scan(), { localReplicaId: deps.replicaId });
+  const state = replayMemoryEvents(deps.ledger.scan(), {
+    ...(deps.replicaId === undefined ? {} : { localReplicaId: deps.replicaId }),
+    ...(deps.now === undefined ? {} : { now: deps.now }),
+    ...(deps.ephemeralTtlMs === undefined ? {} : { ephemeralTtlMs: deps.ephemeralTtlMs }),
+  });
   const snapshot = snapshotFromReplay(state);
   deps.store.replaceMemoryProjection(snapshot);
   return {
@@ -294,12 +375,23 @@ export class MemoryProjectionRebuilder {
   readonly #store: MemoryStore;
   readonly #ledger: EventLedger;
   readonly #replicaId: string | undefined;
+  readonly #now: (() => Date) | undefined;
+  readonly #ephemeralTtlMs: number | undefined;
   #lastResult: RebuildResult | null = null;
 
-  constructor(deps: { store: MemoryStore; ledger: EventLedger; replicaId?: string }) {
+  constructor(deps: {
+    store: MemoryStore;
+    ledger: EventLedger;
+    replicaId?: string;
+    /** 重放时钟（#64-A3）：投影重建后过期临时记忆不复活 */
+    now?: () => Date;
+    ephemeralTtlMs?: number;
+  }) {
     this.#store = deps.store;
     this.#ledger = deps.ledger;
     this.#replicaId = deps.replicaId;
+    this.#now = deps.now;
+    this.#ephemeralTtlMs = deps.ephemeralTtlMs;
   }
 
   get lastResult(): RebuildResult | null {
@@ -311,6 +403,8 @@ export class MemoryProjectionRebuilder {
       store: this.#store,
       ledger: this.#ledger,
       ...(this.#replicaId === undefined ? {} : { replicaId: this.#replicaId }),
+      ...(this.#now === undefined ? {} : { now: this.#now() }),
+      ...(this.#ephemeralTtlMs === undefined ? {} : { ephemeralTtlMs: this.#ephemeralTtlMs }),
     });
     this.#lastResult = result;
     return result;
@@ -321,6 +415,8 @@ export class MemoryProjectionRebuilder {
       store: this.#store,
       ledger: this.#ledger,
       ...(this.#replicaId === undefined ? {} : { replicaId: this.#replicaId }),
+      ...(this.#now === undefined ? {} : { now: this.#now() }),
+      ...(this.#ephemeralTtlMs === undefined ? {} : { ephemeralTtlMs: this.#ephemeralTtlMs }),
     });
   }
 }
@@ -336,9 +432,15 @@ export function checkMemoryProjectionConsistency(deps: {
   store: MemoryStore;
   ledger: EventLedger;
   replicaId?: string;
+  now?: Date;
+  ephemeralTtlMs?: number;
 }): ConsistencyReport {
   const snapshot = snapshotFromReplay(
-    replayMemoryEvents(deps.ledger.scan(), { localReplicaId: deps.replicaId }),
+    replayMemoryEvents(deps.ledger.scan(), {
+      ...(deps.replicaId === undefined ? {} : { localReplicaId: deps.replicaId }),
+      ...(deps.now === undefined ? {} : { now: deps.now }),
+      ...(deps.ephemeralTtlMs === undefined ? {} : { ephemeralTtlMs: deps.ephemeralTtlMs }),
+    }),
   );
   const expectedFacts = new Map(snapshot.facts.map((fact) => [fact.fact_id, fact]));
   const actualFacts = new Map(deps.store.listAllFacts().map((fact) => [fact.fact_id, fact]));

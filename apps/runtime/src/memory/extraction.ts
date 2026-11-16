@@ -1,5 +1,6 @@
-import type { MemoryEntryKind, SensitivityLevel } from "@morrow/protocol";
+import type { MemoryEntryKind, Persona, SensitivityLevel } from "@morrow/protocol";
 import type { AgentRuntime } from "@morrow/pi-adapter";
+import { composePersonaPrompt } from "../persona.ts";
 import { detectAllHighValue } from "./heuristics.ts";
 
 /**
@@ -58,8 +59,12 @@ export class HeuristicExtractor implements MemoryExtractor {
 
 // --- LLM 抽取器（M1 code-review / Issue #14 补齐）：经 PiAdapter 一次 prompt -----------
 
-/** 抽取运行时工厂：一次抽取一个 AgentRuntime（生产 = 默认 Provider + 抽取系统提示词） */
-export type ExtractorRuntimeFactory = () => Promise<AgentRuntime>;
+/**
+ * 抽取运行时工厂：一次抽取一个 AgentRuntime（生产 = 默认 Provider + 抽取系统提示词）。
+ * systemPrompt 由 LlmMemoryExtractor 按当前 Persona 构造后传入（票 M7-A-T1 / Issue #58）；
+ * 零参实现仍可直接赋值（旧测试与宿主无需改动）。
+ */
+export type ExtractorRuntimeFactory = (systemPrompt: string) => Promise<AgentRuntime>;
 
 /** 抽取系统提示词：契约 = 只输出一个 JSON 数组，每个元素形如候选投影 */
 export const LLM_EXTRACTOR_SYSTEM_PROMPT = [
@@ -71,6 +76,21 @@ export const LLM_EXTRACTOR_SYSTEM_PROMPT = [
   "规则：没有值得记的内容就输出 []；confidence 反映确定性（<0.6 的不要输出）；",
   "拿不准的敏感等级一律 private。",
 ].join("\n");
+
+/**
+ * 抽取系统提示词拼装（票 M7-A-T1 / Issue #58，FR-A3）：
+ * 有 Persona 时把固定顺序的人设段落**前置**在现有抽取契约之前（称谓/视角随人设变化）；
+ * persona 为 null（未接线）时退回现有文案，行为与 M1 完全一致。
+ */
+export function composeExtractorSystemPrompt(persona: Persona | null): string {
+  if (persona === null) return LLM_EXTRACTOR_SYSTEM_PROMPT;
+  return [
+    "以下是当前助手的人设，抽取记忆时应与之一致（例如对主人的称谓与视角）：",
+    composePersonaPrompt(persona),
+    "",
+    LLM_EXTRACTOR_SYSTEM_PROMPT,
+  ].join("\n");
+}
 
 const LLM_KINDS: readonly MemoryEntryKind[] = ["fact", "preference", "profile", "procedural"];
 const LLM_SENSITIVITIES: readonly SensitivityLevel[] = ["public", "private", "locked"];
@@ -84,6 +104,14 @@ function stripCodeFence(text: string): string {
   return fenced !== null ? fenced[1] : text.trim();
 }
 
+export interface LlmMemoryExtractorOptions {
+  /**
+   * 当前 Persona 的读取函数（票 M7-A-T1 / Issue #58）：每次抽取时求值，保证改人设后
+   * 后续抽取立即使用新称谓。返回 null = 未接线，退回 LLM_EXTRACTOR_SYSTEM_PROMPT。
+   */
+  persona?: (() => Persona | null) | null;
+}
+
 /**
  * LLM 抽取器：经 PiAdapter 一次 prompt（近几轮上下文 + 本轮消息），模型只输出
  * JSON 候选数组；解析失败 / 形状非法 / 运行报错一律返回空数组——抽取是
@@ -94,9 +122,11 @@ function stripCodeFence(text: string): string {
  */
 export class LlmMemoryExtractor implements MemoryExtractor {
   readonly #factory: ExtractorRuntimeFactory;
+  readonly #persona: (() => Persona | null) | null;
 
-  constructor(factory: ExtractorRuntimeFactory) {
+  constructor(factory: ExtractorRuntimeFactory, options: LlmMemoryExtractorOptions = {}) {
     this.#factory = factory;
+    this.#persona = options.persona ?? null;
   }
 
   async extract(input: ExtractionInput): Promise<ExtractedCandidate[]> {
@@ -107,7 +137,7 @@ export class LlmMemoryExtractor implements MemoryExtractor {
     };
     let runtime: AgentRuntime;
     try {
-      runtime = await this.#factory();
+      runtime = await this.#factory(composeExtractorSystemPrompt(this.#currentPersona()));
     } catch {
       return []; // 工厂不可用（无 Provider 等）：本轮无候选，不抛
     }
@@ -143,6 +173,16 @@ export class LlmMemoryExtractor implements MemoryExtractor {
       return [];
     }
     return parseLlmCandidates(run.text);
+  }
+
+  /** Persona 读取失败不应打断抽取：退回未接线文案（null）。 */
+  #currentPersona(): Persona | null {
+    if (this.#persona === null) return null;
+    try {
+      return this.#persona();
+    } catch {
+      return null;
+    }
   }
 }
 

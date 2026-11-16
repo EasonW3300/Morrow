@@ -37,6 +37,11 @@ export interface ConsolidationCandidateView {
   confidence: number;
   /** 候选来源（memory_sources.source_id），修订历史回链用 */
   sourceId: string;
+  /**
+   * 候选作用域（票 M7-A-T3）：巩固匹配只在同作用域事实之间进行——
+   * 临时会话候选不会改写/冲突到长期记忆；缺省 owner（旧注入实现无需改动）。
+   */
+  scope?: string;
 }
 
 /** 现存长期事实视图（仅巩固判定所需字段） */

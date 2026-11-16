@@ -12,8 +12,16 @@ export function sendJson(res: ServerResponse, status: number, body: unknown): vo
   res.end(JSON.stringify(body));
 }
 
-export function sendError(res: ServerResponse, status: number, code: string, message: string): void {
-  sendJson(res, status, { error: { code, message } });
+export function sendError(
+  res: ServerResponse,
+  status: number,
+  code: string,
+  message: string,
+  details?: Record<string, unknown>,
+): void {
+  // 可操作诊断字段平铺在 error 信封内（UI 的 ApiError.details 直接消费）：
+  // 如 branch_in_use 的持有者、uncommitted_changes 的文件列表。
+  sendJson(res, status, { error: { code, message, ...(details ?? {}) } });
 }
 
 /**

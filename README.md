@@ -13,6 +13,7 @@
 - [版本变更日志](CHANGELOG.md) —— 0.1.0 的 M0–M4 功能清单与「已知限制」
 - [0.1.0 发布检查表](docs/release/m6-checklist.md) —— 版本/构建/测试/产物/CI/合并与 tag 的逐项命令（合并、tag、push **由 Owner 确认后执行**）
 - [PRD M7（会话体验 · 能力扩展 · 自动化）](docs/prd/PRD-M7.md)
+- [M7-A 门禁报告（会话体验）](docs/gates/m7a-gate-report.md)
 - [M6 门禁报告](docs/gates/m6-gate-report.md) —— AC-01..AC-15 逐项裁决、M6 门槛核对、release blocker 与外部依赖、v0.1.0 发布建议
 - [Ubuntu systemd 真机证据](docs/gates/m6-ubuntu-systemd-evidence.md) —— 9 项检查全 PASS + 清理核对
 - [回滚演练证据](docs/gates/m6-rollback-drill.md) —— 安装→卸载保留数据→重装，副本身份与账本完好

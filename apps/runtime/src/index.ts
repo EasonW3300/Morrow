@@ -70,14 +70,31 @@ export type { RuntimeConfig, ProviderConfig } from "./config.ts";
 export {
   SessionManager,
   SESSION_EVENT_TYPES,
+  SESSION_DELETE_RETENTION_MS,
   type AgentAdapterFactory,
   type AgentRuntimeExtras,
   type MemoryObserver,
   type MessageRecord,
   type SessionFrame,
   type SessionHistory,
+  type SessionListInclude,
+  type SessionMetadataMutation,
+  type SessionRestoreResult,
   type SessionSummary,
 } from "./sessions.ts";
+// 全局 Persona（M7-A-T1 / Issue #58，ADR-0009）
+export {
+  DEFAULT_PERSONA,
+  PERSONA_EVENT_TYPES,
+  PERSONA_LIMITS,
+  PersonaService,
+  PersonaValidationError,
+  composePersonaPrompt,
+  parsePersona,
+} from "./persona.ts";
+export type { Persona, PersonaServiceOptions, PersonaUpdateResult } from "./persona.ts";
+export { personaRoutes } from "./persona-routes.ts";
+export type { PersonaRoute, PersonaRouteContext } from "./persona-routes.ts";
 export {
   TaskService,
   TaskError,
