@@ -3711,3 +3711,109 @@ input[type="radio"] {
   color: var(--color-danger);
   white-space: pre-wrap;
 }
+
+/* --- `/` 命令面板（M7-B-T5）------------------------------------------------------- */
+/* 玻璃材质来自 GlassSurface（variant=elevated）；这里只定义内部排版与状态色 */
+.palette {
+  position: absolute;
+  bottom: 96px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: min(640px, calc(100% - 32px));
+  max-height: 320px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  z-index: 20;
+}
+
+.palette-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 14px 6px;
+  border-bottom: 1px solid var(--color-border-subtle);
+}
+
+.palette-query {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--color-text);
+}
+
+.palette-hint {
+  font-size: 11px;
+  color: var(--color-text-dim);
+  white-space: nowrap;
+}
+
+.palette-empty {
+  padding: 16px 14px;
+  font-size: 13px;
+  color: var(--color-text-dim);
+}
+
+.palette-list {
+  list-style: none;
+  margin: 0;
+  padding: 4px;
+  overflow-y: auto;
+}
+
+.palette-item {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 10px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+
+/* 选中态用背景而非描边：键盘移动时不能引起布局跳动 */
+.palette-item.selected {
+  background: color-mix(in srgb, var(--color-accent) 12%, transparent);
+}
+
+.palette-label {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--color-text);
+  white-space: nowrap;
+}
+
+.palette-command {
+  color: var(--color-accent);
+}
+
+.palette-desc {
+  font-size: 12px;
+  color: var(--color-text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.palette-notice {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 8px;
+  padding: 8px 12px;
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  color: var(--color-text);
+  background: color-mix(in srgb, var(--color-accent) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--color-accent) 22%, transparent);
+}
+
+.palette-notice-close {
+  border: none;
+  background: none;
+  color: var(--color-text-dim);
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+}
