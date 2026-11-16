@@ -1,6 +1,6 @@
 {
   "name": "@morrow/packaging",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "description": "Runtime 单二进制打包（bun compile）与启动探针（T8 / Issue #9，ADR-0003/0006）",

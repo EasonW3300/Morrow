@@ -1,6 +1,6 @@
 {
   "name": "@morrow/protocol",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "description": "事件信封 schema、API 合约与共享类型（TS + JSON Schema）",
