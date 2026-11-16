@@ -4,6 +4,39 @@
 版本号遵循语义化版本；当前发布版本为 `0.1.0`，版本号唯一来源是各 workspace `package.json`
 （Runtime 的 ready 行与 `/v1/health` 均从 `apps/runtime/package.json` 读取，不设双真相源）。
 
+## [0.2.0] - 2026-11-16
+
+M7-A：会话体验（Persona / 临时会话 / 会话管理 / 会话工作区 / 记忆视图）。逐项门禁证据见
+[`docs/gates/m7a-gate-report.md`](docs/gates/m7a-gate-report.md)。
+
+### 新增
+
+- **Persona（全局人设）**：设置内编辑名字/语气/职责/禁止行为/其他，固定顺序拼装；注入会话 system prompt **与**记忆抽取器（每次抽取读最新值）；`persona.updated` 事件持久化。保存前提示影响范围（**只影响新建会话**，进行中的保持原人设）。
+- **临时会话**：右上角独立面板；可读全局记忆、写入隔离在 `scope=session:<id>`；单条「提升为长期记忆」；关闭后 24h 可恢复；写入类能力在能力网关/skill invoke/任务创建三处统一拒绝。
+- **会话管理**：改名 / 归档 / 软删（30 天可恢复）/ 恢复，全部走账本事件，列表仍是对账本的折叠（无 sessions 表）；删除**不影响记忆**。
+- **会话工作区**：新建会话可选本地项目目录 / GitHub 仓库（已有副本按 remote URL 关联，否则 clone）/ 新建分支；只读会话附件（注入 user 消息）；同仓库多会话自动 worktree 隔离，同分支 409；关闭时未提交改动强制三选一（提交/保留/丢弃）。
+- **记忆视图**：只读树视图（按类型分组 + 主题聚类，复用 consolidator 词元）与时间线；展开见版本链与来源事件；无任何写端点。
+
+### 修复
+
+- **GitHub PAT 只注入白名单 host**：原实现用全局 `http.extraHeader`，粘贴任意 URL 即可把 PAT 送出去；现按 `http.https://github.com/.extraHeader` 精确限定，并清除 `GIT_CURL_VERBOSE`、对错误详情脱敏。
+- **默认分支名唯一性**：原取 uuidv7 前 6 位（时间戳高位），约 4.7 小时内新建的会话会撞名导致第二个 GitHub 绑定必然 409；现取尾部随机位，撞名自动追加 `-2..-5`。
+- **临时会话过期不再复活**：过期状态改由 `ephemeral_closed.closed_at + 24h` 与当前时间推导（重放可复原），`overview`/`promote` 入口补 sweep。
+- **`checkpoint.faults` 挂起 878 秒**（Issue #65，自 M1 引入）：根因是 `slow` 工具默认 60 秒且用例未显式设 kill 窗口，错过窗口即等满 60 秒并叠加；默认降到 5 秒且每个用例显式 700ms。连续 5 次全文件跑 15–17 秒。
+- 附件上限改累计校验（原按单次请求）；`discard` 对本地绑定返回专用错误码而非伪装 `not_isolated`；realpath 校验改为「必须仍在 worktreesRoot 之下」（原实现两值恒等，symlink 逃逸拦不住）。
+
+### 质量
+
+runtime **824** / desktop **179** / Rust **9** 全绿（首次含 `checkpoint.faults` 的完整通过）；Docker Linux 的 workspace+session+ephemeral 套件 **63/63**。code-review 双轴发现 10 项（含 2 个安全级）全部修复。
+
+### 已知限制（增量，接续 0.1.0 的 8 条）
+
+- 临时会话「禁写入类能力」在**注册/生成**入口仍无法在 HTTP 层拒绝（这些端点无会话归属参数），只做到调用层 403 + UI 禁用。
+- 新建会话的本地目录是**文本路径输入**（未接 Tauri dialog 插件）。
+- 记忆视图不含 `confidence`（该属性属于候选记忆，长期事实没有）。
+- `open_memory_dir` 唤起 Finder 未真机验证（cargo 编译与测试已过）。
+- 会话工作区为**设备本地**，不随同步传播（仓库内容通过 git 远程共享）。
+
 ## [0.1.0] - 2026-11-11
 
 首个可发布版本：M0–M4 里程碑合并态（M5 语音不在范围内）。逐项门禁证据见
