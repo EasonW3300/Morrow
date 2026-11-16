@@ -33,6 +33,13 @@
 //   [I25] R pending_review 经人工核对放行（Owner 决策 seam）→ resume 完成
 //
 // 可重复执行：全部注入经临时目录 + 显式脚本，无跨测试共享状态。
+//
+// ⚠️ slowMs 必须每个用例显式给（2026-11-16 修 Issue #65）：
+// 这些用例靠"看到节点 running 就 kill -9"提前结束，因此 slow 工具只需要"足够慢到能
+// 被 kill 到"即可。fixture 的默认值曾是 60000ms——一旦某个用例的 kill 窗口错过
+// （并发负载下 pause/等边界更容易错过），就要等满 60 秒；全文件顺序执行时多个
+// 这样的等待叠加，实测出现过 878 秒挂起（单跑却 3.6s 通过，极难归因）。
+// 现在：默认值降到 5000ms，且每个用 slow 的用例显式 `slowMs: 700`。
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
@@ -197,7 +204,7 @@ test("[P1] kill -9 mid-node (reversible): resume replays exactly once and comple
   const taskId = await killAt(
     t,
     dir,
-    { plan, nodeScripts: { a: [{ kind: "tool", toolName: "slow" }, { kind: "text", deltas: ["a-v1"] }] } },
+    { plan, nodeScripts: { a: [{ kind: "tool", toolName: "slow" }, { kind: "text", deltas: ["a-v1"] }] } , slowMs: 700 },
     (base) => postTask(base, "P1"),
     async (base, id) => waitForHttp("a running", async () => (await nodeStatus(base, id, "a")()) === "running"),
   );
@@ -224,7 +231,7 @@ test("[P2] kill -9 mid-node (delivery_unknown): resume flags pending_review, nev
   const taskId = await killAt(
     t,
     dir,
-    { plan, nodeScripts: { a: [{ kind: "tool", toolName: "slow" }, { kind: "text", deltas: ["a-v1"] }] } },
+    { plan, nodeScripts: { a: [{ kind: "tool", toolName: "slow" }, { kind: "text", deltas: ["a-v1"] }] } , slowMs: 700 },
     (base) => postTask(base, "P2"),
     async (base, id) => waitForHttp("a running", async () => (await nodeStatus(base, id, "a")()) === "running"),
   );
@@ -246,7 +253,7 @@ test("[P3] kill -9 mid-node (compensatable): resume replays and records pending 
   const taskId = await killAt(
     t,
     dir,
-    { plan, nodeScripts: { a: [{ kind: "tool", toolName: "slow" }, { kind: "text", deltas: ["a-v1"] }] } },
+    { plan, nodeScripts: { a: [{ kind: "tool", toolName: "slow" }, { kind: "text", deltas: ["a-v1"] }] } , slowMs: 700 },
     (base) => postTask(base, "P3"),
     async (base, id) => waitForHttp("a running", async () => (await nodeStatus(base, id, "a")()) === "running"),
   );
@@ -267,7 +274,7 @@ test("[P4] kill -9 mid-node (irreversible): resume flags pending_review, never r
   const taskId = await killAt(
     t,
     dir,
-    { plan, nodeScripts: { a: [{ kind: "tool", toolName: "slow" }, { kind: "text", deltas: ["a-v1"] }] } },
+    { plan, nodeScripts: { a: [{ kind: "tool", toolName: "slow" }, { kind: "text", deltas: ["a-v1"] }] } , slowMs: 700 },
     (base) => postTask(base, "P4"),
     async (base, id) => waitForHttp("a running", async () => (await nodeStatus(base, id, "a")()) === "running"),
   );
@@ -287,7 +294,7 @@ test("[P5] kill -9 during the pause boundary wait: no checkpoint, stale-running 
   const taskId = await killAt(
     t,
     dir,
-    { plan, nodeScripts: { a: [{ kind: "tool", toolName: "slow" }, { kind: "text", deltas: ["a-v1"] }] } },
+    { plan, nodeScripts: { a: [{ kind: "tool", toolName: "slow" }, { kind: "text", deltas: ["a-v1"] }] } , slowMs: 700 },
     (base) => postTask(base, "P5"),
     async (base, id) => {
       await waitForHttp("a running", async () => (await nodeStatus(base, id, "a")()) === "running");
@@ -388,7 +395,7 @@ test("[P8] kill -9 during a resume drive: second restart completes with honest a
   const taskId = await killAt(
     t,
     dir,
-    { plan, nodeScripts: { a: [{ kind: "tool", toolName: "slow" }, { kind: "text", deltas: ["never"] }] } },
+    { plan, nodeScripts: { a: [{ kind: "tool", toolName: "slow" }, { kind: "text", deltas: ["never"] }] } , slowMs: 700 },
     (base) => postTask(base, "P8"),
     async (base, id) => waitForHttp("a running", async () => (await nodeStatus(base, id, "a")()) === "running"),
   );
@@ -546,7 +553,7 @@ test("[P12] two consecutive kill -9: final resume completes; ledger integrity ve
   const taskId = await killAt(
     t,
     dir,
-    { plan, nodeScripts: { a: [{ kind: "tool", toolName: "slow" }, { kind: "text", deltas: ["never"] }] } },
+    { plan, nodeScripts: { a: [{ kind: "tool", toolName: "slow" }, { kind: "text", deltas: ["never"] }] } , slowMs: 700 },
     (base) => postTask(base, "P12"),
     async (base, id) => waitForHttp("a running", async () => (await nodeStatus(base, id, "a")()) === "running"),
   );

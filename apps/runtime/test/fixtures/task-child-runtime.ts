@@ -14,7 +14,10 @@ import { startRuntime } from "../../src/runtime.ts";
  * - MORROW_TEST_PLAN：规划 JSON（存在即注入 FakePi 规划器与节点工厂）；
  * - MORROW_TEST_PLANNER_SCRIPT：规划器完整脚本 JSON（缺省 = [{text MORROW_TEST_PLAN}]）；
  * - MORROW_TEST_NODE_SCRIPTS：节点 key → FakeStep[] 的 JSON map；
- * - MORROW_TEST_SLOW_MS：slow 工具时长（默认 60000；kill 窗口用）。
+ * - MORROW_TEST_SLOW_MS：slow 工具时长（默认 5000；kill 窗口用）。
+ *   默认值曾为 60000：用例靠"看到 running 就 kill"提前结束，一旦窗口错过就要等满
+ *   60 秒，全文件并发跑时叠成分钟级挂起（Issue #65）。5 秒足够做 kill 窗口，
+ *   又不会让一次错过变成漫长等待；需要更长窗口的用例显式传慢值。
  *
  * stdout 单行 JSON ready 事件（父子协议同 main.ts）；SIGTERM/SIGINT 优雅退出。
  */
@@ -54,13 +57,13 @@ async function main(): Promise<void> {
             const script: FakeStep[] = plannerScript !== undefined
               ? (JSON.parse(plannerScript) as FakeStep[])
               : [{ kind: "text", deltas: [plan] }];
-            return createFakePi({ script, tools: [slowTool(Number(process.env.MORROW_TEST_SLOW_MS ?? "60000"))] });
+            return createFakePi({ script, tools: [slowTool(Number(process.env.MORROW_TEST_SLOW_MS ?? "5000"))] });
           },
           taskNodeAgentFactory: async (node) => {
             const scripts = JSON.parse(process.env.MORROW_TEST_NODE_SCRIPTS ?? "{}") as Record<string, FakeStep[]>;
             return createFakePi({
               script: scripts[node.key] ?? [{ kind: "text", deltas: [node.goal] }],
-              tools: [slowTool(Number(process.env.MORROW_TEST_SLOW_MS ?? "60000"))],
+              tools: [slowTool(Number(process.env.MORROW_TEST_SLOW_MS ?? "5000"))],
             });
           },
         }),
