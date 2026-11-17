@@ -111,6 +111,9 @@ import { GoalStore } from "./goals/store.ts";
 import { GoalService } from "./goals/service.ts";
 import { goalRoutes } from "./goals/routes.ts";
 import { GoalDriver } from "./goals/driver.ts";
+import { BestStore } from "./best/store.ts";
+import { BestService } from "./best/service.ts";
+import { bestRoutes } from "./best/routes.ts";
 import { composePlanSystemPrompt } from "./plan/prompt.ts";
 import type { ParsedPlan } from "./plan/plan-block.ts";
 import { ExecService } from "./exec/service.ts";
@@ -223,6 +226,8 @@ interface RequestContext {
   goals: GoalService;
   /** Goal 续跑驱动器（票 M7-C-T5 / #79：tick/recordRun） */
   goalDriver: GoalDriver;
+  /** Best 模式（票 M7-C-T6 / #80：四阶段 + 规格门） */
+  best: BestService;
   /** 记录会话活动（续跑静默阈值的输入；用户发消息时调用） */
   touchSessionActivity(sessionId: string): void;
   /** 动态 bash（票 M7-B-T6 / Issue #70：模式判定 + 确认 + 快照 + 容器执行 + 审计） */
@@ -468,6 +473,8 @@ export interface RuntimeOptions {
   goalResumeIdleMs?: number;
   /** Goal 时钟注入（测试零 sleep） */
   goalNow?: () => number;
+  /** Best 模式访谈轮次上限（默认 12；到限强制收束） */
+  bestInterviewMaxTurns?: number;
   skillPackageInstall?: (options: {
     spec: string;
     targetDir: string;
@@ -541,6 +548,8 @@ export interface RuntimeHandle {
   goals: GoalService;
   /** Goal 续跑驱动器（库形态可直用：tick 手动驱动） */
   goalDriver: GoalDriver;
+  /** Best 模式服务（库形态可直用：start/interview/submitSpec/decideSpecGate/abort） */
+  best: BestService;
   /** 动态 bash 执行服务（M7-B-T6 / Issue #70：submit/approve/revert/setMode，库形态可直用） */
   exec: ExecService;
   /** 执行模式注册表（会话级内存态；诊断用：size 证明关闭会话后释放） */
@@ -670,6 +679,13 @@ const routes: Route[] = [
     re: route.re,
     handler: (req: IncomingMessage, res: ServerResponse, url: URL, ctx: RequestContext, params: string[]) =>
       route.handler(req, res, url, { mcp: ctx.mcp }, params),
+  })),
+  // Best 模式（票 M7-C-T6 / #80）：启动/访谈/规格门/中止（拆票与实现门在 C7）
+  ...bestRoutes.map((route) => ({
+    method: route.method,
+    re: route.re,
+    handler: (req: IncomingMessage, res: ServerResponse, url: URL, ctx: RequestContext, params: string[]) =>
+      route.handler(req, res, url, { best: ctx.best }, params),
   })),
   // Thread Goal（票 M7-C-T4 / #78）：显式创建 + 六态迁移 + 双预算
   ...goalRoutes.map((route) => ({
@@ -1183,6 +1199,19 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     ...(options.goalResumeIdleMs === undefined ? {} : { idleThresholdMs: options.goalResumeIdleMs }),
   });
 
+  // Best 模式（票 M7-C-T6 / #80）：四阶段自动化，由一个 Thread Goal 承载。
+  // 落表持久化：它会建分支、写文件、跑很久，重启后必须能找回半成品。
+  const bestStore = new BestStore({ dataDir: config.dataDir });
+  const best = new BestService({
+    store: bestStore,
+    ledger,
+    replicaId: config.replicaId,
+    goals,
+    isSessionExecutable: (sessionId) => sessions.isExecutable(sessionId),
+    sessionKind: (sessionId) => sessions.sessionKind(sessionId),
+    ...(options.bestInterviewMaxTurns === undefined ? {} : { maxInterviewTurns: options.bestInterviewMaxTurns }),
+  });
+
   let ephemeralSession: ((sessionId: string) => boolean) | null = null;
   // Plan 模式晚绑定（与 ephemeralSession 同款：SessionManager 在 PlanModeRegistry 之后构造）
   let planModeSession: ((sessionId: string) => boolean) | null = null;
@@ -1592,6 +1621,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     planQuestions,
     goals,
     goalDriver,
+    best,
     touchSessionActivity: (sessionId) => lastActivity.set(sessionId, Date.now()),
     exec,
     execModes,
@@ -1626,6 +1656,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     if (goalResumeTimer !== null) clearInterval(goalResumeTimer);
     unsubscribeNotifications();
     notifications.close();
+    bestStore.close();
     goalStore.close();
     proposalStore.close();
     skillPackageStore.close();
@@ -1749,6 +1780,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     planQuestions,
     goals,
     goalDriver,
+    best,
     exec,
     execModes,
     mcp,
