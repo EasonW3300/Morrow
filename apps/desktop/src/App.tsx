@@ -12,6 +12,7 @@ import { ThemeToggle } from "./design-system/ThemeToggle.tsx";
 import { applyTheme, getInitialTheme, saveTheme, type Theme } from "./design-system/theme.ts";
 import { NotificationCenter } from "./NotificationCenter.tsx";
 import { EphemeralPanel } from "./EphemeralPanel.tsx";
+import { ExecPanel } from "./ExecPanel.tsx";
 import { NewSessionDialog } from "./NewSessionDialog.tsx";
 import { draftToWorkspaceBody, type WorkspaceDraft } from "./workspace-ui.ts";
 import { MemoryView } from "./MemoryView.tsx";
@@ -266,6 +267,9 @@ export default function App() {
           {ephemeralId !== null && (
             <EphemeralPanel base={base} sessionId={ephemeralId} onExit={() => setEphemeralId(null)} />
           )}
+          {/* 脚本执行面板（票 M7-B-T6 / Issue #70）：执行模式 + 提交/确认/撤销。
+              与临时会话面板并列，同属"会话内的控制面"，不打断聊天主区。 */}
+          {selectedId !== null && <ExecPanel base={base} sessionId={selectedId} />}
         </div>
       )}
       {view === "tasks" && (

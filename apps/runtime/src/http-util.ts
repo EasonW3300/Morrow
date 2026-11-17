@@ -78,6 +78,24 @@ export interface PagingParams {
 }
 
 /**
+ * 可选 JSON body（关闭/撤销一类"body 里有可选项"的端点）：content-type 不是 JSON
+ * 或显式 content-length: 0 时按空对象处理——老客户端/脚本 POST 空体仍是合法请求。
+ *
+ * 从 runtime.ts 移到这里（M7-B-T6）的理由：exec 路由也要用同一口径，而 routes
+ * 模块不该反向 import runtime.ts。
+ */
+export async function readOptionalJsonBody(
+  req: IncomingMessage,
+  res: ServerResponse,
+): Promise<Record<string, unknown> | null> {
+  const contentType = req.headers["content-type"];
+  const length = req.headers["content-length"];
+  const isJson = typeof contentType === "string" && /^application\/json\b/i.test(contentType.trim());
+  if (!isJson || length === "0") return {};
+  return await readJsonBody(req, res);
+}
+
+/**
  * 分页公共参数（limit 1–200、offset ≥ 0；defaultLimit 由调用方按端点口径给定：
  * events 族 50、memory 列表族 200）；非法时写出 400 并返回 null。
  * （原 runtime.ts parsePageParams 与 memory/routes.ts parsePaging 的同步收敛。）

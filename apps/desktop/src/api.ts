@@ -1148,4 +1148,178 @@ export const api = {
       body: JSON.stringify(body),
     });
   },
+
+  // --- 动态 bash（票 M7-B-T6 / Issue #70）----------------------------------------
+
+  /** GET /v1/sessions/:id/exec-mode：会话级执行模式（不持久化）+ 边界声明 */
+  getExecMode(base: string, sessionId: string): Promise<ExecModeState> {
+    return request<ExecModeState>(base, `/v1/sessions/${encodeURIComponent(sessionId)}/exec-mode`);
+  },
+
+  /** PUT /v1/sessions/:id/exec-mode：切换模式（写 exec.mode_changed 审计） */
+  setExecMode(base: string, sessionId: string, mode: ExecMode): Promise<ExecModeState & { changed: boolean; event_id: string | null }> {
+    return request(base, `/v1/sessions/${encodeURIComponent(sessionId)}/exec-mode`, {
+      method: "PUT",
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ mode }),
+    });
+  },
+
+  /**
+   * POST /v1/sessions/:id/exec：提交脚本。
+   *
+   * 三种结果都**不是**异常：denied 走 400（ApiError 里带 hits）、needs_confirmation
+   * 走 202、executed 走 200。这里统一成一个判别联合，调用方不必 catch 控制流。
+   */
+  async submitExec(
+    base: string,
+    sessionId: string,
+    script: string,
+    options: { timeoutMs?: number; maxOutputBytes?: number } = {},
+  ): Promise<ExecSubmitResponse> {
+    try {
+      return await request<ExecSubmitResponse>(base, `/v1/sessions/${encodeURIComponent(sessionId)}/exec`, {
+        method: "POST",
+        headers: JSON_HEADERS,
+        body: JSON.stringify({
+          script,
+          ...(options.timeoutMs === undefined ? {} : { timeout_ms: options.timeoutMs }),
+          ...(options.maxOutputBytes === undefined ? {} : { max_output_bytes: options.maxOutputBytes }),
+        }),
+      });
+    } catch (err) {
+      // 危险规则命中的 400 是**判定结果**而非传输错误：转成 denied 联合成员，
+      // 让 UI 用同一套渲染路径展示"被哪条规则拦下"。
+      if (err instanceof ApiError && err.code === "exec_forbidden") {
+        const hits = Array.isArray(err.details.hits) ? (err.details.hits as ExecDangerHit[]) : [];
+        return { status: "denied", hits, decision: "deny" } as ExecDeniedResponse;
+      }
+      throw err;
+    }
+  },
+
+  /** GET /v1/exec/confirmations/:id：待确认详情（完整脚本） */
+  getExecConfirmation(base: string, confirmationId: string): Promise<ExecConfirmationDetail> {
+    return request<ExecConfirmationDetail>(base, `/v1/exec/confirmations/${encodeURIComponent(confirmationId)}`);
+  },
+
+  /** POST /v1/exec/confirmations/:id/approve：确认并执行（票一次性，重放 404） */
+  approveExec(
+    base: string,
+    confirmationId: string,
+    options: { timeoutMs?: number; maxOutputBytes?: number } = {},
+  ): Promise<ExecExecutedResponse> {
+    return request<ExecExecutedResponse>(
+      base,
+      `/v1/exec/confirmations/${encodeURIComponent(confirmationId)}/approve`,
+      {
+        method: "POST",
+        headers: JSON_HEADERS,
+        body: JSON.stringify({
+          ...(options.timeoutMs === undefined ? {} : { timeout_ms: options.timeoutMs }),
+          ...(options.maxOutputBytes === undefined ? {} : { max_output_bytes: options.maxOutputBytes }),
+        }),
+      },
+    );
+  },
+
+  /** POST /v1/sessions/:id/exec/revert：撤销最近一次（或指定）快照 */
+  revertExec(base: string, sessionId: string, snapshotId?: string): Promise<ExecRevertResponse> {
+    return request<ExecRevertResponse>(base, `/v1/sessions/${encodeURIComponent(sessionId)}/exec/revert`, {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify(snapshotId === undefined ? {} : { snapshot_id: snapshotId }),
+    });
+  },
 };
+
+// --- 动态 bash 响应类型（与 runtime 的 exec/routes.ts 同源形状）---------------------
+
+export type ExecMode = "confirm_each" | "full_access";
+
+export interface ExecModeState {
+  session_id: string;
+  mode: ExecMode;
+  default_mode: ExecMode;
+  readonly_confirmed: boolean;
+  persisted: boolean;
+  snapshot_scope_notice: string;
+  limits: { timeout_ms: number; max_timeout_ms: number; max_output_bytes: number };
+}
+
+export interface ExecDangerHit {
+  id: string;
+  level: string;
+  reason: string;
+}
+
+export interface ExecDeniedResponse {
+  status: "denied";
+  session_id: string;
+  mode: ExecMode;
+  hits: ExecDangerHit[];
+  decision: "deny";
+}
+
+export interface ExecNeedsConfirmationResponse {
+  status: "needs_confirmation";
+  session_id: string;
+  mode: ExecMode;
+  confirmation_id: string;
+  /** 完整未截断脚本 */
+  script: string;
+  why: string;
+  expires_at: string;
+  readonly: boolean;
+}
+
+export interface ExecResultView {
+  ok: boolean;
+  exit_code: number;
+  timed_out: boolean;
+  truncated: boolean;
+  stdout: string;
+  stderr: string;
+  duration_ms: number;
+  engine: string;
+  image: string;
+  container: string;
+  error_code?: string;
+  error?: string;
+}
+
+export interface ExecExecutedResponse {
+  status: "executed";
+  session_id: string;
+  mode: ExecMode;
+  /** null = 会话未绑定工作区（无可保护对象），不是"快照失败" */
+  snapshot_id: string | null;
+  snapshot_strategy: "git" | "copy" | null;
+  scope_notice: string;
+  result: ExecResultView;
+  event_id: string;
+  sequence: number;
+}
+
+export type ExecSubmitResponse = ExecDeniedResponse | ExecNeedsConfirmationResponse | ExecExecutedResponse;
+
+export interface ExecConfirmationDetail {
+  confirmation_id: string;
+  session_id: string;
+  script: string;
+  mode: ExecMode;
+  readonly: boolean;
+  created_at: string;
+  expires_at: string;
+}
+
+export interface ExecRevertResponse {
+  session_id: string;
+  snapshot_id: string;
+  strategy: "git" | "copy";
+  restored: number;
+  removed: number;
+  scope_notice: string;
+  event_id: string;
+  sequence: number;
+}
