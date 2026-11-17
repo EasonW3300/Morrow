@@ -109,6 +109,11 @@ import { execRoutes } from "./exec/routes.ts";
 import { createDefaultExecRunner, type LocalExecRunner } from "./exec/runner.ts";
 import { DefaultSnapshotManager, type SnapshotManager } from "./exec/snapshot.ts";
 import type { GitRunner } from "./workspace.ts";
+import { McpServerStore } from "./mcp/store.ts";
+import { McpServerService } from "./mcp/service.ts";
+import { mcpRoutes } from "./mcp/routes.ts";
+import { createStdioTransport } from "./mcp/stdio-transport.ts";
+import type { McpTransport } from "./mcp/client.ts";
 
 /**
  * Runtime HTTP 服务（PRD §6.2 的 M0 子集 + M1 任务族 + M2-T1 能力族）。
@@ -197,6 +202,8 @@ interface RequestContext {
   exec: ExecService;
   /** 执行模式注册表（会话级、不持久化；路由层读 GET /v1/sessions/:id/exec-mode） */
   execModes: ExecModeRegistry;
+  /** MCP Server 管理（票 M7-B-T2 / Issue #71：安装/启停/授权/健康） */
+  mcp: McpServerService;
 }
 
 type Handler = (
@@ -388,6 +395,11 @@ export interface RuntimeOptions {
   execSnapshotsRoot?: string;
   /** 快照 git 子进程接缝（测试注入，零真实 git） */
   execSnapshotGitRunner?: GitRunner;
+  /**
+   * MCP 传输工厂注入 seam（票 M7-B-T2 / Issue #71）：缺省按 server 配置建真实 stdio
+   * 子进程。测试注入假传输即可覆盖全部安装/启停路径（零子进程、零网络）。
+   */
+  mcpTransportFactory?: (record: { command: string; args: string[]; cwd: string | null }) => McpTransport;
 }
 
 export interface RuntimeHandle {
@@ -452,6 +464,8 @@ export interface RuntimeHandle {
   exec: ExecService;
   /** 执行模式注册表（会话级内存态；诊断用：size 证明关闭会话后释放） */
   execModes: ExecModeRegistry;
+  /** MCP Server 管理（库形态可直用：install/enable/disable/remove/updateGrants） */
+  mcp: McpServerService;
   /**
    * 优雅停止：停止接收请求 → 中止并释放会话运行时与在跑任务节点 → 记账 runtime.stopped
    * → 关闭任务投影库与账本（WAL checkpoint）。signal 传入收到的 POSIX 信号名，
@@ -542,6 +556,13 @@ const routes: Route[] = [
   })),
   ...contactRoutes,
   ...channelRoutes,
+  // MCP Server 管理（票 M7-B-T2 / Issue #71）：模板/预览（无副作用）/安装/启停/授权/卸载
+  ...mcpRoutes.map((route) => ({
+    method: route.method,
+    re: route.re,
+    handler: (req: IncomingMessage, res: ServerResponse, url: URL, ctx: RequestContext, params: string[]) =>
+      route.handler(req, res, url, { mcp: ctx.mcp }, params),
+  })),
   // 动态 bash（票 M7-B-T6 / Issue #70）：会话级执行模式 + 脚本提交/确认/撤销。
   // execRoutes 桥接到 exec 自有路由签名（ctx.exec / ctx.execModes 在请求时取）。
   ...execRoutes.map((route) => ({
@@ -1181,6 +1202,24 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
       return workspace === null ? null : { path: workspace.path };
     },
   });
+  // MCP Server 管理（票 M7-B-T2 / Issue #71）：配置投影与账本同库；工具注册走
+  // 同一个 PermissionEngine（五维权限默认全空——启用 server ≠ 授予权限）。
+  // 传输缺省是真实 stdio 子进程；测试注入假传输即可完全离线。
+  const mcpStore = new McpServerStore({ dataDir: config.dataDir });
+  const mcp = new McpServerService({
+    store: mcpStore,
+    ledger,
+    replicaId: config.replicaId,
+    capabilities,
+    transportFactory:
+      options.mcpTransportFactory ??
+      ((record) =>
+        createStdioTransport({
+          command: record.command,
+          args: record.args,
+          ...(record.cwd === null ? {} : { cwd: record.cwd }),
+        })),
+  });
   const ctx: RequestContext = {
     ledger,
     replicaId: config.replicaId,
@@ -1208,6 +1247,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     workspace: workspaceManager,
     exec,
     execModes,
+    mcp,
     // 临时会话写入门（#64-A4）：能力网关 / skill invoke / 任务创建共用同一判定函数。
     ephemeralGate: {
       sessionKind: (sessionId) => sessions.sessionKind(sessionId),
@@ -1322,6 +1362,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     notifications,
     exec,
     execModes,
+    mcp,
     async close(signal?: string): Promise<void> {
       if (closing) return;
       closing = true;

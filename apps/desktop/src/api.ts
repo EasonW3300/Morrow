@@ -1231,7 +1231,145 @@ export const api = {
       body: JSON.stringify(snapshotId === undefined ? {} : { snapshot_id: snapshotId }),
     });
   },
+
+  // --- MCP Server 管理（票 M7-B-T2 / Issue #71）-----------------------------------
+
+  /** GET /v1/mcp/templates：模板（仅预填；服务端明确 installs_on_select=false） */
+  listMcpTemplates(base: string): Promise<{ templates: McpTemplateView[]; installs_on_select: boolean }> {
+    return request(base, "/v1/mcp/templates");
+  },
+
+  /** GET /v1/mcp/risk-notice：风险文案（单源在服务端，UI 不另写一份） */
+  getMcpRiskNotice(base: string): Promise<{ risk_notice: string; requires_explicit_acknowledgment: boolean }> {
+    return request(base, "/v1/mcp/risk-notice");
+  },
+
+  /**
+   * POST /v1/mcp/preview：解析预览（**无副作用**）。
+   * 安装页要在勾选风险确认之前就能展示"将要执行什么"，所以预览是独立端点。
+   */
+  previewMcp(base: string, config: string, displayName?: string): Promise<McpPreviewResponse> {
+    return request<McpPreviewResponse>(base, "/v1/mcp/preview", {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ config, ...(displayName === undefined ? {} : { display_name: displayName }) }),
+    });
+  },
+
+  /** GET /v1/mcp/servers：已安装列表（来源/状态/权限/健康） */
+  listMcpServers(base: string): Promise<{ servers: McpServerRowView[] }> {
+    return request(base, "/v1/mcp/servers");
+  },
+
+  /** POST /v1/mcp/servers：安装（服务端要求 risk_acknowledged === true） */
+  installMcpServer(
+    base: string,
+    input: { config: string; displayName?: string; source?: string },
+  ): Promise<{ servers: McpServerRowView[]; warnings: string[]; event_ids: string[]; enabled: boolean }> {
+    return request(base, "/v1/mcp/servers", {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify({
+        config: input.config,
+        risk_acknowledged: true,
+        ...(input.displayName === undefined ? {} : { display_name: input.displayName }),
+        ...(input.source === undefined ? {} : { source: input.source }),
+      }),
+    });
+  },
+
+  /** POST /v1/mcp/servers/:id/enable：启用（启动进程 + 探测 + 注册工具） */
+  enableMcpServer(base: string, serverId: string): Promise<{ ok: boolean; server: McpServerRowView }> {
+    return request(base, `/v1/mcp/servers/${encodeURIComponent(serverId)}/enable`, {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify({}),
+    });
+  },
+
+  /** POST /v1/mcp/servers/:id/disable：停用（关进程 + 禁用工具） */
+  disableMcpServer(base: string, serverId: string): Promise<{ server: McpServerRowView }> {
+    return request(base, `/v1/mcp/servers/${encodeURIComponent(serverId)}/disable`, {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify({}),
+    });
+  },
+
+  /** DELETE /v1/mcp/servers/:id：卸载（先停再删配置；审计保留） */
+  removeMcpServer(base: string, serverId: string): Promise<{ removed: boolean; event_id: string | null }> {
+    return request(base, `/v1/mcp/servers/${encodeURIComponent(serverId)}`, { method: "DELETE" });
+  },
+
+  /** PUT /v1/mcp/servers/:id/grants：更新该 server 的五维权限 */
+  updateMcpServerGrants(
+    base: string,
+    serverId: string,
+    grants: Record<string, string[]>,
+  ): Promise<{ server: McpServerRowView; event_id: string }> {
+    return request(base, `/v1/mcp/servers/${encodeURIComponent(serverId)}/grants`, {
+      method: "PUT",
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ grants }),
+    });
+  },
 };
+
+// --- MCP 响应类型（与 runtime 的 mcp/routes.ts 同源形状）----------------------------
+
+export interface McpTemplateView {
+  id: string;
+  label: string;
+  description: string;
+  command: string;
+  args: string[];
+  notes: string;
+  /** 完整未截断的启动命令 */
+  launch_command: string;
+}
+
+export interface McpPreviewResponse {
+  servers: Array<{
+    display_name: string;
+    command: string;
+    args: string[];
+    env_keys: string[];
+    cwd: string | null;
+    source: string;
+    launch_command: string;
+    tokens: string[];
+  }>;
+  warnings: string[];
+  installed: boolean;
+}
+
+export interface McpServerRowView {
+  server_id: string;
+  display_name: string;
+  source: string;
+  launch_command: string;
+  command: string;
+  args: string[];
+  env_keys: string[];
+  cwd: string | null;
+  enabled: boolean;
+  status: string;
+  grants: Record<string, string[]>;
+  health: {
+    state: string;
+    last_error: string | null;
+    restarts: number;
+    generation: string | null;
+    protocol_version: string | null;
+    server_name: string | null;
+    server_version: string | null;
+    unsupported_capabilities: string[];
+    tools_count: number;
+  };
+  risk_acknowledged: boolean;
+  created_at: string;
+  updated_at: string;
+}
 
 // --- 动态 bash 响应类型（与 runtime 的 exec/routes.ts 同源形状）---------------------
 
