@@ -107,6 +107,9 @@ import { ExecModeRegistry } from "./exec/mode.ts";
 import { PlanModeRegistry, filterPlanModeTools, isPlanModeReadOnly } from "./plan/mode.ts";
 import { planRoutes } from "./plan/routes.ts";
 import { PlanQuestionRegistry } from "./plan/questions.ts";
+import { GoalStore } from "./goals/store.ts";
+import { GoalService } from "./goals/service.ts";
+import { goalRoutes } from "./goals/routes.ts";
 import { composePlanSystemPrompt } from "./plan/prompt.ts";
 import type { ParsedPlan } from "./plan/plan-block.ts";
 import { ExecService } from "./exec/service.ts";
@@ -215,6 +218,8 @@ interface RequestContext {
   planMode: PlanModeRegistry;
   /** Plan 问答（票 M7-C-T3 / #77：阻塞式提问的待回答队列） */
   planQuestions: PlanQuestionRegistry;
+  /** Thread Goal（票 M7-C-T4 / #78：六态状态机 + 双预算） */
+  goals: GoalService;
   /** 动态 bash（票 M7-B-T6 / Issue #70：模式判定 + 确认 + 快照 + 容器执行 + 审计） */
   exec: ExecService;
   /** 执行模式注册表（会话级、不持久化；路由层读 GET /v1/sessions/:id/exec-mode） */
@@ -518,6 +523,8 @@ export interface RuntimeHandle {
   planMode: PlanModeRegistry;
   /** Plan 问答注册表（阻塞式提问的待回答队列） */
   planQuestions: PlanQuestionRegistry;
+  /** Thread Goal 服务（库形态可直用：create/pause/resume/complete/recordRun） */
+  goals: GoalService;
   /** 动态 bash 执行服务（M7-B-T6 / Issue #70：submit/approve/revert/setMode，库形态可直用） */
   exec: ExecService;
   /** 执行模式注册表（会话级内存态；诊断用：size 证明关闭会话后释放） */
@@ -647,6 +654,13 @@ const routes: Route[] = [
     re: route.re,
     handler: (req: IncomingMessage, res: ServerResponse, url: URL, ctx: RequestContext, params: string[]) =>
       route.handler(req, res, url, { mcp: ctx.mcp }, params),
+  })),
+  // Thread Goal（票 M7-C-T4 / #78）：显式创建 + 六态迁移 + 双预算
+  ...goalRoutes.map((route) => ({
+    method: route.method,
+    re: route.re,
+    handler: (req: IncomingMessage, res: ServerResponse, url: URL, ctx: RequestContext, params: string[]) =>
+      route.handler(req, res, url, { goals: ctx.goals }, params),
   })),
   // Plan 模式（票 M7-C-T2 / #76）：进入/退出/阶段。进入退出只走 HTTP 端点，
   // 模型侧没有对应工具——这就是 FR-C4「自动回合不得自行进入/离开 Plan」的保证。
@@ -1121,6 +1135,21 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
   // Plan 问答（票 M7-C-T3 / #77）：待回答的问题只活在本进程（与 Plan 模式同款）
   const planQuestions = new PlanQuestionRegistry({ isOpen: (sessionId) => sessions.isExecutable(sessionId) });
 
+  // Thread Goal（票 M7-C-T4 / #78）：落表持久化（跨重启继续），与 Plan/Best 的
+  // 内存态不同——Goal 的全部意义就是"跨重启还在做这件事"。
+  const goalStore = new GoalStore({ dataDir: config.dataDir });
+  const goals = new GoalService({
+    store: goalStore,
+    ledger,
+    replicaId: config.replicaId,
+    isSessionExecutable: (sessionId) => sessions.isExecutable(sessionId),
+    sessionKind: (sessionId) => sessions.sessionKind(sessionId),
+    sessionUsage: (sessionId) => {
+      const usage = sessions.usageOf(sessionId);
+      return { total: usage.total, estimated: usage.estimated };
+    },
+  });
+
   let ephemeralSession: ((sessionId: string) => boolean) | null = null;
   // Plan 模式晚绑定（与 ephemeralSession 同款：SessionManager 在 PlanModeRegistry 之后构造）
   let planModeSession: ((sessionId: string) => boolean) | null = null;
@@ -1512,6 +1541,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     workspace: workspaceManager,
     planMode,
     planQuestions,
+    goals,
     exec,
     execModes,
     mcp,
@@ -1544,6 +1574,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     if (mcpReclaimTimer !== null) clearInterval(mcpReclaimTimer);
     unsubscribeNotifications();
     notifications.close();
+    goalStore.close();
     proposalStore.close();
     skillPackageStore.close();
     skills.close();
@@ -1651,6 +1682,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     notifications,
     planMode,
     planQuestions,
+    goals,
     exec,
     execModes,
     mcp,
