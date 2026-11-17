@@ -1313,6 +1313,74 @@ export const api = {
       body: JSON.stringify({ grants }),
     });
   },
+
+  // --- 智能安装（票 M7-B-T4 / Issue #72）----------------------------------------
+
+  /** GET /v1/skill-install/config：抓取策略（公网开关/上限/阻断网段） */
+  getSkillInstallConfig(base: string): Promise<SkillInstallConfig> {
+    return request<SkillInstallConfig>(base, "/v1/skill-install/config");
+  },
+
+  /** POST /v1/skill-install/propose：由文档生成提案（**不落地**） */
+  proposeSkillInstall(
+    base: string,
+    input: { sourceKind: "upload" | "paste" | "url"; text?: string; url?: string; fileName?: string },
+  ): Promise<{ proposal: SkillInstallProposal; doc_fetch: SkillDocFetch | null; materialized: boolean }> {
+    return request(base, "/v1/skill-install/propose", {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify({
+        source_kind: input.sourceKind,
+        ...(input.text === undefined ? {} : { text: input.text }),
+        ...(input.url === undefined ? {} : { url: input.url }),
+        ...(input.fileName === undefined ? {} : { file_name: input.fileName }),
+      }),
+    });
+  },
+
+  /** GET /v1/skill-install/proposals：提案列表（可按状态过滤） */
+  listSkillInstallProposals(base: string, status?: string): Promise<{ proposals: SkillInstallProposal[] }> {
+    const query = status === undefined ? "" : `?status=${encodeURIComponent(status)}`;
+    return request(base, `/v1/skill-install/proposals${query}`);
+  },
+
+  /** GET /v1/skill-install/proposals/:id：提案详情（含权限清单与示例调用） */
+  getSkillInstallProposal(
+    base: string,
+    proposalId: string,
+  ): Promise<{ proposal: SkillInstallProposal; materialized: boolean }> {
+    return request(base, `/v1/skill-install/proposals/${encodeURIComponent(proposalId)}`);
+  },
+
+  /** POST /v1/skill-install/proposals/:id/confirm：确认并落地 */
+  confirmSkillInstallProposal(
+    base: string,
+    proposalId: string,
+  ): Promise<{
+    proposal: SkillInstallProposal;
+    materialized: boolean;
+    materialized_as: { kind: "skill" | "factory_request"; id: string } | null;
+    error_message?: string;
+  }> {
+    return request(base, `/v1/skill-install/proposals/${encodeURIComponent(proposalId)}/confirm`, {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify({}),
+    });
+  },
+
+  /** POST /v1/skill-install/proposals/:id/reject：拒绝提案 */
+  rejectSkillInstallProposal(
+    base: string,
+    proposalId: string,
+    reason?: string,
+  ): Promise<{ proposal: SkillInstallProposal }> {
+    return request(base, `/v1/skill-install/proposals/${encodeURIComponent(proposalId)}/reject`, {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify(reason === undefined ? {} : { reason }),
+    });
+  },
 };
 
 // --- MCP 响应类型（与 runtime 的 mcp/routes.ts 同源形状）----------------------------
@@ -1460,4 +1528,52 @@ export interface ExecRevertResponse {
   scope_notice: string;
   event_id: string;
   sequence: number;
+}
+
+// --- 智能安装响应类型（与 runtime 的 proposal-routes.ts 同源形状）------------------
+
+export interface SkillInstallConfig {
+  https_only: boolean;
+  allow_public_network: boolean;
+  max_bytes: number;
+  timeout_ms: number;
+  blocked_ranges: string[];
+  proposes_only: boolean;
+}
+
+export interface SkillDocFetch {
+  ok: boolean;
+  url: string;
+  host: string;
+  bytes?: number;
+  content_type?: string;
+  addresses?: string[];
+  code?: string;
+  message?: string;
+  duration_ms: number;
+}
+
+export interface SkillInstallProposal {
+  proposal_id: string;
+  source_kind: "upload" | "paste" | "url";
+  source_ref: string;
+  source_bytes: number;
+  name: string;
+  title: string;
+  description: string;
+  capabilities: Array<{ capability: string; purpose: string; example_args?: Record<string, unknown> }>;
+  new_tools: Array<{
+    suggested_name: string;
+    description: string;
+    permissions: Record<string, string[]>;
+    rationale: string;
+  }>;
+  permissions: Record<string, string[]>;
+  examples: Array<{ request: string; expected: string }>;
+  uncertainties: string[];
+  status: string;
+  created_at: string;
+  updated_at: string;
+  materialized_as: { kind: "skill" | "factory_request"; id: string } | null;
+  error: string | null;
 }

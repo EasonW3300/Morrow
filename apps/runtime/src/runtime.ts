@@ -114,6 +114,12 @@ import { McpServerService } from "./mcp/service.ts";
 import { mcpRoutes } from "./mcp/routes.ts";
 import { createStdioTransport } from "./mcp/stdio-transport.ts";
 import type { McpTransport } from "./mcp/client.ts";
+import { ProposalStore } from "./skills-package/proposal.ts";
+import { InstallProposalService } from "./skills-package/proposal-service.ts";
+import { PiProposalGenerator } from "./skills-package/proposal-generator.ts";
+import { DEFAULT_FETCH_POLICY, proposalRoutes } from "./skills-package/proposal-routes.ts";
+import type { InstallProposal, ProposalGenerator } from "./skills-package/proposal.ts";
+import { DOC_MAX_BYTES, DOC_TIMEOUT_MS, fetchDocument } from "./skills-package/doc-fetch.ts";
 
 /**
  * Runtime HTTP 服务（PRD §6.2 的 M0 子集 + M1 任务族 + M2-T1 能力族）。
@@ -204,6 +210,10 @@ interface RequestContext {
   execModes: ExecModeRegistry;
   /** MCP Server 管理（票 M7-B-T2 / Issue #71：安装/启停/授权/健康） */
   mcp: McpServerService;
+  /** 智能安装提案（票 M7-B-T4 / Issue #72：文档→提案→确认→落地） */
+  proposals: InstallProposalService;
+  /** 文档抓取策略（公网开关/上限；GET /v1/skill-install/config 回传） */
+  proposalFetchPolicy: { allowPublicNetwork: boolean; maxBytes: number; timeoutMs: number };
 }
 
 type Handler = (
@@ -400,6 +410,21 @@ export interface RuntimeOptions {
    * 子进程。测试注入假传输即可覆盖全部安装/启停路径（零子进程、零网络）。
    */
   mcpTransportFactory?: (record: { command: string; args: string[]; cwd: string | null }) => McpTransport;
+  /**
+   * 智能安装的提案生成器（票 M7-B-T4 / Issue #72）：缺省 = Provider 一次 prompt。
+   * 测试注入脚本化生成器即可零网络覆盖四道门。
+   */
+  proposalGenerator?: ProposalGenerator;
+  /**
+   * 是否允许文档抓取访问公网（默认 **false**：只允许内网/私有网络文档）。
+   * 对应 FR-B11 的「公网需显式开启"允许文档抓取出网"」。
+   */
+  allowPublicDocFetch?: boolean;
+  /**
+   * 文档抓取接缝（票 M7-B-T4 / Issue #72）：缺省 = fetchDocument（真实 HTTPS + DNS 校验）。
+   * 测试注入假抓取即可覆盖"抓取→提案"编排，零网络、零 DNS。
+   */
+  skillInstallFetch?: (url: string) => Promise<import("./skills-package/doc-fetch.ts").DocFetchResult>;
 }
 
 export interface RuntimeHandle {
@@ -466,6 +491,8 @@ export interface RuntimeHandle {
   execModes: ExecModeRegistry;
   /** MCP Server 管理（库形态可直用：install/enable/disable/remove/updateGrants） */
   mcp: McpServerService;
+  /** 智能安装提案（库形态可直用：propose/confirm/reject/list） */
+  proposals: InstallProposalService;
   /**
    * 优雅停止：停止接收请求 → 中止并释放会话运行时与在跑任务节点 → 记账 runtime.stopped
    * → 关闭任务投影库与账本（WAL checkpoint）。signal 传入收到的 POSIX 信号名，
@@ -556,6 +583,22 @@ const routes: Route[] = [
   })),
   ...contactRoutes,
   ...channelRoutes,
+  // 智能安装（票 M7-B-T4 / Issue #72）：/v1/skill-install/*（与 M2-T5 的案例晋升分路径族）
+  ...proposalRoutes.map((route) => ({
+    method: route.method,
+    re: route.re,
+    handler: (req: IncomingMessage, res: ServerResponse, url: URL, ctx: RequestContext, params: string[]) =>
+      route.handler(
+        req,
+        res,
+        url,
+        {
+          proposals: ctx.proposals,
+          fetchPolicy: ctx.proposalFetchPolicy,
+        },
+        params,
+      ),
+  })),
   // MCP Server 管理（票 M7-B-T2 / Issue #71）：模板/预览（无副作用）/安装/启停/授权/卸载
   ...mcpRoutes.map((route) => ({
     method: route.method,
@@ -1220,6 +1263,36 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
           ...(record.cwd === null ? {} : { cwd: record.cwd }),
         })),
   });
+  // 智能安装（票 M7-B-T4 / Issue #72）：文档 → 提案 → 预览 → 确认 → 落地。
+  // 关键在于「未确认不落地」：propose 只写 status=pending 的提案行，confirm 才调用
+  // materialize。落地分派沿用既有闭环——纯组合 → SkillService（声明式 steps，无代码）；
+  // 需要新工具 → CapabilityFactory（生成→沙箱验证→Owner 确认→注册）。
+  const proposalStore = new ProposalStore({ dataDir: config.dataDir });
+  const proposals = new InstallProposalService({
+    store: proposalStore,
+    ledger,
+    replicaId: config.replicaId,
+    generator:
+      options.proposalGenerator ??
+      new PiProposalGenerator({ runtimeFactory: defaultFactoryRuntimeFactory(providers) }),
+    existingCapabilities: () =>
+      capabilities.list().map((record) => ({
+        name: record.name,
+        description:
+          typeof record.manifest.input_schema === "object"
+            ? null
+            : null,
+      })),
+    grants: () => capabilities.getGrants(),
+    materialize: (proposal) => materializeProposal(proposal, { skills, factory }),
+    fetchOptions: {
+      allowPublicNetwork: options.allowPublicDocFetch === true,
+      maxBytes: DOC_MAX_BYTES,
+      timeoutMs: DOC_TIMEOUT_MS,
+    },
+    ...(options.skillInstallFetch === undefined ? {} : { fetchDocument: options.skillInstallFetch }),
+  });
+
   const ctx: RequestContext = {
     ledger,
     replicaId: config.replicaId,
@@ -1248,6 +1321,12 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     exec,
     execModes,
     mcp,
+    proposals,
+    proposalFetchPolicy: {
+      allowPublicNetwork: options.allowPublicDocFetch === true,
+      maxBytes: DOC_MAX_BYTES,
+      timeoutMs: DOC_TIMEOUT_MS,
+    },
     // 临时会话写入门（#64-A4）：能力网关 / skill invoke / 任务创建共用同一判定函数。
     ephemeralGate: {
       sessionKind: (sessionId) => sessions.sessionKind(sessionId),
@@ -1269,6 +1348,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     if (outboxTimer !== null) clearInterval(outboxTimer);
     unsubscribeNotifications();
     notifications.close();
+    proposalStore.close();
     skills.close();
     factory.close();
     tasks.close();
@@ -1363,6 +1443,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     exec,
     execModes,
     mcp,
+    proposals,
     async close(signal?: string): Promise<void> {
       if (closing) return;
       closing = true;
@@ -1591,6 +1672,55 @@ function handleAsyncError(res: ServerResponse, err: unknown): void {
  * 否则会出现"路由 409 但服务仍在跑脚本"这类自相矛盾的状态。实现委托给
  * SessionManager.isExecutable（存在 + 未关闭 + 未软删 + 未过期）。
  */
+
+/**
+ * 提案落地的分派（票 M7-B-T4 / Issue #72 的第四道门）。
+ *
+ * 两条路径都可能被判为"需要新建工具"，规则写死在这里而不是让 LLM 决定归途：
+ *   - `new_tools` 非空 → 交给 **CapabilityFactory**（生成 → 沙箱验证 → Owner 确认 →
+ *     注册）。这就是规格要求的「若是，走 Tool Factory 而非直接注册」：提案里不产码，
+ *     代码必须在工厂的验证闭环里产生。
+ *   - 否则 → 用 **SkillService** 建声明式 skill（steps 只引用已注册 capability，
+ *     不含代码）。
+ *
+ * 注意：工厂是 fire-and-forget 的（`submitRequest` 立即返回 requestId），所以这里
+ * 如实把 kind=factory_request 记成落地产物——"已提交"不等于"已注册成能力"，
+ * Owner 还要在工厂流程里再确认一次。
+ */
+async function materializeProposal(
+  proposal: InstallProposal,
+  deps: {
+    skills: SkillService;
+    factory: CapabilityFactory;
+  },
+): Promise<{ kind: "skill" | "factory_request"; id: string }> {
+  if (proposal.new_tools.length > 0) {
+    const description = [
+      proposal.title,
+      proposal.description,
+      "",
+      "Required new tools:",
+      ...proposal.new_tools.map(
+        (tool) => `- ${tool.suggested_name}: ${tool.description} (rationale: ${tool.rationale})`,
+      ),
+      "",
+      `Requested permissions: ${JSON.stringify(proposal.permissions)}`,
+    ].join("\n");
+    const { requestId } = deps.factory.submitRequest(description);
+    return { kind: "factory_request", id: requestId };
+  }
+
+  const created = deps.skills.propose({
+    name: proposal.name,
+    title: proposal.title,
+    description: proposal.description,
+    // 声明式组合：参数映射留空表示透传（提案阶段不臆造参数绑定）
+    steps: proposal.capabilities.map((ref) => ({ capability_id: ref.capability, arg_mapping: {} })),
+    actorId: "owner",
+  });
+  return { kind: "skill", id: created.skill_id };
+}
+
 function isSessionExecutable(ctx: Pick<RequestContext, "sessions">, sessionId: string): boolean {
   return ctx.sessions.isExecutable(sessionId);
 }

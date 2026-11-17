@@ -17,6 +17,7 @@ import { NewSessionDialog } from "./NewSessionDialog.tsx";
 import { draftToWorkspaceBody, type WorkspaceDraft } from "./workspace-ui.ts";
 import { MemoryView } from "./MemoryView.tsx";
 import { McpInstallView } from "./McpInstallView.tsx";
+import { SkillInstallView } from "./SkillInstallView.tsx";
 
 /**
  * 桌面壳根组件：解析控制面地址（sidecar ready）→ 顶栏导航（会话 / 任务 / 设置 / 健康）。
@@ -30,7 +31,7 @@ import { McpInstallView } from "./McpInstallView.tsx";
  * 记忆页（票 M7-A-T6 / Issue #62）：只读树/时间线视图，一级页签；来源回链经 openSource
  * 切回对应会话（壳内 state 路由）。
  */
-type View = "chat" | "tasks" | "memory" | "mcp" | "settings" | "health";
+type View = "chat" | "tasks" | "memory" | "mcp" | "skills" | "settings" | "health";
 
 const NAV_ITEMS: { key: View; label: string }[] = [
   { key: "chat", label: "会话" },
@@ -38,6 +39,8 @@ const NAV_ITEMS: { key: View; label: string }[] = [
   { key: "memory", label: "记忆" },
   // 扩展 → MCP（票 M7-B-T2 / Issue #71）：安装第三方 MCP Server
   { key: "mcp", label: "MCP" },
+  // 智能安装（票 M7-B-T4 / Issue #72）：文档 → 提案 → 确认 → 落地
+  { key: "skills", label: "技能" },
   { key: "settings", label: "设置" },
   { key: "health", label: "健康" },
 ];
@@ -297,6 +300,11 @@ export default function App() {
       {view === "mcp" && (
         <main className="main page-host">
           <McpInstallView base={base} />
+        </main>
+      )}
+      {view === "skills" && (
+        <main className="main page-host">
+          <SkillInstallView base={base} />
         </main>
       )}
       {view === "health" && (
