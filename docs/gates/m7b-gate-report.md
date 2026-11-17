@@ -3,7 +3,7 @@
 - **阶段**：M7-B 能力扩展（FR-B1..B16）
 - **规格**：#66（`docs/prd/PRD-M7.md` 决策 #7–#22）
 - **集成分支**：`integration/m7b`
-- **验证时间**：2026-11-17
+- **验证时间**：2026-11-17（含 code-review 修复批 `60c156c`）
 - **验证口径**：Node 24.22 / macOS arm64（本机 Docker 可用，真实容器测试实跑）
 
 ## 0. 一句话结论
@@ -16,7 +16,7 @@ UI 断言，列为已知小缺口（见 §5）。建议打 `v0.3.0`。
 
 | 项 | 数值 | 命令 |
 |---|---|---|
-| runtime 单元/集成测试 | **1112 通过 / 0 失败** | `node --experimental-sqlite --experimental-strip-types --test test/*.test.ts`（排除容器套件） |
+| runtime 单元/集成测试 | **1119 通过 / 0 失败** | `node --experimental-sqlite --experimental-strip-types --test test/*.test.ts`（排除容器套件） |
 | runtime 真实容器套件 | **12 通过 / 0 失败** | `test/exec.container.test.ts`（本机 docker） |
 | desktop UI 逻辑测试 | **244 通过 / 0 失败** | `node --experimental-strip-types --test "src/*.test.ts"` |
 | 全 workspace typecheck | 干净 | `pnpm -r typecheck` |
@@ -31,6 +31,7 @@ UI 断言，列为已知小缺口（见 §5）。建议打 `v0.3.0`。
 | B6 (#70) | `exec-danger-rules` / `exec-mode` / `exec-service` / `exec.api` / `exec-runner-args` / `exec.container` | 27 + 22 + 26 + 17 + 12 + 12 |
 | B2 (#71) | `mcp-install` / `mcp.api` | 26 + 18 |
 | B4 (#72) | `skill-install-doc-fetch` / `skill-install-proposal` / `skill-install.api` | 28 + 18 + 19 |
+| code-review 修复批 | `m7b-review-fixes` | 6 |
 
 ## 2. FR-B1..B16 逐条证据
 
@@ -131,6 +132,22 @@ UI 断言，列为已知小缺口（见 §5）。建议打 `v0.3.0`。
 | 关闭→恢复的会话继承「完全权限」/只读豁免 | 写 `exec-mode.test.ts` 的"关闭后豁免失效"用例 | 引入 `executionEpoch` 代际号（两道防线） |
 | MCP 安装的 `"[]"` / `"null"` 输入被当成可执行文件名 | 坏形状测试 | 收紧 JSON 形态判定 + 显式拒绝 JSON 字面量残片 |
 | `McpInstallInputError` 未映射 → 未勾选风险确认返回 500 | `mcp.api.test.ts` 断言 400 | `sendMcpError` 同时识别两种错误类型 |
+
+### 5.2.1 code-review（两轴）发现并修复的三个"看起来做完、实际不可用"
+
+阶段 B 的实现票全部"测试绿"之后，安全/正确性两轴复审又抓到三个真缺陷。它们的
+共同点是**单测覆盖了零件、但没有人验证整条链路真的通**：
+
+| 缺陷 | 症状 | 根因 | 修法 |
+|---|---|---|---|
+| **MCP 空闲回收从不发生** | FR-B4「空闲 10min 退出」在生产上是死代码 | `reclaimIdle` 零调用点（单测直接调它，所以"绿"） | 补 `mcpReclaimIntervalMs` 定时器（默认 60s）+ close 清理 + 关子进程 |
+| **MCP 工具注册了但不可调** | 注册表 enabled，`invoke` 报 `unknown_tool` | `enable` 只注册进 PermissionEngine，没登记进 ToolInvoker；落进 "no executable implementation wired" 分支被 unregister | 加 MCP 分派分支 + `McpServerService.callTool`（含懒启动）+ `mcpDispatch` 晚绑定解开构造顺序 |
+| **"停用"被报成"不存在"** | disable 后 invoke 404 `unknown_tool`，Owner 以为能力被删了 | 停用时 `unregister` | 保留注册，让权限层报 `capability_disabled`（403）；执行体仍不会被调用 |
+| **快照失败无审计** | 快照失败正确拒绝了执行，但账本上这次执行"从未发生" | `#execute` 的快照调用没有 try/catch | 补 `phase=snapshot_failed` 审计 |
+
+顺带更正了一条把缺陷写成期望的旧测试（`capabilities.invoke.test.ts` 断言
+"disable → 404 unknown_tool"），并新增一条"从未注册的能力仍是 404"以示两种语义
+可区分。
 
 ### 5.3 仍存在的限制（不阻塞发布，需 Owner 知晓）
 
