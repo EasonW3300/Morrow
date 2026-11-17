@@ -104,6 +104,8 @@ import { ToolInvoker, type InvocationResult } from "./sandbox/invoker.ts";
 import { createRegistryPermissionAdapter, type SandboxPermissionEngine } from "./sandbox/permission.ts";
 import type { SandboxRunner } from "./sandbox/runner.ts";
 import { ExecModeRegistry } from "./exec/mode.ts";
+import { PlanModeRegistry, filterPlanModeTools, isPlanModeReadOnly } from "./plan/mode.ts";
+import { planRoutes } from "./plan/routes.ts";
 import { ExecService } from "./exec/service.ts";
 import { execRoutes } from "./exec/routes.ts";
 import { createDefaultExecRunner, type LocalExecRunner } from "./exec/runner.ts";
@@ -206,6 +208,8 @@ interface RequestContext {
   workspace: WorkspaceManager;
   /** 临时会话写入门（票 M7-A-T3 / #64-A4：能力网关、skill invoke、任务创建共用同一判定） */
   ephemeralGate: EphemeralGateDeps;
+  /** Plan 模式（票 M7-C-T2 / #76：只读工具集 + 进入/退出/阶段） */
+  planMode: PlanModeRegistry;
   /** 动态 bash（票 M7-B-T6 / Issue #70：模式判定 + 确认 + 快照 + 容器执行 + 审计） */
   exec: ExecService;
   /** 执行模式注册表（会话级、不持久化；路由层读 GET /v1/sessions/:id/exec-mode） */
@@ -505,6 +509,8 @@ export interface RuntimeHandle {
   outbox: OutboxService;
   /** 通知规则与路由（M4-T7 / Issue #44：handleEnvelope/flushDue/dispatchQueued，库形态可直用） */
   notifications: NotificationService;
+  /** Plan 模式注册表（会话级内存态；库形态可直用） */
+  planMode: PlanModeRegistry;
   /** 动态 bash 执行服务（M7-B-T6 / Issue #70：submit/approve/revert/setMode，库形态可直用） */
   exec: ExecService;
   /** 执行模式注册表（会话级内存态；诊断用：size 证明关闭会话后释放） */
@@ -635,6 +641,26 @@ const routes: Route[] = [
     handler: (req: IncomingMessage, res: ServerResponse, url: URL, ctx: RequestContext, params: string[]) =>
       route.handler(req, res, url, { mcp: ctx.mcp }, params),
   })),
+  // Plan 模式（票 M7-C-T2 / #76）：进入/退出/阶段。进入退出只走 HTTP 端点，
+  // 模型侧没有对应工具——这就是 FR-C4「自动回合不得自行进入/离开 Plan」的保证。
+  ...planRoutes.map((route) => ({
+    method: route.method,
+    re: route.re,
+    handler: (req: IncomingMessage, res: ServerResponse, url: URL, ctx: RequestContext, params: string[]) =>
+      route.handler(
+        req,
+        res,
+        url,
+        {
+          planMode: ctx.planMode,
+          ledger: ctx.ledger,
+          replicaId: ctx.replicaId,
+          isSessionExecutable: (sessionId) => isSessionExecutable(ctx, sessionId),
+          sessionExists: (sessionId) => ctx.sessions.sessionExists(sessionId),
+        },
+        params,
+      ),
+  })),
   // 动态 bash（票 M7-B-T6 / Issue #70）：会话级执行模式 + 脚本提交/确认/撤销。
   // execRoutes 桥接到 exec 自有路由签名（ctx.exec / ctx.execModes 在请求时取）。
   ...execRoutes.map((route) => ({
@@ -669,6 +695,23 @@ const routes: Route[] = [
       route.handler(req, res, url, ctx.factory, params),
   })),
 ];
+
+/**
+ * Plan 模式下写意图被拦的审计（票 M7-C-T2 / #76）。
+ *
+ * 记下"模型想调什么"而不是只记"被拒了"——事后复盘时这条最有价值：
+ * 它能证明限制真的被尝试过、以及模型当时想干什么。
+ */
+function appendPlanBlocked(ctx: RequestContext, sessionId: string, capabilityId: string): void {
+  const envelope = buildEventEnvelope({
+    replicaId: ctx.replicaId,
+    actorId: "agent:runtime",
+    eventType: "plan.write_attempt_blocked",
+    sessionId,
+    payload: { capability: capabilityId },
+  });
+  ctx.ledger.append(envelope);
+}
 
 export async function startRuntime(config: RuntimeConfig, options: RuntimeOptions = {}): Promise<RuntimeHandle> {
   const ledger = EventLedger.open(config.dataDir);
@@ -1034,7 +1077,15 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
   // null/未接线 = Owner 或普通会话，不做联系人收窄。
   let contactToolCapabilities: ((sessionId: string) => string[] | null) | null = null;
   // 临时会话判定（票 M7-A-T3）：晚绑定到 SessionManager（构造闭包在运行时执行）
+  // Plan 模式（票 M7-C-T2 / #76）：会话级、不持久化；代际号防"关闭→恢复"继承只读
+  const planMode = new PlanModeRegistry({
+    isOpen: (sessionId) => sessions.isExecutable(sessionId),
+    epoch: (sessionId) => sessions.executionEpoch(sessionId),
+  });
+
   let ephemeralSession: ((sessionId: string) => boolean) | null = null;
+  // Plan 模式晚绑定（与 ephemeralSession 同款：SessionManager 在 PlanModeRegistry 之后构造）
+  let planModeSession: ((sessionId: string) => boolean) | null = null;
   // 会话工具注入改查注册表（票 M2-T1）：enabled 且有内置实现的 typescript 能力才实例化
   const sessions = new SessionManager({
     ledger,
@@ -1076,15 +1127,20 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
       // 临时会话禁写入类能力（票 M7-A-T3）：权限单入口的判定同样约束 Agent 工具面，
       // 不只拦 HTTP invoke——模型在临时会话里看不到写操作类能力工具。
       const ephemeral = ephemeralSession?.(sessionId) === true;
+      // Plan 模式（票 M7-C-T2 / #76）：只读是**装配层**的硬限制——不给写工具，
+      // 而不是劝模型别用。这是全阶段最关键的一处强制（提示词挡不住被诱导的模型）。
+      const planMode = planModeSession?.(sessionId) === true;
       return capabilities
         .list({ status: "enabled", runtime: "typescript" })
         .filter((capability) => builtinToolFactories[capability.name] !== undefined)
         .filter((capability) => contactScopes === null || contactScopes.includes(capability.name))
         .filter((capability) => !ephemeral || !isEphemeralWriteClassCapability(capability.manifest))
+        .filter((capability) => !planMode || filterPlanModeTools([capability]).length > 0)
         .map((capability) => builtinToolFactories[capability.name](sessionId));
     },
   });
   ephemeralSession = (sessionId) => sessions.sessionKind(sessionId) === "ephemeral";
+  planModeSession = (sessionId) => planMode.isActive(sessionId);
   // 任务域（M1-T4）：规划器/节点工厂注入语义对齐会话——注入时不做 Provider 预检，
   // 默认工厂路径要求存在可解析的默认 Provider（POST /v1/tasks 预检 503 依据）。
   const taskPlannerInjected = options.taskPlannerFactory !== undefined;
@@ -1406,6 +1462,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     outbox,
     notifications,
     workspace: workspaceManager,
+    planMode,
     exec,
     execModes,
     mcp,
@@ -1543,6 +1600,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     contacts,
     outbox,
     notifications,
+    planMode,
     exec,
     execModes,
     mcp,
@@ -2160,6 +2218,7 @@ async function handleCloseSession(
       const result = ctx.sessions.closeEphemeralSession(sessionId);
       // 关闭即失效（FR-B14）：执行模式与待确认票一起清掉
       ctx.exec.forgetSession(sessionId);
+      ctx.planMode.forget(sessionId);
       sendJson(res, 200, {
         session_id: sessionId,
         closed_at: result.closedAt,
@@ -2252,8 +2311,9 @@ async function handleCloseSession(
 
   try {
     const closed = ctx.sessions.closeNormalSession(sessionId, outcome);
-    // 关闭即失效（FR-B14）：普通会话关闭同样清掉执行模式与待确认票
+    // 关闭即失效（FR-B14 / FR-C1）：普通会话关闭同样清掉执行模式、待确认票与 Plan 模式
     ctx.exec.forgetSession(sessionId);
+    ctx.planMode.forget(sessionId);
     sendJson(res, 200, {
       session_id: sessionId,
       closed_at: closed.closedAt,
@@ -2917,6 +2977,24 @@ async function handleInvokeCapability(
     // 权限单入口判定，先于执行链（未知能力不在此拒绝，留给 unknown_tool；UI 侧同门禁
     // 禁用按钮，双保险）。
     assertEphemeralCapabilityUse(ctx.ephemeralGate, sessionId, [capabilityId]);
+    // Plan 模式只读纵深防护（票 M7-C-T2 / #76 第二层）：装配层已经不给写工具，
+    // 但模型仍可能通过幻觉工具名 / 历史残留构造出一次写调用——这里必须拦住并留审计。
+    // 拒绝是 403（不是 404）：能力是真的，只是此模式下不允许。
+    if (sessionId !== undefined && ctx.planMode.isActive(sessionId)) {
+      const target = ctx.capabilities.get(capabilityId);
+      // 不存在的能力**不**在这里拒：让执行链报 unknown_tool（404）语义更准确。
+      // 把"不存在"也说成"Plan 模式不允许"，会让 Owner 以为能力被删了。
+      if (target !== null && !isPlanModeReadOnly(target.record.manifest)) {
+        appendPlanBlocked(ctx, sessionId, capabilityId);
+        sendError(
+          res,
+          403,
+          "plan_mode_readonly",
+          `capability "${capabilityId}" is not allowed in plan mode (read-only tools only)`,
+        );
+        return;
+      }
+    }
     const result = await ctx.sandbox.invoke(capabilityId, body, { actorId: "owner", ...(sessionId !== undefined ? { sessionId } : {}) });
     // 先落审计后返回（账本可追踪优先于响应时延；审计失败不改变执行结果口径）
     appendCapabilityUsed(ctx, capabilityId, result, result.duration_ms, sessionId);
