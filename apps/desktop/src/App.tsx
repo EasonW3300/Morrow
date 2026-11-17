@@ -18,6 +18,7 @@ import { draftToWorkspaceBody, type WorkspaceDraft } from "./workspace-ui.ts";
 import { MemoryView } from "./MemoryView.tsx";
 import { McpInstallView } from "./McpInstallView.tsx";
 import { SkillInstallView } from "./SkillInstallView.tsx";
+import { SkillPackagesView } from "./SkillPackagesView.tsx";
 
 /**
  * 桌面壳根组件：解析控制面地址（sidecar ready）→ 顶栏导航（会话 / 任务 / 设置 / 健康）。
@@ -305,6 +306,8 @@ export default function App() {
       {view === "skills" && (
         <main className="main page-host">
           <SkillInstallView base={base} />
+          {/* Skill 包（npm）：与"智能安装"并列，来源不同但都落在同一份能力注册表上 */}
+          <SkillPackagesView base={base} />
         </main>
       )}
       {view === "health" && (

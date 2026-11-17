@@ -1369,6 +1369,50 @@ export const api = {
     });
   },
 
+  // --- Skill 包（票 M7-B-T3 补齐：npm 安装/升级/卸载）-----------------------------
+
+  /** GET /v1/skills/packages：已安装技能包列表 */
+  listSkillPackages(base: string): Promise<{ packages: SkillPackageRowView[] }> {
+    return request(base, "/v1/skills/packages");
+  },
+
+  /** POST /v1/skills/packages/install：npm 安装（服务端强制 --ignore-scripts） */
+  installSkillPackage(base: string, spec: string): Promise<{ package: SkillPackageRowView; ignored_scripts: boolean }> {
+    return request(base, "/v1/skills/packages/install", {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ spec }),
+    });
+  },
+
+  /**
+   * POST /v1/skills/packages/:name/upgrade：升级。
+   * 不带 confirm → 202 返回 diff（**不安装**）；带 confirm 才装。
+   */
+  upgradeSkillPackage(
+    base: string,
+    packageName: string,
+    input: { spec?: string; confirm?: boolean; acceptPermissionWidening?: boolean } = {},
+  ): Promise<SkillPackageUpgradePreview | { package: SkillPackageRowView }> {
+    return request(base, `/v1/skills/packages/${encodeURIComponent(packageName)}/upgrade`, {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify({
+        ...(input.spec === undefined ? {} : { spec: input.spec }),
+        confirm: input.confirm === true,
+        accept_permission_widening: input.acceptPermissionWidening === true,
+      }),
+    });
+  },
+
+  /** DELETE /v1/skills/packages/:name：卸载（删目录 + 禁用能力；审计保留） */
+  uninstallSkillPackage(
+    base: string,
+    packageName: string,
+  ): Promise<{ removed: boolean; capability_disabled: boolean }> {
+    return request(base, `/v1/skills/packages/${encodeURIComponent(packageName)}`, { method: "DELETE" });
+  },
+
   /** POST /v1/skill-install/proposals/:id/reject：拒绝提案 */
   rejectSkillInstallProposal(
     base: string,
@@ -1576,4 +1620,34 @@ export interface SkillInstallProposal {
   updated_at: string;
   materialized_as: { kind: "skill" | "factory_request"; id: string } | null;
   error: string | null;
+}
+
+// --- Skill 包响应类型（与 runtime 的 package-service.ts 同源形状）-------------------
+
+export interface SkillPackageRowView {
+  package_name: string;
+  spec: string;
+  version: string;
+  source_hash: string;
+  package_dir: string;
+  capability: string;
+  has_entry: boolean;
+  permissions: Record<string, string[]>;
+  status: string;
+  installed_at: string;
+  updated_at: string;
+}
+
+export interface SkillPackageUpgradePreview {
+  package_name: string;
+  from_version: string;
+  to_version: string;
+  diff: {
+    added: Array<{ dimension: string; value: string }>;
+    removed: Array<{ dimension: string; value: string }>;
+    unchanged: Array<{ dimension: string; value: string }>;
+    widens: boolean;
+  };
+  requires_confirmation: boolean;
+  requires_permission_widening_acceptance: boolean;
 }

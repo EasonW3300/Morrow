@@ -4250,3 +4250,14 @@ input[type="radio"] {
   font-size: 12px;
   color: var(--color-danger, #dc2626);
 }
+
+/* --- Skill 包管理（票 M7-B-T3 补齐）--------------------------------------------- */
+
+.skill-pkg-view {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  max-width: 880px;
+  margin: 0 auto;
+  padding: 0 20px 20px;
+}
