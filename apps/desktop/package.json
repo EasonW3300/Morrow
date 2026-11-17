@@ -1,7 +1,7 @@
 {
   "name": "@morrow/desktop",
   "private": true,
-  "version": "0.2.0",
+  "version": "0.3.0",
   "type": "module",
   "description": "Tauri 2 + React 桌面壳（票 T6 / Issue #7）：sidecar 拉起 Runtime，Chat 视图经控制面 HTTP/SSE 通信",
   "scripts": {

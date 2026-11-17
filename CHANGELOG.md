@@ -1,8 +1,46 @@
 # 变更日志
 
 本文件记录 Morrow 的对外可见变更。格式参照 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
-版本号遵循语义化版本；当前发布版本为 `0.1.0`，版本号唯一来源是各 workspace `package.json`
+版本号遵循语义化版本；当前发布版本为 `0.3.0`，版本号唯一来源是各 workspace `package.json`
 （Runtime 的 ready 行与 `/v1/health` 均从 `apps/runtime/package.json` 读取，不设双真相源）。
+
+## [0.3.0] - 2026-11-17
+
+M7-B：能力扩展（MCP 接入 / Skill 包安装 / 智能安装 / `/` 命令面板 / 动态 bash）。逐项门禁证据见
+[`docs/gates/m7b-gate-report.md`](docs/gates/m7b-gate-report.md)。
+
+### 新增
+
+- **MCP 接入**：粘贴 JSON 配置或启动命令即可安装 Server（含 filesystem/git/fetch 模板，**仅预填**）；安装前展示**完整未截断**启动命令并强制勾选宿主权限风险；新装默认 **disabled**，显式启用后才启动。协议**双代际**（`server/discover` 优先；版本不支持按其 `supported` 换版本且**不回退** `initialize`；其他错误/超时才回退）；进程懒启动、空闲 10 分钟退出、崩溃重启 ≤3 次后 `degraded`；工具注册为 capability（`mcp.<server>.<tool>`），**默认五维权限全空**。「已安装」页统一展示来源/状态/权限/健康（含协议代际与降级原因）。
+- **Skill 包安装（npm）**：强制 `--ignore-scripts`（有负向对照测试证明探针不会执行）；只解析 `morrow.skill.json`，服务端重算 `source_hash`；含 `entry` 的包**必须**声明 `sandbox` + `tests`，且只能注册为容器沙箱能力（忽略包内更宽松的声明）。升级为**两步**：先给权限 diff（预览不落盘），扩权还需显式接受 + 全局 grants 放行；卸载删目录并禁用能力，审计永久保留。
+- **智能安装**：上传文件 / 粘贴正文 / 内网 URL → LLM 读文档产「安装提案」（需要哪些现有能力、是否要新建工具、权限清单、示例调用）→ 预览 → Owner 确认 → 才落地。需要新工具时转交 **Tool Factory**（生成→沙箱验证→再确认），**不在提案阶段产码或注册**。出网抓取：仅 https、拒绝回环/私网/链路本地/云元数据/CGNAT、DNS 解析后复检（防 rebinding）、≤5MB 流式中止、10s 超时、每次抓取写审计；**公网默认关闭**（`MORROW_ALLOW_PUBLIC_DOC_FETCH=1` 开启）。
+- **`/` 命令面板**：命令区（`/plan` `/goal` `/best` `/clear` `/memory` `/skill`）+ 技能区，前缀/中缀/子序列三档逐字过滤，↑↓ 回绕、Enter/Esc。
+- **动态 bash**：Agent 写脚本在**容器内**执行（`--network none`、workspace 挂载、根只读 + `/tmp` tmpfs、`--pids-limit`、`no-new-privileges`、超时按容器名 kill、输出按字节上限截断）。会话级执行模式：「每次命令确认」（默认）/「完全权限」，**不持久化**，关闭会话即失效（含「关闭→恢复」的代际号防绕过）。完全权限下**危险命令仍被硬拒绝**（12 条静态规则：删系统路径/写 `~/.ssh`/读凭据库/`curl|sh`/`eval`/强制推送/改 `/etc`/sudoers/fork 炸弹/写块设备/关机重启），执行前**快照**、执行后**审计**。只读命令「会话内首次确认后」免二次确认；写命令逐次确认并回传完整脚本。撤销覆盖会话工作区，边界（`~/.ssh`、`/etc` 等不在保护范围）随响应回传并在 UI 常驻。
+
+### 修复
+
+- **MCP 工具「注册了但不可调」**：`enable` 只注册进 PermissionEngine，未登记进 ToolInvoker，调用永远 `unknown_tool`。补 MCP 分派分支与 `callTool`（含空闲回收后的懒重启）。
+- **MCP 空闲回收从未发生**：`reclaimIdle` 零调用点，FR-B4 在生产上是死代码。补 60s 轮询定时器，并在关闭时清理定时器与子进程。
+- **「停用」被报成「不存在」**：停用后原实现 `unregister`，invoke 报 404 `unknown_tool`。改为保留注册，由权限层报 `capability_disabled`（403）；执行体仍不会被调用。
+- **快照失败无审计**：快照失败正确拒绝执行，但账本上这次执行「从未发生」。补 `phase=snapshot_failed` 审计。
+- **Skill 包升级预览会真的装包**：初版预览直接装到正式目录，看一眼 diff 就覆盖了 `node_modules`。改为装到暂存目录算完即删。
+- **危险规则漏拦两个变体**：`sudo -u root rm -rf /`（`-u` 带值选项未跳过）、`git push origin +main`（`+refspec`）。
+- **输出截断切出替换字符**：按字节切多字节 UTF-8 字符产生 U+FFFD，改为回退到字符边界。
+- **关闭→恢复的会话继承「完全权限」/只读豁免**：引入 `executionEpoch` 代际号（两道防线）。
+
+### 质量
+
+runtime **1119** / desktop **244** / Rust 全绿；真实容器套件 **12/12**（本机 Docker：联网失败是隔离的正面证据）。code-review 双轴发现 4 项（全部为「看起来做完、实际不可用」型）已修复并补回归测试。
+
+### 已知限制（增量，接续 0.2.0）
+
+- **DNS rebinding 复检有 TOCTOU 窗口**：Node 原生 `fetch` 自行解析 DNS，无法把已校验 IP 钉进连接；当前是连接前后两次独立解析。完美方案需自定义 agent。
+- **MCP 只支持 tools**：resources/prompts 不支持，协商时如实记为 `unsupportedCapabilities` 并在健康详情展示。
+- **MCP Server 不是沙箱**：它是宿主进程，拥有与 Morrow 同等的宿主权限；Morrow 只能约束*经其注册的工具调用*。风险文案原文落库以便取证。
+- **「完全权限」不是无边界**：静态规则集是「宁严勿松」的黑名单，无法覆盖所有危险写法（例如混淆脚本）。兜底是快照 + 审计 + 可撤销。
+- **快照只覆盖会话工作区**：`~/.ssh`、`/etc`、其他项目目录、OS 凭据库、远端仓库都不在保护范围。
+- 真实容器验证采用本机 macOS/Docker；CI 的 ubuntu 腿会跑但本轮未在 CI 复验。
+- 桌面端无 DOM 测试环境，「安装后默认未启用」等状态仅有纯逻辑断言，无组件级断言。
 
 ## [0.2.0] - 2026-11-16
 
