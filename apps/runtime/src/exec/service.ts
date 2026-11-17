@@ -355,7 +355,22 @@ export class ExecService {
     // 无工作区时不快照（没有可保护的对象），并在审计里如实记录。
     let snapshot: SnapshotRecord | null = null;
     if (workspace !== null) {
-      snapshot = await this.#deps.snapshots.create({ sessionId, workspaceDir: workspace.path });
+      try {
+        snapshot = await this.#deps.snapshots.create({ sessionId, workspaceDir: workspace.path });
+      } catch (error) {
+        // 快照失败 → 拒绝执行，但**必须留审计**：否则从账本看这次执行"从未发生"，
+        // 而 Owner 那边确实点过确认，事后无法归因。
+        const message = error instanceof Error ? error.message : String(error);
+        this.#append(sessionId, EXEC_EVENT_TYPES.requested, {
+          phase: "snapshot_failed",
+          script,
+          script_hash: scriptHash(script),
+          mode,
+          workspace_dir: workspace.path,
+          error: message,
+        });
+        throw error;
+      }
     }
 
     const request: ExecRequest = {

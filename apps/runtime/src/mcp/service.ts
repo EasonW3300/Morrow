@@ -116,6 +116,11 @@ export interface McpServerServiceDeps {
   capabilities: PermissionEngine;
   /** 传输工厂（测试注入假 stdio；生产按 record.command/args 建真子进程） */
   transportFactory: (record: McpServerRecord) => McpTransport;
+  /**
+   * 空闲阈值（默认 10 分钟，FR-B4 的规格值）。
+   * 测试注入短值即可验证"回收真的发生"，不必等 10 分钟。
+   */
+  idleTimeoutMs?: number;
   now?: () => Date;
 }
 
@@ -237,6 +242,7 @@ export class McpServerService {
 
     const client = new McpClient({
       transportFactory: () => this.#deps.transportFactory(record),
+      ...(this.#deps.idleTimeoutMs === undefined ? {} : { idleTimeoutMs: this.#deps.idleTimeoutMs }),
     });
     const runtime: ServerRuntime = { client, tools: [], unsupportedCapabilities: [], restarts: 0, lastError: null };
     this.#runtimes.set(serverId, runtime);
@@ -359,6 +365,47 @@ export class McpServerService {
       await runtime.client.close();
     }
     this.#runtimes.clear();
+  }
+
+  /**
+   * 调用该 server 的某个工具（供 ToolInvoker 分派 MCP capability 用）。
+   *
+   * 这是「注册了但不可调」缺口的修复点：`enable` 把工具注册成 capability 后，
+   * `ToolInvoker.invoke` 必须有一条能真正执行它的路径；否则注册表里显示 enabled、
+   * 调用却报 `unknown_tool`（M7-B 之前在其他能力上踩过同一个坑）。
+   *
+   * 会话（runtime）按需懒启动：空闲回收后这里会自动重新拉起，不需要 enable 重来。
+   */
+  async callTool(
+    serverId: string,
+    toolName: string,
+    args: unknown,
+  ): Promise<{ ok: boolean; text: string; error?: string; raw: unknown }> {
+    const record = this.#deps.store.get(serverId);
+    if (record === null) {
+      return { ok: false, text: "", error: `MCP server "${serverId}" is not installed`, raw: null };
+    }
+    if (!record.enabled) {
+      return { ok: false, text: "", error: `MCP server "${serverId}" is disabled`, raw: null };
+    }
+    let runtime = this.#runtimes.get(serverId);
+    if (runtime === undefined) {
+      // 空闲回收后重来：重建 client（下次调用会懒启动）
+      runtime = {
+        client: new McpClient({
+          transportFactory: () => this.#deps.transportFactory(record),
+          ...(this.#deps.idleTimeoutMs === undefined ? {} : { idleTimeoutMs: this.#deps.idleTimeoutMs }),
+        }),
+        tools: [],
+        unsupportedCapabilities: [],
+        restarts: 0,
+        lastError: null,
+      };
+      this.#runtimes.set(serverId, runtime);
+    }
+    const outcome = await runtime.client.callTool(toolName, args ?? {});
+    if (!outcome.ok) runtime.lastError = outcome.error ?? "tool call failed";
+    return { ok: outcome.ok, text: outcome.text, ...(outcome.error === undefined ? {} : { error: outcome.error }), raw: outcome.raw };
   }
 
   /** 健康快照（degraded 时带原因与重启次数——UI 要能解释"为什么不工作了"） */

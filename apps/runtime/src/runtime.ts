@@ -433,6 +433,13 @@ export interface RuntimeOptions {
    * Skill 包安装接缝（票 M7-B-T3 补齐）：缺省 = installSkillPackage（真实 npm，强制
    * `--ignore-scripts`）。测试注入假实现即可覆盖安装/升级/卸载全流程，零 npm。
    */
+  /**
+   * MCP 空闲回收轮询间隔（毫秒，默认 60s）：FR-B4「空闲 10min 退出」的驱动器。
+   * 0 = 不启动定时器（测试手动调 reclaimIdle，避免时序不确定）。
+   */
+  mcpReclaimIntervalMs?: number;
+  /** MCP 空闲阈值（毫秒，默认 10min）。测试注入短值验证回收；生产保持规格值。 */
+  mcpIdleTimeoutMs?: number;
   skillPackageInstall?: (options: {
     spec: string;
     targetDir: string;
@@ -778,6 +785,11 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
   // 审计事件落账本后回调——把 ToolInvoker 注册表与能力注册表保持同相（disable 即从
   // 调用接缝摘除、enable/rollback 重新登记）。syncInvoker 晚绑定（sandbox 在其后构建）。
   let syncInvoker: ((event: CapabilityLifecycleEvent) => void) | undefined;
+  // MCP 服务晚绑定：`registerCapabilityIntoInvoker`（下方）需要分派 MCP 工具调用，
+  // 而 McpServerService 依赖 capabilities/sandbox，构造顺序在它之后。
+  let mcpDispatch: ((serverId: string, toolName: string, input: unknown) => Promise<
+    { ok: boolean; text: string; error?: string }
+  >) | null = null;
   const capabilities = new PermissionEngine({
     dataDir: config.dataDir,
     ledger,
@@ -901,7 +913,8 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
   //   其余（无实现的 human 注册、无构建产物追踪的 go 注册）→ 跳过并告警（invoke 404，不静默假装可调）。
   const registerCapabilityIntoInvoker = (record: CapabilityRecord): void => {
     if (record.status !== "enabled") {
-      sandbox.unregister(record.name);
+      // 停用的能力**保持**已注册的执行体：invoke 时由权限层以 capability_disabled
+      // 拒绝，而不是在这里摘除后让调用方看到 unknown_tool。只有"启用"才需要重新登记。
       return;
     }
     const manifest = record.manifest;
@@ -925,6 +938,38 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
           return outcome.isError
             ? { ok: false, error: outcome.text }
             : { ok: true, result: { text: outcome.text } };
+        },
+      });
+      return;
+    }
+    // MCP 工具（票 M7-B-T1 的注册 + 票 M7-B-T2 的启用）：name 形如 mcp.<server>.<tool>。
+    // 没有这个分支时它们会落到最后一句 "no executable implementation wired" 被
+    // unregister——注册表里 enabled、调用报 unknown_tool（本阶段 code-review 抓到的真缺陷）。
+    if (manifest.sandbox.type === "process" && manifest.name.startsWith("mcp.")) {
+      const { serverId, toolName } = parseMcpCapabilityName(manifest.name);
+      if (serverId === null || toolName === null) {
+        console.warn(`[morrow] MCP capability "${manifest.name}" has an unparseable name; invoke reports unknown_tool`);
+        sandbox.unregister(record.name);
+        return;
+      }
+      sandbox.register({
+        manifest: {
+          name: manifest.name,
+          version: manifest.version,
+          author: manifest.author,
+          runtime: manifest.runtime,
+          permissions: manifest.permissions,
+          sandbox: { type: "process", network: "none", filesystem: "none" },
+        },
+        package: { name: manifest.name, kind: "typescript" },
+        inProcess: async (input) => {
+          if (mcpDispatch === null) {
+            return { ok: false, error: `MCP runtime not ready; cannot call ${record.name}` };
+          }
+          const outcome = await mcpDispatch(serverId, toolName, input);
+          return outcome.ok
+            ? { ok: true, result: { text: outcome.text } }
+            : { ok: false, error: outcome.error ?? "MCP tool call failed" };
         },
       });
       return;
@@ -959,7 +1004,14 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
   };
   syncInvoker = (event: CapabilityLifecycleEvent) => {
     if (event.eventType === CAPABILITY_EVENT_TYPES.disabled) {
-      sandbox.unregister(event.record.name);
+      // **保留**注册（而不是 unregister）——这是刻意的语义修正：
+      // `ToolInvoker.invoke` 先按名字查表，查不到就抛 `unknown_tool`，会把"已停用"
+      // 误报成"不存在"，让 Owner 以为能力被删了。保留注册后执行链会走到权限复核，
+      // 由 `assertRuntimeUse` 以 `capability_disabled` 拒绝——语义准确，且执行体
+      // （inProcess / runner）绝不会被调用（权限复核先于分发）。
+      //
+      // 只处理"曾经登记过"的条目：从未登记的能力没有执行体，保留一个空壳只会让
+      // 调用链走到底再报错，反而更难诊断。
       return;
     }
     registerCapabilityIntoInvoker(event.record);
@@ -1164,6 +1216,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
   // 触发；0 = 关闭（测试手动 dispatchOnce）。在 channels.start() 之后启动。
   const outboxDrainIntervalMs = options.outboxDrainIntervalMs ?? 1_000;
   let outboxTimer: NodeJS.Timeout | null = null;
+  let mcpReclaimTimer: NodeJS.Timeout | null = null;
   if (notificationDrainIntervalMs > 0) {
     notificationTimer = setInterval(() => {
       void notifications.drain().catch((err: unknown) => {
@@ -1284,7 +1337,10 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
           args: record.args,
           ...(record.cwd === null ? {} : { cwd: record.cwd }),
         })),
+    ...(options.mcpIdleTimeoutMs === undefined ? {} : { idleTimeoutMs: options.mcpIdleTimeoutMs }),
   });
+  // 晚绑定接线：ToolInvoker 的 MCP 分派在此刻才可用
+  mcpDispatch = (serverId, toolName, input) => mcp.callTool(serverId, toolName, input);
   // 智能安装（票 M7-B-T4 / Issue #72）：文档 → 提案 → 预览 → 确认 → 落地。
   // 关键在于「未确认不落地」：propose 只写 status=pending 的提案行，confirm 才调用
   // materialize。落地分派沿用既有闭环——纯组合 → SkillService（声明式 steps，无代码）；
@@ -1379,6 +1435,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
   } catch (err) {
     if (notificationTimer !== null) clearInterval(notificationTimer);
     if (outboxTimer !== null) clearInterval(outboxTimer);
+    if (mcpReclaimTimer !== null) clearInterval(mcpReclaimTimer);
     unsubscribeNotifications();
     notifications.close();
     proposalStore.close();
@@ -1427,6 +1484,18 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
       });
     }, outboxDrainIntervalMs);
     if (typeof outboxTimer.unref === "function") outboxTimer.unref();
+  }
+  // MCP 空闲回收（FR-B4「空闲 10min 退出」）：`McpClient.reclaimIdle` 早就写好了，
+  // 但此前**没有任何调用点**——等于生产上永不回收，进程会一直挂着。这里补上驱动器。
+  // 默认 60s 轮询：空闲阈值是 10min，轮询粒度不需要更细。
+  const mcpReclaimIntervalMs = options.mcpReclaimIntervalMs ?? 60_000;
+  if (mcpReclaimIntervalMs > 0) {
+    mcpReclaimTimer = setInterval(() => {
+      void mcp.reclaimIdle().catch((err: unknown) => {
+        console.error("[morrow] mcp idle reclaim failed:", err);
+      });
+    }, mcpReclaimIntervalMs);
+    if (typeof mcpReclaimTimer.unref === "function") mcpReclaimTimer.unref();
   }
   // 调用接缝初始登记（#22 修复批 / FR-CAP-5）：把注册表里全部 enabled 能力登记进
   // ToolInvoker（本进程新建的经 onLifecycle 已登记；这里覆盖重启场景——历史行不重放
@@ -1490,7 +1559,13 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
         clearInterval(outboxTimer);
         outboxTimer = null;
       }
+      if (mcpReclaimTimer !== null) {
+        clearInterval(mcpReclaimTimer);
+        mcpReclaimTimer = null;
+      }
       unsubscribeNotifications();
+      // MCP 子进程必须在关账本前关掉：它们是宿主进程，泄漏会跨进程存活
+      await mcp.close().catch(() => undefined);
       server.closeAllConnections();
       await new Promise<void>((resolve) => server.close(() => resolve()));
       // 会话运行先收尾（中止在跑的轮次并释放 AgentRuntime），再记账、再关库
@@ -1754,6 +1829,19 @@ async function materializeProposal(
     actorId: "owner",
   });
   return { kind: "skill", id: created.skill_id };
+}
+
+/**
+ * 解析 MCP capability 名（`mcp.<serverId>.<toolName>`）。
+ *
+ * 与 `mcpCapabilityName` 的合成规则互为逆运算。注意 serverId 自身可能含点号？
+ * 不会——`mcpCapabilityName` 把所有非 `[a-z0-9_-]` 字符都替换成了 `-`，所以
+ * 第一个点一定在 `mcp` 之后、第二个点之后全是工具名（工具名同样被安全化过）。
+ */
+export function parseMcpCapabilityName(name: string): { serverId: string | null; toolName: string | null } {
+  const match = /^mcp\.([a-z0-9_-]+)\.(.+)$/.exec(name);
+  if (match === null) return { serverId: null, toolName: null };
+  return { serverId: match[1], toolName: match[2] };
 }
 
 function isSessionExecutable(ctx: Pick<RequestContext, "sessions">, sessionId: string): boolean {
