@@ -16,6 +16,7 @@ import { ExecPanel } from "./ExecPanel.tsx";
 import { NewSessionDialog } from "./NewSessionDialog.tsx";
 import { draftToWorkspaceBody, type WorkspaceDraft } from "./workspace-ui.ts";
 import { MemoryView } from "./MemoryView.tsx";
+import { McpInstallView } from "./McpInstallView.tsx";
 
 /**
  * 桌面壳根组件：解析控制面地址（sidecar ready）→ 顶栏导航（会话 / 任务 / 设置 / 健康）。
@@ -29,12 +30,14 @@ import { MemoryView } from "./MemoryView.tsx";
  * 记忆页（票 M7-A-T6 / Issue #62）：只读树/时间线视图，一级页签；来源回链经 openSource
  * 切回对应会话（壳内 state 路由）。
  */
-type View = "chat" | "tasks" | "memory" | "settings" | "health";
+type View = "chat" | "tasks" | "memory" | "mcp" | "settings" | "health";
 
 const NAV_ITEMS: { key: View; label: string }[] = [
   { key: "chat", label: "会话" },
   { key: "tasks", label: "任务" },
   { key: "memory", label: "记忆" },
+  // 扩展 → MCP（票 M7-B-T2 / Issue #71）：安装第三方 MCP Server
+  { key: "mcp", label: "MCP" },
   { key: "settings", label: "设置" },
   { key: "health", label: "健康" },
 ];
@@ -289,6 +292,11 @@ export default function App() {
       {view === "settings" && (
         <main className="main page-host">
           <SettingsView base={base} initialCapabilityName={openCapabilityName} />
+        </main>
+      )}
+      {view === "mcp" && (
+        <main className="main page-host">
+          <McpInstallView base={base} />
         </main>
       )}
       {view === "health" && (
