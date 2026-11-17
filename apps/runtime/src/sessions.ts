@@ -1115,6 +1115,22 @@ export class SessionManager {
    * 内存态、重启归零（理由见 SessionState.usage 的注释）。未知会话返回零值而不是
    * null——调用方（Goal 预算）不该为"还没跑过"写一条分支。
    */
+  /**
+   * 最近一条助手消息的文本（票 M7-C-T3 / #77）：Plan 的 `<proposed_plan>` 从这里解析。
+   *
+   * 从账本读而不是缓存：计划必须来自**已落账**的助手输出（可审计、可回溯），
+   * 而不是某个可能被改过的内存副本。
+   */
+  lastAssistantText(sessionId: string): string | null {
+    let text: string | null = null;
+    for (const { envelope } of this.#ledger.scan({ sessionId })) {
+      if (envelope.event_type !== SESSION_EVENT_TYPES.messageAssistant) continue;
+      const value = envelope.payload.text;
+      text = typeof value === "string" ? value : null;
+    }
+    return text;
+  }
+
   usageOf(sessionId: string): MorrowRunUsage {
     return this.#states.get(sessionId)?.usage ?? {
       input: 0,

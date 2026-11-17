@@ -106,6 +106,9 @@ import type { SandboxRunner } from "./sandbox/runner.ts";
 import { ExecModeRegistry } from "./exec/mode.ts";
 import { PlanModeRegistry, filterPlanModeTools, isPlanModeReadOnly } from "./plan/mode.ts";
 import { planRoutes } from "./plan/routes.ts";
+import { PlanQuestionRegistry } from "./plan/questions.ts";
+import { composePlanSystemPrompt } from "./plan/prompt.ts";
+import type { ParsedPlan } from "./plan/plan-block.ts";
 import { ExecService } from "./exec/service.ts";
 import { execRoutes } from "./exec/routes.ts";
 import { createDefaultExecRunner, type LocalExecRunner } from "./exec/runner.ts";
@@ -210,6 +213,8 @@ interface RequestContext {
   ephemeralGate: EphemeralGateDeps;
   /** Plan 模式（票 M7-C-T2 / #76：只读工具集 + 进入/退出/阶段） */
   planMode: PlanModeRegistry;
+  /** Plan 问答（票 M7-C-T3 / #77：阻塞式提问的待回答队列） */
+  planQuestions: PlanQuestionRegistry;
   /** 动态 bash（票 M7-B-T6 / Issue #70：模式判定 + 确认 + 快照 + 容器执行 + 审计） */
   exec: ExecService;
   /** 执行模式注册表（会话级、不持久化；路由层读 GET /v1/sessions/:id/exec-mode） */
@@ -511,6 +516,8 @@ export interface RuntimeHandle {
   notifications: NotificationService;
   /** Plan 模式注册表（会话级内存态；库形态可直用） */
   planMode: PlanModeRegistry;
+  /** Plan 问答注册表（阻塞式提问的待回答队列） */
+  planQuestions: PlanQuestionRegistry;
   /** 动态 bash 执行服务（M7-B-T6 / Issue #70：submit/approve/revert/setMode，库形态可直用） */
   exec: ExecService;
   /** 执行模式注册表（会话级内存态；诊断用：size 证明关闭会话后释放） */
@@ -653,10 +660,16 @@ const routes: Route[] = [
         url,
         {
           planMode: ctx.planMode,
+          questions: ctx.planQuestions,
           ledger: ctx.ledger,
           replicaId: ctx.replicaId,
           isSessionExecutable: (sessionId) => isSessionExecutable(ctx, sessionId),
           sessionExists: (sessionId) => ctx.sessions.sessionExists(sessionId),
+          personaPrompt: () => composePersonaPrompt(ctx.persona.get()),
+          workspacePathOf: (sessionId) => ctx.sessions.workspaceOf(sessionId)?.path ?? null,
+          lastAssistantText: (sessionId) => ctx.sessions.lastAssistantText(sessionId),
+          convertToTask: (sessionId, plan) => createTaskFromPlan(ctx, sessionId, plan),
+          now: () => new Date(),
         },
         params,
       ),
@@ -711,6 +724,25 @@ function appendPlanBlocked(ctx: RequestContext, sessionId: string, capabilityId:
     payload: { capability: capabilityId },
   });
   ctx.ledger.append(envelope);
+}
+
+
+/**
+ * 已批准的计划 → Task（票 M7-C-T3 / Issue #77 的 FR-C5）。
+ *
+ * 复用既有 TaskService（计划 → DAG → 调度 → Checkpoint），不新写编排。
+ * 计划全文作为 goal 传进去：任务详情要能追溯"这份任务从哪份计划来"（PRD 决策 #41）。
+ */
+async function createTaskFromPlan(
+  ctx: RequestContext,
+  sessionId: string,
+  plan: ParsedPlan,
+): Promise<{ taskId: string; eventId: string }> {
+  const goal = [`# ${plan.title}`, "", plan.raw].join("\n");
+  const task = await ctx.tasks.createTask(goal, { sessionId });
+  // TaskDetail 没有 event_id 字段：用 task.created_at 无法回链，所以 eventId 留空，
+  // 由 plan.converted_to_task 审计事件承担"这次转换"的回链（那条事件里有 task_id）。
+  return { taskId: task.task_id, eventId: "" };
 }
 
 export async function startRuntime(config: RuntimeConfig, options: RuntimeOptions = {}): Promise<RuntimeHandle> {
@@ -1077,11 +1109,17 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
   // null/未接线 = Owner 或普通会话，不做联系人收窄。
   let contactToolCapabilities: ((sessionId: string) => string[] | null) | null = null;
   // 临时会话判定（票 M7-A-T3）：晚绑定到 SessionManager（构造闭包在运行时执行）
-  // Plan 模式（票 M7-C-T2 / #76）：会话级、不持久化；代际号防"关闭→恢复"继承只读
-  const planMode = new PlanModeRegistry({
-    isOpen: (sessionId) => sessions.isExecutable(sessionId),
-    epoch: (sessionId) => sessions.executionEpoch(sessionId),
+  // Plan 模式（票 M7-C-T2 / #76）：会话级、不持久化；代际号防"关闭→恢复"继承只读。
+  // 用晚绑定变量解开"planMode ↔ sessions"的构造循环（sessions 的 systemPrompt 要读
+  // planMode，而 planMode 的 isOpen 要问 sessions）。
+  let sessionsRef: SessionManager | null = null;
+  const planMode: PlanModeRegistry = new PlanModeRegistry({
+    isOpen: (sessionId) => sessionsRef?.isExecutable(sessionId) === true,
+    epoch: (sessionId) => sessionsRef?.executionEpoch(sessionId) ?? 0,
   });
+
+  // Plan 问答（票 M7-C-T3 / #77）：待回答的问题只活在本进程（与 Plan 模式同款）
+  const planQuestions = new PlanQuestionRegistry({ isOpen: (sessionId) => sessions.isExecutable(sessionId) });
 
   let ephemeralSession: ((sessionId: string) => boolean) | null = null;
   // Plan 模式晚绑定（与 ephemeralSession 同款：SessionManager 在 PlanModeRegistry 之后构造）
@@ -1099,7 +1137,16 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     memory,
     // 全局 Persona → 会话 system prompt（M7-A-T1 / Issue #58）：固定顺序拼装，随会话
     // AgentRuntime 创建注入；不注入任务规划器。
-    systemPrompt: () => composePersonaPrompt(persona.get()),
+    // Plan 模式（票 M7-C-T3 / #77）：Plan 提示词作为附加段拼在 Persona 之后，
+    // 不替换人设——"它是谁"与"此刻怎么工作"是正交的。
+    // Plan 模式（票 M7-C-T3 / #77）：Plan 提示词作为附加段拼在 Persona 之后，
+    // 不替换人设——"它是谁"与"此刻怎么工作"是正交的。提示词只是引导，
+    // 真正的强制在 agentTools 的只读白名单（C2）。
+    systemPrompt: (sessionId) => {
+      const personaPrompt = composePersonaPrompt(persona.get());
+      if (!planMode.isActive(sessionId)) return personaPrompt;
+      return composePlanSystemPrompt({ personaPrompt, phase: planMode.phaseOf(sessionId) });
+    },
     // 元数据时钟（M7-A-T2）：软删 30 天到期判定
     ...(options.sessionsNow === undefined ? {} : { now: options.sessionsNow }),
     // 工作区接缝（票 M7-A-T4）：附件注入按路径重读（只读），工作区绑定走同一实现
@@ -1139,6 +1186,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
         .map((capability) => builtinToolFactories[capability.name](sessionId));
     },
   });
+  sessionsRef = sessions;
   ephemeralSession = (sessionId) => sessions.sessionKind(sessionId) === "ephemeral";
   planModeSession = (sessionId) => planMode.isActive(sessionId);
   // 任务域（M1-T4）：规划器/节点工厂注入语义对齐会话——注入时不做 Provider 预检，
@@ -1463,6 +1511,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     notifications,
     workspace: workspaceManager,
     planMode,
+    planQuestions,
     exec,
     execModes,
     mcp,
@@ -1601,6 +1650,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     outbox,
     notifications,
     planMode,
+    planQuestions,
     exec,
     execModes,
     mcp,
