@@ -14,6 +14,7 @@ export type {
   BeforeToolCallHook,
   MorrowAgentEvent,
   MorrowMessage,
+  MorrowRunUsage,
   MorrowTool,
   MorrowToolResult,
   ToolCallDecision,
@@ -22,4 +23,7 @@ export type {
 } from "./types.ts";
 export { createFakePi, type FakePiConfig, type FakeStep } from "./fake-pi.ts";
 export { translatePiEvent } from "./events.ts";
+// 用量助手（票 M7-C-T1 / Issue #75）：事件族里的 usage 由适配层产出，累加/估算的
+// 纯函数也在这一层——会话层与 Goal 预算共用同一套口径，不各写一份。
+export { CHARS_PER_TOKEN, EMPTY_USAGE, addUsage, estimateUsage, readPiUsage, resolveRunUsage } from "./usage.ts";
 export { createPiAdapter } from "./pi-adapter.ts";

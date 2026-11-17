@@ -1,4 +1,4 @@
-import type { AgentRuntime, MorrowAgentEvent, MorrowTool } from "@morrow/pi-adapter";
+import { addUsage, type AgentRuntime, type MorrowAgentEvent, type MorrowRunUsage, type MorrowTool } from "@morrow/pi-adapter";
 import type {
   ActorId,
   EventEnvelope,
@@ -298,6 +298,16 @@ interface SessionState {
   frames: Set<(frame: SessionFrame) => void>;
   runtime: AgentRuntime | null;
   running: boolean;
+  /**
+   * 本会话累计用量（票 M7-C-T1 / Issue #75）：Thread Goal 的 token 预算从这里读。
+   *
+   * 只活在内存：用量是"本进程看到的消耗"，重启后归零。刻意不持久化——持久化会让
+   * 预算在重启后仍然生效，而重启本身就意味着"这是一次新的开始"（与执行模式的
+   * 不持久化同理）。
+   */
+  usage: MorrowRunUsage;
+  /** 本轮尚未结算的用量（usage 事件先于 agent_end 到达） */
+  pendingUsage: MorrowRunUsage | null;
   queue: QueuedInput[];
 }
 
@@ -1099,6 +1109,23 @@ export class SessionManager {
     return this.#states.get(sessionId)?.running === true;
   }
 
+  /**
+   * 会话累计用量（票 M7-C-T1 / Issue #75）：Thread Goal 的 token 预算从这里读。
+   *
+   * 内存态、重启归零（理由见 SessionState.usage 的注释）。未知会话返回零值而不是
+   * null——调用方（Goal 预算）不该为"还没跑过"写一条分支。
+   */
+  usageOf(sessionId: string): MorrowRunUsage {
+    return this.#states.get(sessionId)?.usage ?? {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      total: 0,
+      estimated: false,
+    };
+  }
+
   /** 订阅会话事件帧（SSE）；返回退订函数。未知会话返回 null。 */
   subscribe(sessionId: string, listener: (frame: SessionFrame) => void): (() => void) | null {
     if (!this.sessionExists(sessionId)) return null;
@@ -1306,14 +1333,32 @@ export class SessionManager {
         this.#append(sessionId, SESSION_EVENT_TYPES.agentError, "agent:runtime", { message: event.message }, input.userEventId);
         break;
       }
+      case "usage": {
+        // 本轮用量先暂存，在 agent_end 里并入累计值（一条 message.assistant 一条 usage，
+        // 保证"轮次结束"与"用量到账"原子）
+        state.pendingUsage = event.usage;
+        break;
+      }
       case "agent_end": {
+        const runUsage = state.pendingUsage;
+        state.pendingUsage = null;
         const assistant = this.#append(
           sessionId,
           SESSION_EVENT_TYPES.messageAssistant,
           "agent:runtime",
-          { message_id: uuidv7(), text: ctx.getText(), stop_reason: event.stopReason },
+          {
+            message_id: uuidv7(),
+            text: ctx.getText(),
+            stop_reason: event.stopReason,
+            // 本轮用量随 message.assistant 一起落账（缺失则不写该字段，保持既有事件字节兼容）
+            ...(runUsage === null ? {} : { usage: runUsage }),
+          },
           input.userEventId,
         );
+        // 会话级累计（Goal 预算读这里）
+        if (runUsage !== null) {
+          state.usage = addUsage(state.usage ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, estimated: false }, runUsage);
+        }
         // 后台抽取触发（票 M1-T2）：轮次收尾（message.assistant 已落账）→ fire-and-forget。
         // 失败只记日志：记忆是增强路径，不得吞掉本轮已持久化的会话事件。
         if (this.#memory?.observeTurnEnd !== undefined) {
@@ -1363,7 +1408,14 @@ export class SessionManager {
   #stateOf(sessionId: string): SessionState {
     let state = this.#states.get(sessionId);
     if (state === undefined) {
-      state = { frames: new Set(), runtime: null, running: false, queue: [] };
+      state = {
+        frames: new Set(),
+        runtime: null,
+        running: false,
+        queue: [],
+        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, estimated: false },
+        pendingUsage: null,
+      };
       this.#states.set(sessionId, state);
     }
     return state;

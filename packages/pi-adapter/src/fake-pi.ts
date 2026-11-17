@@ -33,6 +33,14 @@ export type FakeStep =
     }
   /** 注入供应商错误：error 事件 + agent_end(stopReason: "error") */
   | { kind: "error"; message: string }
+  /**
+   * 发射一条 usage 事件（票 M7-C-T1 / Issue #75）。
+   *
+   * FakePi 不模拟真实 adapter 的 usage 提取（那是 PiAdapter 的职责，由 fixtures
+   * 回放测试覆盖）；这里让**业务层测试**能精确控制"这一轮报了多少用量"，
+   * 从而验证 Goal 预算累加与超限停止。
+   */
+  | { kind: "usage"; input: number; output: number; estimated?: boolean }
   /** 挂起直到 abort()（模拟流式中断场景） */
   | { kind: "hang" };
 
@@ -118,6 +126,20 @@ export async function createFakePi(config: FakePiConfig = {}): Promise<AgentRunt
         }
         case "tool": {
           await runToolStep(step);
+          break;
+        }
+        case "usage": {
+          emit({
+            type: "usage",
+            usage: {
+              input: step.input,
+              output: step.output,
+              cacheRead: 0,
+              cacheWrite: 0,
+              total: step.input + step.output,
+              estimated: step.estimated === true,
+            },
+          });
           break;
         }
         case "error": {

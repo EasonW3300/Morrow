@@ -42,6 +42,21 @@ describe("Pi 1.4.0 fixtures 回放：正常对话流（文本 + 工具 + 文本�
         durationMs: 0, // 真实测量值（录制时工具瞬时完成）；静态 fixture 回放故为确定值
       },
       { type: "text_delta", delta: "北京晴，12°C。" },
+      // 用量在 agent_end 之前（票 M7-C-T1 / #75）：Goal 预算累加只关心它，
+      // 收尾时必须已到账。录制 fixture 的 assistant 消息未带 usage（Pi 未开
+      // include_usage），故走 chars/4 估算路径，estimated=true。
+      {
+        type: "usage",
+        usage: {
+          // 录制 fixture 的真实字符数折算：输入 9 字符 → 3 token；输出 16 字符 → 4 token
+          input: 3,
+          output: 4,
+          cacheRead: 0,
+          cacheWrite: 0,
+          total: 7,
+          estimated: true,
+        },
+      },
       { type: "agent_end", stopReason: "stop" },
     ]);
   });
@@ -49,7 +64,7 @@ describe("Pi 1.4.0 fixtures 回放：正常对话流（文本 + 工具 + 文本�
   it("turn/message 生命周期与 toolcall 流式细节被丢弃（不出现在窄事件里）", () => {
     const types = new Set<MorrowAgentEvent["type"]>();
     for (const event of fixture.events) for (const e of translatePiEvent(event)) types.add(e.type);
-    assert.deepEqual([...types].sort(), ["agent_end", "text_delta", "tool_end", "tool_start"]);
+    assert.deepEqual([...types].sort(), ["agent_end", "text_delta", "tool_end", "tool_start", "usage"]);
   });
 });
 
@@ -62,6 +77,11 @@ describe("Pi 1.4.0 fixtures 回放：供应商错误", () => {
 
     // error message 由 Pi 1.4.0 真实产生：状态码 + 响应体 JSON 原文（录制所得，勿手工改写）
     assert.deepEqual(out, [
+      // 失败的轮次也要记用量：它同样烧了 token（可能是 0，但"没烧"与"没记"不同）
+      {
+        type: "usage",
+        usage: { input: 3, output: 0, cacheRead: 0, cacheWrite: 0, total: 3, estimated: true },
+      },
       { type: "error", message: '502: {"message":"upstream connect error","type":"bad_gateway"}' },
       { type: "agent_end", stopReason: "error" },
     ]);
@@ -78,6 +98,17 @@ describe("Pi 1.4.0 fixtures 回放：流式中断", () => {
     assert.deepEqual(out, [
       { type: "text_delta", delta: "我正在" },
       { type: "text_delta", delta: "整理你的偏好" },
+      {
+        type: "usage",
+        usage: {
+          input: 3,
+          output: 3,
+          cacheRead: 0,
+          cacheWrite: 0,
+          total: 6,
+          estimated: true,
+        },
+      },
       { type: "agent_end", stopReason: "aborted" },
     ]);
   });
