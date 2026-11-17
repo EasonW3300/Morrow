@@ -110,6 +110,7 @@ import { PlanQuestionRegistry } from "./plan/questions.ts";
 import { GoalStore } from "./goals/store.ts";
 import { GoalService } from "./goals/service.ts";
 import { goalRoutes } from "./goals/routes.ts";
+import { GoalDriver } from "./goals/driver.ts";
 import { composePlanSystemPrompt } from "./plan/prompt.ts";
 import type { ParsedPlan } from "./plan/plan-block.ts";
 import { ExecService } from "./exec/service.ts";
@@ -220,6 +221,10 @@ interface RequestContext {
   planQuestions: PlanQuestionRegistry;
   /** Thread Goal（票 M7-C-T4 / #78：六态状态机 + 双预算） */
   goals: GoalService;
+  /** Goal 续跑驱动器（票 M7-C-T5 / #79：tick/recordRun） */
+  goalDriver: GoalDriver;
+  /** 记录会话活动（续跑静默阈值的输入；用户发消息时调用） */
+  touchSessionActivity(sessionId: string): void;
   /** 动态 bash（票 M7-B-T6 / Issue #70：模式判定 + 确认 + 快照 + 容器执行 + 审计） */
   exec: ExecService;
   /** 执行模式注册表（会话级、不持久化；路由层读 GET /v1/sessions/:id/exec-mode） */
@@ -454,6 +459,15 @@ export interface RuntimeOptions {
   mcpReclaimIntervalMs?: number;
   /** MCP 空闲阈值（毫秒，默认 10min）。测试注入短值验证回收；生产保持规格值。 */
   mcpIdleTimeoutMs?: number;
+  /**
+   * Goal 续跑扫描间隔（毫秒，默认 30s）；0 = 不启动定时器（测试手动 tick）。
+   * 静默阈值由 goalResumeIdleMs 单独控制。
+   */
+  goalResumeIntervalMs?: number;
+  /** Goal 续跑静默阈值（毫秒，默认 30s）：距上次活动超过这个时长才自跑 */
+  goalResumeIdleMs?: number;
+  /** Goal 时钟注入（测试零 sleep） */
+  goalNow?: () => number;
   skillPackageInstall?: (options: {
     spec: string;
     targetDir: string;
@@ -525,6 +539,8 @@ export interface RuntimeHandle {
   planQuestions: PlanQuestionRegistry;
   /** Thread Goal 服务（库形态可直用：create/pause/resume/complete/recordRun） */
   goals: GoalService;
+  /** Goal 续跑驱动器（库形态可直用：tick 手动驱动） */
+  goalDriver: GoalDriver;
   /** 动态 bash 执行服务（M7-B-T6 / Issue #70：submit/approve/revert/setMode，库形态可直用） */
   exec: ExecService;
   /** 执行模式注册表（会话级内存态；诊断用：size 证明关闭会话后释放） */
@@ -1150,6 +1166,23 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     },
   });
 
+  // Goal 续跑驱动器（票 M7-C-T5 / #79）：周期性问"谁该跑"，让会话自己跑一轮。
+  // 决策与执行分离：这里只判定，运行走会话的既有发送路径（不另起第二条运行链）。
+  /** 各会话最后一次活动时间（续跑静默阈值判定用） */
+  const lastActivity = new Map<string, number>();
+  const goalDriver = new GoalDriver({
+    goals,
+    isSessionExecutable: (sessionId) => sessions.isExecutable(sessionId),
+    isSessionBusy: (sessionId) => sessions.isRunning(sessionId),
+    isPlanModeActive: (sessionId) => planMode.isActive(sessionId),
+    sendMessage: (sessionId, text) => {
+      sessions.sendUserMessage(sessionId, text, { actorId: "agent:runtime" });
+    },
+    lastActivityAt: (sessionId) => lastActivity.get(sessionId) ?? 0,
+    ...(options.goalNow === undefined ? {} : { now: options.goalNow }),
+    ...(options.goalResumeIdleMs === undefined ? {} : { idleThresholdMs: options.goalResumeIdleMs }),
+  });
+
   let ephemeralSession: ((sessionId: string) => boolean) | null = null;
   // Plan 模式晚绑定（与 ephemeralSession 同款：SessionManager 在 PlanModeRegistry 之后构造）
   let planModeSession: ((sessionId: string) => boolean) | null = null;
@@ -1182,6 +1215,21 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     workspace: workspaceManager,
     // 工具完成观察（M2-T5）：tool.finished → Skill 案例收集（is_error → failure）。
     // 观察是增强路径：失败记日志不阻断会话主链路。
+    // Goal 轮次推进（票 M7-C-T5 / #79）：每轮结束把用量与错误交给驱动器分类。
+    // 无 goal 的会话这里是 no-op（openForSession 返回 null）。
+    turnObserver: {
+      observeTurnFinished: (info) => {
+        lastActivity.set(info.sessionId, Date.now());
+        const goal = goals.openForSession(info.sessionId);
+        if (goal === null) return;
+        goalDriver.recordRun({
+          goalId: goal.goal_id,
+          error: info.error,
+          ...(info.status === undefined ? {} : { status: info.status }),
+          elapsedMs: info.elapsedMs,
+        });
+      },
+    },
     toolObserver: {
       observeToolFinished: (input) => {
         try {
@@ -1350,6 +1398,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
   const outboxDrainIntervalMs = options.outboxDrainIntervalMs ?? 1_000;
   let outboxTimer: NodeJS.Timeout | null = null;
   let mcpReclaimTimer: NodeJS.Timeout | null = null;
+  let goalResumeTimer: NodeJS.Timeout | null = null;
   if (notificationDrainIntervalMs > 0) {
     notificationTimer = setInterval(() => {
       void notifications.drain().catch((err: unknown) => {
@@ -1542,6 +1591,8 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     planMode,
     planQuestions,
     goals,
+    goalDriver,
+    touchSessionActivity: (sessionId) => lastActivity.set(sessionId, Date.now()),
     exec,
     execModes,
     mcp,
@@ -1572,6 +1623,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     if (notificationTimer !== null) clearInterval(notificationTimer);
     if (outboxTimer !== null) clearInterval(outboxTimer);
     if (mcpReclaimTimer !== null) clearInterval(mcpReclaimTimer);
+    if (goalResumeTimer !== null) clearInterval(goalResumeTimer);
     unsubscribeNotifications();
     notifications.close();
     goalStore.close();
@@ -1634,6 +1686,19 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     }, mcpReclaimIntervalMs);
     if (typeof mcpReclaimTimer.unref === "function") mcpReclaimTimer.unref();
   }
+  // Goal 空闲续跑（票 M7-C-T5 / #79，FR-C10）：周期性扫描 active goal。
+  // 默认 30s 扫描、30s 静默阈值——两个数字分开可调，便于测试与调参。
+  const goalResumeIntervalMs = options.goalResumeIntervalMs ?? 30_000;
+  if (goalResumeIntervalMs > 0) {
+    goalResumeTimer = setInterval(() => {
+      try {
+        goalDriver.tick();
+      } catch (err) {
+        console.error("[morrow] goal resume tick failed:", err);
+      }
+    }, goalResumeIntervalMs);
+    if (typeof goalResumeTimer.unref === "function") goalResumeTimer.unref();
+  }
   // 调用接缝初始登记（#22 修复批 / FR-CAP-5）：把注册表里全部 enabled 能力登记进
   // ToolInvoker（本进程新建的经 onLifecycle 已登记；这里覆盖重启场景——历史行不重放
   // registered 事件）。登记失败的条目跳过并告警（invoke 404，不静默假装可调）。
@@ -1683,6 +1748,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     planMode,
     planQuestions,
     goals,
+    goalDriver,
     exec,
     execModes,
     mcp,
@@ -1702,6 +1768,10 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
       if (mcpReclaimTimer !== null) {
         clearInterval(mcpReclaimTimer);
         mcpReclaimTimer = null;
+      }
+      if (goalResumeTimer !== null) {
+        clearInterval(goalResumeTimer);
+        goalResumeTimer = null;
       }
       unsubscribeNotifications();
       // MCP 子进程必须在关账本前关掉：它们是宿主进程，泄漏会跨进程存活
@@ -2795,6 +2865,8 @@ async function handleSendMessage(
     sendError(res, 400, "invalid_body", "text must be a non-empty string");
     return;
   }
+  // 用户发言算"活动"：续跑静默阈值从这一刻起算，避免"刚说完就自跑"（#79）
+  ctx.touchSessionActivity(sessionId);
   const ack = ctx.sessions.sendUserMessage(sessionId, text);
   sendJson(res, 202, {
     message_id: ack.messageId,
