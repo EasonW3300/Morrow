@@ -1148,4 +1148,506 @@ export const api = {
       body: JSON.stringify(body),
     });
   },
+
+  // --- 动态 bash（票 M7-B-T6 / Issue #70）----------------------------------------
+
+  /** GET /v1/sessions/:id/exec-mode：会话级执行模式（不持久化）+ 边界声明 */
+  getExecMode(base: string, sessionId: string): Promise<ExecModeState> {
+    return request<ExecModeState>(base, `/v1/sessions/${encodeURIComponent(sessionId)}/exec-mode`);
+  },
+
+  /** PUT /v1/sessions/:id/exec-mode：切换模式（写 exec.mode_changed 审计） */
+  setExecMode(base: string, sessionId: string, mode: ExecMode): Promise<ExecModeState & { changed: boolean; event_id: string | null }> {
+    return request(base, `/v1/sessions/${encodeURIComponent(sessionId)}/exec-mode`, {
+      method: "PUT",
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ mode }),
+    });
+  },
+
+  /**
+   * POST /v1/sessions/:id/exec：提交脚本。
+   *
+   * 三种结果都**不是**异常：denied 走 400（ApiError 里带 hits）、needs_confirmation
+   * 走 202、executed 走 200。这里统一成一个判别联合，调用方不必 catch 控制流。
+   */
+  async submitExec(
+    base: string,
+    sessionId: string,
+    script: string,
+    options: { timeoutMs?: number; maxOutputBytes?: number } = {},
+  ): Promise<ExecSubmitResponse> {
+    try {
+      return await request<ExecSubmitResponse>(base, `/v1/sessions/${encodeURIComponent(sessionId)}/exec`, {
+        method: "POST",
+        headers: JSON_HEADERS,
+        body: JSON.stringify({
+          script,
+          ...(options.timeoutMs === undefined ? {} : { timeout_ms: options.timeoutMs }),
+          ...(options.maxOutputBytes === undefined ? {} : { max_output_bytes: options.maxOutputBytes }),
+        }),
+      });
+    } catch (err) {
+      // 危险规则命中的 400 是**判定结果**而非传输错误：转成 denied 联合成员，
+      // 让 UI 用同一套渲染路径展示"被哪条规则拦下"。
+      if (err instanceof ApiError && err.code === "exec_forbidden") {
+        const hits = Array.isArray(err.details.hits) ? (err.details.hits as ExecDangerHit[]) : [];
+        return { status: "denied", hits, decision: "deny" } as ExecDeniedResponse;
+      }
+      throw err;
+    }
+  },
+
+  /** GET /v1/exec/confirmations/:id：待确认详情（完整脚本） */
+  getExecConfirmation(base: string, confirmationId: string): Promise<ExecConfirmationDetail> {
+    return request<ExecConfirmationDetail>(base, `/v1/exec/confirmations/${encodeURIComponent(confirmationId)}`);
+  },
+
+  /** POST /v1/exec/confirmations/:id/approve：确认并执行（票一次性，重放 404） */
+  approveExec(
+    base: string,
+    confirmationId: string,
+    options: { timeoutMs?: number; maxOutputBytes?: number } = {},
+  ): Promise<ExecExecutedResponse> {
+    return request<ExecExecutedResponse>(
+      base,
+      `/v1/exec/confirmations/${encodeURIComponent(confirmationId)}/approve`,
+      {
+        method: "POST",
+        headers: JSON_HEADERS,
+        body: JSON.stringify({
+          ...(options.timeoutMs === undefined ? {} : { timeout_ms: options.timeoutMs }),
+          ...(options.maxOutputBytes === undefined ? {} : { max_output_bytes: options.maxOutputBytes }),
+        }),
+      },
+    );
+  },
+
+  /** POST /v1/sessions/:id/exec/revert：撤销最近一次（或指定）快照 */
+  revertExec(base: string, sessionId: string, snapshotId?: string): Promise<ExecRevertResponse> {
+    return request<ExecRevertResponse>(base, `/v1/sessions/${encodeURIComponent(sessionId)}/exec/revert`, {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify(snapshotId === undefined ? {} : { snapshot_id: snapshotId }),
+    });
+  },
+
+  // --- MCP Server 管理（票 M7-B-T2 / Issue #71）-----------------------------------
+
+  /** GET /v1/mcp/templates：模板（仅预填；服务端明确 installs_on_select=false） */
+  listMcpTemplates(base: string): Promise<{ templates: McpTemplateView[]; installs_on_select: boolean }> {
+    return request(base, "/v1/mcp/templates");
+  },
+
+  /** GET /v1/mcp/risk-notice：风险文案（单源在服务端，UI 不另写一份） */
+  getMcpRiskNotice(base: string): Promise<{ risk_notice: string; requires_explicit_acknowledgment: boolean }> {
+    return request(base, "/v1/mcp/risk-notice");
+  },
+
+  /**
+   * POST /v1/mcp/preview：解析预览（**无副作用**）。
+   * 安装页要在勾选风险确认之前就能展示"将要执行什么"，所以预览是独立端点。
+   */
+  previewMcp(base: string, config: string, displayName?: string): Promise<McpPreviewResponse> {
+    return request<McpPreviewResponse>(base, "/v1/mcp/preview", {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ config, ...(displayName === undefined ? {} : { display_name: displayName }) }),
+    });
+  },
+
+  /** GET /v1/mcp/servers：已安装列表（来源/状态/权限/健康） */
+  listMcpServers(base: string): Promise<{ servers: McpServerRowView[] }> {
+    return request(base, "/v1/mcp/servers");
+  },
+
+  /** POST /v1/mcp/servers：安装（服务端要求 risk_acknowledged === true） */
+  installMcpServer(
+    base: string,
+    input: { config: string; displayName?: string; source?: string },
+  ): Promise<{ servers: McpServerRowView[]; warnings: string[]; event_ids: string[]; enabled: boolean }> {
+    return request(base, "/v1/mcp/servers", {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify({
+        config: input.config,
+        risk_acknowledged: true,
+        ...(input.displayName === undefined ? {} : { display_name: input.displayName }),
+        ...(input.source === undefined ? {} : { source: input.source }),
+      }),
+    });
+  },
+
+  /** POST /v1/mcp/servers/:id/enable：启用（启动进程 + 探测 + 注册工具） */
+  enableMcpServer(base: string, serverId: string): Promise<{ ok: boolean; server: McpServerRowView }> {
+    return request(base, `/v1/mcp/servers/${encodeURIComponent(serverId)}/enable`, {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify({}),
+    });
+  },
+
+  /** POST /v1/mcp/servers/:id/disable：停用（关进程 + 禁用工具） */
+  disableMcpServer(base: string, serverId: string): Promise<{ server: McpServerRowView }> {
+    return request(base, `/v1/mcp/servers/${encodeURIComponent(serverId)}/disable`, {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify({}),
+    });
+  },
+
+  /** DELETE /v1/mcp/servers/:id：卸载（先停再删配置；审计保留） */
+  removeMcpServer(base: string, serverId: string): Promise<{ removed: boolean; event_id: string | null }> {
+    return request(base, `/v1/mcp/servers/${encodeURIComponent(serverId)}`, { method: "DELETE" });
+  },
+
+  /** PUT /v1/mcp/servers/:id/grants：更新该 server 的五维权限 */
+  updateMcpServerGrants(
+    base: string,
+    serverId: string,
+    grants: Record<string, string[]>,
+  ): Promise<{ server: McpServerRowView; event_id: string }> {
+    return request(base, `/v1/mcp/servers/${encodeURIComponent(serverId)}/grants`, {
+      method: "PUT",
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ grants }),
+    });
+  },
+
+  // --- 智能安装（票 M7-B-T4 / Issue #72）----------------------------------------
+
+  /** GET /v1/skill-install/config：抓取策略（公网开关/上限/阻断网段） */
+  getSkillInstallConfig(base: string): Promise<SkillInstallConfig> {
+    return request<SkillInstallConfig>(base, "/v1/skill-install/config");
+  },
+
+  /** POST /v1/skill-install/propose：由文档生成提案（**不落地**） */
+  proposeSkillInstall(
+    base: string,
+    input: { sourceKind: "upload" | "paste" | "url"; text?: string; url?: string; fileName?: string },
+  ): Promise<{ proposal: SkillInstallProposal; doc_fetch: SkillDocFetch | null; materialized: boolean }> {
+    return request(base, "/v1/skill-install/propose", {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify({
+        source_kind: input.sourceKind,
+        ...(input.text === undefined ? {} : { text: input.text }),
+        ...(input.url === undefined ? {} : { url: input.url }),
+        ...(input.fileName === undefined ? {} : { file_name: input.fileName }),
+      }),
+    });
+  },
+
+  /** GET /v1/skill-install/proposals：提案列表（可按状态过滤） */
+  listSkillInstallProposals(base: string, status?: string): Promise<{ proposals: SkillInstallProposal[] }> {
+    const query = status === undefined ? "" : `?status=${encodeURIComponent(status)}`;
+    return request(base, `/v1/skill-install/proposals${query}`);
+  },
+
+  /** GET /v1/skill-install/proposals/:id：提案详情（含权限清单与示例调用） */
+  getSkillInstallProposal(
+    base: string,
+    proposalId: string,
+  ): Promise<{ proposal: SkillInstallProposal; materialized: boolean }> {
+    return request(base, `/v1/skill-install/proposals/${encodeURIComponent(proposalId)}`);
+  },
+
+  /** POST /v1/skill-install/proposals/:id/confirm：确认并落地 */
+  confirmSkillInstallProposal(
+    base: string,
+    proposalId: string,
+  ): Promise<{
+    proposal: SkillInstallProposal;
+    materialized: boolean;
+    materialized_as: { kind: "skill" | "factory_request"; id: string } | null;
+    error_message?: string;
+  }> {
+    return request(base, `/v1/skill-install/proposals/${encodeURIComponent(proposalId)}/confirm`, {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify({}),
+    });
+  },
+
+  // --- Skill 包（票 M7-B-T3 补齐：npm 安装/升级/卸载）-----------------------------
+
+  /** GET /v1/skills/packages：已安装技能包列表 */
+  listSkillPackages(base: string): Promise<{ packages: SkillPackageRowView[] }> {
+    return request(base, "/v1/skills/packages");
+  },
+
+  /** POST /v1/skills/packages/install：npm 安装（服务端强制 --ignore-scripts） */
+  installSkillPackage(base: string, spec: string): Promise<{ package: SkillPackageRowView; ignored_scripts: boolean }> {
+    return request(base, "/v1/skills/packages/install", {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ spec }),
+    });
+  },
+
+  /**
+   * POST /v1/skills/packages/:name/upgrade：升级。
+   * 不带 confirm → 202 返回 diff（**不安装**）；带 confirm 才装。
+   */
+  upgradeSkillPackage(
+    base: string,
+    packageName: string,
+    input: { spec?: string; confirm?: boolean; acceptPermissionWidening?: boolean } = {},
+  ): Promise<SkillPackageUpgradePreview | { package: SkillPackageRowView }> {
+    return request(base, `/v1/skills/packages/${encodeURIComponent(packageName)}/upgrade`, {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify({
+        ...(input.spec === undefined ? {} : { spec: input.spec }),
+        confirm: input.confirm === true,
+        accept_permission_widening: input.acceptPermissionWidening === true,
+      }),
+    });
+  },
+
+  /** DELETE /v1/skills/packages/:name：卸载（删目录 + 禁用能力；审计保留） */
+  uninstallSkillPackage(
+    base: string,
+    packageName: string,
+  ): Promise<{ removed: boolean; capability_disabled: boolean }> {
+    return request(base, `/v1/skills/packages/${encodeURIComponent(packageName)}`, { method: "DELETE" });
+  },
+
+  /** POST /v1/skill-install/proposals/:id/reject：拒绝提案 */
+  rejectSkillInstallProposal(
+    base: string,
+    proposalId: string,
+    reason?: string,
+  ): Promise<{ proposal: SkillInstallProposal }> {
+    return request(base, `/v1/skill-install/proposals/${encodeURIComponent(proposalId)}/reject`, {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify(reason === undefined ? {} : { reason }),
+    });
+  },
 };
+
+// --- MCP 响应类型（与 runtime 的 mcp/routes.ts 同源形状）----------------------------
+
+export interface McpTemplateView {
+  id: string;
+  label: string;
+  description: string;
+  command: string;
+  args: string[];
+  notes: string;
+  /** 完整未截断的启动命令 */
+  launch_command: string;
+}
+
+export interface McpPreviewResponse {
+  servers: Array<{
+    display_name: string;
+    command: string;
+    args: string[];
+    env_keys: string[];
+    cwd: string | null;
+    source: string;
+    launch_command: string;
+    tokens: string[];
+  }>;
+  warnings: string[];
+  installed: boolean;
+}
+
+export interface McpServerRowView {
+  server_id: string;
+  display_name: string;
+  source: string;
+  launch_command: string;
+  command: string;
+  args: string[];
+  env_keys: string[];
+  cwd: string | null;
+  enabled: boolean;
+  status: string;
+  grants: Record<string, string[]>;
+  health: {
+    state: string;
+    last_error: string | null;
+    restarts: number;
+    generation: string | null;
+    protocol_version: string | null;
+    server_name: string | null;
+    server_version: string | null;
+    unsupported_capabilities: string[];
+    tools_count: number;
+  };
+  risk_acknowledged: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+// --- 动态 bash 响应类型（与 runtime 的 exec/routes.ts 同源形状）---------------------
+
+export type ExecMode = "confirm_each" | "full_access";
+
+export interface ExecModeState {
+  session_id: string;
+  mode: ExecMode;
+  default_mode: ExecMode;
+  readonly_confirmed: boolean;
+  persisted: boolean;
+  snapshot_scope_notice: string;
+  limits: { timeout_ms: number; max_timeout_ms: number; max_output_bytes: number };
+}
+
+export interface ExecDangerHit {
+  id: string;
+  level: string;
+  reason: string;
+}
+
+export interface ExecDeniedResponse {
+  status: "denied";
+  session_id: string;
+  mode: ExecMode;
+  hits: ExecDangerHit[];
+  decision: "deny";
+}
+
+export interface ExecNeedsConfirmationResponse {
+  status: "needs_confirmation";
+  session_id: string;
+  mode: ExecMode;
+  confirmation_id: string;
+  /** 完整未截断脚本 */
+  script: string;
+  why: string;
+  expires_at: string;
+  readonly: boolean;
+}
+
+export interface ExecResultView {
+  ok: boolean;
+  exit_code: number;
+  timed_out: boolean;
+  truncated: boolean;
+  stdout: string;
+  stderr: string;
+  duration_ms: number;
+  engine: string;
+  image: string;
+  container: string;
+  error_code?: string;
+  error?: string;
+}
+
+export interface ExecExecutedResponse {
+  status: "executed";
+  session_id: string;
+  mode: ExecMode;
+  /** null = 会话未绑定工作区（无可保护对象），不是"快照失败" */
+  snapshot_id: string | null;
+  snapshot_strategy: "git" | "copy" | null;
+  scope_notice: string;
+  result: ExecResultView;
+  event_id: string;
+  sequence: number;
+}
+
+export type ExecSubmitResponse = ExecDeniedResponse | ExecNeedsConfirmationResponse | ExecExecutedResponse;
+
+export interface ExecConfirmationDetail {
+  confirmation_id: string;
+  session_id: string;
+  script: string;
+  mode: ExecMode;
+  readonly: boolean;
+  created_at: string;
+  expires_at: string;
+}
+
+export interface ExecRevertResponse {
+  session_id: string;
+  snapshot_id: string;
+  strategy: "git" | "copy";
+  restored: number;
+  removed: number;
+  scope_notice: string;
+  event_id: string;
+  sequence: number;
+}
+
+// --- 智能安装响应类型（与 runtime 的 proposal-routes.ts 同源形状）------------------
+
+export interface SkillInstallConfig {
+  https_only: boolean;
+  allow_public_network: boolean;
+  max_bytes: number;
+  timeout_ms: number;
+  blocked_ranges: string[];
+  proposes_only: boolean;
+}
+
+export interface SkillDocFetch {
+  ok: boolean;
+  url: string;
+  host: string;
+  bytes?: number;
+  content_type?: string;
+  addresses?: string[];
+  code?: string;
+  message?: string;
+  duration_ms: number;
+}
+
+export interface SkillInstallProposal {
+  proposal_id: string;
+  source_kind: "upload" | "paste" | "url";
+  source_ref: string;
+  source_bytes: number;
+  name: string;
+  title: string;
+  description: string;
+  capabilities: Array<{ capability: string; purpose: string; example_args?: Record<string, unknown> }>;
+  new_tools: Array<{
+    suggested_name: string;
+    description: string;
+    permissions: Record<string, string[]>;
+    rationale: string;
+  }>;
+  permissions: Record<string, string[]>;
+  examples: Array<{ request: string; expected: string }>;
+  uncertainties: string[];
+  status: string;
+  created_at: string;
+  updated_at: string;
+  materialized_as: { kind: "skill" | "factory_request"; id: string } | null;
+  error: string | null;
+}
+
+// --- Skill 包响应类型（与 runtime 的 package-service.ts 同源形状）-------------------
+
+export interface SkillPackageRowView {
+  package_name: string;
+  spec: string;
+  version: string;
+  source_hash: string;
+  package_dir: string;
+  capability: string;
+  has_entry: boolean;
+  permissions: Record<string, string[]>;
+  status: string;
+  installed_at: string;
+  updated_at: string;
+}
+
+export interface SkillPackageUpgradePreview {
+  package_name: string;
+  from_version: string;
+  to_version: string;
+  diff: {
+    added: Array<{ dimension: string; value: string }>;
+    removed: Array<{ dimension: string; value: string }>;
+    unchanged: Array<{ dimension: string; value: string }>;
+    widens: boolean;
+  };
+  requires_confirmation: boolean;
+  requires_permission_widening_acceptance: boolean;
+}

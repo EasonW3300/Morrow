@@ -14,6 +14,15 @@ import { describeSendError, type SendErrorView } from "./chat-ui.ts";
 import { addAttachmentPaths, attachmentLabel } from "./workspace-ui.ts";
 import { Badge } from "./design-system/primitives/Badge.tsx";
 import { Button } from "./design-system/primitives/Button.tsx";
+import { CommandPalette } from "./CommandPalette.tsx";
+import {
+  initialPaletteState,
+  paletteReducer,
+  parseAction,
+  visibleEntries,
+  type PaletteEntry,
+  type PaletteSkill,
+} from "./command-palette.ts";
 import { GlassSurface } from "./design-system/primitives/GlassSurface.tsx";
 
 /**
@@ -48,11 +57,13 @@ export function ChatView({
   sessionId,
   onOpenTask,
   onOpenSettings,
+  onOpenMemory,
 }: {
   base: string;
   sessionId: string;
   onOpenTask?: (taskId: string) => void;
   onOpenSettings?: () => void;
+  onOpenMemory?: () => void;
 }) {
   const [state, setState] = useState<ChatState>(emptyChatState());
   const [streamError, setStreamError] = useState<SendErrorView | null>(null);
@@ -64,6 +75,10 @@ export function ChatView({
   const [attachmentPath, setAttachmentPath] = useState("");
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const [attachmentBusy, setAttachmentBusy] = useState(false);
+  // `/` 命令面板（M7-B-T5）：状态与判定都在 command-palette.ts（可单测）
+  const [palette, setPalette] = useState(initialPaletteState);
+  const [paletteSkills] = useState<PaletteSkill[]>([]);
+  const [notice, setNotice] = useState<string | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -180,6 +195,33 @@ export function ChatView({
     }
   };
 
+  /** `/` 面板确认：待实现命令给提示、其余落到具体动作 */
+  const runPaletteEntry = (entry: PaletteEntry) => {
+    setPalette(initialPaletteState);
+    setDraft("");
+    if (entry.pending) {
+      setNotice(`${entry.label} 即将支持（M7-C），当前版本尚未实现。`);
+      return;
+    }
+    if (entry.kind === "skill") {
+      setNotice(`技能 ${entry.label} 的显式调用将在 M7-B 后续票接入。`);
+      return;
+    }
+    // 命令：复用 parseAction 的同一套语义（避免两处判断漂移）
+    const action = parseAction(`/${entry.id}`);
+    if (action === null) return;
+    if (action.kind === "clear-session") {
+      setState(emptyChatState());
+      setNotice("已清空当前会话的上下文视图（记忆不受影响）。");
+      return;
+    }
+    if (action.kind === "open-memory") {
+      onOpenMemory?.();
+      return;
+    }
+    if (action.kind === "error") setNotice(action.message);
+  };
+
   const send = async () => {
     const text = draft.trim();
     if (text.length === 0 || sending) return;
@@ -284,14 +326,53 @@ export function ChatView({
         </div>
         {attachmentError !== null && <div className="list-error">{attachmentError}</div>}
       </div>
+      {notice !== null && (
+        <div className="palette-notice" role="status">
+          {notice}
+          <button className="palette-notice-close" aria-label="关闭提示" onClick={() => setNotice(null)}>
+            ×
+          </button>
+        </div>
+      )}
+      <CommandPalette
+        state={palette}
+        entries={visibleEntries(palette.query, paletteSkills)}
+        skills={paletteSkills}
+        onConfirm={runPaletteEntry}
+        onMove={(index) => setPalette((previous) => ({ ...previous, index }))}
+        onClose={() => setPalette((previous) => paletteReducer(previous, { type: "close" }))}
+      />
       <GlassSurface className="composer">
         <textarea
           value={draft}
-          placeholder="输入消息，Enter 发送，Shift+Enter 换行"
-          onChange={(event) => setDraft(event.target.value)}
+          placeholder="输入消息，Enter 发送；输入 / 打开命令面板"
+          onChange={(event) => {
+            setDraft(event.target.value);
+            setPalette((previous) => paletteReducer(previous, { type: "input", draft: event.target.value }));
+          }}
           onKeyDown={(event) => {
+            // 面板打开时：上下键与 Esc 交给面板；输入框仍可继续打字过滤
+            if (palette.open && (event.key === "ArrowDown" || event.key === "ArrowUp" || event.key === "Escape")) {
+              event.preventDefault();
+              if (event.key === "Escape") {
+                setPalette((previous) => paletteReducer(previous, { type: "close" }));
+                return;
+              }
+              const offset = event.key === "ArrowDown" ? 1 : -1;
+              const length = visibleEntries(palette.query, paletteSkills).length;
+              setPalette((previous) => paletteReducer(previous, { type: "move", offset, length }));
+              return;
+            }
             if (event.key === "Enter" && !event.shiftKey) {
               event.preventDefault();
+              if (palette.open) {
+                const entries = visibleEntries(palette.query, paletteSkills);
+                const selected = entries[palette.index];
+                if (selected !== undefined) {
+                  runPaletteEntry(selected);
+                  return;
+                }
+              }
               void send();
             }
           }}

@@ -1,6 +1,6 @@
 {
   "name": "@morrow/pi-adapter",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "description": "Pi 内核适配层：冻结接口面 + 事件翻译 + FakePi 测试替身 + 契约测试（ADR-0001）",

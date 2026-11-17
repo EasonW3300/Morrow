@@ -543,6 +543,41 @@ export class SessionManager {
   }
 
   /**
+   * 会话是否**可执行**（票 M7-B-T6 / Issue #70）：存在、未关闭、未软删。
+   *
+   * 与 `sessionExists` 的区别是这把尺子更严：已关闭或已删的会话仍然"存在"，但
+   * 不能再切执行模式、不能再提交脚本。规格要求「关闭会话即失效」，这条判定是
+   * 模式注册表（ExecModeRegistry）与执行服务共用的唯一口径。
+   */
+  isExecutable(sessionId: string): boolean {
+    const folded = this.#foldSession(sessionId);
+    if (folded === null || folded.expired) return false;
+    if (folded.summary.deleted_at !== undefined) return false;
+    return !this.isClosed(sessionId);
+  }
+
+  /**
+   * 执行代际（票 M7-B-T6 / Issue #70）：会话每关闭一次就 +1。
+   *
+   * 存在的理由是一个真实的漏洞：执行模式与只读豁免都是内存态，如果只用
+   * "会话是否开着"作判据，**关闭后再恢复**的会话会重新"开着"，于是继承关闭前
+   * 的豁免——等于给了一个绕过"关闭即失效"的路径。用代际号作身份，恢复后的
+   * 会话是新的一代，旧状态自然失效。
+   */
+  executionEpoch(sessionId: string): number {
+    let epoch = 0;
+    for (const { envelope } of this.#ledger.scan({ sessionId })) {
+      if (
+        envelope.event_type === SESSION_EVENT_TYPES.sessionClosed ||
+        envelope.event_type === SESSION_EVENT_TYPES.sessionEphemeralClosed
+      ) {
+        epoch += 1;
+      }
+    }
+    return epoch;
+  }
+
+  /**
    * 会话工作区（票 M7-A-T4）：折叠最后一次 session.workspace_bound；未绑定返回 null。
    * 列表摘要的 workspace 字段与这里同源（同一折叠逻辑）。
    */

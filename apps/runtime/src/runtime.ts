@@ -83,7 +83,13 @@ import { PLANNER_SYSTEM_PROMPT, TaskError, TaskService, type PlannerFactory } fr
 import { buildEventEnvelope } from "./envelope.ts";
 import { computeIntegrityHash, type EventEnvelope } from "@morrow/protocol";
 import { UUID_RE } from "./uuid-v7.ts";
-import { parsePaging, readJsonBody, sendError, sendJson } from "./http-util.ts";
+import {
+  parsePaging,
+  readJsonBody,
+  readOptionalJsonBody as readOptionalJsonBodyShared,
+  sendError,
+  sendJson,
+} from "./http-util.ts";
 import { sendInvocationError } from "./invocation-errors.ts";
 import { LockTable } from "./locks.ts";
 import { LeaseStore } from "./lease/store.ts";
@@ -97,6 +103,25 @@ import { DockerRunner } from "./sandbox/docker-runner.ts";
 import { ToolInvoker, type InvocationResult } from "./sandbox/invoker.ts";
 import { createRegistryPermissionAdapter, type SandboxPermissionEngine } from "./sandbox/permission.ts";
 import type { SandboxRunner } from "./sandbox/runner.ts";
+import { ExecModeRegistry } from "./exec/mode.ts";
+import { ExecService } from "./exec/service.ts";
+import { execRoutes } from "./exec/routes.ts";
+import { createDefaultExecRunner, type LocalExecRunner } from "./exec/runner.ts";
+import { DefaultSnapshotManager, type SnapshotManager } from "./exec/snapshot.ts";
+import type { GitRunner } from "./workspace.ts";
+import { McpServerStore } from "./mcp/store.ts";
+import { McpServerService } from "./mcp/service.ts";
+import { mcpRoutes } from "./mcp/routes.ts";
+import { createStdioTransport } from "./mcp/stdio-transport.ts";
+import type { McpTransport } from "./mcp/client.ts";
+import { ProposalStore } from "./skills-package/proposal.ts";
+import { InstallProposalService } from "./skills-package/proposal-service.ts";
+import { PiProposalGenerator } from "./skills-package/proposal-generator.ts";
+import { DEFAULT_FETCH_POLICY, proposalRoutes } from "./skills-package/proposal-routes.ts";
+import type { InstallProposal, ProposalGenerator } from "./skills-package/proposal.ts";
+import { DOC_MAX_BYTES, DOC_TIMEOUT_MS, fetchDocument } from "./skills-package/doc-fetch.ts";
+import { SkillPackageStore } from "./skills-package/package-store.ts";
+import { SkillPackageService, skillPackageRoutes } from "./skills-package/package-service.ts";
 
 /**
  * Runtime HTTP 服务（PRD §6.2 的 M0 子集 + M1 任务族 + M2-T1 能力族）。
@@ -181,6 +206,18 @@ interface RequestContext {
   workspace: WorkspaceManager;
   /** 临时会话写入门（票 M7-A-T3 / #64-A4：能力网关、skill invoke、任务创建共用同一判定） */
   ephemeralGate: EphemeralGateDeps;
+  /** 动态 bash（票 M7-B-T6 / Issue #70：模式判定 + 确认 + 快照 + 容器执行 + 审计） */
+  exec: ExecService;
+  /** 执行模式注册表（会话级、不持久化；路由层读 GET /v1/sessions/:id/exec-mode） */
+  execModes: ExecModeRegistry;
+  /** MCP Server 管理（票 M7-B-T2 / Issue #71：安装/启停/授权/健康） */
+  mcp: McpServerService;
+  /** 智能安装提案（票 M7-B-T4 / Issue #72：文档→提案→确认→落地） */
+  proposals: InstallProposalService;
+  /** 文档抓取策略（公网开关/上限；GET /v1/skill-install/config 回传） */
+  proposalFetchPolicy: { allowPublicNetwork: boolean; maxBytes: number; timeoutMs: number };
+  /** Skill 包安装（票 M7-B-T3 补齐：npm 安装/升级 diff/卸载） */
+  skillPackages: SkillPackageService;
 }
 
 type Handler = (
@@ -359,6 +396,55 @@ export interface RuntimeOptions {
    * `gh auth token` 再读 OS 凭据库 `github:pat`。测试注入假实现即可完全隔离真实 git/gh。
    */
   workspaceManager?: WorkspaceManager;
+  /**
+   * 动态 bash 执行接缝（票 M7-B-T6 / Issue #70）：缺省 = ContainerExecRunner（**唯一**
+   * 生产路径，无宿主直跑分支）。测试注入 FakeExecRunner 即可覆盖"完全权限下仍拦截
+   * 危险命令""只读首确认后免确认""关闭会话后模式失效"等全部判定路径，零 docker。
+   */
+  execRunner?: LocalExecRunner;
+  /**
+   * 执行前快照根（票 M7-B-T6）：缺省 `<dataDir>/snapshots`。刻意**不**放在会话
+   * 工作区内——放在工作区里 Agent 能自己删掉"保险单"。
+   */
+  execSnapshotsRoot?: string;
+  /** 快照 git 子进程接缝（测试注入，零真实 git） */
+  execSnapshotGitRunner?: GitRunner;
+  /**
+   * MCP 传输工厂注入 seam（票 M7-B-T2 / Issue #71）：缺省按 server 配置建真实 stdio
+   * 子进程。测试注入假传输即可覆盖全部安装/启停路径（零子进程、零网络）。
+   */
+  mcpTransportFactory?: (record: { command: string; args: string[]; cwd: string | null }) => McpTransport;
+  /**
+   * 智能安装的提案生成器（票 M7-B-T4 / Issue #72）：缺省 = Provider 一次 prompt。
+   * 测试注入脚本化生成器即可零网络覆盖四道门。
+   */
+  proposalGenerator?: ProposalGenerator;
+  /**
+   * 是否允许文档抓取访问公网（默认 **false**：只允许内网/私有网络文档）。
+   * 对应 FR-B11 的「公网需显式开启"允许文档抓取出网"」。
+   */
+  allowPublicDocFetch?: boolean;
+  /**
+   * 文档抓取接缝（票 M7-B-T4 / Issue #72）：缺省 = fetchDocument（真实 HTTPS + DNS 校验）。
+   * 测试注入假抓取即可覆盖"抓取→提案"编排，零网络、零 DNS。
+   */
+  skillInstallFetch?: (url: string) => Promise<import("./skills-package/doc-fetch.ts").DocFetchResult>;
+  /**
+   * Skill 包安装接缝（票 M7-B-T3 补齐）：缺省 = installSkillPackage（真实 npm，强制
+   * `--ignore-scripts`）。测试注入假实现即可覆盖安装/升级/卸载全流程，零 npm。
+   */
+  /**
+   * MCP 空闲回收轮询间隔（毫秒，默认 60s）：FR-B4「空闲 10min 退出」的驱动器。
+   * 0 = 不启动定时器（测试手动调 reclaimIdle，避免时序不确定）。
+   */
+  mcpReclaimIntervalMs?: number;
+  /** MCP 空闲阈值（毫秒，默认 10min）。测试注入短值验证回收；生产保持规格值。 */
+  mcpIdleTimeoutMs?: number;
+  skillPackageInstall?: (options: {
+    spec: string;
+    targetDir: string;
+    packageDir: string;
+  }) => Promise<import("./skills-package/installer.ts").InstalledSkillPackage>;
 }
 
 export interface RuntimeHandle {
@@ -419,6 +505,16 @@ export interface RuntimeHandle {
   outbox: OutboxService;
   /** 通知规则与路由（M4-T7 / Issue #44：handleEnvelope/flushDue/dispatchQueued，库形态可直用） */
   notifications: NotificationService;
+  /** 动态 bash 执行服务（M7-B-T6 / Issue #70：submit/approve/revert/setMode，库形态可直用） */
+  exec: ExecService;
+  /** 执行模式注册表（会话级内存态；诊断用：size 证明关闭会话后释放） */
+  execModes: ExecModeRegistry;
+  /** MCP Server 管理（库形态可直用：install/enable/disable/remove/updateGrants） */
+  mcp: McpServerService;
+  /** 智能安装提案（库形态可直用：propose/confirm/reject/list） */
+  proposals: InstallProposalService;
+  /** Skill 包（库形态可直用：install/upgrade/uninstall/list） */
+  skillPackages: SkillPackageService;
   /**
    * 优雅停止：停止接收请求 → 中止并释放会话运行时与在跑任务节点 → 记账 runtime.stopped
    * → 关闭任务投影库与账本（WAL checkpoint）。signal 传入收到的 POSIX 信号名，
@@ -509,6 +605,56 @@ const routes: Route[] = [
   })),
   ...contactRoutes,
   ...channelRoutes,
+  // Skill 包安装（票 M7-B-T3 补齐）：/v1/skills/packages*（npm 安装/升级 diff/卸载）
+  ...skillPackageRoutes.map((route) => ({
+    method: route.method,
+    re: route.re,
+    handler: (req: IncomingMessage, res: ServerResponse, url: URL, ctx: RequestContext, params: string[]) =>
+      route.handler(req, res, url, { packages: ctx.skillPackages }, params),
+  })),
+  // 智能安装（票 M7-B-T4 / Issue #72）：/v1/skill-install/*（与 M2-T5 的案例晋升分路径族）
+  ...proposalRoutes.map((route) => ({
+    method: route.method,
+    re: route.re,
+    handler: (req: IncomingMessage, res: ServerResponse, url: URL, ctx: RequestContext, params: string[]) =>
+      route.handler(
+        req,
+        res,
+        url,
+        {
+          proposals: ctx.proposals,
+          fetchPolicy: ctx.proposalFetchPolicy,
+        },
+        params,
+      ),
+  })),
+  // MCP Server 管理（票 M7-B-T2 / Issue #71）：模板/预览（无副作用）/安装/启停/授权/卸载
+  ...mcpRoutes.map((route) => ({
+    method: route.method,
+    re: route.re,
+    handler: (req: IncomingMessage, res: ServerResponse, url: URL, ctx: RequestContext, params: string[]) =>
+      route.handler(req, res, url, { mcp: ctx.mcp }, params),
+  })),
+  // 动态 bash（票 M7-B-T6 / Issue #70）：会话级执行模式 + 脚本提交/确认/撤销。
+  // execRoutes 桥接到 exec 自有路由签名（ctx.exec / ctx.execModes 在请求时取）。
+  ...execRoutes.map((route) => ({
+    method: route.method,
+    re: route.re,
+    handler: (req: IncomingMessage, res: ServerResponse, url: URL, ctx: RequestContext, params: string[]) =>
+      route.handler(
+        req,
+        res,
+        url,
+        {
+          exec: ctx.exec,
+          modes: ctx.execModes,
+          // 与 ExecService 同一判定口径：存在 + 未关闭 + 未删
+          isSessionExecutable: (sessionId) => isSessionExecutable(ctx, sessionId),
+          sessionExists: (sessionId) => ctx.sessions.sessionExists(sessionId),
+        },
+        params,
+      ),
+  })),
   // 能力调用端点（#22 修复批 / FR-CAP-5）：POST /v1/capabilities/:id/invoke（body = 工具
   // input）——经 ToolInvoker 统一执行链（权限复核在链上），builtin 进程内直呼、sandboxed
   // 走容器；capability.used 审计先落账本后返回。与既有生命周期路由无路径/方法冲突。
@@ -639,6 +785,11 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
   // 审计事件落账本后回调——把 ToolInvoker 注册表与能力注册表保持同相（disable 即从
   // 调用接缝摘除、enable/rollback 重新登记）。syncInvoker 晚绑定（sandbox 在其后构建）。
   let syncInvoker: ((event: CapabilityLifecycleEvent) => void) | undefined;
+  // MCP 服务晚绑定：`registerCapabilityIntoInvoker`（下方）需要分派 MCP 工具调用，
+  // 而 McpServerService 依赖 capabilities/sandbox，构造顺序在它之后。
+  let mcpDispatch: ((serverId: string, toolName: string, input: unknown) => Promise<
+    { ok: boolean; text: string; error?: string }
+  >) | null = null;
   const capabilities = new PermissionEngine({
     dataDir: config.dataDir,
     ledger,
@@ -762,7 +913,8 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
   //   其余（无实现的 human 注册、无构建产物追踪的 go 注册）→ 跳过并告警（invoke 404，不静默假装可调）。
   const registerCapabilityIntoInvoker = (record: CapabilityRecord): void => {
     if (record.status !== "enabled") {
-      sandbox.unregister(record.name);
+      // 停用的能力**保持**已注册的执行体：invoke 时由权限层以 capability_disabled
+      // 拒绝，而不是在这里摘除后让调用方看到 unknown_tool。只有"启用"才需要重新登记。
       return;
     }
     const manifest = record.manifest;
@@ -786,6 +938,38 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
           return outcome.isError
             ? { ok: false, error: outcome.text }
             : { ok: true, result: { text: outcome.text } };
+        },
+      });
+      return;
+    }
+    // MCP 工具（票 M7-B-T1 的注册 + 票 M7-B-T2 的启用）：name 形如 mcp.<server>.<tool>。
+    // 没有这个分支时它们会落到最后一句 "no executable implementation wired" 被
+    // unregister——注册表里 enabled、调用报 unknown_tool（本阶段 code-review 抓到的真缺陷）。
+    if (manifest.sandbox.type === "process" && manifest.name.startsWith("mcp.")) {
+      const { serverId, toolName } = parseMcpCapabilityName(manifest.name);
+      if (serverId === null || toolName === null) {
+        console.warn(`[morrow] MCP capability "${manifest.name}" has an unparseable name; invoke reports unknown_tool`);
+        sandbox.unregister(record.name);
+        return;
+      }
+      sandbox.register({
+        manifest: {
+          name: manifest.name,
+          version: manifest.version,
+          author: manifest.author,
+          runtime: manifest.runtime,
+          permissions: manifest.permissions,
+          sandbox: { type: "process", network: "none", filesystem: "none" },
+        },
+        package: { name: manifest.name, kind: "typescript" },
+        inProcess: async (input) => {
+          if (mcpDispatch === null) {
+            return { ok: false, error: `MCP runtime not ready; cannot call ${record.name}` };
+          }
+          const outcome = await mcpDispatch(serverId, toolName, input);
+          return outcome.ok
+            ? { ok: true, result: { text: outcome.text } }
+            : { ok: false, error: outcome.error ?? "MCP tool call failed" };
         },
       });
       return;
@@ -820,7 +1004,14 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
   };
   syncInvoker = (event: CapabilityLifecycleEvent) => {
     if (event.eventType === CAPABILITY_EVENT_TYPES.disabled) {
-      sandbox.unregister(event.record.name);
+      // **保留**注册（而不是 unregister）——这是刻意的语义修正：
+      // `ToolInvoker.invoke` 先按名字查表，查不到就抛 `unknown_tool`，会把"已停用"
+      // 误报成"不存在"，让 Owner 以为能力被删了。保留注册后执行链会走到权限复核，
+      // 由 `assertRuntimeUse` 以 `capability_disabled` 拒绝——语义准确，且执行体
+      // （inProcess / runner）绝不会被调用（权限复核先于分发）。
+      //
+      // 只处理"曾经登记过"的条目：从未登记的能力没有执行体，保留一个空壳只会让
+      // 调用链走到底再报错，反而更难诊断。
       return;
     }
     registerCapabilityIntoInvoker(event.record);
@@ -1025,6 +1216,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
   // 触发；0 = 关闭（测试手动 dispatchOnce）。在 channels.start() 之后启动。
   const outboxDrainIntervalMs = options.outboxDrainIntervalMs ?? 1_000;
   let outboxTimer: NodeJS.Timeout | null = null;
+  let mcpReclaimTimer: NodeJS.Timeout | null = null;
   if (notificationDrainIntervalMs > 0) {
     notificationTimer = setInterval(() => {
       void notifications.drain().catch((err: unknown) => {
@@ -1103,6 +1295,92 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     memorySearch: (query) => memory.search(query).map((hit) => ({ content: hit.content, entry_kind: hit.stage })),
     workspaceRoot,
   });
+  // 动态 bash（票 M7-B-T6 / Issue #70）：执行模式是**会话级内存态**（不持久化，
+  // 关闭会话/进程重启即失效），所以权威状态在 ExecModeRegistry 而不是账本；
+  // 账本只留 exec.mode_changed 之类的审计痕迹。Runner 缺省 = 容器，无宿主直跑分支。
+  const execRunnerInstance: LocalExecRunner = options.execRunner ?? createDefaultExecRunner();
+  const execSnapshots: SnapshotManager = new DefaultSnapshotManager({
+    snapshotsRoot: options.execSnapshotsRoot ?? join(config.dataDir, "snapshots"),
+    ...(options.execSnapshotGitRunner === undefined ? {} : { gitRunner: options.execSnapshotGitRunner }),
+  });
+  const execModes = new ExecModeRegistry({
+    isOpen: (sessionId) => sessions.isExecutable(sessionId),
+    // 代际号：关闭一次 +1，防止"关闭→恢复"继承关闭前的完全权限/只读豁免
+    epoch: (sessionId) => sessions.executionEpoch(sessionId),
+  });
+  const exec = new ExecService({
+    ledger,
+    replicaId: config.replicaId,
+    modes: execModes,
+    runner: execRunnerInstance,
+    snapshots: execSnapshots,
+    isSessionExecutable: (sessionId) => sessions.isExecutable(sessionId),
+    workspaceOf: (sessionId) => {
+      const workspace = sessions.workspaceOf(sessionId);
+      return workspace === null ? null : { path: workspace.path };
+    },
+  });
+  // MCP Server 管理（票 M7-B-T2 / Issue #71）：配置投影与账本同库；工具注册走
+  // 同一个 PermissionEngine（五维权限默认全空——启用 server ≠ 授予权限）。
+  // 传输缺省是真实 stdio 子进程；测试注入假传输即可完全离线。
+  const mcpStore = new McpServerStore({ dataDir: config.dataDir });
+  const mcp = new McpServerService({
+    store: mcpStore,
+    ledger,
+    replicaId: config.replicaId,
+    capabilities,
+    transportFactory:
+      options.mcpTransportFactory ??
+      ((record) =>
+        createStdioTransport({
+          command: record.command,
+          args: record.args,
+          ...(record.cwd === null ? {} : { cwd: record.cwd }),
+        })),
+    ...(options.mcpIdleTimeoutMs === undefined ? {} : { idleTimeoutMs: options.mcpIdleTimeoutMs }),
+  });
+  // 晚绑定接线：ToolInvoker 的 MCP 分派在此刻才可用
+  mcpDispatch = (serverId, toolName, input) => mcp.callTool(serverId, toolName, input);
+  // 智能安装（票 M7-B-T4 / Issue #72）：文档 → 提案 → 预览 → 确认 → 落地。
+  // 关键在于「未确认不落地」：propose 只写 status=pending 的提案行，confirm 才调用
+  // materialize。落地分派沿用既有闭环——纯组合 → SkillService（声明式 steps，无代码）；
+  // 需要新工具 → CapabilityFactory（生成→沙箱验证→Owner 确认→注册）。
+  // Skill 包安装（票 M7-B-T3 的 HTTP 面补齐）：FR-B7（npm 源）与 FR-B10（升级 diff/卸载）
+  const skillPackageStore = new SkillPackageStore({ dataDir: config.dataDir });
+  const skillPackages = new SkillPackageService({
+    store: skillPackageStore,
+    ledger,
+    replicaId: config.replicaId,
+    capabilities,
+    packagesRoot: join(config.dataDir, "skill-packages"),
+    ...(options.skillPackageInstall === undefined ? {} : { install: options.skillPackageInstall }),
+  });
+  const proposalStore = new ProposalStore({ dataDir: config.dataDir });
+  const proposals = new InstallProposalService({
+    store: proposalStore,
+    ledger,
+    replicaId: config.replicaId,
+    generator:
+      options.proposalGenerator ??
+      new PiProposalGenerator({ runtimeFactory: defaultFactoryRuntimeFactory(providers) }),
+    existingCapabilities: () =>
+      capabilities.list().map((record) => ({
+        name: record.name,
+        description:
+          typeof record.manifest.input_schema === "object"
+            ? null
+            : null,
+      })),
+    grants: () => capabilities.getGrants(),
+    materialize: (proposal) => materializeProposal(proposal, { skills, factory }),
+    fetchOptions: {
+      allowPublicNetwork: options.allowPublicDocFetch === true,
+      maxBytes: DOC_MAX_BYTES,
+      timeoutMs: DOC_TIMEOUT_MS,
+    },
+    ...(options.skillInstallFetch === undefined ? {} : { fetchDocument: options.skillInstallFetch }),
+  });
+
   const ctx: RequestContext = {
     ledger,
     replicaId: config.replicaId,
@@ -1128,6 +1406,16 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     outbox,
     notifications,
     workspace: workspaceManager,
+    exec,
+    execModes,
+    mcp,
+    proposals,
+    skillPackages,
+    proposalFetchPolicy: {
+      allowPublicNetwork: options.allowPublicDocFetch === true,
+      maxBytes: DOC_MAX_BYTES,
+      timeoutMs: DOC_TIMEOUT_MS,
+    },
     // 临时会话写入门（#64-A4）：能力网关 / skill invoke / 任务创建共用同一判定函数。
     ephemeralGate: {
       sessionKind: (sessionId) => sessions.sessionKind(sessionId),
@@ -1147,8 +1435,11 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
   } catch (err) {
     if (notificationTimer !== null) clearInterval(notificationTimer);
     if (outboxTimer !== null) clearInterval(outboxTimer);
+    if (mcpReclaimTimer !== null) clearInterval(mcpReclaimTimer);
     unsubscribeNotifications();
     notifications.close();
+    proposalStore.close();
+    skillPackageStore.close();
     skills.close();
     factory.close();
     tasks.close();
@@ -1193,6 +1484,18 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
       });
     }, outboxDrainIntervalMs);
     if (typeof outboxTimer.unref === "function") outboxTimer.unref();
+  }
+  // MCP 空闲回收（FR-B4「空闲 10min 退出」）：`McpClient.reclaimIdle` 早就写好了，
+  // 但此前**没有任何调用点**——等于生产上永不回收，进程会一直挂着。这里补上驱动器。
+  // 默认 60s 轮询：空闲阈值是 10min，轮询粒度不需要更细。
+  const mcpReclaimIntervalMs = options.mcpReclaimIntervalMs ?? 60_000;
+  if (mcpReclaimIntervalMs > 0) {
+    mcpReclaimTimer = setInterval(() => {
+      void mcp.reclaimIdle().catch((err: unknown) => {
+        console.error("[morrow] mcp idle reclaim failed:", err);
+      });
+    }, mcpReclaimIntervalMs);
+    if (typeof mcpReclaimTimer.unref === "function") mcpReclaimTimer.unref();
   }
   // 调用接缝初始登记（#22 修复批 / FR-CAP-5）：把注册表里全部 enabled 能力登记进
   // ToolInvoker（本进程新建的经 onLifecycle 已登记；这里覆盖重启场景——历史行不重放
@@ -1240,6 +1543,11 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     contacts,
     outbox,
     notifications,
+    exec,
+    execModes,
+    mcp,
+    proposals,
+    skillPackages,
     async close(signal?: string): Promise<void> {
       if (closing) return;
       closing = true;
@@ -1251,7 +1559,13 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
         clearInterval(outboxTimer);
         outboxTimer = null;
       }
+      if (mcpReclaimTimer !== null) {
+        clearInterval(mcpReclaimTimer);
+        mcpReclaimTimer = null;
+      }
       unsubscribeNotifications();
+      // MCP 子进程必须在关账本前关掉：它们是宿主进程，泄漏会跨进程存活
+      await mcp.close().catch(() => undefined);
       server.closeAllConnections();
       await new Promise<void>((resolve) => server.close(() => resolve()));
       // 会话运行先收尾（中止在跑的轮次并释放 AgentRuntime），再记账、再关库
@@ -1459,6 +1773,79 @@ function handleAsyncError(res: ServerResponse, err: unknown): void {
   } else {
     res.end();
   }
+}
+
+/**
+ * 会话可执行判定（票 M7-B-T6 / Issue #70 的单一口径）。
+ *
+ * 路由层的 404/409 区分与 ExecService / ExecModeRegistry 的判定必须同源，
+ * 否则会出现"路由 409 但服务仍在跑脚本"这类自相矛盾的状态。实现委托给
+ * SessionManager.isExecutable（存在 + 未关闭 + 未软删 + 未过期）。
+ */
+
+/**
+ * 提案落地的分派（票 M7-B-T4 / Issue #72 的第四道门）。
+ *
+ * 两条路径都可能被判为"需要新建工具"，规则写死在这里而不是让 LLM 决定归途：
+ *   - `new_tools` 非空 → 交给 **CapabilityFactory**（生成 → 沙箱验证 → Owner 确认 →
+ *     注册）。这就是规格要求的「若是，走 Tool Factory 而非直接注册」：提案里不产码，
+ *     代码必须在工厂的验证闭环里产生。
+ *   - 否则 → 用 **SkillService** 建声明式 skill（steps 只引用已注册 capability，
+ *     不含代码）。
+ *
+ * 注意：工厂是 fire-and-forget 的（`submitRequest` 立即返回 requestId），所以这里
+ * 如实把 kind=factory_request 记成落地产物——"已提交"不等于"已注册成能力"，
+ * Owner 还要在工厂流程里再确认一次。
+ */
+async function materializeProposal(
+  proposal: InstallProposal,
+  deps: {
+    skills: SkillService;
+    factory: CapabilityFactory;
+  },
+): Promise<{ kind: "skill" | "factory_request"; id: string }> {
+  if (proposal.new_tools.length > 0) {
+    const description = [
+      proposal.title,
+      proposal.description,
+      "",
+      "Required new tools:",
+      ...proposal.new_tools.map(
+        (tool) => `- ${tool.suggested_name}: ${tool.description} (rationale: ${tool.rationale})`,
+      ),
+      "",
+      `Requested permissions: ${JSON.stringify(proposal.permissions)}`,
+    ].join("\n");
+    const { requestId } = deps.factory.submitRequest(description);
+    return { kind: "factory_request", id: requestId };
+  }
+
+  const created = deps.skills.propose({
+    name: proposal.name,
+    title: proposal.title,
+    description: proposal.description,
+    // 声明式组合：参数映射留空表示透传（提案阶段不臆造参数绑定）
+    steps: proposal.capabilities.map((ref) => ({ capability_id: ref.capability, arg_mapping: {} })),
+    actorId: "owner",
+  });
+  return { kind: "skill", id: created.skill_id };
+}
+
+/**
+ * 解析 MCP capability 名（`mcp.<serverId>.<toolName>`）。
+ *
+ * 与 `mcpCapabilityName` 的合成规则互为逆运算。注意 serverId 自身可能含点号？
+ * 不会——`mcpCapabilityName` 把所有非 `[a-z0-9_-]` 字符都替换成了 `-`，所以
+ * 第一个点一定在 `mcp` 之后、第二个点之后全是工具名（工具名同样被安全化过）。
+ */
+export function parseMcpCapabilityName(name: string): { serverId: string | null; toolName: string | null } {
+  const match = /^mcp\.([a-z0-9_-]+)\.(.+)$/.exec(name);
+  if (match === null) return { serverId: null, toolName: null };
+  return { serverId: match[1], toolName: match[2] };
+}
+
+function isSessionExecutable(ctx: Pick<RequestContext, "sessions">, sessionId: string): boolean {
+  return ctx.sessions.isExecutable(sessionId);
 }
 
 async function handleHealth(_req: IncomingMessage, res: ServerResponse, _url: URL, ctx: RequestContext): Promise<void> {
@@ -1679,6 +2066,9 @@ function handleDeleteSession(
     sendError(res, 404, "not_found", `session ${sessionId} does not exist`);
     return;
   }
+  // 执行模式/待确认票随会话失效（FR-B14「关闭会话失效」的删除分支）；
+  // 模式状态本身已由 isExecutable 兜底，这里显式清理是为了不留内存残值。
+  if (mutation.changed) ctx.exec.forgetSession(sessionId);
   sendJson(res, 200, {
     session_id: sessionId,
     deleted_at: mutation.deletedAt ?? null,
@@ -1768,6 +2158,8 @@ async function handleCloseSession(
   if (kind === "ephemeral") {
     try {
       const result = ctx.sessions.closeEphemeralSession(sessionId);
+      // 关闭即失效（FR-B14）：执行模式与待确认票一起清掉
+      ctx.exec.forgetSession(sessionId);
       sendJson(res, 200, {
         session_id: sessionId,
         closed_at: result.closedAt,
@@ -1860,6 +2252,8 @@ async function handleCloseSession(
 
   try {
     const closed = ctx.sessions.closeNormalSession(sessionId, outcome);
+    // 关闭即失效（FR-B14）：普通会话关闭同样清掉执行模式与待确认票
+    ctx.exec.forgetSession(sessionId);
     sendJson(res, 200, {
       session_id: sessionId,
       closed_at: closed.closedAt,
@@ -1875,19 +2269,10 @@ async function handleCloseSession(
 }
 
 /**
- * 可选 JSON body（关闭端点）：content-type 不是 JSON 或显式 content-length: 0 时按
- * 空对象处理——`{uncommitted?}` 是可选的，老客户端/脚本 POST 空体仍是合法请求。
+ * 可选 JSON body（关闭端点）：实现已上移到 http-util（M7-B-T6 起 exec 路由共用
+ * 同一口径）；这里保留薄别名避免改动既有调用点。
  */
-async function readOptionalJsonBody(
-  req: IncomingMessage,
-  res: ServerResponse,
-): Promise<Record<string, unknown> | null> {
-  const contentType = req.headers["content-type"];
-  const length = req.headers["content-length"];
-  const isJson = typeof contentType === "string" && /^application\/json\b/i.test(contentType.trim());
-  if (!isJson || length === "0") return {};
-  return await readJsonBody(req, res);
-}
+const readOptionalJsonBody = readOptionalJsonBodyShared;
 
 function handleSessionLifecycleError(res: ServerResponse, err: unknown): void {
   if (err instanceof SessionLifecycleError) {

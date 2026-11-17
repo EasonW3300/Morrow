@@ -157,7 +157,7 @@ test("无归属会话的 memory.write：执行链真实触达工具语义（502 
 
 // --- 2. 生命周期事件同步调用注册表 ----------------------------------------------
 
-test("disable 摘除调用条目（invoke 404 unknown_tool + 审计留痕）；enable 重新登记恢复执行", async (t) => {
+test("disable 后调用被拒是「已停用」而非「不存在」（403 capability_disabled）；enable 恢复执行", async (t) => {
   const dir = tmpDir("morrow-cap-lifecycle-invoke-");
   t.after(() => removeDir(dir));
   const runtime = await startRuntime(testConfig(dir));
@@ -167,21 +167,39 @@ test("disable 摘除调用条目（invoke 404 unknown_tool + 审计留痕）；e
 
     const disable = await postJson(runtime, "/v1/capabilities/memory.write/disable");
     assert.equal(disable.status, 200);
+
+    // 语义修正（M7-B code-review）：停用后**保留**注册条目，让执行链走到权限复核，
+    // 由它报 capability_disabled —— 而不是 unregister 之后报 unknown_tool。
+    // 后者会把"我停用了它"误读成"这个能力不存在"，让 Owner 以为能力被删了。
     const off = await invokeCapability(runtime, "memory.write", { content: "x" }, session.sessionId);
-    assert.equal(off.status, 404);
-    assert.equal(off.body.error.code, "unknown_tool");
+    assert.equal(off.status, 403, JSON.stringify(off.body));
+    const offText = `${off.body.error.code} ${off.body.error.message}`;
+    assert.match(offText, /capability_disabled|disabled/);
+    assert.equal(/unknown_tool/.test(offText), false, "不得把「已停用」报成「不存在」");
 
     const used = await usedEvents(runtime);
     const denied = used.find((e) => e.payload.capability === "memory.write");
     assert.ok(denied);
     assert.equal(denied.payload.ok, false);
-    assert.equal(denied.payload.error_code, "unknown_tool");
 
     const enable = await postJson(runtime, "/v1/capabilities/memory.write/enable");
     assert.equal(enable.status, 200);
     const back = await invokeCapability(runtime, "memory.write", { content: "恢复后的写入" }, session.sessionId);
     assert.equal(back.status, 200, JSON.stringify(back.body));
     assert.equal(back.body.ok, true);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test("从未注册的能力：invoke 仍是 404 unknown_tool（与「已停用」区分开）", async (t) => {
+  const dir = tmpDir("morrow-cap-never-registered-");
+  t.after(() => removeDir(dir));
+  const runtime = await startRuntime(testConfig(dir));
+  try {
+    const { status, body } = await invokeCapability(runtime, "never.registered", {});
+    assert.equal(status, 404);
+    assert.equal(body.error.code, "unknown_tool");
   } finally {
     await runtime.close();
   }
