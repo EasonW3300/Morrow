@@ -108,7 +108,7 @@ test("白名单内的只读能力通过（无任何写类权限）", () => {
         version: "1.0.0",
         author: "human",
         runtime: "typescript",
-        permissions: { filesystem: [], network: [], shell: [], channel: [], channels: [], credentials: [] },
+        permissions: { filesystem: [], network: [], shell: [], channels: [], credentials: [] },
         input_schema: {},
         output_schema: {},
         sandbox: { type: "process", network: "none", filesystem: "none" },
@@ -138,7 +138,7 @@ test("白名单里的能力若声明了写权限，仍然拒绝（manifest 权�
   );
 });
 
-test("shell 只读类别允许；arbitrary 拒绝", () => {
+test("shell 只读类别（read/vcs/test）允许；build/write/arbitrary 拒绝", () => {
   const base = {
     version: "1.0.0",
     author: "human" as const,
@@ -152,17 +152,20 @@ test("shell 只读类别允许；arbitrary 拒绝", () => {
   assert.equal(
     isPlanModeReadOnly({
       ...base,
-      permissions: { filesystem: [], network: [], shell: ["readonly"], channels: [], credentials: [] },
+      permissions: { filesystem: [], network: [], shell: ["read"], channels: [], credentials: [] },
     }),
     true,
   );
-  assert.equal(
-    isPlanModeReadOnly({
-      ...base,
-      permissions: { filesystem: [], network: [], shell: ["arbitrary"], channels: [], credentials: [] },
-    }),
-    false,
-  );
+  for (const writable of ["build", "package", "process", "write", "arbitrary"] as const) {
+    assert.equal(
+      isPlanModeReadOnly({
+        ...base,
+        permissions: { filesystem: [], network: [], shell: [writable], channels: [], credentials: [] },
+      }),
+      false,
+      `${writable} 会改文件或起进程，不该进 Plan`,
+    );
+  }
 });
 
 // --- 模式注册表：不持久化 + 代际号 ------------------------------------------------

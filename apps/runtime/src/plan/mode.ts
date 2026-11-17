@@ -42,12 +42,14 @@ export const PLAN_MODE_READONLY_CAPABILITIES: readonly string[] = [
   "memory.search",
 ];
 
-/** 允许在 Plan 模式下执行的 shell 命令类别（manifest.permissions.shell 的取值） */
-export const PLAN_MODE_READONLY_SHELL_CATEGORIES: readonly string[] = [
-  // 只读类别由 danger-rules.ts 的 isReadOnlyScript 在运行前二次判定；
-  // 这里只放"允许被考虑"的类别，具体脚本仍要过静态只读检查。
-  "readonly",
-];
+/**
+ * 允许在 Plan 模式下出现的 shell 命令类别（`ShellCommandCategory` 的取值子集）。
+ *
+ * 只放真正只读的三类：读文件（read）、版本控制只读操作（vcs）、跑测试（test）。
+ * **不放** build / package / process / write / arbitrary：它们都会改文件系统或
+ * 起进程。具体脚本仍要过 `danger-rules.ts` 的只读检查（双层）。
+ */
+export const PLAN_MODE_READONLY_SHELL_CATEGORIES: readonly string[] = ["read", "vcs", "test"];
 
 /**
  * 判定一个能力在 Plan 模式下是否可用。
