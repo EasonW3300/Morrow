@@ -9,6 +9,27 @@
 export type AgentStopReason = "stop" | "length" | "toolUse" | "aborted" | "error" | "deferred";
 
 /**
+ * 一次运行消耗的 token 用量（票 M7-C-T1 / Issue #75）。
+ *
+ * `estimated: true` 表示供应商**没有**返回 usage，这个数字是按 `chars/4` 粗估的。
+ * 这个标记是刻意的：Thread Goal 的预算判定必须知道"数字准不准"——把估算值当真实
+ * 值会让 Owner 对预算产生错误信任（PRD 决策 #34 要求"缺失时估算并标注"）。
+ *
+ * `cacheRead`/`cacheWrite` 保留是因为它们计入 totalTokens 但不按普通 input 计价；
+ * 只用 total 做预算判定，但展示时分开更有解释力。
+ */
+export interface MorrowRunUsage {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  /** input + output + cacheRead + cacheWrite（供应商口径见下） */
+  total: number;
+  /** true = 供应商未返回 usage，数值来自 chars/4 估算 */
+  estimated: boolean;
+}
+
+/**
  * Morrow 侧窄事件（五类）。Pi 原始 10+ 类事件在适配层内翻译；
  * 被丢弃的信息（turn/message 生命周期、thinking、toolcall 流式细节）
  * 属于会话层的关注点，不经此接口外泄（NOTES-pi §9）。
@@ -29,6 +50,14 @@ export type MorrowAgentEvent =
       /** 执行耗时（毫秒，存在时） */
       durationMs?: number;
     }
+  /**
+   * 本轮 token 用量（在 agent_end **之前**发出，保证收尾时用量已到账）。
+   *
+   * 为什么不合并进 agent_end：用量是"这一轮花了多少"的独立事实，Goal 的预算累加
+   * 只关心它；把它塞进 agent_end 会让每个消费 agent_end 的地方都得处理一个可选
+   * 字段，反而更容易漏读。
+   */
+  | { type: "usage"; usage: MorrowRunUsage }
   /** 一次 prompt 运行结束；总是最后一条事件 */
   | { type: "agent_end"; stopReason: AgentStopReason }
   /** 供应商/运行错误；其后仍会有 agent_end 收尾 */
