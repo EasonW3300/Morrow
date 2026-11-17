@@ -81,7 +81,11 @@ export type SkillInstallErrorCode =
   | "manifest_missing"
   | "manifest_invalid"
   | "source_hash_mismatch"
-  | "entry_escaping_package";
+  | "entry_escaping_package"
+  // 生命周期错误（票 M7-B-T3 的 HTTP 面补齐时新增：安装/升级/卸载的状态冲突）
+  | "already_installed"
+  | "not_installed"
+  | "permission_widening_not_accepted";
 
 export class SkillInstallError extends Error {
   readonly code: SkillInstallErrorCode;

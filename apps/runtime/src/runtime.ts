@@ -120,6 +120,8 @@ import { PiProposalGenerator } from "./skills-package/proposal-generator.ts";
 import { DEFAULT_FETCH_POLICY, proposalRoutes } from "./skills-package/proposal-routes.ts";
 import type { InstallProposal, ProposalGenerator } from "./skills-package/proposal.ts";
 import { DOC_MAX_BYTES, DOC_TIMEOUT_MS, fetchDocument } from "./skills-package/doc-fetch.ts";
+import { SkillPackageStore } from "./skills-package/package-store.ts";
+import { SkillPackageService, skillPackageRoutes } from "./skills-package/package-service.ts";
 
 /**
  * Runtime HTTP 服务（PRD §6.2 的 M0 子集 + M1 任务族 + M2-T1 能力族）。
@@ -214,6 +216,8 @@ interface RequestContext {
   proposals: InstallProposalService;
   /** 文档抓取策略（公网开关/上限；GET /v1/skill-install/config 回传） */
   proposalFetchPolicy: { allowPublicNetwork: boolean; maxBytes: number; timeoutMs: number };
+  /** Skill 包安装（票 M7-B-T3 补齐：npm 安装/升级 diff/卸载） */
+  skillPackages: SkillPackageService;
 }
 
 type Handler = (
@@ -425,6 +429,15 @@ export interface RuntimeOptions {
    * 测试注入假抓取即可覆盖"抓取→提案"编排，零网络、零 DNS。
    */
   skillInstallFetch?: (url: string) => Promise<import("./skills-package/doc-fetch.ts").DocFetchResult>;
+  /**
+   * Skill 包安装接缝（票 M7-B-T3 补齐）：缺省 = installSkillPackage（真实 npm，强制
+   * `--ignore-scripts`）。测试注入假实现即可覆盖安装/升级/卸载全流程，零 npm。
+   */
+  skillPackageInstall?: (options: {
+    spec: string;
+    targetDir: string;
+    packageDir: string;
+  }) => Promise<import("./skills-package/installer.ts").InstalledSkillPackage>;
 }
 
 export interface RuntimeHandle {
@@ -493,6 +506,8 @@ export interface RuntimeHandle {
   mcp: McpServerService;
   /** 智能安装提案（库形态可直用：propose/confirm/reject/list） */
   proposals: InstallProposalService;
+  /** Skill 包（库形态可直用：install/upgrade/uninstall/list） */
+  skillPackages: SkillPackageService;
   /**
    * 优雅停止：停止接收请求 → 中止并释放会话运行时与在跑任务节点 → 记账 runtime.stopped
    * → 关闭任务投影库与账本（WAL checkpoint）。signal 传入收到的 POSIX 信号名，
@@ -583,6 +598,13 @@ const routes: Route[] = [
   })),
   ...contactRoutes,
   ...channelRoutes,
+  // Skill 包安装（票 M7-B-T3 补齐）：/v1/skills/packages*（npm 安装/升级 diff/卸载）
+  ...skillPackageRoutes.map((route) => ({
+    method: route.method,
+    re: route.re,
+    handler: (req: IncomingMessage, res: ServerResponse, url: URL, ctx: RequestContext, params: string[]) =>
+      route.handler(req, res, url, { packages: ctx.skillPackages }, params),
+  })),
   // 智能安装（票 M7-B-T4 / Issue #72）：/v1/skill-install/*（与 M2-T5 的案例晋升分路径族）
   ...proposalRoutes.map((route) => ({
     method: route.method,
@@ -1267,6 +1289,16 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
   // 关键在于「未确认不落地」：propose 只写 status=pending 的提案行，confirm 才调用
   // materialize。落地分派沿用既有闭环——纯组合 → SkillService（声明式 steps，无代码）；
   // 需要新工具 → CapabilityFactory（生成→沙箱验证→Owner 确认→注册）。
+  // Skill 包安装（票 M7-B-T3 的 HTTP 面补齐）：FR-B7（npm 源）与 FR-B10（升级 diff/卸载）
+  const skillPackageStore = new SkillPackageStore({ dataDir: config.dataDir });
+  const skillPackages = new SkillPackageService({
+    store: skillPackageStore,
+    ledger,
+    replicaId: config.replicaId,
+    capabilities,
+    packagesRoot: join(config.dataDir, "skill-packages"),
+    ...(options.skillPackageInstall === undefined ? {} : { install: options.skillPackageInstall }),
+  });
   const proposalStore = new ProposalStore({ dataDir: config.dataDir });
   const proposals = new InstallProposalService({
     store: proposalStore,
@@ -1322,6 +1354,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     execModes,
     mcp,
     proposals,
+    skillPackages,
     proposalFetchPolicy: {
       allowPublicNetwork: options.allowPublicDocFetch === true,
       maxBytes: DOC_MAX_BYTES,
@@ -1349,6 +1382,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     unsubscribeNotifications();
     notifications.close();
     proposalStore.close();
+    skillPackageStore.close();
     skills.close();
     factory.close();
     tasks.close();
@@ -1444,6 +1478,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     execModes,
     mcp,
     proposals,
+    skillPackages,
     async close(signal?: string): Promise<void> {
       if (closing) return;
       closing = true;
