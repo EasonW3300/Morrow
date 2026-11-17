@@ -83,7 +83,13 @@ import { PLANNER_SYSTEM_PROMPT, TaskError, TaskService, type PlannerFactory } fr
 import { buildEventEnvelope } from "./envelope.ts";
 import { computeIntegrityHash, type EventEnvelope } from "@morrow/protocol";
 import { UUID_RE } from "./uuid-v7.ts";
-import { parsePaging, readJsonBody, sendError, sendJson } from "./http-util.ts";
+import {
+  parsePaging,
+  readJsonBody,
+  readOptionalJsonBody as readOptionalJsonBodyShared,
+  sendError,
+  sendJson,
+} from "./http-util.ts";
 import { sendInvocationError } from "./invocation-errors.ts";
 import { LockTable } from "./locks.ts";
 import { LeaseStore } from "./lease/store.ts";
@@ -97,6 +103,12 @@ import { DockerRunner } from "./sandbox/docker-runner.ts";
 import { ToolInvoker, type InvocationResult } from "./sandbox/invoker.ts";
 import { createRegistryPermissionAdapter, type SandboxPermissionEngine } from "./sandbox/permission.ts";
 import type { SandboxRunner } from "./sandbox/runner.ts";
+import { ExecModeRegistry } from "./exec/mode.ts";
+import { ExecService } from "./exec/service.ts";
+import { execRoutes } from "./exec/routes.ts";
+import { createDefaultExecRunner, type LocalExecRunner } from "./exec/runner.ts";
+import { DefaultSnapshotManager, type SnapshotManager } from "./exec/snapshot.ts";
+import type { GitRunner } from "./workspace.ts";
 
 /**
  * Runtime HTTP 服务（PRD §6.2 的 M0 子集 + M1 任务族 + M2-T1 能力族）。
@@ -181,6 +193,10 @@ interface RequestContext {
   workspace: WorkspaceManager;
   /** 临时会话写入门（票 M7-A-T3 / #64-A4：能力网关、skill invoke、任务创建共用同一判定） */
   ephemeralGate: EphemeralGateDeps;
+  /** 动态 bash（票 M7-B-T6 / Issue #70：模式判定 + 确认 + 快照 + 容器执行 + 审计） */
+  exec: ExecService;
+  /** 执行模式注册表（会话级、不持久化；路由层读 GET /v1/sessions/:id/exec-mode） */
+  execModes: ExecModeRegistry;
 }
 
 type Handler = (
@@ -359,6 +375,19 @@ export interface RuntimeOptions {
    * `gh auth token` 再读 OS 凭据库 `github:pat`。测试注入假实现即可完全隔离真实 git/gh。
    */
   workspaceManager?: WorkspaceManager;
+  /**
+   * 动态 bash 执行接缝（票 M7-B-T6 / Issue #70）：缺省 = ContainerExecRunner（**唯一**
+   * 生产路径，无宿主直跑分支）。测试注入 FakeExecRunner 即可覆盖"完全权限下仍拦截
+   * 危险命令""只读首确认后免确认""关闭会话后模式失效"等全部判定路径，零 docker。
+   */
+  execRunner?: LocalExecRunner;
+  /**
+   * 执行前快照根（票 M7-B-T6）：缺省 `<dataDir>/snapshots`。刻意**不**放在会话
+   * 工作区内——放在工作区里 Agent 能自己删掉"保险单"。
+   */
+  execSnapshotsRoot?: string;
+  /** 快照 git 子进程接缝（测试注入，零真实 git） */
+  execSnapshotGitRunner?: GitRunner;
 }
 
 export interface RuntimeHandle {
@@ -419,6 +448,10 @@ export interface RuntimeHandle {
   outbox: OutboxService;
   /** 通知规则与路由（M4-T7 / Issue #44：handleEnvelope/flushDue/dispatchQueued，库形态可直用） */
   notifications: NotificationService;
+  /** 动态 bash 执行服务（M7-B-T6 / Issue #70：submit/approve/revert/setMode，库形态可直用） */
+  exec: ExecService;
+  /** 执行模式注册表（会话级内存态；诊断用：size 证明关闭会话后释放） */
+  execModes: ExecModeRegistry;
   /**
    * 优雅停止：停止接收请求 → 中止并释放会话运行时与在跑任务节点 → 记账 runtime.stopped
    * → 关闭任务投影库与账本（WAL checkpoint）。signal 传入收到的 POSIX 信号名，
@@ -509,6 +542,26 @@ const routes: Route[] = [
   })),
   ...contactRoutes,
   ...channelRoutes,
+  // 动态 bash（票 M7-B-T6 / Issue #70）：会话级执行模式 + 脚本提交/确认/撤销。
+  // execRoutes 桥接到 exec 自有路由签名（ctx.exec / ctx.execModes 在请求时取）。
+  ...execRoutes.map((route) => ({
+    method: route.method,
+    re: route.re,
+    handler: (req: IncomingMessage, res: ServerResponse, url: URL, ctx: RequestContext, params: string[]) =>
+      route.handler(
+        req,
+        res,
+        url,
+        {
+          exec: ctx.exec,
+          modes: ctx.execModes,
+          // 与 ExecService 同一判定口径：存在 + 未关闭 + 未删
+          isSessionExecutable: (sessionId) => isSessionExecutable(ctx, sessionId),
+          sessionExists: (sessionId) => ctx.sessions.sessionExists(sessionId),
+        },
+        params,
+      ),
+  })),
   // 能力调用端点（#22 修复批 / FR-CAP-5）：POST /v1/capabilities/:id/invoke（body = 工具
   // input）——经 ToolInvoker 统一执行链（权限复核在链上），builtin 进程内直呼、sandboxed
   // 走容器；capability.used 审计先落账本后返回。与既有生命周期路由无路径/方法冲突。
@@ -1103,6 +1156,31 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     memorySearch: (query) => memory.search(query).map((hit) => ({ content: hit.content, entry_kind: hit.stage })),
     workspaceRoot,
   });
+  // 动态 bash（票 M7-B-T6 / Issue #70）：执行模式是**会话级内存态**（不持久化，
+  // 关闭会话/进程重启即失效），所以权威状态在 ExecModeRegistry 而不是账本；
+  // 账本只留 exec.mode_changed 之类的审计痕迹。Runner 缺省 = 容器，无宿主直跑分支。
+  const execRunnerInstance: LocalExecRunner = options.execRunner ?? createDefaultExecRunner();
+  const execSnapshots: SnapshotManager = new DefaultSnapshotManager({
+    snapshotsRoot: options.execSnapshotsRoot ?? join(config.dataDir, "snapshots"),
+    ...(options.execSnapshotGitRunner === undefined ? {} : { gitRunner: options.execSnapshotGitRunner }),
+  });
+  const execModes = new ExecModeRegistry({
+    isOpen: (sessionId) => sessions.isExecutable(sessionId),
+    // 代际号：关闭一次 +1，防止"关闭→恢复"继承关闭前的完全权限/只读豁免
+    epoch: (sessionId) => sessions.executionEpoch(sessionId),
+  });
+  const exec = new ExecService({
+    ledger,
+    replicaId: config.replicaId,
+    modes: execModes,
+    runner: execRunnerInstance,
+    snapshots: execSnapshots,
+    isSessionExecutable: (sessionId) => sessions.isExecutable(sessionId),
+    workspaceOf: (sessionId) => {
+      const workspace = sessions.workspaceOf(sessionId);
+      return workspace === null ? null : { path: workspace.path };
+    },
+  });
   const ctx: RequestContext = {
     ledger,
     replicaId: config.replicaId,
@@ -1128,6 +1206,8 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     outbox,
     notifications,
     workspace: workspaceManager,
+    exec,
+    execModes,
     // 临时会话写入门（#64-A4）：能力网关 / skill invoke / 任务创建共用同一判定函数。
     ephemeralGate: {
       sessionKind: (sessionId) => sessions.sessionKind(sessionId),
@@ -1240,6 +1320,8 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     contacts,
     outbox,
     notifications,
+    exec,
+    execModes,
     async close(signal?: string): Promise<void> {
       if (closing) return;
       closing = true;
@@ -1461,6 +1543,17 @@ function handleAsyncError(res: ServerResponse, err: unknown): void {
   }
 }
 
+/**
+ * 会话可执行判定（票 M7-B-T6 / Issue #70 的单一口径）。
+ *
+ * 路由层的 404/409 区分与 ExecService / ExecModeRegistry 的判定必须同源，
+ * 否则会出现"路由 409 但服务仍在跑脚本"这类自相矛盾的状态。实现委托给
+ * SessionManager.isExecutable（存在 + 未关闭 + 未软删 + 未过期）。
+ */
+function isSessionExecutable(ctx: Pick<RequestContext, "sessions">, sessionId: string): boolean {
+  return ctx.sessions.isExecutable(sessionId);
+}
+
 async function handleHealth(_req: IncomingMessage, res: ServerResponse, _url: URL, ctx: RequestContext): Promise<void> {
   sendJson(res, 200, {
     status: "ok",
@@ -1679,6 +1772,9 @@ function handleDeleteSession(
     sendError(res, 404, "not_found", `session ${sessionId} does not exist`);
     return;
   }
+  // 执行模式/待确认票随会话失效（FR-B14「关闭会话失效」的删除分支）；
+  // 模式状态本身已由 isExecutable 兜底，这里显式清理是为了不留内存残值。
+  if (mutation.changed) ctx.exec.forgetSession(sessionId);
   sendJson(res, 200, {
     session_id: sessionId,
     deleted_at: mutation.deletedAt ?? null,
@@ -1768,6 +1864,8 @@ async function handleCloseSession(
   if (kind === "ephemeral") {
     try {
       const result = ctx.sessions.closeEphemeralSession(sessionId);
+      // 关闭即失效（FR-B14）：执行模式与待确认票一起清掉
+      ctx.exec.forgetSession(sessionId);
       sendJson(res, 200, {
         session_id: sessionId,
         closed_at: result.closedAt,
@@ -1860,6 +1958,8 @@ async function handleCloseSession(
 
   try {
     const closed = ctx.sessions.closeNormalSession(sessionId, outcome);
+    // 关闭即失效（FR-B14）：普通会话关闭同样清掉执行模式与待确认票
+    ctx.exec.forgetSession(sessionId);
     sendJson(res, 200, {
       session_id: sessionId,
       closed_at: closed.closedAt,
@@ -1875,19 +1975,10 @@ async function handleCloseSession(
 }
 
 /**
- * 可选 JSON body（关闭端点）：content-type 不是 JSON 或显式 content-length: 0 时按
- * 空对象处理——`{uncommitted?}` 是可选的，老客户端/脚本 POST 空体仍是合法请求。
+ * 可选 JSON body（关闭端点）：实现已上移到 http-util（M7-B-T6 起 exec 路由共用
+ * 同一口径）；这里保留薄别名避免改动既有调用点。
  */
-async function readOptionalJsonBody(
-  req: IncomingMessage,
-  res: ServerResponse,
-): Promise<Record<string, unknown> | null> {
-  const contentType = req.headers["content-type"];
-  const length = req.headers["content-length"];
-  const isJson = typeof contentType === "string" && /^application\/json\b/i.test(contentType.trim());
-  if (!isJson || length === "0") return {};
-  return await readJsonBody(req, res);
-}
+const readOptionalJsonBody = readOptionalJsonBodyShared;
 
 function handleSessionLifecycleError(res: ServerResponse, err: unknown): void {
   if (err instanceof SessionLifecycleError) {
