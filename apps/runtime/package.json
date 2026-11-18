@@ -13,12 +13,13 @@
     "build": "pnpm run build:dist",
     "build:dist": "esbuild src/main.ts --bundle --platform=node --format=esm --target=node22 --outfile=dist/main.js",
     "typecheck": "tsc --noEmit",
-    "test": "tsc --noEmit && node --experimental-sqlite --test --test-concurrency=4 --experimental-strip-types \"test/*.test.ts\"",
+    "test": "tsc --noEmit && node --experimental-sqlite --test --test-concurrency=2 --experimental-strip-types \"test/*.test.ts\"",
     "test:sandbox": "node --experimental-sqlite --test --experimental-strip-types \"test/sandbox.*.test.ts\"",
     "memory:ac03": "node --experimental-sqlite --experimental-strip-types scripts/memory-ac03.ts",
     "factory:ac06": "node --experimental-sqlite --experimental-strip-types scripts/factory-ac06.ts",
     "factory:harness:container": "node --experimental-sqlite --test --experimental-strip-types \"test/capability-factory.harness.container.test.ts\"",
-    "test:unit": "node --experimental-sqlite --test --test-concurrency=4 --experimental-strip-types $(find test -maxdepth 1 -name \"*.test.ts\" ! -name \"sandbox.docker.test.ts\" ! -name \"capability-factory.harness.container.test.ts\")"
+    "test:unit": "node --experimental-sqlite --test --test-concurrency=2 --experimental-strip-types $(find test -maxdepth 1 -name \"*.test.ts\" ! -name \"sandbox.docker.test.ts\" ! -name \"capability-factory.harness.container.test.ts\" ! -name \"checkpoint.faults.test.ts\")",
+    "test:faults": "node --experimental-sqlite --test --test-concurrency=1 --experimental-strip-types \"test/checkpoint.faults.test.ts\""
   },
   "dependencies": {
     "@morrow/pi-adapter": "workspace:*",

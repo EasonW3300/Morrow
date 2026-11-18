@@ -88,6 +88,10 @@ async function startChild(t: { after(fn: () => unknown): void }, dir: string, en
       ...(env.nodeScripts === undefined ? {} : { MORROW_TEST_NODE_SCRIPTS: JSON.stringify(env.nodeScripts) }),
       ...(env.slowMs === undefined ? {} : { MORROW_TEST_SLOW_MS: String(env.slowMs) }),
     },
+    // detached: 让子进程成为新进程组的组长。这样清理时能 kill 整个组（含它 spawn
+    // 的 go worker / 工具进程）——否则孙进程会带着 SQLite 文件句柄活下来，
+    // 让 removeDir 卡住、文件进程退出被拖到 test runner 的兜底超时（实测 900s+）。
+    detached: true,
     stdio: ["ignore", "pipe", "pipe"],
   });
   let stdout = "";
@@ -109,7 +113,8 @@ async function startChild(t: { after(fn: () => unknown): void }, dir: string, en
     child.once("error", reject);
   });
   t.after(() => {
-    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    // 杀整个进程组（负 pid）。即使组长已退出，组内的孙进程也可能还活着。
+    killGroup(child.pid);
   });
   const { port } = await ready;
   return { child, base: `http://127.0.0.1:${port}`, port };
@@ -120,6 +125,26 @@ async function kill9(c: Child): Promise<void> {
     c.child.once("exit", () => resolve());
     c.child.kill("SIGKILL");
   });
+  // 组长死了不代表组内孙进程死了：补一刀杀整组（不等待——它们没有 exit 事件可等）
+  killGroup(c.child.pid);
+}
+
+/**
+ * 杀掉以 pid 为组长的整个进程组（票 M7-C-T7 期间定位的测试脆弱性根因）。
+ *
+ * 背景：这些用例 kill -9 的是 runtime 子进程，但 runtime 还会 spawn go worker 与
+ * 工具进程。只杀组长会留下孙进程持有 SQLite 文件句柄，导致 `removeDir` 长时间
+ * 重试、文件进程退出被拖到 node:test 的兜底超时（实测单个用例 900s+）。
+ *
+ * `process.kill(-pid)` 对不存在的组会抛 ESRCH——这是正常的（组已空），忽略即可。
+ */
+function killGroup(pid: number | undefined): void {
+  if (pid === undefined) return;
+  try {
+    process.kill(-pid, "SIGKILL");
+  } catch {
+    // ESRCH：组已不存在；EPERM：不是组长（detached 失败）——都不影响测试语义
+  }
 }
 
 async function stopChild(c: Child): Promise<void> {
@@ -127,6 +152,7 @@ async function stopChild(c: Child): Promise<void> {
     c.child.once("exit", () => resolve());
     c.child.kill("SIGTERM");
   });
+  killGroup(c.child.pid);
 }
 
 type ApiTask = TaskDetail & { error?: string };

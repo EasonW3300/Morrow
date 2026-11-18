@@ -114,6 +114,7 @@ import { GoalDriver } from "./goals/driver.ts";
 import { BestStore } from "./best/store.ts";
 import { BestService } from "./best/service.ts";
 import { bestRoutes } from "./best/routes.ts";
+import { BestTicketsService } from "./best/tickets-service.ts";
 import { composePlanSystemPrompt } from "./plan/prompt.ts";
 import type { ParsedPlan } from "./plan/plan-block.ts";
 import { ExecService } from "./exec/service.ts";
@@ -228,6 +229,8 @@ interface RequestContext {
   goalDriver: GoalDriver;
   /** Best 模式（票 M7-C-T6 / #80：四阶段 + 规格门） */
   best: BestService;
+  /** Best 拆票与实现（票 M7-C-T7 / #81） */
+  bestTickets: BestTicketsService;
   /** 记录会话活动（续跑静默阈值的输入；用户发消息时调用） */
   touchSessionActivity(sessionId: string): void;
   /** 动态 bash（票 M7-B-T6 / Issue #70：模式判定 + 确认 + 快照 + 容器执行 + 审计） */
@@ -550,6 +553,8 @@ export interface RuntimeHandle {
   goalDriver: GoalDriver;
   /** Best 模式服务（库形态可直用：start/interview/submitSpec/decideSpecGate/abort） */
   best: BestService;
+  /** Best 拆票与实现（库形态可直用） */
+  bestTickets: BestTicketsService;
   /** 动态 bash 执行服务（M7-B-T6 / Issue #70：submit/approve/revert/setMode，库形态可直用） */
   exec: ExecService;
   /** 执行模式注册表（会话级内存态；诊断用：size 证明关闭会话后释放） */
@@ -685,7 +690,21 @@ const routes: Route[] = [
     method: route.method,
     re: route.re,
     handler: (req: IncomingMessage, res: ServerResponse, url: URL, ctx: RequestContext, params: string[]) =>
-      route.handler(req, res, url, { best: ctx.best }, params),
+      route.handler(
+        req,
+        res,
+        url,
+        {
+          best: ctx.best,
+          tickets: ctx.bestTickets,
+          // 实现门的批准状态从账本推导（事件是唯一真相源，不看内存态）
+          events: () => ctx.ledger.scan({}).map((entry) => ({
+            event_type: entry.envelope.event_type,
+            payload: entry.envelope.payload,
+          })),
+        },
+        params,
+      ),
   })),
   // Thread Goal（票 M7-C-T4 / #78）：显式创建 + 六态迁移 + 双预算
   ...goalRoutes.map((route) => ({
@@ -1212,6 +1231,33 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     ...(options.bestInterviewMaxTurns === undefined ? {} : { maxInterviewTurns: options.bestInterviewMaxTurns }),
   });
 
+  // Best 拆票与实现（票 M7-C-T7 / #81）：产物落位、feat 分支、Task DAG、推送计划
+  const bestTickets = new BestTicketsService({
+    store: bestStore,
+    best,
+    ledger,
+    replicaId: config.replicaId,
+    workspace: workspaceManager,
+    createTask: async ({ goal, sessionId }) => {
+      const task = await tasks.createTask(goal, { sessionId });
+      return { taskId: task.task_id };
+    },
+    workspaceOf: (sessionId) => {
+      const bound = sessions.workspaceOf(sessionId);
+      return bound === null ? null : bound;
+    },
+    bindSessionWorkspace: async (sessionId, binding) => {
+      const prepared = await workspaceManager.prepareWorktree(binding.repoPath, binding.branch, sessionId);
+      sessions.bindWorkspace(sessionId, {
+        kind: "local",
+        path: prepared.dir,
+        repo_path: binding.repoPath,
+        branch: binding.branch,
+      } as never);
+      return { path: prepared.dir };
+    },
+  });
+
   let ephemeralSession: ((sessionId: string) => boolean) | null = null;
   // Plan 模式晚绑定（与 ephemeralSession 同款：SessionManager 在 PlanModeRegistry 之后构造）
   let planModeSession: ((sessionId: string) => boolean) | null = null;
@@ -1622,6 +1668,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     goals,
     goalDriver,
     best,
+    bestTickets,
     touchSessionActivity: (sessionId) => lastActivity.set(sessionId, Date.now()),
     exec,
     execModes,
@@ -1781,6 +1828,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     goals,
     goalDriver,
     best,
+    bestTickets,
     exec,
     execModes,
     mcp,
