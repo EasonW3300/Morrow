@@ -3,7 +3,7 @@
 - **阶段**：M7-C 自动化编排（FR-C1..C16）
 - **规格**：#74（`docs/prd/PRD-M7.md` 决策 #30–#41）
 - **集成分支**：`integration/m7c`
-- **验证时间**：2026-11-18
+- **验证时间**：2026-11-18（含 code-review 修复批 `4dfbbb0`）
 - **验证口径**：Node 24.22 / macOS arm64
 
 ## 0. 一句话结论
@@ -17,7 +17,7 @@
 
 | 项 | 数值 | 命令 |
 |---|---|---|
-| runtime 单元/集成测试 | **1233 通过 / 0 失败** | `pnpm --filter @morrow/runtime test:unit` |
+| runtime 单元/集成测试 | **1244 通过 / 0 失败** | `pnpm --filter @morrow/runtime test:unit` |
 | runtime 故障注入套件 | **25 通过 / 0 失败**（独立脚本） | `pnpm --filter @morrow/runtime test:faults` |
 | runtime 真实容器套件 | **12 通过 / 0 失败** | `test/exec.container.test.ts` |
 | pi-adapter | **46 通过 / 0 失败**（含 4 项 live） | `pnpm --filter @morrow/pi-adapter test` |
@@ -35,9 +35,10 @@
 | C5 (#79) | `goal-driver` | 18 |
 | C6 (#80) | `best` | 25 |
 | C7 (#81) | `best-tickets` | 18 |
-| C8 (#82) | `desktop/src/automation-ui` | 20 |
+| C8 (#82) | `desktop/src/automation-ui` / `plan-readonly-tools` | 20 + 4 |
+| code-review 修复批 | `m7c-review-fixes` | 5 |
 
-阶段 C 合计新增 **162** 项测试。
+阶段 C 合计新增 **171** 项测试。
 
 ## 2. FR-C1..C16 逐条证据
 
@@ -113,6 +114,20 @@
 | `submitSpec` 用 `#requireRunning("interview")` 导致**门被拒后无法重提** | `best.test.ts`「规格门被拒 → 停在 spec，可再提交」失败 | 允许从 `interview` 或 `spec` 提交 |
 | Best 拆票测试依赖本机 `gh` 登录状态 | 开发机有 gh → 走了 issues 分支 | 注入 `tokenProvider`，让两条路径都可测 |
 | 测试用中文标题时 slug 是哈希，路径写死会 404 | 文件读取 ENOENT | 改用 artifact 返回的实际路径 |
+
+### 5.2.1 code-review 抓到并修复的四个缺陷
+
+实现票全部"测试绿"之后，安全/正确性复审又抓到四个。第一个是本阶段最严重的一个：
+
+| 缺陷 | 症状 | 根因 | 修法 |
+|---|---|---|---|
+| **Plan 的只读工具全是空壳** | Plan 模式下工具集**为空**——模型只能干看着，「只读研究」完全无法工作 | 白名单写了 6 个"未来会有"的工具名（`fs.read`/`code.search`/`git.read`…），但项目里只有一个 builtin 且它是写工具 | 白名单收敛到真实存在的工具 + 补真实的只读工具 `memory.search`；加测试断言"每个白名单名字都有实现" |
+| **Best 中止后承载 goal 仍 active** | 已放弃的目标每 30s 被续跑器拉起来继续烧预算 | `abort` 只改 best 状态，没管它承载的 goal | abort 时把 goal 置 `complete` |
+| **Plan 退出后待回答问题残留** | 下次进 Plan 看到上一个已作废的问题 | 退出时没清 `questions` | 退出时 `forget` |
+| **无预算的 goal 可无限自跑** | 不设 token/时间预算时，自动续跑永不停止 | 两个预算都允许 null（"不设限"合法），但没有兜底 | 加 100 轮硬上限，到限转 `budget_limited` 并提示设预算 |
+
+第一个缺陷的性质与前两阶段的「MCP 注册了但不可调」「B3 只有库层没有端点」完全同类：
+**零件单测全绿、链路实际不通**。这也是为什么门禁取证必须逐条追问"这条真的能用吗"。
 
 ### 5.3 测试基础设施的两个真问题
 
