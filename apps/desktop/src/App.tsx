@@ -19,6 +19,9 @@ import { MemoryView } from "./MemoryView.tsx";
 import { McpInstallView } from "./McpInstallView.tsx";
 import { SkillInstallView } from "./SkillInstallView.tsx";
 import { SkillPackagesView } from "./SkillPackagesView.tsx";
+import { PlanPanel } from "./PlanPanel.tsx";
+import { GoalPanel } from "./GoalPanel.tsx";
+import { BestPanel } from "./BestPanel.tsx";
 
 /**
  * 桌面壳根组件：解析控制面地址（sidecar ready）→ 顶栏导航（会话 / 任务 / 设置 / 健康）。
@@ -32,7 +35,7 @@ import { SkillPackagesView } from "./SkillPackagesView.tsx";
  * 记忆页（票 M7-A-T6 / Issue #62）：只读树/时间线视图，一级页签；来源回链经 openSource
  * 切回对应会话（壳内 state 路由）。
  */
-type View = "chat" | "tasks" | "memory" | "mcp" | "skills" | "settings" | "health";
+type View = "chat" | "tasks" | "memory" | "mcp" | "skills" | "automation" | "settings" | "health";
 
 const NAV_ITEMS: { key: View; label: string }[] = [
   { key: "chat", label: "会话" },
@@ -42,6 +45,8 @@ const NAV_ITEMS: { key: View; label: string }[] = [
   { key: "mcp", label: "MCP" },
   // 智能安装（票 M7-B-T4 / Issue #72）：文档 → 提案 → 确认 → 落地
   { key: "skills", label: "技能" },
+  // 自动化（票 M7-C / #74）：计划模式 / 线程目标 / Best 模式
+  { key: "automation", label: "自动化" },
   { key: "settings", label: "设置" },
   { key: "health", label: "健康" },
 ];
@@ -308,6 +313,22 @@ export default function App() {
           <SkillInstallView base={base} />
           {/* Skill 包（npm）：与"智能安装"并列，来源不同但都落在同一份能力注册表上 */}
           <SkillPackagesView base={base} />
+        </main>
+      )}
+      {view === "automation" && (
+        <main className="main page-host">
+          <div className="automation-view">
+            {/* 三者都需要会话上下文：未选会话时给提示而不是空面板 */}
+            {selectedId === null ? (
+              <p className="exec-panel__hint">先在「会话」里选一个会话，再使用自动化功能。</p>
+            ) : (
+              <>
+                <PlanPanel base={base} sessionId={selectedId} />
+                <GoalPanel base={base} sessionId={selectedId} />
+                <BestPanel base={base} sessionId={selectedId} />
+              </>
+            )}
+          </div>
         </main>
       )}
       {view === "health" && (

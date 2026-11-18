@@ -124,11 +124,13 @@ describe(
 
       await rt.prompt("早上好");
 
-      assert.deepEqual(events, [
+      // usage 在 agent_end 之前（票 M7-C-T1 / #75）；mock 不返回 usage → 估算
+      assert.deepEqual(events.slice(0, 2), [
         { type: "text_delta", delta: "你好" },
         { type: "text_delta", delta: "！" },
-        { type: "agent_end", stopReason: "stop" },
       ]);
+      assert.equal(events[2]?.type, "usage");
+      assert.deepEqual(events.at(-1), { type: "agent_end", stopReason: "stop" });
 
       assert.equal(server.requests.length, 1);
       const { auth, body } = server.requests[0];
@@ -194,10 +196,15 @@ describe(
       assert.equal(toolEnd.text, "3");
       assert.equal(toolEnd.isError, false);
       assert.equal(typeof toolEnd.durationMs, "number");
-      assert.deepEqual(events.slice(2), [
-        { type: "text_delta", delta: "1+2=3。" },
-        { type: "agent_end", stopReason: "stop" },
-      ]);
+      // 用量在 agent_end 前（票 M7-C-T1 / #75）：本地 mock 不开 include_usage，
+      // 故走 chars/4 估算路径，estimated=true。这里只锁"有且标了估算"，
+      // 不锁具体字符数（mock 的请求/响应文本会随用例演进）。
+      const tail = events.slice(2);
+      assert.deepEqual(tail[0], { type: "text_delta", delta: "1+2=3。" });
+      const usageEvent = tail[1] as { type: string; usage: { estimated: boolean; total: number } };
+      assert.equal(usageEvent.type, "usage");
+      assert.equal(usageEvent.usage.estimated, true, "mock 未返回 usage → 必须标估算");
+      assert.deepEqual(events.at(-1), { type: "agent_end", stopReason: "stop" });
 
       assert.equal(server.requests.length, 2);
       const second = server.requests[1].body.messages as Array<Record<string, unknown>>;

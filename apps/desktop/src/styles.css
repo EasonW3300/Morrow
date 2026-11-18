@@ -4261,3 +4261,14 @@ input[type="radio"] {
   margin: 0 auto;
   padding: 0 20px 20px;
 }
+
+/* --- 自动化页（票 M7-C / #74）--------------------------------------------------- */
+
+.automation-view {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  max-width: 880px;
+  margin: 0 auto;
+  padding: 20px;
+}

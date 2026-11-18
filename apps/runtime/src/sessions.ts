@@ -1,4 +1,4 @@
-import type { AgentRuntime, MorrowAgentEvent, MorrowTool } from "@morrow/pi-adapter";
+import { addUsage, type AgentRuntime, type MorrowAgentEvent, type MorrowRunUsage, type MorrowTool } from "@morrow/pi-adapter";
 import type {
   ActorId,
   EventEnvelope,
@@ -242,6 +242,41 @@ export interface MemoryObserver {
 }
 
 /**
+ * 从错误文案里尽力解析 HTTP 状态码（票 M7-C-T5 / #79）。
+ *
+ * 适配层把供应商错误压成一条字符串（如 `502: {...}` 或 `429 Too Many Requests`），
+ * 结构化状态码已经丢了。这里只做"开头是 3 位数"的保守解析——解析不出来就不带
+ * status，让 Goal 分类退回文案匹配（两者都在 `looksLikeUsageLimit` 里）。
+ */
+export function parseStatusFromError(message: string | null): number | undefined {
+  if (message === null) return undefined;
+  const match = /^\s*(\d{3})\b/.exec(message);
+  if (match === null) return undefined;
+  const status = Number(match[1]);
+  return status >= 100 && status <= 599 ? status : undefined;
+}
+
+/**
+ * 轮次结束观察面（票 M7-C-T5 / Issue #79）。
+ *
+ * 与 MemoryObserver.observeTurnEnd 分开的理由：那个是"记忆抽取"，这个是"Goal 的
+ * 用量与状态推进"。合成一个会让两个域的失败互相牵连（记忆是增强路径、可以静默
+ * 失败；Goal 的状态推进不能静默——静默会让 goal 永远停在 active 空转）。
+ */
+export interface TurnObserver {
+  observeTurnFinished(input: {
+    sessionId: string;
+    /** 本轮是否有错误（error 事件在 agent_end 之前出现过） */
+    error: string | null;
+    /** 供应商状态码（能从错误里解析出来时带上；用于 429 → usage_limited） */
+    status?: number;
+    /** 本轮耗时（毫秒，由 SessionManager 测量） */
+    elapsedMs: number;
+    occurredAt: string;
+  }): void;
+}
+
+/**
  * 工具完成观察面（票 M2-T5 / Issue #26）：tool.finished 落账后由 SessionManager 调用，
  * 是 Skill 案例收集（成功/失败经验计数）的推送入口。窄结构接口（同 MemoryObserver 模式），
  * 观察方异常不阻断会话主链路（SessionManager 捕获同步异常记日志）。
@@ -298,6 +333,20 @@ interface SessionState {
   frames: Set<(frame: SessionFrame) => void>;
   runtime: AgentRuntime | null;
   running: boolean;
+  /**
+   * 本会话累计用量（票 M7-C-T1 / Issue #75）：Thread Goal 的 token 预算从这里读。
+   *
+   * 只活在内存：用量是"本进程看到的消耗"，重启后归零。刻意不持久化——持久化会让
+   * 预算在重启后仍然生效，而重启本身就意味着"这是一次新的开始"（与执行模式的
+   * 不持久化同理）。
+   */
+  usage: MorrowRunUsage;
+  /** 本轮尚未结算的用量（usage 事件先于 agent_end 到达） */
+  pendingUsage: MorrowRunUsage | null;
+  /** 本轮开始时间（毫秒，Goal 的 elapsed 统计用） */
+  runStartedAt: number | null;
+  /** 本轮出现过的错误（取最后一条；agent_end 时交给 TurnObserver） */
+  runError: string | null;
   queue: QueuedInput[];
 }
 
@@ -324,6 +373,8 @@ export interface SessionManagerOptions {
   toolObserver?: ToolObserver | null;
   /** 会话运行时的工具工厂（M1-T1：按会话构建 memory.write 工具，经工厂 extras 注入） */
   agentTools?: (sessionId: string) => MorrowTool[];
+  /** 轮次结束观察（票 M7-C-T5 / #79：Goal 的用量与状态推进） */
+  turnObserver?: TurnObserver | null;
   /**
    * 会话 system prompt 读取面（票 M7-A-T1 / Issue #58）：返回 undefined = 不注入。
    * 在创建 AgentRuntime 时求值（会话复用一个运行时；改 Persona 影响后续新会话）。
@@ -351,6 +402,7 @@ export class SessionManager {
   readonly #memory: MemoryObserver | null;
   readonly #toolObserver: ToolObserver | null;
   readonly #agentTools: ((sessionId: string) => MorrowTool[]) | null;
+  readonly #turnObserver: TurnObserver | null;
   readonly #systemPrompt: ((sessionId: string) => string | undefined) | null;
   readonly #now: () => Date;
   readonly #workspace: WorkspaceManager | null;
@@ -372,6 +424,7 @@ export class SessionManager {
     this.#memory = options.memory ?? null;
     this.#toolObserver = options.toolObserver ?? null;
     this.#agentTools = options.agentTools ?? null;
+    this.#turnObserver = options.turnObserver ?? null;
     this.#systemPrompt = options.systemPrompt ?? null;
     this.#now = options.now ?? (() => new Date());
     this.#workspace = options.workspace ?? null;
@@ -1099,6 +1152,39 @@ export class SessionManager {
     return this.#states.get(sessionId)?.running === true;
   }
 
+  /**
+   * 会话累计用量（票 M7-C-T1 / Issue #75）：Thread Goal 的 token 预算从这里读。
+   *
+   * 内存态、重启归零（理由见 SessionState.usage 的注释）。未知会话返回零值而不是
+   * null——调用方（Goal 预算）不该为"还没跑过"写一条分支。
+   */
+  /**
+   * 最近一条助手消息的文本（票 M7-C-T3 / #77）：Plan 的 `<proposed_plan>` 从这里解析。
+   *
+   * 从账本读而不是缓存：计划必须来自**已落账**的助手输出（可审计、可回溯），
+   * 而不是某个可能被改过的内存副本。
+   */
+  lastAssistantText(sessionId: string): string | null {
+    let text: string | null = null;
+    for (const { envelope } of this.#ledger.scan({ sessionId })) {
+      if (envelope.event_type !== SESSION_EVENT_TYPES.messageAssistant) continue;
+      const value = envelope.payload.text;
+      text = typeof value === "string" ? value : null;
+    }
+    return text;
+  }
+
+  usageOf(sessionId: string): MorrowRunUsage {
+    return this.#states.get(sessionId)?.usage ?? {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      total: 0,
+      estimated: false,
+    };
+  }
+
   /** 订阅会话事件帧（SSE）；返回退订函数。未知会话返回 null。 */
   subscribe(sessionId: string, listener: (frame: SessionFrame) => void): (() => void) | null {
     if (!this.sessionExists(sessionId)) return null;
@@ -1185,6 +1271,9 @@ export class SessionManager {
           state.runtime = runtime;
         }
 
+        // 本轮计时起点（Goal 的 elapsed 统计用；每轮重置）
+        state.runStartedAt = Date.now();
+        state.runError = null;
         let text = "";
         const toolStarted = new Map<string, string>();
         const unsubscribe = runtime.subscribe((event: MorrowAgentEvent) => {
@@ -1303,17 +1392,36 @@ export class SessionManager {
         break;
       }
       case "error": {
+        state.runError = event.message;
         this.#append(sessionId, SESSION_EVENT_TYPES.agentError, "agent:runtime", { message: event.message }, input.userEventId);
         break;
       }
+      case "usage": {
+        // 本轮用量先暂存，在 agent_end 里并入累计值（一条 message.assistant 一条 usage，
+        // 保证"轮次结束"与"用量到账"原子）
+        state.pendingUsage = event.usage;
+        break;
+      }
       case "agent_end": {
+        const runUsage = state.pendingUsage;
+        state.pendingUsage = null;
         const assistant = this.#append(
           sessionId,
           SESSION_EVENT_TYPES.messageAssistant,
           "agent:runtime",
-          { message_id: uuidv7(), text: ctx.getText(), stop_reason: event.stopReason },
+          {
+            message_id: uuidv7(),
+            text: ctx.getText(),
+            stop_reason: event.stopReason,
+            // 本轮用量随 message.assistant 一起落账（缺失则不写该字段，保持既有事件字节兼容）
+            ...(runUsage === null ? {} : { usage: runUsage }),
+          },
           input.userEventId,
         );
+        // 会话级累计（Goal 预算读这里）
+        if (runUsage !== null) {
+          state.usage = addUsage(state.usage ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, estimated: false }, runUsage);
+        }
         // 后台抽取触发（票 M1-T2）：轮次收尾（message.assistant 已落账）→ fire-and-forget。
         // 失败只记日志：记忆是增强路径，不得吞掉本轮已持久化的会话事件。
         if (this.#memory?.observeTurnEnd !== undefined) {
@@ -1329,6 +1437,28 @@ export class SessionManager {
             console.error("[morrow] memory turn-end observe failed:", err);
           }
         }
+        // Goal 的轮次推进（票 M7-C-T5 / #79）：错误不静默吞掉——它决定 goal 是继续、
+        // 受限还是阻塞，静默会让 goal 永远停在 active 空转。这里记日志但仍不抛出
+        // （观察方异常不该改变会话主链路的口径）。
+        if (this.#turnObserver !== null) {
+          const elapsedMs = state.runStartedAt === null ? 0 : Date.now() - state.runStartedAt;
+          const errorMessage = state.runError;
+          try {
+            this.#turnObserver.observeTurnFinished({
+              sessionId,
+              error: errorMessage,
+              ...(parseStatusFromError(errorMessage) === undefined
+                ? {}
+                : { status: parseStatusFromError(errorMessage) }),
+              elapsedMs,
+              occurredAt: assistant.envelope.occurred_at,
+            });
+          } catch (err) {
+            console.error("[morrow] turn observer failed:", err);
+          }
+        }
+        state.runError = null;
+        state.runStartedAt = null;
         break;
       }
     }
@@ -1363,7 +1493,16 @@ export class SessionManager {
   #stateOf(sessionId: string): SessionState {
     let state = this.#states.get(sessionId);
     if (state === undefined) {
-      state = { frames: new Set(), runtime: null, running: false, queue: [] };
+      state = {
+        frames: new Set(),
+        runtime: null,
+        running: false,
+        queue: [],
+        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, estimated: false },
+        pendingUsage: null,
+        runStartedAt: null,
+        runError: null,
+      };
       this.#states.set(sessionId, state);
     }
     return state;

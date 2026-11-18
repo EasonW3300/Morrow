@@ -1,8 +1,40 @@
 # 变更日志
 
 本文件记录 Morrow 的对外可见变更。格式参照 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
-版本号遵循语义化版本；当前发布版本为 `0.3.0`，版本号唯一来源是各 workspace `package.json`
+版本号遵循语义化版本；当前发布版本为 `0.4.0`，版本号唯一来源是各 workspace `package.json`
 （Runtime 的 ready 行与 `/v1/health` 均从 `apps/runtime/package.json` 读取，不设双真相源）。
+
+## [0.4.0] - 2026-11-18
+
+M7-C：自动化编排（Plan 模式 / Thread Goal / Best 模式）。逐项门禁证据见
+[`docs/gates/m7c-gate-report.md`](docs/gates/m7c-gate-report.md)。M7 三段至此收官。
+
+### 新增
+
+- **Plan 模式（`/plan`）**：会话进入**真的**只读模式——只读是**装配层硬限制**（写工具根本不出现在工具集里），不是提示词约定；即使模型构造出写调用也会在执行层被拒并留 `plan.write_attempt_blocked` 审计。三阶段对话流（环境探查 → 意图澄清 → 实现细节），其中提问是**阻塞式**的（工具立即返回"已提问"、会话进入等回答态，回答作为下一轮 prompt；不占用悬挂 Promise）。计划以 `<proposed_plan>` 严格解析（缺标题/缺步骤/空块都拒绝并说明原因），解析后三种选择（实现 / 清空上下文后实现 / 继续规划），计划可「转为任务」复用 Task DAG。状态**不持久化**，关闭会话即回默认。
+- **Thread Goal（`/goal`）**：会话级长跑意图，**六态状态机**（active / paused / blocked / usage_limited / budget_limited / complete，迁移表逐格验证，`complete` 是终态）。双预算：token（自行累加 Provider 返回的 usage，缺失时按 `chars/4` 估算并**显式标注**）+ 时间（暂停不累计）。任一超限自动停。空闲自动续跑（默认 30s 扫描、30s 静默阈值），**Plan 模式下不续跑**。429/配额错误映射 `usage_limited`；同一阻塞连续 3 轮才判 `blocked`（换错误签名从 1 重数）。创建需**显式确认**，模型侧没有 `create_goal` 工具。落表持久化，跨重启继续。
+- **Best 模式（`/best`）**：给一个想法自动走完访谈 → 规格 → 拆票 → 实现。访谈逐轮提问且**每题必带推荐答案**，轮次上限默认 12。规格成稿后**确认门**（被拒停在规格可编辑重提，**不回退访谈**）；拆票不设门（垂直切片 + 阻塞边，已配 gh 建 issues、未配写本地一票一文件 + index 依赖图）；实现前**确认门**——**「完全权限」也不能跳过**（写死在状态迁移里，不查任何权限开关）。实现阶段复用会话工作区建 `feat/<slug>` 分支 + worktree、展开 Task DAG、**提交但不 push**，最后给「推送并开 PR」的指令。
+- **用量通道**：适配层新增 `usage` 事件（在 `agent_end` 之前发出），从 Provider 流式响应提取 input/output/cache token；缺失时按 `chars/4` 估算并标 `estimated`。会话级 `usageOf` 累计。
+
+### 修复
+
+- **Plan 的只读工具全是空壳**：白名单写了 6 个"未来会有"的工具名，但项目里只有一个 builtin（且是写工具）→ Plan 模式下工具集为空，「只读研究」什么都做不了。白名单收敛到真实存在的工具，并补真实的只读工具 `memory.search`（记忆 FTS 检索）。
+- **Best 中止后承载 goal 仍 active**：已放弃的目标仍被续跑器每 30s 拉起继续烧预算。abort 时把 goal 置 complete。
+- **Plan 退出后待回答问题残留**：下次进 Plan 会看到已作废的问题。退出时清理。
+- **无预算的 goal 可无限自跑**：两个预算都允许 null，但没有兜底。加 100 轮硬上限，到限转 `budget_limited` 并提示设预算。
+
+### 质量
+
+runtime **1244** / desktop **264** / pi-adapter **46** 全绿；真实容器套件 **12/12**；全 workspace typecheck 干净。阶段 C 新增 171 项测试。code-review 双轴发现 4 项（1 项严重）全部修复并补回归测试。
+
+### 已知限制（增量，接续 0.3.0）
+
+- **`usage_limited` 靠 429 + 文案匹配**：不同网关错误码不统一（PRD §10 开放项），可能误判；原始错误保留在 goal 的 `last_error` 供核对。
+- **token 估算对中文系统性偏小**：`chars/4` 是英文近似；估算值时预算判定应当下界。
+- **Best 拆票的垂直切片性无法自动判定**：`validateTickets` 会拒无验收/悬空引用/有环的票，但"票是否真的可独立交付"是语义判断。
+- **Best 实现阶段不自动 push/开 PR**：设计如此（不可撤销 + 对外可见），只给指令。
+- **Plan 的阻塞提问是两段式**：对模型等价，但不占用悬挂 Promise（进程可观测性更好）。
+- **桌面端无 DOM 测试环境**：阶段 C 的 UI（Plan/Goal/Best 面板）判定与文案走纯函数测试，无组件级断言。
 
 ## [0.3.0] - 2026-11-17
 

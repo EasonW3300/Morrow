@@ -14,6 +14,7 @@
  *   其余（agent/turn/message 生命周期、thinking、toolcall 流式细节）→ 丢弃
  */
 import type { AgentStopReason, MorrowAgentEvent } from "./types.ts";
+import { resolveRunUsage } from "./usage.ts";
 
 const KNOWN_STOP_REASONS: readonly AgentStopReason[] = [
   "stop",
@@ -64,6 +65,17 @@ function translateAgentEnd(messages: unknown): MorrowAgentEvent[] {
   const lastAssistant = findLastAssistant(messages);
   const stopReason = normalizeStopReason(lastAssistant?.stopReason);
   const out: MorrowAgentEvent[] = [];
+
+  // 用量在 agent_end **之前**发（Goal 的预算累加只关心它，收尾时必须已到账）。
+  // 优先采信供应商返回的 usage；缺失则按 messages 的字符数估算并标 estimated
+  // ——这一步必须在这里做，因为 messages 只在 agent_end 事件里拿得到。
+  const usage = resolveRunUsage({
+    assistantMessage: lastAssistant,
+    promptChars: countChars(messages, "user"),
+    outputChars: countChars(messages, "assistant"),
+  });
+  out.push({ type: "usage", usage });
+
   if (stopReason === "error") {
     const message =
       typeof lastAssistant?.errorMessage === "string" && lastAssistant.errorMessage.length > 0
@@ -87,6 +99,35 @@ function findLastAssistant(messages: unknown): AssistantLike | undefined {
     if (m?.role === "assistant") return m as AssistantLike;
   }
   return undefined;
+}
+
+/**
+ * 统计某角色的消息文本总字符数（估算路径用）。
+ *
+ * 只数 text 内容块：tool call 参数与工具结果不计入（它们的 token 由供应商的
+ * usage 覆盖；估算路径下把它们算进来会让数字虚高，而我们宁愿低估——低估会让
+ * 预算判定偏向"再跑一轮"，比高估导致过早停摆更安全）。
+ */
+function countChars(messages: unknown, role: "user" | "assistant"): number {
+  if (!Array.isArray(messages)) return 0;
+  let total = 0;
+  for (const raw of messages) {
+    if (typeof raw !== "object" || raw === null) continue;
+    const message = raw as Record<string, unknown>;
+    if (message.role !== role) continue;
+    const content = message.content;
+    if (typeof content === "string") {
+      total += content.length;
+      continue;
+    }
+    if (!Array.isArray(content)) continue;
+    for (const block of content) {
+      if (typeof block !== "object" || block === null) continue;
+      const typed = block as Record<string, unknown>;
+      if (typed.type === "text" && typeof typed.text === "string") total += typed.text.length;
+    }
+  }
+  return total;
 }
 
 function normalizeStopReason(value: unknown): AgentStopReason {

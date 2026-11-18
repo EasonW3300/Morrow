@@ -1425,6 +1425,149 @@ export const api = {
       body: JSON.stringify(reason === undefined ? {} : { reason }),
     });
   },
+  // --- Plan / Goal / Best（票 M7-C / #74）----------------------------------------
+
+  /** GET /v1/sessions/:id/plan：Plan 模式状态 */
+  getPlanState(
+    base: string,
+    sessionId: string,
+  ): Promise<{ active: boolean; phase: string | null; readonly_notice: string; persisted: boolean }> {
+    return request(base, `/v1/sessions/${encodeURIComponent(sessionId)}/plan`);
+  },
+
+  /** POST /v1/sessions/:id/plan/enter|exit */
+  setPlanMode(
+    base: string,
+    sessionId: string,
+    action: "enter" | "exit",
+  ): Promise<{ active: boolean; changed: boolean; phase?: string | null }> {
+    return request(base, `/v1/sessions/${encodeURIComponent(sessionId)}/plan/${action}`, {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify({}),
+    });
+  },
+
+  /** PUT /v1/sessions/:id/plan/phase */
+  setPlanPhase(base: string, sessionId: string, phase: string): Promise<{ phase: string; changed: boolean }> {
+    return request(base, `/v1/sessions/${encodeURIComponent(sessionId)}/plan/phase`, {
+      method: "PUT",
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ phase }),
+    });
+  },
+
+  /** POST /v1/sessions/:id/plan/decision：计划落地三选一 */
+  decidePlan(
+    base: string,
+    sessionId: string,
+    decision: "implement" | "implement_clean" | "continue",
+  ): Promise<{
+    decision: string;
+    plan: { title: string; steps: string[] } | null;
+    next: string;
+    clean_context_prompt?: string;
+    parse_error?: { reason: string; detail: string };
+  }> {
+    return request(base, `/v1/sessions/${encodeURIComponent(sessionId)}/plan/decision`, {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ decision }),
+    });
+  },
+
+  /** GET /v1/goals?session_id= */
+  listGoals(base: string, sessionId?: string): Promise<{ goals: GoalView[] }> {
+    const query = sessionId === undefined ? "" : `?session_id=${encodeURIComponent(sessionId)}`;
+    return request(base, `/v1/goals${query}`);
+  },
+
+  /** POST /v1/goals（必须 confirm=true） */
+  createGoal(
+    base: string,
+    input: { sessionId: string; objective: string; tokenLimit?: number; timeLimitMs?: number },
+  ): Promise<{ goal: GoalView }> {
+    return request(base, "/v1/goals", {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify({
+        session_id: input.sessionId,
+        objective: input.objective,
+        confirm: true,
+        ...(input.tokenLimit === undefined ? {} : { token_limit: input.tokenLimit }),
+        ...(input.timeLimitMs === undefined ? {} : { time_limit_ms: input.timeLimitMs }),
+      }),
+    });
+  },
+
+  /** POST /v1/goals/:id/{pause,resume,complete} */
+  goalAction(
+    base: string,
+    goalId: string,
+    action: "pause" | "resume" | "complete",
+    tokenLimit?: number,
+  ): Promise<{ goal: GoalView }> {
+    return request(base, `/v1/goals/${encodeURIComponent(goalId)}/${action}`, {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify(tokenLimit === undefined ? {} : { token_limit: tokenLimit }),
+    });
+  },
+
+  /** POST /v1/best：启动 Best 模式 */
+  startBest(base: string, input: { sessionId: string; idea: string }): Promise<{ run: BestRunView }> {
+    return request(base, "/v1/best", {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ session_id: input.sessionId, idea: input.idea }),
+    });
+  },
+
+  /** GET /v1/best/:id */
+  getBest(base: string, bestId: string): Promise<{ run: BestRunView }> {
+    return request(base, `/v1/best/${encodeURIComponent(bestId)}`);
+  },
+
+  /** POST /v1/best/:id/spec-gate */
+  decideBestSpecGate(
+    base: string,
+    bestId: string,
+    decision: "approve" | "reject",
+    reason?: string,
+  ): Promise<{ run: BestRunView }> {
+    return request(base, `/v1/best/${encodeURIComponent(bestId)}/spec-gate`, {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ decision, ...(reason === undefined ? {} : { reason }) }),
+    });
+  },
+
+  /** POST /v1/best/:id/implement-gate */
+  approveBestImplementGate(base: string, bestId: string): Promise<{ run: BestRunView; approved: boolean }> {
+    return request(base, `/v1/best/${encodeURIComponent(bestId)}/implement-gate`, {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify({}),
+    });
+  },
+
+  /** POST /v1/best/:id/implement */
+  startBestImplement(
+    base: string,
+    bestId: string,
+  ): Promise<{ run: BestRunView; branch: string; task_id: string; pushed: boolean }> {
+    return request(base, `/v1/best/${encodeURIComponent(bestId)}/implement`, {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify({}),
+    });
+  },
+
+  /** GET /v1/best/:id/push-plan */
+  bestPushPlan(base: string, bestId: string): Promise<{ branch: string; commands: string[]; notice: string }> {
+    return request(base, `/v1/best/${encodeURIComponent(bestId)}/push-plan`);
+  },
+
 };
 
 // --- MCP 响应类型（与 runtime 的 mcp/routes.ts 同源形状）----------------------------
@@ -1650,4 +1793,49 @@ export interface SkillPackageUpgradePreview {
   };
   requires_confirmation: boolean;
   requires_permission_widening_acceptance: boolean;
+}
+
+// --- Plan / Goal / Best 响应类型（与 runtime 的 plan/goals/best 路由同源）----------
+
+export interface GoalView {
+  goal_id: string;
+  session_id: string;
+  objective: string;
+  status: string;
+  status_label: string;
+  token_limit: number | null;
+  time_limit_ms: number | null;
+  blocked_streak: number;
+  last_error: string | null;
+  best_slug: string | null;
+  created_at: string;
+  updated_at: string;
+  usage: {
+    tokens: number;
+    tokens_estimated: boolean;
+    elapsed_ms: number;
+    runs: number;
+    token_progress: number | null;
+    time_progress: number | null;
+  };
+}
+
+export interface BestRunView {
+  best_id: string;
+  session_id: string;
+  goal_id: string | null;
+  idea: string;
+  stage: string;
+  stage_label: string;
+  status: string;
+  slug: string | null;
+  spec_markdown: string | null;
+  spec_path: string | null;
+  tickets: Array<{ title: string; what_to_build: string; criteria: string[]; blocked_by: string[] }>;
+  branch: string | null;
+  workspace_path: string | null;
+  last_error: string | null;
+  interview: Array<{ question: { question: string; recommendation: string; options?: string[] }; answer: string }>;
+  interview_count: number;
+  next: string;
 }

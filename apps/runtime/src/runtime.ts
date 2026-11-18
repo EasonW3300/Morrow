@@ -5,7 +5,11 @@ import { homedir } from "node:os";
 import { createPiAdapter, type AgentRuntime, type MorrowTool } from "@morrow/pi-adapter";
 import packageJson from "../package.json" with { type: "json" };
 import piAdapterPackageJson from "../../../packages/pi-adapter/package.json" with { type: "json" };
-import { ensureBuiltinCapabilities, MEMORY_WRITE_CAPABILITY_MANIFEST } from "./capabilities/builtin.ts";
+import {
+  ensureBuiltinCapabilities,
+  MEMORY_SEARCH_CAPABILITY_MANIFEST,
+  MEMORY_WRITE_CAPABILITY_MANIFEST,
+} from "./capabilities/builtin.ts";
 import { CAPABILITY_EVENT_TYPES, PermissionEngine, isEphemeralWriteClassCapability, type CapabilityLifecycleEvent } from "./capabilities/engine.ts";
 import type { CapabilityRecord, SessionAttachment, SessionWorkspace } from "@morrow/protocol";
 import { capabilityRoutes } from "./capabilities/routes.ts";
@@ -32,7 +36,7 @@ import { probeSandbox } from "./health.ts";
 import { EventLedger } from "./ledger.ts";
 import { MemoryService } from "./memory/service.ts";
 import { MemoryStore } from "./memory/store.ts";
-import { createMemoryWriteTool } from "./memory/tool.ts";
+import { createMemorySearchTool, createMemoryWriteTool } from "./memory/tool.ts";
 import { memoryRoutes } from "./memory/routes.ts";
 import { MemoryProjector } from "./memory/projection.ts";
 import { LlmMemoryExtractor, type MemoryExtractor } from "./memory/extraction.ts";
@@ -104,6 +108,19 @@ import { ToolInvoker, type InvocationResult } from "./sandbox/invoker.ts";
 import { createRegistryPermissionAdapter, type SandboxPermissionEngine } from "./sandbox/permission.ts";
 import type { SandboxRunner } from "./sandbox/runner.ts";
 import { ExecModeRegistry } from "./exec/mode.ts";
+import { PlanModeRegistry, filterPlanModeTools, isPlanModeReadOnly } from "./plan/mode.ts";
+import { planRoutes } from "./plan/routes.ts";
+import { PlanQuestionRegistry } from "./plan/questions.ts";
+import { GoalStore } from "./goals/store.ts";
+import { GoalService } from "./goals/service.ts";
+import { goalRoutes } from "./goals/routes.ts";
+import { GoalDriver } from "./goals/driver.ts";
+import { BestStore } from "./best/store.ts";
+import { BestService } from "./best/service.ts";
+import { bestRoutes } from "./best/routes.ts";
+import { BestTicketsService } from "./best/tickets-service.ts";
+import { composePlanSystemPrompt } from "./plan/prompt.ts";
+import type { ParsedPlan } from "./plan/plan-block.ts";
 import { ExecService } from "./exec/service.ts";
 import { execRoutes } from "./exec/routes.ts";
 import { createDefaultExecRunner, type LocalExecRunner } from "./exec/runner.ts";
@@ -206,6 +223,20 @@ interface RequestContext {
   workspace: WorkspaceManager;
   /** 临时会话写入门（票 M7-A-T3 / #64-A4：能力网关、skill invoke、任务创建共用同一判定） */
   ephemeralGate: EphemeralGateDeps;
+  /** Plan 模式（票 M7-C-T2 / #76：只读工具集 + 进入/退出/阶段） */
+  planMode: PlanModeRegistry;
+  /** Plan 问答（票 M7-C-T3 / #77：阻塞式提问的待回答队列） */
+  planQuestions: PlanQuestionRegistry;
+  /** Thread Goal（票 M7-C-T4 / #78：六态状态机 + 双预算） */
+  goals: GoalService;
+  /** Goal 续跑驱动器（票 M7-C-T5 / #79：tick/recordRun） */
+  goalDriver: GoalDriver;
+  /** Best 模式（票 M7-C-T6 / #80：四阶段 + 规格门） */
+  best: BestService;
+  /** Best 拆票与实现（票 M7-C-T7 / #81） */
+  bestTickets: BestTicketsService;
+  /** 记录会话活动（续跑静默阈值的输入；用户发消息时调用） */
+  touchSessionActivity(sessionId: string): void;
   /** 动态 bash（票 M7-B-T6 / Issue #70：模式判定 + 确认 + 快照 + 容器执行 + 审计） */
   exec: ExecService;
   /** 执行模式注册表（会话级、不持久化；路由层读 GET /v1/sessions/:id/exec-mode） */
@@ -440,6 +471,17 @@ export interface RuntimeOptions {
   mcpReclaimIntervalMs?: number;
   /** MCP 空闲阈值（毫秒，默认 10min）。测试注入短值验证回收；生产保持规格值。 */
   mcpIdleTimeoutMs?: number;
+  /**
+   * Goal 续跑扫描间隔（毫秒，默认 30s）；0 = 不启动定时器（测试手动 tick）。
+   * 静默阈值由 goalResumeIdleMs 单独控制。
+   */
+  goalResumeIntervalMs?: number;
+  /** Goal 续跑静默阈值（毫秒，默认 30s）：距上次活动超过这个时长才自跑 */
+  goalResumeIdleMs?: number;
+  /** Goal 时钟注入（测试零 sleep） */
+  goalNow?: () => number;
+  /** Best 模式访谈轮次上限（默认 12；到限强制收束） */
+  bestInterviewMaxTurns?: number;
   skillPackageInstall?: (options: {
     spec: string;
     targetDir: string;
@@ -505,6 +547,18 @@ export interface RuntimeHandle {
   outbox: OutboxService;
   /** 通知规则与路由（M4-T7 / Issue #44：handleEnvelope/flushDue/dispatchQueued，库形态可直用） */
   notifications: NotificationService;
+  /** Plan 模式注册表（会话级内存态；库形态可直用） */
+  planMode: PlanModeRegistry;
+  /** Plan 问答注册表（阻塞式提问的待回答队列） */
+  planQuestions: PlanQuestionRegistry;
+  /** Thread Goal 服务（库形态可直用：create/pause/resume/complete/recordRun） */
+  goals: GoalService;
+  /** Goal 续跑驱动器（库形态可直用：tick 手动驱动） */
+  goalDriver: GoalDriver;
+  /** Best 模式服务（库形态可直用：start/interview/submitSpec/decideSpecGate/abort） */
+  best: BestService;
+  /** Best 拆票与实现（库形态可直用） */
+  bestTickets: BestTicketsService;
   /** 动态 bash 执行服务（M7-B-T6 / Issue #70：submit/approve/revert/setMode，库形态可直用） */
   exec: ExecService;
   /** 执行模式注册表（会话级内存态；诊断用：size 证明关闭会话后释放） */
@@ -635,6 +689,60 @@ const routes: Route[] = [
     handler: (req: IncomingMessage, res: ServerResponse, url: URL, ctx: RequestContext, params: string[]) =>
       route.handler(req, res, url, { mcp: ctx.mcp }, params),
   })),
+  // Best 模式（票 M7-C-T6 / #80）：启动/访谈/规格门/中止（拆票与实现门在 C7）
+  ...bestRoutes.map((route) => ({
+    method: route.method,
+    re: route.re,
+    handler: (req: IncomingMessage, res: ServerResponse, url: URL, ctx: RequestContext, params: string[]) =>
+      route.handler(
+        req,
+        res,
+        url,
+        {
+          best: ctx.best,
+          tickets: ctx.bestTickets,
+          // 实现门的批准状态从账本推导（事件是唯一真相源，不看内存态）
+          events: () => ctx.ledger.scan({}).map((entry) => ({
+            event_type: entry.envelope.event_type,
+            payload: entry.envelope.payload,
+          })),
+        },
+        params,
+      ),
+  })),
+  // Thread Goal（票 M7-C-T4 / #78）：显式创建 + 六态迁移 + 双预算
+  ...goalRoutes.map((route) => ({
+    method: route.method,
+    re: route.re,
+    handler: (req: IncomingMessage, res: ServerResponse, url: URL, ctx: RequestContext, params: string[]) =>
+      route.handler(req, res, url, { goals: ctx.goals }, params),
+  })),
+  // Plan 模式（票 M7-C-T2 / #76）：进入/退出/阶段。进入退出只走 HTTP 端点，
+  // 模型侧没有对应工具——这就是 FR-C4「自动回合不得自行进入/离开 Plan」的保证。
+  ...planRoutes.map((route) => ({
+    method: route.method,
+    re: route.re,
+    handler: (req: IncomingMessage, res: ServerResponse, url: URL, ctx: RequestContext, params: string[]) =>
+      route.handler(
+        req,
+        res,
+        url,
+        {
+          planMode: ctx.planMode,
+          questions: ctx.planQuestions,
+          ledger: ctx.ledger,
+          replicaId: ctx.replicaId,
+          isSessionExecutable: (sessionId) => isSessionExecutable(ctx, sessionId),
+          sessionExists: (sessionId) => ctx.sessions.sessionExists(sessionId),
+          personaPrompt: () => composePersonaPrompt(ctx.persona.get()),
+          workspacePathOf: (sessionId) => ctx.sessions.workspaceOf(sessionId)?.path ?? null,
+          lastAssistantText: (sessionId) => ctx.sessions.lastAssistantText(sessionId),
+          convertToTask: (sessionId, plan) => createTaskFromPlan(ctx, sessionId, plan),
+          now: () => new Date(),
+        },
+        params,
+      ),
+  })),
   // 动态 bash（票 M7-B-T6 / Issue #70）：会话级执行模式 + 脚本提交/确认/撤销。
   // execRoutes 桥接到 exec 自有路由签名（ctx.exec / ctx.execModes 在请求时取）。
   ...execRoutes.map((route) => ({
@@ -669,6 +777,42 @@ const routes: Route[] = [
       route.handler(req, res, url, ctx.factory, params),
   })),
 ];
+
+/**
+ * Plan 模式下写意图被拦的审计（票 M7-C-T2 / #76）。
+ *
+ * 记下"模型想调什么"而不是只记"被拒了"——事后复盘时这条最有价值：
+ * 它能证明限制真的被尝试过、以及模型当时想干什么。
+ */
+function appendPlanBlocked(ctx: RequestContext, sessionId: string, capabilityId: string): void {
+  const envelope = buildEventEnvelope({
+    replicaId: ctx.replicaId,
+    actorId: "agent:runtime",
+    eventType: "plan.write_attempt_blocked",
+    sessionId,
+    payload: { capability: capabilityId },
+  });
+  ctx.ledger.append(envelope);
+}
+
+
+/**
+ * 已批准的计划 → Task（票 M7-C-T3 / Issue #77 的 FR-C5）。
+ *
+ * 复用既有 TaskService（计划 → DAG → 调度 → Checkpoint），不新写编排。
+ * 计划全文作为 goal 传进去：任务详情要能追溯"这份任务从哪份计划来"（PRD 决策 #41）。
+ */
+async function createTaskFromPlan(
+  ctx: RequestContext,
+  sessionId: string,
+  plan: ParsedPlan,
+): Promise<{ taskId: string; eventId: string }> {
+  const goal = [`# ${plan.title}`, "", plan.raw].join("\n");
+  const task = await ctx.tasks.createTask(goal, { sessionId });
+  // TaskDetail 没有 event_id 字段：用 task.created_at 无法回链，所以 eventId 留空，
+  // 由 plan.converted_to_task 审计事件承担"这次转换"的回链（那条事件里有 task_id）。
+  return { taskId: task.task_id, eventId: "" };
+}
 
 export async function startRuntime(config: RuntimeConfig, options: RuntimeOptions = {}): Promise<RuntimeHandle> {
   const ledger = EventLedger.open(config.dataDir);
@@ -906,6 +1050,8 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
   // 新 builtin 工具在此追加工厂并加入 capabilities/builtin.ts 的 manifest 全集。
   const builtinToolFactories: Record<string, (sessionId: string) => MorrowTool> = {
     [MEMORY_WRITE_CAPABILITY_MANIFEST.name]: (sessionId) => createMemoryWriteTool({ service: memory, sessionId }),
+    // 只读检索（票 M7-C code-review）：Plan 模式要有真实可用的只读工具
+    [MEMORY_SEARCH_CAPABILITY_MANIFEST.name]: () => createMemorySearchTool({ service: memory }),
   };
   // 能力 → 调用接缝登记（#22 修复批 / FR-CAP-5「能力调用路径做真」）：
   //   builtin 实现存在（memory.write 等 human vetted 内置件）→ sandbox.type=process 进程内执行；
@@ -1034,7 +1180,93 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
   // null/未接线 = Owner 或普通会话，不做联系人收窄。
   let contactToolCapabilities: ((sessionId: string) => string[] | null) | null = null;
   // 临时会话判定（票 M7-A-T3）：晚绑定到 SessionManager（构造闭包在运行时执行）
+  // Plan 模式（票 M7-C-T2 / #76）：会话级、不持久化；代际号防"关闭→恢复"继承只读。
+  // 用晚绑定变量解开"planMode ↔ sessions"的构造循环（sessions 的 systemPrompt 要读
+  // planMode，而 planMode 的 isOpen 要问 sessions）。
+  let sessionsRef: SessionManager | null = null;
+  const planMode: PlanModeRegistry = new PlanModeRegistry({
+    isOpen: (sessionId) => sessionsRef?.isExecutable(sessionId) === true,
+    epoch: (sessionId) => sessionsRef?.executionEpoch(sessionId) ?? 0,
+  });
+
+  // Plan 问答（票 M7-C-T3 / #77）：待回答的问题只活在本进程（与 Plan 模式同款）
+  const planQuestions = new PlanQuestionRegistry({ isOpen: (sessionId) => sessions.isExecutable(sessionId) });
+
+  // Thread Goal（票 M7-C-T4 / #78）：落表持久化（跨重启继续），与 Plan/Best 的
+  // 内存态不同——Goal 的全部意义就是"跨重启还在做这件事"。
+  const goalStore = new GoalStore({ dataDir: config.dataDir });
+  const goals = new GoalService({
+    store: goalStore,
+    ledger,
+    replicaId: config.replicaId,
+    isSessionExecutable: (sessionId) => sessions.isExecutable(sessionId),
+    sessionKind: (sessionId) => sessions.sessionKind(sessionId),
+    sessionUsage: (sessionId) => {
+      const usage = sessions.usageOf(sessionId);
+      return { total: usage.total, estimated: usage.estimated };
+    },
+  });
+
+  // Goal 续跑驱动器（票 M7-C-T5 / #79）：周期性问"谁该跑"，让会话自己跑一轮。
+  // 决策与执行分离：这里只判定，运行走会话的既有发送路径（不另起第二条运行链）。
+  /** 各会话最后一次活动时间（续跑静默阈值判定用） */
+  const lastActivity = new Map<string, number>();
+  const goalDriver = new GoalDriver({
+    goals,
+    isSessionExecutable: (sessionId) => sessions.isExecutable(sessionId),
+    isSessionBusy: (sessionId) => sessions.isRunning(sessionId),
+    isPlanModeActive: (sessionId) => planMode.isActive(sessionId),
+    sendMessage: (sessionId, text) => {
+      sessions.sendUserMessage(sessionId, text, { actorId: "agent:runtime" });
+    },
+    lastActivityAt: (sessionId) => lastActivity.get(sessionId) ?? 0,
+    ...(options.goalNow === undefined ? {} : { now: options.goalNow }),
+    ...(options.goalResumeIdleMs === undefined ? {} : { idleThresholdMs: options.goalResumeIdleMs }),
+  });
+
+  // Best 模式（票 M7-C-T6 / #80）：四阶段自动化，由一个 Thread Goal 承载。
+  // 落表持久化：它会建分支、写文件、跑很久，重启后必须能找回半成品。
+  const bestStore = new BestStore({ dataDir: config.dataDir });
+  const best = new BestService({
+    store: bestStore,
+    ledger,
+    replicaId: config.replicaId,
+    goals,
+    isSessionExecutable: (sessionId) => sessions.isExecutable(sessionId),
+    sessionKind: (sessionId) => sessions.sessionKind(sessionId),
+    ...(options.bestInterviewMaxTurns === undefined ? {} : { maxInterviewTurns: options.bestInterviewMaxTurns }),
+  });
+
+  // Best 拆票与实现（票 M7-C-T7 / #81）：产物落位、feat 分支、Task DAG、推送计划
+  const bestTickets = new BestTicketsService({
+    store: bestStore,
+    best,
+    ledger,
+    replicaId: config.replicaId,
+    workspace: workspaceManager,
+    createTask: async ({ goal, sessionId }) => {
+      const task = await tasks.createTask(goal, { sessionId });
+      return { taskId: task.task_id };
+    },
+    workspaceOf: (sessionId) => {
+      const bound = sessions.workspaceOf(sessionId);
+      return bound === null ? null : bound;
+    },
+    bindSessionWorkspace: async (sessionId, binding) => {
+      const prepared = await workspaceManager.prepareWorktree(binding.repoPath, binding.branch, sessionId);
+      sessions.bindWorkspace(sessionId, {
+        kind: "local",
+        path: prepared.dir,
+        repo_path: binding.repoPath,
+        branch: binding.branch,
+      } as never);
+      return { path: prepared.dir };
+    },
+  });
+
   let ephemeralSession: ((sessionId: string) => boolean) | null = null;
+  // Plan 模式晚绑定（与 ephemeralSession 同款：SessionManager 在 PlanModeRegistry 之后构造）
+  let planModeSession: ((sessionId: string) => boolean) | null = null;
   // 会话工具注入改查注册表（票 M2-T1）：enabled 且有内置实现的 typescript 能力才实例化
   const sessions = new SessionManager({
     ledger,
@@ -1048,13 +1280,37 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     memory,
     // 全局 Persona → 会话 system prompt（M7-A-T1 / Issue #58）：固定顺序拼装，随会话
     // AgentRuntime 创建注入；不注入任务规划器。
-    systemPrompt: () => composePersonaPrompt(persona.get()),
+    // Plan 模式（票 M7-C-T3 / #77）：Plan 提示词作为附加段拼在 Persona 之后，
+    // 不替换人设——"它是谁"与"此刻怎么工作"是正交的。
+    // Plan 模式（票 M7-C-T3 / #77）：Plan 提示词作为附加段拼在 Persona 之后，
+    // 不替换人设——"它是谁"与"此刻怎么工作"是正交的。提示词只是引导，
+    // 真正的强制在 agentTools 的只读白名单（C2）。
+    systemPrompt: (sessionId) => {
+      const personaPrompt = composePersonaPrompt(persona.get());
+      if (!planMode.isActive(sessionId)) return personaPrompt;
+      return composePlanSystemPrompt({ personaPrompt, phase: planMode.phaseOf(sessionId) });
+    },
     // 元数据时钟（M7-A-T2）：软删 30 天到期判定
     ...(options.sessionsNow === undefined ? {} : { now: options.sessionsNow }),
     // 工作区接缝（票 M7-A-T4）：附件注入按路径重读（只读），工作区绑定走同一实现
     workspace: workspaceManager,
     // 工具完成观察（M2-T5）：tool.finished → Skill 案例收集（is_error → failure）。
     // 观察是增强路径：失败记日志不阻断会话主链路。
+    // Goal 轮次推进（票 M7-C-T5 / #79）：每轮结束把用量与错误交给驱动器分类。
+    // 无 goal 的会话这里是 no-op（openForSession 返回 null）。
+    turnObserver: {
+      observeTurnFinished: (info) => {
+        lastActivity.set(info.sessionId, Date.now());
+        const goal = goals.openForSession(info.sessionId);
+        if (goal === null) return;
+        goalDriver.recordRun({
+          goalId: goal.goal_id,
+          error: info.error,
+          ...(info.status === undefined ? {} : { status: info.status }),
+          elapsedMs: info.elapsedMs,
+        });
+      },
+    },
     toolObserver: {
       observeToolFinished: (input) => {
         try {
@@ -1076,15 +1332,21 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
       // 临时会话禁写入类能力（票 M7-A-T3）：权限单入口的判定同样约束 Agent 工具面，
       // 不只拦 HTTP invoke——模型在临时会话里看不到写操作类能力工具。
       const ephemeral = ephemeralSession?.(sessionId) === true;
+      // Plan 模式（票 M7-C-T2 / #76）：只读是**装配层**的硬限制——不给写工具，
+      // 而不是劝模型别用。这是全阶段最关键的一处强制（提示词挡不住被诱导的模型）。
+      const planMode = planModeSession?.(sessionId) === true;
       return capabilities
         .list({ status: "enabled", runtime: "typescript" })
         .filter((capability) => builtinToolFactories[capability.name] !== undefined)
         .filter((capability) => contactScopes === null || contactScopes.includes(capability.name))
         .filter((capability) => !ephemeral || !isEphemeralWriteClassCapability(capability.manifest))
+        .filter((capability) => !planMode || filterPlanModeTools([capability]).length > 0)
         .map((capability) => builtinToolFactories[capability.name](sessionId));
     },
   });
+  sessionsRef = sessions;
   ephemeralSession = (sessionId) => sessions.sessionKind(sessionId) === "ephemeral";
+  planModeSession = (sessionId) => planMode.isActive(sessionId);
   // 任务域（M1-T4）：规划器/节点工厂注入语义对齐会话——注入时不做 Provider 预检，
   // 默认工厂路径要求存在可解析的默认 Provider（POST /v1/tasks 预检 503 依据）。
   const taskPlannerInjected = options.taskPlannerFactory !== undefined;
@@ -1217,6 +1479,7 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
   const outboxDrainIntervalMs = options.outboxDrainIntervalMs ?? 1_000;
   let outboxTimer: NodeJS.Timeout | null = null;
   let mcpReclaimTimer: NodeJS.Timeout | null = null;
+  let goalResumeTimer: NodeJS.Timeout | null = null;
   if (notificationDrainIntervalMs > 0) {
     notificationTimer = setInterval(() => {
       void notifications.drain().catch((err: unknown) => {
@@ -1406,6 +1669,13 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     outbox,
     notifications,
     workspace: workspaceManager,
+    planMode,
+    planQuestions,
+    goals,
+    goalDriver,
+    best,
+    bestTickets,
+    touchSessionActivity: (sessionId) => lastActivity.set(sessionId, Date.now()),
     exec,
     execModes,
     mcp,
@@ -1436,8 +1706,11 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     if (notificationTimer !== null) clearInterval(notificationTimer);
     if (outboxTimer !== null) clearInterval(outboxTimer);
     if (mcpReclaimTimer !== null) clearInterval(mcpReclaimTimer);
+    if (goalResumeTimer !== null) clearInterval(goalResumeTimer);
     unsubscribeNotifications();
     notifications.close();
+    bestStore.close();
+    goalStore.close();
     proposalStore.close();
     skillPackageStore.close();
     skills.close();
@@ -1497,6 +1770,19 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     }, mcpReclaimIntervalMs);
     if (typeof mcpReclaimTimer.unref === "function") mcpReclaimTimer.unref();
   }
+  // Goal 空闲续跑（票 M7-C-T5 / #79，FR-C10）：周期性扫描 active goal。
+  // 默认 30s 扫描、30s 静默阈值——两个数字分开可调，便于测试与调参。
+  const goalResumeIntervalMs = options.goalResumeIntervalMs ?? 30_000;
+  if (goalResumeIntervalMs > 0) {
+    goalResumeTimer = setInterval(() => {
+      try {
+        goalDriver.tick();
+      } catch (err) {
+        console.error("[morrow] goal resume tick failed:", err);
+      }
+    }, goalResumeIntervalMs);
+    if (typeof goalResumeTimer.unref === "function") goalResumeTimer.unref();
+  }
   // 调用接缝初始登记（#22 修复批 / FR-CAP-5）：把注册表里全部 enabled 能力登记进
   // ToolInvoker（本进程新建的经 onLifecycle 已登记；这里覆盖重启场景——历史行不重放
   // registered 事件）。登记失败的条目跳过并告警（invoke 404，不静默假装可调）。
@@ -1543,6 +1829,12 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
     contacts,
     outbox,
     notifications,
+    planMode,
+    planQuestions,
+    goals,
+    goalDriver,
+    best,
+    bestTickets,
     exec,
     execModes,
     mcp,
@@ -1562,6 +1854,10 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
       if (mcpReclaimTimer !== null) {
         clearInterval(mcpReclaimTimer);
         mcpReclaimTimer = null;
+      }
+      if (goalResumeTimer !== null) {
+        clearInterval(goalResumeTimer);
+        goalResumeTimer = null;
       }
       unsubscribeNotifications();
       // MCP 子进程必须在关账本前关掉：它们是宿主进程，泄漏会跨进程存活
@@ -2160,6 +2456,7 @@ async function handleCloseSession(
       const result = ctx.sessions.closeEphemeralSession(sessionId);
       // 关闭即失效（FR-B14）：执行模式与待确认票一起清掉
       ctx.exec.forgetSession(sessionId);
+      ctx.planMode.forget(sessionId);
       sendJson(res, 200, {
         session_id: sessionId,
         closed_at: result.closedAt,
@@ -2252,8 +2549,9 @@ async function handleCloseSession(
 
   try {
     const closed = ctx.sessions.closeNormalSession(sessionId, outcome);
-    // 关闭即失效（FR-B14）：普通会话关闭同样清掉执行模式与待确认票
+    // 关闭即失效（FR-B14 / FR-C1）：普通会话关闭同样清掉执行模式、待确认票与 Plan 模式
     ctx.exec.forgetSession(sessionId);
+    ctx.planMode.forget(sessionId);
     sendJson(res, 200, {
       session_id: sessionId,
       closed_at: closed.closedAt,
@@ -2653,6 +2951,8 @@ async function handleSendMessage(
     sendError(res, 400, "invalid_body", "text must be a non-empty string");
     return;
   }
+  // 用户发言算"活动"：续跑静默阈值从这一刻起算，避免"刚说完就自跑"（#79）
+  ctx.touchSessionActivity(sessionId);
   const ack = ctx.sessions.sendUserMessage(sessionId, text);
   sendJson(res, 202, {
     message_id: ack.messageId,
@@ -2917,6 +3217,24 @@ async function handleInvokeCapability(
     // 权限单入口判定，先于执行链（未知能力不在此拒绝，留给 unknown_tool；UI 侧同门禁
     // 禁用按钮，双保险）。
     assertEphemeralCapabilityUse(ctx.ephemeralGate, sessionId, [capabilityId]);
+    // Plan 模式只读纵深防护（票 M7-C-T2 / #76 第二层）：装配层已经不给写工具，
+    // 但模型仍可能通过幻觉工具名 / 历史残留构造出一次写调用——这里必须拦住并留审计。
+    // 拒绝是 403（不是 404）：能力是真的，只是此模式下不允许。
+    if (sessionId !== undefined && ctx.planMode.isActive(sessionId)) {
+      const target = ctx.capabilities.get(capabilityId);
+      // 不存在的能力**不**在这里拒：让执行链报 unknown_tool（404）语义更准确。
+      // 把"不存在"也说成"Plan 模式不允许"，会让 Owner 以为能力被删了。
+      if (target !== null && !isPlanModeReadOnly(target.record.manifest)) {
+        appendPlanBlocked(ctx, sessionId, capabilityId);
+        sendError(
+          res,
+          403,
+          "plan_mode_readonly",
+          `capability "${capabilityId}" is not allowed in plan mode (read-only tools only)`,
+        );
+        return;
+      }
+    }
     const result = await ctx.sandbox.invoke(capabilityId, body, { actorId: "owner", ...(sessionId !== undefined ? { sessionId } : {}) });
     // 先落审计后返回（账本可追踪优先于响应时延；审计失败不改变执行结果口径）
     appendCapabilityUsed(ctx, capabilityId, result, result.duration_ms, sessionId);

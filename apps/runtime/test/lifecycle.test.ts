@@ -113,14 +113,15 @@ test("events recorded before shutdown survive a restart", { timeout: 30000 }, as
   pre.append(e2);
   pre.close();
 
-  // 第一次运行：2 笔预置 + 1 笔 started + 1 笔 builtin capability.registered（票 M2-T1
-  // 启动 ensure-registered）；SIGTERM 优雅退出再记 1 笔 stopped
+  // 第一次运行：2 笔预置 + 1 笔 started + 2 笔 builtin capability.registered
+  // （memory.write 与 memory.search；票 M2-T1 启动 ensure-registered，M7-C code-review
+  // 新增了只读检索工具）；SIGTERM 优雅退出再记 1 笔 stopped
   const first = startManaged(t, { MORROW_DATA_DIR: dir, MORROW_PORT: "0" });
   const ready1 = await first.ready;
   const health1 = await json<HealthBody>(await fetch(`http://127.0.0.1:${ready1.port}/v1/health`));
   const replicaId = health1.replica_id;
   const run1 = await json<EventPage>(await fetch(`http://127.0.0.1:${ready1.port}/v1/events?limit=200`));
-  assert.equal(run1.total, 4);
+  assert.equal(run1.total, 5);
   assert.equal(await first.stop("SIGTERM"), 0);
 
   // 第二次运行：退出前全部事件仍在（含 run1 的 started 与 stopped），再加 1 笔新 started；
@@ -130,7 +131,7 @@ test("events recorded before shutdown survive a restart", { timeout: 30000 }, as
   const health2 = await json<HealthBody>(await fetch(`http://127.0.0.1:${ready2.port}/v1/health`));
   assert.equal(health2.replica_id, replicaId, "replica identity is stable across restarts");
   const run2 = await json<EventPage>(await fetch(`http://127.0.0.1:${ready2.port}/v1/events?limit=200`));
-  assert.equal(run2.total, 6, "seeded 2 + run1 started/registered/stopped + run2 started");
+  assert.equal(run2.total, 7, "seeded 2 + run1 started/2 registered/stopped + run2 started");
   const run2Ids = new Set<string>(run2.events.map((e) => e.event_id));
   for (const id of run1.events.map((e) => e.event_id)) {
     assert.ok(run2Ids.has(id), `event ${id} must survive the restart`);

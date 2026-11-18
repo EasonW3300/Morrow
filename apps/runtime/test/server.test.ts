@@ -154,7 +154,8 @@ test("mutation methods on /v1/events are rejected at the request layer", async (
       const body = await json<ApiError>(res);
       assert.equal(body.error.code, "method_not_allowed", method);
     }
-    assert.equal(runtime.ledger.list().events.length, 2); // 启动 + builtin 注册（票 M2-T1），没有被改/删
+    // 启动 + 2 个 builtin 注册（memory.write / memory.search）；没有任何被改/删的事件
+    assert.equal(runtime.ledger.list().events.length, 3);
   } finally {
     await runtime.close();
     removeDir(dir);
