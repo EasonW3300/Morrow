@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Morrow",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "identifier": "app.morrow.desktop",
   "build": {
     "beforeDevCommand": "pnpm --filter @morrow/runtime build && pnpm --filter @morrow/desktop dev",

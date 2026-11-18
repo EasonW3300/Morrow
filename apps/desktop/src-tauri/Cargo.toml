@@ -1,6 +1,6 @@
 [package]
 name = "morrow-desktop"
-version = "0.3.0"
+version = "0.4.0"
 description = "Morrow 桌面壳（Tauri 2）：拉起 Runtime sidecar，Chat 视图经控制面 HTTP/SSE 通信"
 edition = "2021"
 

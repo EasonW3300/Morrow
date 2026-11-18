@@ -1,6 +1,6 @@
 {
   "name": "@morrow/runtime",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
   "type": "module",
   "description": "Runtime 骨架 + 事件账本 v1（node:http 极简路由 + node:sqlite append-only 账本）",
