@@ -16,8 +16,10 @@ import type { GoalService } from "./service.ts";
 import type { GoalRecord } from "./store.ts";
 import {
   DEFAULT_RESUME_IDLE_MS,
+  UNBOUNDED_GOAL_RUN_LIMIT,
   classifyRunOutcome,
   decideResume,
+  hitUnboundedRunLimit,
   resumePrompt,
   type ResumeDecision,
 } from "./resume.ts";
@@ -118,7 +120,21 @@ export class GoalDriver {
       elapsedMs: input.elapsedMs,
     });
 
-    // 3) 分类并迁移
+    // 3a) 无预算的轮次上限（code-review 补的兜底）：到 100 轮推成 budget_limited，
+    // 而不是"不再续跑但状态还是 active"——后者会让 Owner 以为它还在跑。
+    if (hitUnboundedRunLimit(recorded.goal)) {
+      const limited = this.#safe(
+        () =>
+          this.#deps.goals.markBudgetLimited(
+            input.goalId,
+            `reached the ${UNBOUNDED_GOAL_RUN_LIMIT}-run safety limit with no budget set; set a token or time budget to continue`,
+          ),
+        recorded.goal,
+      );
+      return { goal: limited, action: "budget_limited" };
+    }
+
+    // 3b) 分类并迁移
     const action = classifyRunOutcome({
       error: input.error,
       ...(input.status === undefined ? {} : { status: input.status }),

@@ -12,8 +12,10 @@ import { startRuntime, type RuntimeHandle } from "../src/runtime.ts";
 import { GoalDriver } from "../src/goals/driver.ts";
 import {
   DEFAULT_RESUME_IDLE_MS,
+  UNBOUNDED_GOAL_RUN_LIMIT,
   classifyRunOutcome,
   decideResume,
+  hitUnboundedRunLimit,
   resumePrompt,
 } from "../src/goals/resume.ts";
 import { errorSignature } from "../src/goals/state.ts";
@@ -132,6 +134,39 @@ test("会话忙 / 未到静默阈值 / 不可执行 各自不续跑", () => {
 
 test("默认静默阈值是 30 秒（太短会在 Owner 刚看完一轮就自跑）", () => {
   assert.equal(DEFAULT_RESUME_IDLE_MS, 30_000);
+});
+
+test("**无预算时的轮次上限兜底**（否则自动续跑永不停止）", () => {
+  assert.equal(UNBOUNDED_GOAL_RUN_LIMIT, 100);
+  const unbounded = { runs: 100, token_limit: null, time_limit_ms: null };
+  assert.equal(hitUnboundedRunLimit(unbounded), true);
+  // 设了任一预算 → 由预算判定负责，不由轮次兜底
+  assert.equal(hitUnboundedRunLimit({ ...unbounded, token_limit: 1000 }), false);
+  assert.equal(hitUnboundedRunLimit({ ...unbounded, time_limit_ms: 60000 }), false);
+
+  // 达到上限后 decideResume 不再续跑，且给出的原因是它
+  const decision = decideResume({
+    goal: goal({ runs: 100, token_limit: null, time_limit_ms: null }),
+    sessionExecutable: true,
+    sessionBusy: false,
+    planModeActive: false,
+    idleMs: 999_999,
+    idleThresholdMs: 1,
+  });
+  assert.equal(decision.resume, false);
+  if (!decision.resume) assert.equal(decision.reason, "unbounded_run_limit");
+});
+
+test("有预算的 goal 不受轮次上限影响（100 轮以上仍可续）", () => {
+  const decision = decideResume({
+    goal: goal({ runs: 150, token_limit: 1_000_000, time_limit_ms: null }),
+    sessionExecutable: true,
+    sessionBusy: false,
+    planModeActive: false,
+    idleMs: 999_999,
+    idleThresholdMs: 1,
+  });
+  assert.equal(decision.resume, true);
 });
 
 test("续跑提示词带轮次与目标，并要求「卡住就说卡在哪」", () => {

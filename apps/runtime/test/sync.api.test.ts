@@ -87,8 +87,9 @@ test("GET /v1/sync/pull 按 since/limit 增量导出，截断置 has_more；拒�
 
     const third = await fetch(url(runtime, `/v1/sync/pull?since=4&limit=2`));
     const thirdBody = await json<SyncPullBatch>(third);
-    assert.deepEqual(thirdBody.envelopes.map((item) => item.sequence), [5]);
-    assert.equal(thirdBody.next_seq, 5);
+    // 启动事件变多了（M7-C 新增 memory.search 的 builtin 注册），所以尾部是 5、6
+    assert.deepEqual(thirdBody.envelopes.map((item) => item.sequence), [5, 6]);
+    assert.equal(thirdBody.next_seq, 6);
     assert.equal(thirdBody.has_more, false);
 
     const defaults = await fetch(url(runtime, "/v1/sync/pull"));

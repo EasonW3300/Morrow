@@ -151,6 +151,9 @@ async function handleExit(
   if (!assertExecutable(res, ctx, sessionId)) return;
   const result = ctx.planMode.exit(sessionId);
   if (result.changed) {
+    // 退出时清掉待回答问题：否则下次进 Plan 会看到上一个已作废的问题，
+    // 而 Owner 可能已经忘了上下文（code-review 抓到的残留）。
+    ctx.questions.forget(sessionId);
     appendEvent(ctx, "plan.mode_exited", sessionId, {});
   }
   sendJson(res, 200, {

@@ -285,6 +285,19 @@ export class GoalService {
     return updated;
   }
 
+  /** 预算受限（超预算，或"无预算但到轮次上限"的安全兜底） */
+  markBudgetLimited(goalId: string, detail: string): GoalRecord {
+    const existing = this.#deps.store.get(goalId);
+    if (existing === null) throw new GoalError("not_found", `goal ${goalId} does not exist`);
+    const updated = this.#transition(goalId, "budget_limited");
+    this.#append(GOAL_EVENT_TYPES.budgetExceeded, updated.session_id, {
+      goal_id: goalId,
+      reason: "run_limit",
+      detail,
+    });
+    return updated;
+  }
+
   /** 阻塞（C5 在连续 3 轮同阻塞后调用） */
   markBlocked(goalId: string, detail: string): GoalRecord {
     const existing = this.#deps.store.get(goalId);

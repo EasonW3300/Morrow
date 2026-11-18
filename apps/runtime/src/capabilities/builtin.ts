@@ -28,9 +28,29 @@ export const MEMORY_WRITE_CAPABILITY_MANIFEST: CapabilityManifest = {
   tests: [],
 };
 
+/** 记忆检索（只读）的 capability manifest（票 M7-C code-review 补齐） */
+export const MEMORY_SEARCH_CAPABILITY_MANIFEST: CapabilityManifest = {
+  name: "memory.search",
+  version: "1.0.0",
+  author: "human",
+  runtime: "typescript",
+  permissions: { filesystem: [], network: [], shell: [], channels: [], credentials: [] },
+  input_schema: {
+    type: "object",
+    properties: {
+      query: { type: "string", minLength: 1 },
+      limit: { type: "integer", minimum: 1, maximum: 20 },
+    },
+    required: ["query"],
+  },
+  output_schema: { type: "object" },
+  sandbox: { type: "none", network: "none", filesystem: "none" },
+  tests: [],
+};
+
 /** builtin 能力全集（后续内置工具在此追加——ensure-registered 逐个幂等注册） */
 export function builtinCapabilityManifests(): CapabilityManifest[] {
-  return [MEMORY_WRITE_CAPABILITY_MANIFEST];
+  return [MEMORY_WRITE_CAPABILITY_MANIFEST, MEMORY_SEARCH_CAPABILITY_MANIFEST];
 }
 
 /**

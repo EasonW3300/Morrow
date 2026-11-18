@@ -292,6 +292,21 @@ export class BestService {
   abort(bestId: string, reason?: string): BestRunRecord {
     const run = this.#deps.store.get(bestId);
     if (run === null) throw new BestError("not_found", `best run ${bestId} does not exist`);
+
+    // 承载的 goal 也必须停。否则会出现最糟的情况：Best 已经中止，但 goal 还是
+    // active，续跑器照样每 30s 把它拉起来继续烧预算（而且跑的是一个已放弃的目标）。
+    // code-review 抓到的缺陷。
+    if (run.goal_id !== null) {
+      try {
+        const goal = this.#deps.goals.get(run.goal_id);
+        if (goal !== null && goal.status !== "complete") {
+          this.#deps.goals.complete(run.goal_id, { reason: `best run aborted: ${reason ?? "no reason given"}` });
+        }
+      } catch {
+        // goal 可能已被 Owner 手动完成/删除：中止 Best 不该因此失败
+      }
+    }
+
     const now = this.#now().toISOString();
     const updated = this.#deps.store.update(bestId, { status: "aborted", last_error: reason ?? null }, now);
     this.#append(BEST_EVENT_TYPES.aborted, run.session_id, {

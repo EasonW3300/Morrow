@@ -5,7 +5,11 @@ import { homedir } from "node:os";
 import { createPiAdapter, type AgentRuntime, type MorrowTool } from "@morrow/pi-adapter";
 import packageJson from "../package.json" with { type: "json" };
 import piAdapterPackageJson from "../../../packages/pi-adapter/package.json" with { type: "json" };
-import { ensureBuiltinCapabilities, MEMORY_WRITE_CAPABILITY_MANIFEST } from "./capabilities/builtin.ts";
+import {
+  ensureBuiltinCapabilities,
+  MEMORY_SEARCH_CAPABILITY_MANIFEST,
+  MEMORY_WRITE_CAPABILITY_MANIFEST,
+} from "./capabilities/builtin.ts";
 import { CAPABILITY_EVENT_TYPES, PermissionEngine, isEphemeralWriteClassCapability, type CapabilityLifecycleEvent } from "./capabilities/engine.ts";
 import type { CapabilityRecord, SessionAttachment, SessionWorkspace } from "@morrow/protocol";
 import { capabilityRoutes } from "./capabilities/routes.ts";
@@ -32,7 +36,7 @@ import { probeSandbox } from "./health.ts";
 import { EventLedger } from "./ledger.ts";
 import { MemoryService } from "./memory/service.ts";
 import { MemoryStore } from "./memory/store.ts";
-import { createMemoryWriteTool } from "./memory/tool.ts";
+import { createMemorySearchTool, createMemoryWriteTool } from "./memory/tool.ts";
 import { memoryRoutes } from "./memory/routes.ts";
 import { MemoryProjector } from "./memory/projection.ts";
 import { LlmMemoryExtractor, type MemoryExtractor } from "./memory/extraction.ts";
@@ -1046,6 +1050,8 @@ export async function startRuntime(config: RuntimeConfig, options: RuntimeOption
   // 新 builtin 工具在此追加工厂并加入 capabilities/builtin.ts 的 manifest 全集。
   const builtinToolFactories: Record<string, (sessionId: string) => MorrowTool> = {
     [MEMORY_WRITE_CAPABILITY_MANIFEST.name]: (sessionId) => createMemoryWriteTool({ service: memory, sessionId }),
+    // 只读检索（票 M7-C code-review）：Plan 模式要有真实可用的只读工具
+    [MEMORY_SEARCH_CAPABILITY_MANIFEST.name]: () => createMemorySearchTool({ service: memory }),
   };
   // 能力 → 调用接缝登记（#22 修复批 / FR-CAP-5「能力调用路径做真」）：
   //   builtin 实现存在（memory.write 等 human vetted 内置件）→ sandbox.type=process 进程内执行；

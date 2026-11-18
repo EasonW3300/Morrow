@@ -100,7 +100,8 @@ test("权限全空**不**等于只读：memory.write 是写操作（关键反例
 });
 
 test("白名单内的只读能力通过（无任何写类权限）", () => {
-  for (const name of ["fs.read", "code.search", "memory.search"]) {
+  // 白名单只含真实存在的工具（code-review 后从 6 个空壳名收敛到 memory.search）
+  for (const name of [...PLAN_MODE_READONLY_CAPABILITIES]) {
     assert.ok(PLAN_MODE_READONLY_CAPABILITIES.includes(name));
     assert.equal(
       isPlanModeReadOnly({
@@ -123,7 +124,7 @@ test("白名单内的只读能力通过（无任何写类权限）", () => {
 test("白名单里的能力若声明了写权限，仍然拒绝（manifest 权威于白名单）", () => {
   assert.equal(
     isPlanModeReadOnly({
-      name: "fs.read",
+      name: "memory.search",
       version: "1.0.0",
       author: "human",
       runtime: "typescript",
@@ -147,7 +148,7 @@ test("shell 只读类别（read/vcs/test）允许；build/write/arbitrary 拒绝
     output_schema: {},
     sandbox: { type: "process" as const, network: "none" as const, filesystem: "none" as const },
     tests: [],
-    name: "fs.read",
+    name: "memory.search",
   };
   assert.equal(
     isPlanModeReadOnly({

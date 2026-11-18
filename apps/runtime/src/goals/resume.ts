@@ -29,6 +29,7 @@ export type ResumeDecision =
 
 export type ResumeBlockedReason =
   | "not_active"
+  | "unbounded_run_limit"
   | "session_not_executable"
   | "session_busy"
   | "not_idle_long_enough"
@@ -53,6 +54,24 @@ export interface ResumeInput {
 export const DEFAULT_RESUME_IDLE_MS = 30_000;
 
 /**
+ * 无预算时的轮次硬上限（100 轮）。
+ *
+ * 这个兜底是 code-review 抓到的真实风险：`token_limit` 与 `time_limit_ms` 都可以
+ * 为 null（"不设限"是合法的），但**自动续跑 + 无任何上限 = 永不停止**。每 30s 一轮，
+ * 没人看着就会一直烧。
+ *
+ * 100 轮远高于任何正常目标（一个 goal 通常几轮到十几轮），所以它只会拦住
+ * "忘了设预算且它跑飞了"这种情况。到上限按 `budget_limited` 处理并说明原因。
+ */
+export const UNBOUNDED_GOAL_RUN_LIMIT = 100;
+
+/** 是否已到无预算轮次上限 */
+export function hitUnboundedRunLimit(goal: { runs: number; token_limit: number | null; time_limit_ms: number | null }): boolean {
+  if (goal.token_limit !== null || goal.time_limit_ms !== null) return false;
+  return goal.runs >= UNBOUNDED_GOAL_RUN_LIMIT;
+}
+
+/**
  * 判定是否续跑。
  *
  * 顺序刻意从"最不可协商"到"最可协商"：先看状态与可执行性（硬条件），再看忙闲
@@ -72,6 +91,10 @@ export function decideResume(input: ResumeInput): ResumeDecision {
   }
   if (input.sessionBusy) {
     return { resume: false, reason: "session_busy", ...base };
+  }
+  if (hitUnboundedRunLimit(input.goal)) {
+    // 无预算且有上限保护：到 100 轮就停（避免"忘了设预算"变成永不停止）
+    return { resume: false, reason: "unbounded_run_limit", ...base };
   }
   if (input.idleMs < input.idleThresholdMs) {
     return { resume: false, reason: "not_idle_long_enough", ...base };

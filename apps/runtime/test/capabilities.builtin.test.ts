@@ -122,7 +122,12 @@ test("会话工具注入改查注册表：disable 后新会话不再注入 memor
     await waitFor("assistant turn", async () =>
       (await allEvents(runtime.port)).some((e) => e.event_type === "message.assistant"),
     );
-    assert.deepEqual(captured.at(-1), [MEMORY_WRITE_TOOL_NAME], "迁移前行为不变：会话注入 memory.write");
+    // 工具集现在还含 memory.search（M7-C code-review 新增的只读检索），
+    // 所以断言"包含"而不是精确相等。
+    assert.ok(
+      (captured.at(-1) ?? []).includes(MEMORY_WRITE_TOOL_NAME),
+      `会话应注入 memory.write；实际 ${JSON.stringify(captured.at(-1))}`,
+    );
 
     // disable：新会话不再注入
     const disable = await lifecyclePost(runtime, `/v1/capabilities/${MEMORY_WRITE_TOOL_NAME}/disable`);
@@ -132,7 +137,12 @@ test("会话工具注入改查注册表：disable 后新会话不再注入 memor
     await waitFor("second assistant turn", async () =>
       (await allEvents(runtime.port)).filter((e) => e.event_type === "message.assistant").length >= 2,
     );
-    assert.deepEqual(captured.at(-1), [], "注册表治理生效：disabled 能力不注入");
+    // memory.write 被停用后应不在工具集里（memory.search 仍在——它没被停用）
+    assert.equal(
+      (captured.at(-1) ?? []).includes(MEMORY_WRITE_TOOL_NAME),
+      false,
+      `disabled 能力不该注入；实际 ${JSON.stringify(captured.at(-1))}`,
+    );
 
     // re-enable：恢复注入
     const enable = await lifecyclePost(runtime, `/v1/capabilities/${MEMORY_WRITE_TOOL_NAME}/enable`);
@@ -142,7 +152,10 @@ test("会话工具注入改查注册表：disable 后新会话不再注入 memor
     await waitFor("third assistant turn", async () =>
       (await allEvents(runtime.port)).filter((e) => e.event_type === "message.assistant").length >= 3,
     );
-    assert.deepEqual(captured.at(-1), [MEMORY_WRITE_TOOL_NAME], "enable 后恢复注入");
+    assert.ok(
+      (captured.at(-1) ?? []).includes(MEMORY_WRITE_TOOL_NAME),
+      `enable 后应恢复注入 memory.write；实际 ${JSON.stringify(captured.at(-1))}`,
+    );
   } finally {
     await runtime.close();
   }

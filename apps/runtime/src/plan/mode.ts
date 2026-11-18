@@ -32,13 +32,11 @@ import type { CapabilityManifest } from "@morrow/protocol";
  * `read_and_delete` 意外通过。精确名单看着笨，但它是可审计的。
  */
 export const PLAN_MODE_READONLY_CAPABILITIES: readonly string[] = [
-  // 内置只读工具（当前批次；M7-C 之前只有 memory.write 一个 builtin，故列表以
-  // 未来的只读工具名为准——现在主要由下面的「按 manifest 判定的只读 shell」承担）
-  "fs.read",
-  "fs.list",
-  "fs.stat",
-  "code.search",
-  "git.read",
+  // 只列**真实存在**的只读内置工具。
+  //
+  // 初版这里写了 fs.read / fs.list / code.search / git.read 等 6 个名字，但项目里
+  // 一个都没有实现（只有 memory.write 一个 builtin）——于是 Plan 模式下工具集是空的，
+  // 「只读研究」什么都做不了。code-review 时把这份名单对齐到实际，并补了 memory.search。
   "memory.search",
 ];
 
