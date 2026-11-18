@@ -392,6 +392,7 @@ export class MemoryStore {
   #factByIdStmt;
   #factSourcesStmt;
   #candidateBySourceStmt;
+  #candidateContentsBySourceStmt;
   #listCandidatesAllStmt;
   #listCandidatesByStatusStmt;
   #setCandidateStatusStmt;
@@ -466,6 +467,12 @@ export class MemoryStore {
       `SELECT c.candidate_id FROM memory_candidates c
        JOIN memory_sources s ON s.source_id = c.source_id
        WHERE s.event_id = ? AND c.content = ? LIMIT 1`,
+    );
+    // 同一来源事件下的全部候选内容（Issue #56：入口去重要能比对"近似但不同措辞"）
+    this.#candidateContentsBySourceStmt = db.prepare(
+      `SELECT c.content FROM memory_candidates c
+       JOIN memory_sources s ON s.source_id = c.source_id
+       WHERE s.event_id = ?`,
     );
     this.#listCandidatesAllStmt = db.prepare(
       `SELECT c.*, s.event_id AS source_event_id
@@ -710,6 +717,18 @@ export class MemoryStore {
   hasCandidateFromSource(sourceEventId: string, content: string): boolean {
     this.#assertOpen();
     return this.#candidateBySourceStmt.get(sourceEventId, content) !== undefined;
+  }
+
+  /**
+   * 同一来源事件下已有的候选内容（Issue #56 入口去重）。
+   *
+   * 返回内容列表而不是布尔值：调用方要做**近似**判定（同一句话经两个写路径会产出
+   * 措辞不同的两条），精确相等不够用。
+   */
+  candidateContentsFromSource(sourceEventId: string): string[] {
+    this.#assertOpen();
+    const rows = this.#candidateContentsBySourceStmt.all(sourceEventId) as Array<{ content: string }>;
+    return rows.map((row) => row.content);
   }
 
   getFact(factId: string): MemoryFactRow | null {
