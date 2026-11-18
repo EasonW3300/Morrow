@@ -1,5 +1,6 @@
 import type { MemoryEntryKind, MemoryWriteInput, SensitivityLevel } from "@morrow/protocol";
 import { buildEventEnvelope } from "../envelope.ts";
+import { findDuplicateContent } from "./dedup.ts";
 import type { EventLedger } from "../ledger.ts";
 import { EPHEMERAL_SESSION_TTL_MS, SESSION_EVENT_TYPES } from "../sessions.ts";
 import {
@@ -788,9 +789,15 @@ export class MemoryService {
     }
     const candidateIds: string[] = [];
     let skippedDuplicates = 0;
+    // 去重（Issue #56）：同一来源事件内，"近似"内容也只写一次。
+    // 原实现只判**完全相同**，但同一句话经两个写路径（memory.write 工具 + 轮次抽取）
+    // 会产出措辞不同的两条候选，于是长期记忆里同一事实存两份。
+    // 每写一条就把内容追加进来，让后续条目也能与刚写的比较。
+    const contentsFromSource = this.#store.candidateContentsFromSource(input.userEventId);
     for (const item of extracted) {
-      // 去重：同一来源事件 + 同一内容只写一次（T1 即时写入/工具路径先写走的候选不重复）
-      if (this.#store.hasCandidateFromSource(input.userEventId, item.content)) {
+      const exact = this.#store.hasCandidateFromSource(input.userEventId, item.content);
+      const near = exact ? null : findDuplicateContent(item.content, contentsFromSource);
+      if (exact || near !== null) {
         skippedDuplicates += 1;
         continue;
       }
@@ -805,6 +812,7 @@ export class MemoryService {
         rule: item.rule,
       });
       candidateIds.push(result.candidate.candidate_id);
+      contentsFromSource.push(item.content);
     }
     const extractedEnvelope = buildEventEnvelope({
       replicaId: this.#replicaId,

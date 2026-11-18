@@ -1,4 +1,5 @@
 import type { MemoryEntryKind, SensitivityLevel } from "@morrow/protocol";
+import { isLikelyDuplicateContent } from "./dedup.ts";
 
 /**
  * 巩固器（票 M1-T2 / Issue #14，FR-MEM-4/5）：记忆管线的第二个内部接缝。
@@ -18,9 +19,16 @@ import type { MemoryEntryKind, SensitivityLevel } from "@morrow/protocol";
  *   3. kind = preference                 → update_fact（常规偏好自动更新留历史）
  *   4. 其余 kind 且内容不同              → escalate "fact_conflict"（重大事实冲突）
  *
- * 同主题判定是确定性的：kind 相同 且 显著词元交集非空。显著词元 = ASCII 词（≥2 字符，
- * 小写）∪ CJK 单字（去常用虚词停用字表）。这是启发式：判定过宽会把无关候选卷进冲突
- * 审核（宁可多问，不静默覆盖），判定过窄会多建事实——两者都可由 Owner 经裁决端点纠偏。
+ * 同主题判定是确定性的，两条路径（Issue #56 修正）：
+ *   1. **同 kind 且显著词元交集非空**——常规口径。显著词元 = ASCII 词（≥2 字符，小写）
+ *      ∪ CJK 单字（去常用虚词停用字表）。
+ *   2. **跨 kind 但内容高度重合**——同一句话经不同写路径可能被归成不同 kind
+ *      （`memory.write` 写 fact、抽取器写 preference），若只按 kind 匹配就会各自建事实。
+ *      跨 kind 时要求 `isLikelyDuplicateContent`（Jaccard ≥ 0.8 且长度比 ≥ 0.5），
+ *      比同 kind 的口径**更严**：宁可多一条，不可把无关陈述合并。
+ *
+ * 两条都是启发式：判定过宽会把无关候选卷进冲突审核（宁可多问，不静默覆盖），
+ * 判定过窄会多建事实——两者都可由 Owner 经裁决端点纠偏。
  *
  * 可注入：生产用 DefaultConsolidator；LLM 巩固（语义合并/置信度整合）后续经同接口替换。
  */
@@ -128,9 +136,12 @@ export class DefaultConsolidator implements MemoryConsolidator {
     // 最优匹配 = 词元交集最大；并列取 facts 数组中更早者（服务层按 created_at 升序给）
     let best: { fact: ConsolidationFactView; overlap: number } | null = null;
     for (const fact of facts) {
-      if (fact.kind !== candidate.kind) continue;
+      const sameKind = fact.kind === candidate.kind;
+      // 跨 kind 不直接用词元交集（太宽），要求内容高度重合（Issue #56）
+      if (!sameKind && !isLikelyDuplicateContent(candidate.content, fact.content)) continue;
       const overlap = overlapSize(candidateTokens, salientTokens(fact.content));
-      if (overlap === 0) continue;
+      // 跨 kind 时 overlap 只用于在多个匹配里挑最优；0 也接受（内容已判为重复）
+      if (sameKind && overlap === 0) continue;
       if (best === null || overlap > best.overlap) best = { fact, overlap };
     }
     if (best === null) {
@@ -144,6 +155,12 @@ export class DefaultConsolidator implements MemoryConsolidator {
     }
     const fact = best.fact;
     if (normalizeForComparison(candidate.content) === normalizeForComparison(fact.content)) {
+      return { action: "corroborate", factId: fact.factId, candidateId: candidate.candidateId };
+    }
+    if (fact.kind !== candidate.kind) {
+      // 跨 kind 但内容重复（Issue #56）：这**不是**新事实，也不是需要改写的偏好更新——
+      // 同一件事被两个写路径用了不同 kind 记录。按印证处理：补来源、不改写既有事实
+      // （改写会把 fact 变成 preference，或反之，等于悄悄改变记忆语义）。
       return { action: "corroborate", factId: fact.factId, candidateId: candidate.candidateId };
     }
     if (fact.sensitivity === "locked") {
